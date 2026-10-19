@@ -1,0 +1,3 @@
+src/rt/gpu_d3d12/shaders/*.hlsl text eol=lf
+src/rt/gpu_d3d12/shaders/*.inc text eol=lf
+tools/compile_d3d12_shaders.py text eol=lf
