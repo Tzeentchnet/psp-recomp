@@ -38,8 +38,10 @@ provide complete corresponding source to your recipients.
 
 ## Prerequisites
 
-- **OS**: Windows 10/11 x64 with a Vulkan-capable GPU.
+- **OS**: Windows 10/11 x64 with a Vulkan 1.1- or D3D12-capable GPU.
 - **Python 3**: For running the offline compilation scripts.
+- **DirectX Shader Compiler**: `dxc.exe` from the Windows SDK when regenerating the
+  checked-in D3D12 shader includes.
 - **MSYS2 (UCRT64)**:
   - GCC: `pacman -S mingw-w64-ucrt-x86_64-gcc`
   - SDL3: `pacman -S mingw-w64-ucrt-x86_64-sdl3`

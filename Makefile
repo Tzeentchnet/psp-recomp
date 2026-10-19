@@ -46,7 +46,9 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/gpu_sdl3vk/sdl3vk.c \
               src/rt/gpu_sdl3vk/ge_gpu.c
 
-.PHONY: all pipeline compile clean run
+DXC        ?= dxc
+
+.PHONY: all pipeline compile clean run shaders-d3d12 check-shaders-d3d12
 
 all: pipeline compile
 
@@ -69,9 +71,17 @@ $(RT_GE_O): src/rt/ge.c src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) -O2 -fno-math-errno -Wall -Wextra -Isrc/rt -c src/rt/ge.c -o $@
 
-$(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h src/rt/ge_shared.h src/rt/recomp.h
+$(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h \
+               src/rt/gpu_d3d12/shaders/psp_vs.inc src/rt/gpu_d3d12/shaders/psp_ps.inc \
+               src/rt/ge_shared.h src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/device.cpp -o $@
+
+shaders-d3d12:
+	$(PYTHON) tools/compile_d3d12_shaders.py --dxc "$(DXC)"
+
+check-shaders-d3d12:
+	$(PYTHON) tools/compile_d3d12_shaders.py --dxc "$(DXC)" --check
 
 # Generated C code gets huge. Cache the compiled object to avoid rebuilding it on runtime changes.
 $(BUILD_DIR)/$(GAME_NAME)_recomp.o: $(BUILD_DIR)/$(GAME_NAME)_recomp.c src/rt/recomp.h

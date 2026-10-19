@@ -15,12 +15,25 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 - software-GE framebuffer upload so `SR_GPU=d3d12` is usable before the HLSL renderer
   lands.
 
+`shaders/psp_vs.hlsl` and `shaders/psp_ps.hlsl` are the native Shader Model 6 ports of
+the Vulkan GE shaders. Their checked-in `*.inc` files contain stripped DXIL consumed by
+`device.cpp`. Regenerate or verify them with:
+
+```text
+python tools/compile_d3d12_shaders.py [--dxc path/to/dxc]
+python tools/compile_d3d12_shaders.py [--dxc path/to/dxc] --check
+```
+
+The Makefile exposes the same operations as `shaders-d3d12` and
+`check-shaders-d3d12`; D3D12-enabled root CMake builds expose
+`kzl_d3d12_shaders` and `kzl_d3d12_shaders_check`.
+
 Set `SR_D3D12_DEBUG=1` to request the D3D12 debug layer. Add
 `SR_D3D12_GPU_VALIDATION=1` to enable GPU-based validation. Both settings fail
 explicitly when the requested debug interface is unavailable.
 
-Later phase-4 tasks add HLSL shaders, root signatures, vertex decoding, PSO and texture
-caches, and GPU-resident framebuffer presentation behind the same descriptor.
+Later phase-4 tasks bind these shaders through root signatures, vertex decoding, PSO and
+texture caches, and GPU-resident framebuffer presentation behind the same descriptor.
 
 The root project keeps this dependency optional:
 

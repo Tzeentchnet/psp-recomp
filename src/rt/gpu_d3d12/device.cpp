@@ -33,6 +33,13 @@ extern "C" {
 
 #define RELEASE_COM(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
 
+static const uint8_t k_psp_vs_dxil[] =
+#include "shaders/psp_vs.inc"
+;
+static const uint8_t k_psp_ps_dxil[] =
+#include "shaders/psp_ps.inc"
+;
+
 struct FrameContext {
     ID3D12CommandAllocator *allocator;
     UINT64 fence_value;
@@ -815,3 +822,11 @@ ID3D12CommandQueue *ged3d12_copy_queue(void) { return s_copy_queue; }
 ID3D12DescriptorHeap *ged3d12_srv_heap(void) { return s_srv_heap; }
 ID3D12DescriptorHeap *ged3d12_rtv_heap(void) { return s_rtv_heap; }
 ID3D12DescriptorHeap *ged3d12_dsv_heap(void) { return s_dsv_heap; }
+D3D12_SHADER_BYTECODE ged3d12_vertex_shader(void) {
+    D3D12_SHADER_BYTECODE shader = {k_psp_vs_dxil, sizeof(k_psp_vs_dxil)};
+    return shader;
+}
+D3D12_SHADER_BYTECODE ged3d12_pixel_shader(void) {
+    D3D12_SHADER_BYTECODE shader = {k_psp_ps_dxil, sizeof(k_psp_ps_dxil)};
+    return shader;
+}

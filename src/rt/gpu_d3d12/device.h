@@ -48,6 +48,8 @@ ID3D12CommandQueue *ged3d12_copy_queue(void);
 ID3D12DescriptorHeap *ged3d12_srv_heap(void);
 ID3D12DescriptorHeap *ged3d12_rtv_heap(void);
 ID3D12DescriptorHeap *ged3d12_dsv_heap(void);
+D3D12_SHADER_BYTECODE ged3d12_vertex_shader(void);
+D3D12_SHADER_BYTECODE ged3d12_pixel_shader(void);
 
 /* Allocations are valid until the current frame slot is reused after its fence completes. */
 bool ged3d12_upload_alloc(UINT64 size, UINT64 alignment, GeD3D12UploadSlice *out);
