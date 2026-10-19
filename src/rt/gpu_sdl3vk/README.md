@@ -41,9 +41,9 @@ mapping as gui.c). Deliverable: pixel-identical output to the GDI build at lower
 resizable window, fullscreen-capable.
 
 ### Phase 1 — GE draw capture → Vulkan rasterization (DONE, `ge_gpu.c`)
-Enabled with `SR_GPU_GE=1`. Implementation:
-- Capture seam: runtime hooks (`GeGpuHooks` in `src/rt/ge_shared.h`, registered via
-  `ge_set_gpu_hooks`) at the top of `raster_tri` and `fill_sprite`. ge.c still does
+Enabled with `SR_GPU=vk`. Implementation:
+- Capture seam: the runtime `GeBackend` descriptor in `src/rt/ge_shared.h`, registered via
+  `ge_set_backend`, at the top of `raster_tri` and `fill_sprite`. ge.c still does
   vertex decode, T&L, near-clipping, primitive acceptance and cull-order reordering;
   the backend receives finished screen-space primitives. The GDI build registers
   nothing and is bit-identical to before.
@@ -62,7 +62,7 @@ Enabled with `SR_GPU_GE=1`. Implementation:
   rasterizer in correct order. Presentation/snapshot code is unchanged.
 - Not reproduced on GPU: ordered dithering (±4 LSB on 16-bit targets) and the integer
   truncation of the software blender (±1 LSB).
-- A/B harness: run twice with `SR_FBSNAP=1` (once `SR_GPU_GE=0`), then
+- A/B harness: run twice with `SR_FBSNAP=1` (once `SR_GPU=sw`), then
   `python tools/ppmdiff.py dirA dirB`. Title/menu sequence matches pixel-exactly
   except dithering. Measured GE cost on the intro: ~1700ms/60-frames software →
   ~330ms/60-frames GPU (~5x).
@@ -99,9 +99,10 @@ Enabled with `SR_GPU_GE=1`. Implementation:
 
 ## Environment variables
 
-- `SR_GPU_GE=1` — enable the GPU rasterizer (SDL3 build only; default off).
+- `SR_GPU=vk` — enable the Vulkan GE backend.
+- `SR_GPU=sw` — keep the reference software rasterizer.
 - `SR_GPU_LOG=1` — one line per flush (reason, batches, verts, target).
-- `SR_VIDEO=gdi` — Phase-0 fallback to the classic GDI window.
+- `SR_GPU_GE` and `SR_VIDEO=gdi` — legacy compatibility switches; prefer `SR_GPU`.
 
 ## PSP/GE semantics that MUST carry over (hard-won, see ge.c comments)
 

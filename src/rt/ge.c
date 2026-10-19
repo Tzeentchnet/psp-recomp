@@ -94,13 +94,13 @@ enum {
 static GeState ge;
 static int s_ge_inited = 0;
 
-/* Optional GPU rasterizer hooks (ge_shared.h). NULL = pure software (the GDI build
- * never registers any; the SDL3 build registers them only under SR_GPU_GE=1). */
-static const GeGpuHooks *s_gpu = NULL;
-void ge_set_gpu_hooks(const GeGpuHooks *h) { s_gpu = h; }
+/* Optional rasterizer backend (ge_shared.h). NULL = the reference software path. */
+static const GeBackend *s_backend = NULL;
+void ge_set_backend(const GeBackend *backend) { s_backend = backend; }
+const GeBackend *ge_backend_get(void) { return s_backend; }
 GeState *ge_state_ptr(void) { return &ge; }
 void sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes) {
-    if (s_gpu && s_gpu->vram_dirty) s_gpu->vram_dirty(addr, bytes);
+    if (s_backend && s_backend->vram_dirty) s_backend->vram_dirty(addr, bytes);
 }
 
 /* Decode a GE 24-bit float mantissa word to IEEE-754 float.
@@ -942,7 +942,7 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
     /* GPU capture seam: a registered backend takes the triangle (and reproduces culling,
      * depth, shading, blending on the GPU); if it declines it has already flushed, so the
      * software path below stays correctly ordered against prior GPU work. */
-    if (s_gpu && s_gpu->tri && s_gpu->tri(A, B, C, persp)) return;
+    if (s_backend && s_backend->tri && s_backend->tri(A, B, C, persp)) return;
 
     float area=(B->x-A->x)*(C->y-A->y)-(C->x-A->x)*(B->y-A->y);
     if (area == 0.0f) { if (persp) s_stat.deg3d++; return; }
@@ -1108,7 +1108,7 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
 
 /* Line rasterizer (DDA), used for prim types 1/2 in both modes. */
 static void draw_line_vtx(const Vtx *A, const Vtx *B, int persp) {
-    if (s_gpu && s_gpu->line && s_gpu->line(A, B, persp)) return;
+    if (s_backend && s_backend->line && s_backend->line(A, B, persp)) return;
     float dx=B->x-A->x, dy=B->y-A->y;
     float len=fmaxf(fabsf(dx),fabsf(dy));
     int steps=(int)len;
@@ -1144,7 +1144,7 @@ static void draw_line_vtx(const Vtx *A, const Vtx *B, int persp) {
 }
 
 static void draw_point_vtx(const Vtx *A, int persp) {
-    if (s_gpu && s_gpu->point && s_gpu->point(A, persp)) return;
+    if (s_backend && s_backend->point && s_backend->point(A, persp)) return;
     if (!zrange_ok(A->z, persp)) { if (s_stat_on > 0) s_stat.zrange++; return; }
     int textured = ge.tex_enable && !ge.clear && ge.tex_addr;
     float u=0, fv=0;
@@ -1591,7 +1591,7 @@ static void fill_rect_clear_fast(int xa, int ya, int xb, int yb, int r, int g, i
 /* Rasterise a sprite (axis-aligned rect from two corner vertices). Used by both modes;
  * persp=1 recovers UV from the over-w storage and depth-tests with the second vertex's z. */
 static void fill_sprite(const Vtx *p0, const Vtx *p1, int persp) {
-    if (s_gpu && s_gpu->sprite && s_gpu->sprite(p0, p1, persp)) return;
+    if (s_backend && s_backend->sprite && s_backend->sprite(p0, p1, persp)) return;
 
     int xa=(int)fminf(p0->x,p1->x), xb=(int)fmaxf(p0->x,p1->x);
     int ya=(int)fminf(p0->y,p1->y), yb=(int)fmaxf(p0->y,p1->y);
@@ -2150,8 +2150,8 @@ static void ge_block_transfer(uint32_t startdata) {
     uint32_t w = (ge.xf_size & 0x3FFu) + 1, h = ((ge.xf_size >> 10) & 0x3FFu) + 1;
     uint32_t bpp = (startdata & 1) ? 4 : 2;
     if (!srcStride || !dstStride) return;
-    if (s_gpu && s_gpu->xfer && s_gpu->xfer(startdata)) return;   /* GPU-side blit */
-    if (s_gpu && s_gpu->flush) s_gpu->flush("xfersrc");
+    if (s_backend && s_backend->xfer && s_backend->xfer(startdata)) return;   /* GPU-side blit */
+    if (s_backend && s_backend->flush) s_backend->flush("xfersrc");
     for (uint32_t y = 0; y < h; y++) {
         uint32_t so = srcBase + ((srcY + y) * srcStride + srcX) * bpp;
         uint32_t dofs = dstBase + ((dstY + y) * dstStride + dstX) * bpp;
@@ -2176,7 +2176,7 @@ void ge_list_begin(uint32_t list_addr) {
 
 void ge_list_end(void) {
     extern unsigned long g_tex_nonzero;
-    if (s_gpu && s_gpu->flush) s_gpu->flush("listend");
+    if (s_backend && s_backend->flush) s_backend->flush("listend");
     if (s_list_snap > 0 && g_tex_nonzero > s_list_start_nz) ge_snapshot("fb_content.ppm");
     g_ge_list_sig = s_list_sig; g_ge_prim_count = s_list_prims;
     if (s_gewatch > 0 && s_ge_frame >= (uint32_t)s_gewatch_after)
@@ -2391,8 +2391,8 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
                 /* Copy (data&0x3F) 32-byte blocks from clut_addr into internal CLUT RAM, like
                  * the hardware (PPSSPP TextureCacheCommon::LoadClut). */
                 /* CLUT sourced from VRAM may read pixels the GPU backend hasn't written back. */
-                if (s_gpu && s_gpu->flush && (ge.clut_addr & 0x0F000000u) == 0x04000000u)
-                    s_gpu->flush("loadclut");
+                if (s_backend && s_backend->flush && (ge.clut_addr & 0x0F000000u) == 0x04000000u)
+                    s_backend->flush("loadclut");
                 uint32_t bytes = (data & 0x3F) * 32;
                 if (bytes > sizeof(ge.clutram)) bytes = sizeof(ge.clutram);
                 for (uint32_t i = 0; i < bytes; i += 4) {

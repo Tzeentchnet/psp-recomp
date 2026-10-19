@@ -183,10 +183,10 @@ void     sr_intr_release(uint32_t intr, uint32_t sub);
 void     sr_intr_run_vblank(CpuState *s);   /* every enabled vblank sub-handler, in order */
 extern uint32_t g_sdk_version;          /* sceKernelSetCompiledSdkVersion (hle.c) */
 
-/* Interactive window front-end (src/rt/gui.c, Win32). gui_init opens the window; gui_present is
+/* Interactive window front-end (src/rt/gui.c). gui_init selects SR_GPU and opens the window; gui_present is
  * called from sceDisplaySetFrameBuf to show a frame, pump messages, and sample the keyboard;
  * gui_buttons returns the live PSP pad state; gui_on reports whether the window is active. */
-void     gui_init(const char *title);
+int      gui_init(const char *title);
 int      gui_on(void);
 uint32_t gui_buttons(void);
 void     gui_analog(uint8_t *lx, uint8_t *ly);   /* live left-stick (0..255, 128=centre) */

@@ -106,8 +106,9 @@ If you have a gamepad connected, SDL3 will map it automatically. Otherwise, use 
 ## Environment Settings
 
 Set these environment variables before running the game to control runtime features:
-- `SR_GPU_GE=1`: Enable Vulkan GPU rasterization (default, recommended).
-- `SR_GPU_GE=0`: Fallback to software rasterizer (slow, useful for debugging visual bugs).
-- `SR_VIDEO=gdi`: Fall back to the classic Win32/GDI presentation path.
+- `SR_GPU=vk`: Use the Vulkan GE backend (SDL3/Vulkan build).
+- `SR_GPU=sw`: Use the reference software rasterizer.
+- `SR_GPU=d3d12`: Select the D3D12 backend when it is compiled in; unavailable backends fail explicitly.
+- `SR_GPU_GE` / `SR_VIDEO=gdi`: Legacy Vulkan/software and presenter overrides.
 - `SR_GPU_LOG=1`: Print GPU cache flushes and batch information to the console.
 - `SR_IOLOG=1`: Print all file system access logs.

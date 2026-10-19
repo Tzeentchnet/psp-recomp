@@ -1,9 +1,9 @@
-/* Shared GE state + GPU-backend hook API.
+/* Shared GE state + rasterizer backend API.
  *
  * GeState/GeVtx were moved here verbatim from ge.c so the optional GPU rasterizer
  * (src/rt/gpu_sdl3vk/ge_gpu.c) can read the live GE state without duplicating it.
  * ge.c remains the only writer of the state and the arbiter of GE semantics; the GPU
- * backend registers hooks at runtime (ge_set_gpu_hooks) and ge.c stays byte-identical
+ * backend registers at runtime (ge_set_backend) and ge.c stays byte-identical
  * in behaviour when no hooks are registered (the GDI build never registers any).
  */
 #ifndef GE_SHARED_H
@@ -85,13 +85,19 @@ typedef struct {
  * pre-multiplied by rw (texel coords over w). */
 typedef struct GeVtx { float x, y, z, rw; float u, v; float fog; int r, g, b, a; } GeVtx;
 
-/* GPU rasterizer hooks. The primitive hooks return 1 when the primitive was taken by
+/* Rasterizer backend. init/present/shutdown provide the lifecycle seam needed to select
+ * Vulkan, D3D12, or the software fallback at runtime. The primitive hooks return 1 when
+ * the primitive was taken by
  * the GPU backend (the software rasterizer is skipped) — in the full GPU renderer they
  * always take it. flush(reason) is called at GE sync points ("listend", "loadclut");
  * the backend decides what each requires. vram_dirty(addr,bytes) tells the backend the
  * CPU wrote guest memory directly (movie decode, DMA) so any GPU framebuffer caching
  * that range must be invalidated. */
-typedef struct GeGpuHooks {
+typedef struct GeBackend {
+    const char *name;
+    int  (*init)(void);
+    int  (*present)(uint32_t fbaddr, int fmt, uint32_t stride);
+    void (*shutdown)(void);
     int  (*tri)(const GeVtx *a, const GeVtx *b, const GeVtx *c, int persp);
     int  (*sprite)(const GeVtx *p0, const GeVtx *p1, int persp);
     int  (*line)(const GeVtx *a, const GeVtx *b, int persp);
@@ -105,10 +111,11 @@ typedef struct GeGpuHooks {
      * this blit per frame (motion blur, pause capture); the CPU route costs a GPU drain +
      * PCIe readback + re-upload each time, which dwarfs the frame itself on discrete GPUs. */
     int  (*xfer)(uint32_t startdata);
-} GeGpuHooks;
+} GeBackend;
 
 /* Implemented in ge.c. */
-void      ge_set_gpu_hooks(const GeGpuHooks *h);
+void             ge_set_backend(const GeBackend *backend);
+const GeBackend *ge_backend_get(void);
 /* CPU-side writes to guest memory that may alias GPU-cached framebuffers (movie decode,
  * DMA memcpy). No-op when no GPU backend is registered. */
 void      sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes);

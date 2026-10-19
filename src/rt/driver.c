@@ -210,7 +210,10 @@ have_image:;
 
     int use_sched = standalone;
     for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--sched") == 0) use_sched = 1;
-    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--gui") == 0) { gui_init("PSP Recomp"); use_sched = 1; }
+    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--gui") == 0) {
+        if (!gui_init("PSP Recomp")) return 2;
+        use_sched = 1;
+    }
 
     if (use_sched) {
         /* Run with the cooperative scheduler so the game's threads interleave (the boot busy-

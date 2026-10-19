@@ -6,7 +6,7 @@
  *
  * Architecture: ge.c keeps doing vertex decode + T&L + clipping + primitive acceptance
  * (the parts validated against PPSSPP), then hands SCREEN-SPACE primitives to this
- * backend through the GeGpuHooks seam. Every primitive renders on the GPU — there is no
+ * backend through the GeBackend seam. Every primitive renders on the GPU — there is no
  * software-rasterizer fallback; unmappable blend modes are approximated (see
  * build_state). GE framebuffers are PERSISTENT GPU images (color RGBA8 + shared D16
  * depth keyed by zbp): no guest-VRAM upload/readback per flush. Guest VRAM is read only
@@ -1385,11 +1385,17 @@ int gegpu_present(uint32_t fbaddr, int fmt, uint32_t stride) {
 
 /* ---- init ----------------------------------------------------------------------------------- */
 
-static const GeGpuHooks k_hooks = {
+static int gegpu_init(void);
+static void gegpu_shutdown(void);
+
+static const GeBackend k_backend = {
+    "vk", gegpu_init, gegpu_present, gegpu_shutdown,
     hook_tri, hook_sprite, hook_line, hook_point, gegpu_flush, hook_vram_dirty, hook_xfer,
 };
 
-int gegpu_init(void) {
+const GeBackend *gegpu_backend(void) { return &k_backend; }
+
+static int gegpu_init(void) {
     Sdl3VkInfo vi;
     if (!sdl3vk_get_vk(&vi)) { fprintf(stderr, "gegpu: sdl3vk not initialized\n"); return 0; }
     s_pdev  = (VkPhysicalDevice)vi.physical;
@@ -1504,15 +1510,13 @@ int gegpu_init(void) {
     if (!s_snap_n || !s_snap_l) return 0;
 
     s_ready = 1;
-    ge_set_gpu_hooks(&k_hooks);
     fprintf(stderr, "gegpu: full GPU GE active (persistent targets, no software fallback)\n");
     return 1;
 }
 
-void gegpu_shutdown(void) {
+static void gegpu_shutdown(void) {
     if (!s_ready) return;
     submit_pending();
-    ge_set_gpu_hooks(NULL);
     s_ready = 0;
     vkDeviceWaitIdle(s_dev);
     /* process exit follows immediately; Vulkan objects die with the device */

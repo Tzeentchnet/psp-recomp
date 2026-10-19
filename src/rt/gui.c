@@ -1,10 +1,5 @@
-/* Interactive front-end: a real window that shows the game's framebuffer and feeds the keyboard
- * to sceCtrl, so the recompiled game runs like a normal app (watch the intro, press START, play).
- *
- * Win32/GDI only (no external deps): a top-level window, a 32-bit DIB the PSP 16/32-bit
- * framebuffer is converted into each frame, and GetAsyncKeyState mapped to the PSP pad. The game
- * loop drives presentation: sceDisplaySetFrameBuf calls gui_present(), which also pumps the window
- * message queue and samples the keyboard. */
+/* Interactive front-end: presents through the selected GE backend and feeds keyboard/gamepad
+ * input to sceCtrl. The dependency-free Win32/GDI path remains the software fallback. */
 
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
@@ -26,6 +21,9 @@
 
 static int      s_on = 0;
 static int      s_sdl3 = 0;            /* SDL3+Vulkan presenter active (src/rt/gpu_sdl3vk) */
+#ifdef SR_SDL3VK
+static const GeBackend *s_ge_backend;
+#endif
 static HWND     s_hwnd;
 static uint32_t *s_px;                 /* PSP_W*PSP_H BGRA for StretchDIBits */
 static BITMAPINFO s_bmi;
@@ -173,32 +171,78 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProc(h, m, w, l);
 }
 
-void gui_init(const char *title) {
+int gui_init(const char *title) {
+    const char *requested = getenv("SR_GPU");
+    int explicit_gpu = requested && requested[0];
+    int want_vk = 0;
+    if (explicit_gpu) {
+        if (strcmp(requested, "vk") == 0) {
+            want_vk = 1;
+        } else if (strcmp(requested, "sw") == 0) {
+            want_vk = 0;
+        } else if (strcmp(requested, "d3d12") == 0) {
+            fprintf(stderr, "gui_init: SR_GPU=d3d12 is not available in this build\n");
+            return 0;
+        } else {
+            fprintf(stderr, "gui_init: invalid SR_GPU=%s (expected d3d12, vk, or sw)\n", requested);
+            return 0;
+        }
+    } else {
+        const char *legacy = getenv("SR_GPU_GE");
+        want_vk = legacy && legacy[0] && strcmp(legacy, "0") != 0;
+    }
+
 #ifdef SR_SDL3VK
-    /* SDL3+Vulkan presenter (src/rt/gpu_sdl3vk, Phase 0): default in this build;
-     * SR_VIDEO=gdi falls back to the classic Win32/GDI window below. */
+    /* SDL3+Vulkan presentation remains the default in this build even for SR_GPU=sw.
+     * SR_VIDEO=gdi is retained as a legacy presenter override. */
     {
         const char *v = getenv("SR_VIDEO");
+        if (want_vk && v && strcmp(v, "gdi") == 0) {
+            fprintf(stderr, "gui_init: SR_GPU=vk cannot be combined with SR_VIDEO=gdi\n");
+            return 0;
+        }
         if (!v || strcmp(v, "gdi") != 0) {
             if (sdl3vk_init(title)) {
                 s_sdl3 = 1;
                 s_px = (uint32_t *)malloc(PSP_W * PSP_H * 4);
+                if (!s_px) {
+                    fprintf(stderr, "gui_init: framebuffer conversion buffer allocation failed\n");
+                    sdl3vk_shutdown();
+                    s_sdl3 = 0;
+                    return 0;
+                }
                 QueryPerformanceFrequency(&s_freq);
                 QueryPerformanceCounter(&s_last);
                 s_on = 1;
-                /* Phase 1 GPU rasterizer (opt-in): captures GE triangles/sprites and
-                 * renders them on the GPU, writing results back to guest VRAM. */
-                {
-                    const char *gge = getenv("SR_GPU_GE");
-                    if (gge && gge[0] && strcmp(gge, "0") != 0) {
-                        if (!gegpu_init())
-                            fprintf(stderr, "gui_init: GPU GE init failed; software GE active\n");
+                if (want_vk) {
+                    s_ge_backend = gegpu_backend();
+                    if (!s_ge_backend || !s_ge_backend->init || !s_ge_backend->init()) {
+                        fprintf(stderr, "gui_init: Vulkan GE backend initialization failed\n");
+                        sdl3vk_shutdown();
+                        s_sdl3 = 0;
+                        s_on = 0;
+                        free(s_px);
+                        s_px = NULL;
+                        s_ge_backend = NULL;
+                        return 0;
                     }
+                    ge_set_backend(s_ge_backend);
                 }
-                return;
+                fprintf(stderr, "gui_init: GE backend %s\n",
+                        s_ge_backend ? s_ge_backend->name : "sw");
+                return 1;
+            }
+            if (want_vk) {
+                fprintf(stderr, "gui_init: SR_GPU=vk requires a working SDL3/Vulkan presenter\n");
+                return 0;
             }
             fprintf(stderr, "gui_init: SDL3/Vulkan init failed; falling back to GDI\n");
         }
+    }
+#else
+    if (want_vk) {
+        fprintf(stderr, "gui_init: SR_GPU=vk is not available in this build\n");
+        return 0;
     }
 #endif
     WNDCLASSA wc = {0};
@@ -213,6 +257,13 @@ void gui_init(const char *title) {
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
         r.right - r.left, r.bottom - r.top, 0, 0, GetModuleHandleA(0), 0);
     s_px = (uint32_t *)malloc(PSP_W * PSP_H * 4);
+    if (!s_hwnd || !s_px) {
+        fprintf(stderr, "gui_init: GDI window initialization failed\n");
+        if (s_hwnd) DestroyWindow(s_hwnd);
+        free(s_px);
+        s_px = NULL;
+        return 0;
+    }
     s_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     s_bmi.bmiHeader.biWidth = PSP_W;
     s_bmi.bmiHeader.biHeight = -PSP_H;          /* top-down */
@@ -223,6 +274,8 @@ void gui_init(const char *title) {
     QueryPerformanceCounter(&s_last);
     s_on = 1;
     pad_init();                            /* XInput / DirectInput controllers */
+    fprintf(stderr, "gui_init: GE backend sw\n");
+    return 1;
 }
 
 int gui_on(void) { return s_on; }
@@ -264,12 +317,19 @@ void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
     if (s_sdl3) {
         /* GPU-resident framebuffer: blit straight from the GE's target image. Falls back
          * to the guest-VRAM convert for CPU-written frames (movies) or pure software GE. */
-        int shown = gegpu_present(fbaddr, fmt, stride);
+        int shown = s_ge_backend && s_ge_backend->present
+            ? s_ge_backend->present(fbaddr, fmt, stride) : -1;
         if (shown < 0) {
             convert_fb(fbaddr, fmt, stride);
             shown = sdl3vk_present_rgba(s_px);
         }
-        if (shown == 0) { sdl3vk_shutdown(); _Exit(0); }
+        if (shown == 0) {
+            if (s_ge_backend && s_ge_backend->shutdown) s_ge_backend->shutdown();
+            ge_set_backend(NULL);
+            s_ge_backend = NULL;
+            sdl3vk_shutdown();
+            _Exit(0);
+        }
         s_buttons = sdl3vk_buttons();
         sdl3vk_analog(&s_lx, &s_ly);
         s_pad_present = sdl3vk_pad_present();
