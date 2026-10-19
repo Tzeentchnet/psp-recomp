@@ -11,6 +11,9 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 - a D3D12 device, direct and copy queues, timeline fences, and a three-buffer
   flip-discard swapchain;
 - shader-visible CBV/SRV/UAV descriptor rings plus RTV and DSV heaps;
+- a 16-DWORD `b0` GE-state root block, `t0` texture/`t1` CLUT table, dynamic
+  `s0` sampler table, and static clamp-nearest `s1`/clamp-linear `s2` samplers;
+- a shader-visible dynamic sampler ring partitioned by fenced frame;
 - a persistently mapped, three-frame upload ring;
 - software-GE framebuffer upload so `SR_GPU=d3d12` is usable before the HLSL renderer
   lands.

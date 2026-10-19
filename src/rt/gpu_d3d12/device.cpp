@@ -26,6 +26,7 @@ extern "C" {
 #define PSP_H 272
 #define FRAME_COUNT 3u
 #define SRV_DESCRIPTOR_COUNT 4095u
+#define SAMPLER_DESCRIPTOR_COUNT 768u
 #define RTV_DESCRIPTOR_COUNT 256u
 #define DSV_DESCRIPTOR_COUNT 64u
 #define UPLOAD_BYTES_PER_FRAME (8ull * 1024ull * 1024ull)
@@ -49,6 +50,9 @@ struct FrameContext {
     UINT srv_begin;
     UINT srv_cursor;
     UINT srv_end;
+    UINT sampler_begin;
+    UINT sampler_cursor;
+    UINT sampler_end;
 };
 
 static SDL_Window *s_window;
@@ -69,9 +73,12 @@ static UINT64 s_next_copy_fence = 1;
 static IDXGISwapChain3 *s_swapchain;
 static ID3D12Resource *s_backbuffers[FRAME_COUNT];
 static ID3D12DescriptorHeap *s_srv_heap;
+static ID3D12DescriptorHeap *s_sampler_heap;
 static ID3D12DescriptorHeap *s_rtv_heap;
 static ID3D12DescriptorHeap *s_dsv_heap;
+static ID3D12RootSignature *s_root_signature;
 static UINT s_srv_stride;
+static UINT s_sampler_stride;
 static UINT s_rtv_stride;
 static UINT s_dsv_stride;
 static uint8_t s_rtv_used[RTV_DESCRIPTOR_COUNT];
@@ -146,7 +153,9 @@ static void release_device(void) {
     }
     RELEASE_COM(s_command_list);
     RELEASE_COM(s_swapchain);
+    RELEASE_COM(s_root_signature);
     RELEASE_COM(s_srv_heap);
+    RELEASE_COM(s_sampler_heap);
     RELEASE_COM(s_rtv_heap);
     RELEASE_COM(s_dsv_heap);
     RELEASE_COM(s_graphics_fence);
@@ -163,6 +172,7 @@ static void release_device(void) {
     s_next_copy_fence = 1;
     s_active_frame = UINT32_MAX;
     s_srv_stride = 0;
+    s_sampler_stride = 0;
     s_rtv_stride = 0;
     s_dsv_stride = 0;
     memset(s_rtv_used, 0, sizeof(s_rtv_used));
@@ -331,6 +341,14 @@ static int create_descriptor_heaps(void) {
         return 0;
     }
     desc = {};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    desc.NumDescriptors = SAMPLER_DESCRIPTOR_COUNT;
+    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (!check_hr(s_device->CreateDescriptorHeap(
+            &desc, IID_PPV_ARGS(&s_sampler_heap)), "create sampler heap")) {
+        return 0;
+    }
+    desc = {};
     desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     desc.NumDescriptors = RTV_DESCRIPTOR_COUNT;
     if (!check_hr(s_device->CreateDescriptorHeap(
@@ -346,6 +364,8 @@ static int create_descriptor_heaps(void) {
     }
     s_srv_stride = s_device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    s_sampler_stride = s_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
     s_rtv_stride = s_device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     s_dsv_stride = s_device->GetDescriptorHandleIncrementSize(
@@ -354,8 +374,97 @@ static int create_descriptor_heaps(void) {
     return 1;
 }
 
+static int create_root_signature(void) {
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 2; /* t0 texture, t1 CLUT */
+    ranges[0].BaseShaderRegister = 0;
+    ranges[0].RegisterSpace = 0;
+    ranges[0].OffsetInDescriptorsFromTableStart =
+        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+    ranges[1].NumDescriptors = 1; /* s0 per-draw sampler */
+    ranges[1].BaseShaderRegister = GE_D3D12_SAMPLER_DYNAMIC;
+    ranges[1].RegisterSpace = 0;
+    ranges[1].OffsetInDescriptorsFromTableStart =
+        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER parameters[3] = {};
+    parameters[GE_D3D12_ROOT_GE_STATE].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[GE_D3D12_ROOT_GE_STATE].Constants.ShaderRegister = 0;
+    parameters[GE_D3D12_ROOT_GE_STATE].Constants.RegisterSpace = 0;
+    parameters[GE_D3D12_ROOT_GE_STATE].Constants.Num32BitValues = 16;
+    parameters[GE_D3D12_ROOT_GE_STATE].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[GE_D3D12_ROOT_TEXTURES].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[GE_D3D12_ROOT_TEXTURES].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[GE_D3D12_ROOT_TEXTURES].DescriptorTable.pDescriptorRanges = &ranges[0];
+    parameters[GE_D3D12_ROOT_TEXTURES].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[GE_D3D12_ROOT_SAMPLER].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[GE_D3D12_ROOT_SAMPLER].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[GE_D3D12_ROOT_SAMPLER].DescriptorTable.pDescriptorRanges = &ranges[1];
+    parameters[GE_D3D12_ROOT_SAMPLER].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC static_samplers[2] = {};
+    for (UINT i = 0; i < 2; i++) {
+        static_samplers[i].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        static_samplers[i].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        static_samplers[i].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        static_samplers[i].MipLODBias = 0.0f;
+        static_samplers[i].MaxAnisotropy = 1;
+        static_samplers[i].ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        static_samplers[i].BorderColor =
+            D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+        static_samplers[i].MinLOD = 0.0f;
+        static_samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
+        static_samplers[i].ShaderRegister =
+            i == 0 ? GE_D3D12_SAMPLER_NEAREST : GE_D3D12_SAMPLER_LINEAR;
+        static_samplers[i].RegisterSpace = 0;
+        static_samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    static_samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    static_samplers[1].Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+
+    D3D12_ROOT_SIGNATURE_DESC desc = {};
+    desc.NumParameters = (UINT)(sizeof(parameters) / sizeof(parameters[0]));
+    desc.pParameters = parameters;
+    desc.NumStaticSamplers =
+        (UINT)(sizeof(static_samplers) / sizeof(static_samplers[0]));
+    desc.pStaticSamplers = static_samplers;
+    desc.Flags =
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+
+    ID3DBlob *serialized = nullptr;
+    ID3DBlob *errors = nullptr;
+    HRESULT serialize_hr = D3D12SerializeRootSignature(
+        &desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+    if (errors && errors->GetBufferSize()) {
+        fwrite(errors->GetBufferPointer(), 1, errors->GetBufferSize(), stderr);
+        fputc('\n', stderr);
+    }
+    RELEASE_COM(errors);
+    if (!check_hr(serialize_hr, "serialize GE root signature")) {
+        RELEASE_COM(serialized);
+        return 0;
+    }
+    HRESULT create_hr = s_device->CreateRootSignature(
+        0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+        IID_PPV_ARGS(&s_root_signature));
+    RELEASE_COM(serialized);
+    return check_hr(create_hr, "create GE root signature");
+}
+
 static int create_frame_resources(void) {
     const UINT descriptors_per_frame = SRV_DESCRIPTOR_COUNT / FRAME_COUNT;
+    const UINT samplers_per_frame = SAMPLER_DESCRIPTOR_COUNT / FRAME_COUNT;
     for (UINT i = 0; i < FRAME_COUNT; i++) {
         if (!check_hr(s_device->CreateCommandAllocator(
                 D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_frames[i].allocator)),
@@ -368,6 +477,9 @@ static int create_frame_resources(void) {
         s_frames[i].srv_begin = i * descriptors_per_frame;
         s_frames[i].srv_cursor = s_frames[i].srv_begin;
         s_frames[i].srv_end = s_frames[i].srv_begin + descriptors_per_frame;
+        s_frames[i].sampler_begin = i * samplers_per_frame;
+        s_frames[i].sampler_cursor = s_frames[i].sampler_begin;
+        s_frames[i].sampler_end = s_frames[i].sampler_begin + samplers_per_frame;
     }
     if (!check_hr(s_device->CreateCommandList(
             0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_frames[0].allocator, nullptr,
@@ -453,6 +565,50 @@ static const char *feature_level_name(D3D_FEATURE_LEVEL level) {
     }
 }
 
+static int bind_default_root_state(void) {
+    GeD3D12DescriptorSlice srvs = {};
+    GeD3D12DescriptorSlice sampler = {};
+    if (!ged3d12_srv_alloc(2, &srvs) ||
+        !ged3d12_sampler_alloc(1, &sampler)) {
+        return 0;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC texture = {};
+    texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    texture.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    texture.Texture2D.MipLevels = 1;
+    s_device->CreateShaderResourceView(nullptr, &texture, srvs.cpu);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC clut = {};
+    clut.Format = DXGI_FORMAT_R32_UINT;
+    clut.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    clut.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    clut.Buffer.NumElements = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE clut_cpu = srvs.cpu;
+    clut_cpu.ptr += s_srv_stride;
+    s_device->CreateShaderResourceView(nullptr, &clut, clut_cpu);
+
+    D3D12_SAMPLER_DESC sampler_desc = {};
+    sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.MaxAnisotropy = 1;
+    sampler_desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    sampler_desc.MaxLOD = D3D12_FLOAT32_MAX;
+    s_device->CreateSampler(&sampler_desc, sampler.cpu);
+
+    UINT constants[16] = {};
+    s_command_list->SetGraphicsRoot32BitConstants(
+        GE_D3D12_ROOT_GE_STATE, 16, constants, 0);
+    s_command_list->SetGraphicsRootDescriptorTable(
+        GE_D3D12_ROOT_TEXTURES, srvs.gpu);
+    s_command_list->SetGraphicsRootDescriptorTable(
+        GE_D3D12_ROOT_SAMPLER, sampler.gpu);
+    return 1;
+}
+
 static int device_init(void) {
     if (!s_window || !s_hwnd) {
         fprintf(stderr, "ged3d12: SDL3 window must be initialized first\n");
@@ -475,6 +631,7 @@ static int device_init(void) {
     int ok = choose_adapter(factory, &adapter_desc) &&
              create_queues_and_fences() &&
              create_descriptor_heaps() &&
+             create_root_signature() &&
              create_frame_resources() &&
              create_swapchain(factory);
     RELEASE_COM(factory);
@@ -503,11 +660,13 @@ static int device_init(void) {
                         adapter_name, sizeof(adapter_name), nullptr, nullptr);
     fprintf(stderr,
             "ged3d12: using %s (feature level %s, %u buffers, "
-            "descriptors=%u/%u/%u, upload=%llu MiB, gamepad=%s)\n",
+            "descriptors=%u srv/%u sampler/%u rtv/%u dsv, "
+            "root=b0[16]+t0-t1+s0+s1/s2, upload=%llu MiB, gamepad=%s)\n",
             adapter_name[0] ? adapter_name : "<unnamed adapter>",
             feature_level_name(levels.MaxSupportedFeatureLevel),
-            FRAME_COUNT, SRV_DESCRIPTOR_COUNT, RTV_DESCRIPTOR_COUNT,
-            DSV_DESCRIPTOR_COUNT, (unsigned long long)(UPLOAD_BYTES / (1024 * 1024)),
+            FRAME_COUNT, SRV_DESCRIPTOR_COUNT, SAMPLER_DESCRIPTOR_COUNT,
+            RTV_DESCRIPTOR_COUNT, DSV_DESCRIPTOR_COUNT,
+            (unsigned long long)(UPLOAD_BYTES / (1024 * 1024)),
             s_pad ? "yes" : "no");
     return 1;
 }
@@ -521,12 +680,21 @@ static int begin_frame(UINT *frame_index) {
     }
     frame->upload_cursor = frame->upload_begin;
     frame->srv_cursor = frame->srv_begin;
+    frame->sampler_cursor = frame->sampler_begin;
     if (!check_hr(frame->allocator->Reset(), "reset frame command allocator") ||
         !check_hr(s_command_list->Reset(frame->allocator, nullptr),
                   "reset graphics command list")) {
         return 0;
     }
+    ID3D12DescriptorHeap *heaps[] = {s_srv_heap, s_sampler_heap};
+    s_command_list->SetDescriptorHeaps(
+        (UINT)(sizeof(heaps) / sizeof(heaps[0])), heaps);
+    s_command_list->SetGraphicsRootSignature(s_root_signature);
     s_active_frame = index;
+    if (!bind_default_root_state()) {
+        s_active_frame = UINT32_MAX;
+        return 0;
+    }
     *frame_index = index;
     return 1;
 }
@@ -565,6 +733,24 @@ bool ged3d12_srv_alloc(UINT count, GeD3D12DescriptorSlice *out) {
     out->cpu.ptr += (SIZE_T)index * s_srv_stride;
     out->gpu = s_srv_heap->GetGPUDescriptorHandleForHeapStart();
     out->gpu.ptr += (UINT64)index * s_srv_stride;
+    out->count = count;
+    return true;
+}
+
+bool ged3d12_sampler_alloc(UINT count, GeD3D12DescriptorSlice *out) {
+    if (!out || s_active_frame >= FRAME_COUNT || !count) return false;
+    FrameContext *frame = &s_frames[s_active_frame];
+    if (count > frame->sampler_end - frame->sampler_cursor) {
+        fprintf(stderr, "ged3d12: frame sampler descriptor ring exhausted "
+                        "(%u descriptors requested)\n", count);
+        return false;
+    }
+    UINT index = frame->sampler_cursor;
+    frame->sampler_cursor += count;
+    out->cpu = s_sampler_heap->GetCPUDescriptorHandleForHeapStart();
+    out->cpu.ptr += (SIZE_T)index * s_sampler_stride;
+    out->gpu = s_sampler_heap->GetGPUDescriptorHandleForHeapStart();
+    out->gpu.ptr += (UINT64)index * s_sampler_stride;
     out->count = count;
     return true;
 }
@@ -820,8 +1006,10 @@ ID3D12GraphicsCommandList *ged3d12_command_list(void) { return s_command_list; }
 ID3D12CommandQueue *ged3d12_graphics_queue(void) { return s_graphics_queue; }
 ID3D12CommandQueue *ged3d12_copy_queue(void) { return s_copy_queue; }
 ID3D12DescriptorHeap *ged3d12_srv_heap(void) { return s_srv_heap; }
+ID3D12DescriptorHeap *ged3d12_sampler_heap(void) { return s_sampler_heap; }
 ID3D12DescriptorHeap *ged3d12_rtv_heap(void) { return s_rtv_heap; }
 ID3D12DescriptorHeap *ged3d12_dsv_heap(void) { return s_dsv_heap; }
+ID3D12RootSignature *ged3d12_root_signature(void) { return s_root_signature; }
 D3D12_SHADER_BYTECODE ged3d12_vertex_shader(void) {
     D3D12_SHADER_BYTECODE shader = {k_psp_vs_dxil, sizeof(k_psp_vs_dxil)};
     return shader;
