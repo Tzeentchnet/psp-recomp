@@ -293,7 +293,7 @@ uint32_t sched_thread_id_list(uint32_t type, uint32_t *out, uint32_t capacity);
 int      sched_current_priority(void);
 int      sched_is_dormant(uint32_t uid);
 uint32_t sched_current_uid(void);
-void     sched_run(uint32_t entry, uint32_t arglen, uint32_t argp);  /* run from the entry thread */
+void     sched_run(uint32_t entry, uint32_t arglen, uint32_t argp, int create_start_thread);
 
 /* A function the static recompiler could not translate (an unimplemented instruction). The
  * body traps loudly with the guest address and reason rather than silently doing nothing, so

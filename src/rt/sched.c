@@ -828,12 +828,9 @@ int sched_is_dormant(uint32_t uid) {
 
 /* The scheduler loop. Runs on the main (converted) fiber. Creates the entry thread, then keeps
  * resuming the highest-priority ready thread until none remain runnable. */
-void sched_run(uint32_t entry, uint32_t arglen, uint32_t argp) {
-    /* The entry thread (module_start) was created and started by the oracle's kernel: the driver
-     * seeded its registers and the top of its stack. PPSSPP's FillStack left the thread UID at
-     * k0+0xc0 and the stack base at k0+0xc8, so adopt that UID and reserve that exact stack block
-     * in the user partition. The kernel deletes this thread when module_start returns, which
-     * frees the stack for the game's later allocations. */
+void sched_run(uint32_t entry, uint32_t arglen, uint32_t argp, int create_start_thread) {
+    /* A differential run adopts the oracle's module_start thread from its seeded k0 block.
+     * Standalone boot creates the same 0x400-byte high stack through start_reset(). */
     TCB *t0 = tcb_slot();
     memset(t0, 0, sizeof(*t0));
     snprintf(t0->name, sizeof(t0->name), "module_start");
@@ -846,27 +843,44 @@ void sched_run(uint32_t entry, uint32_t arglen, uint32_t argp) {
     uint32_t k0 = s_cpu->r[26];
     uint32_t base = sr_inrange(k0) ? MEM_R32(k0 + 0xc8) : 0;
     uint32_t seed_uid = sr_inrange(k0) ? MEM_R32(k0 + 0xc0) : 0;
-    if (base && base < k0 && k0 + 0x100 - base <= 0x100000 && seed_uid >= 0x100 &&
-        sr_ba_alloc_at(sr_kmem_user(), base, k0 + 0x100 - base, "stack/module_start") == base) {
+    if (!create_start_thread) {
+        if (!base || base >= k0 || k0 + 0x100 - base > 0x100000 || seed_uid < 0x100) {
+            fprintf(stderr, "sched_run: invalid seeded module_start stack\n");
+            abort();
+        }
+        uint32_t stack_size = k0 + 0x100 - base;
+        if (sr_ba_alloc_at(sr_kmem_user(), base, stack_size, "stack/module_start") != base) {
+            fprintf(stderr, "sched_run: seeded module_start stack is unavailable\n");
+            abort();
+        }
         t0->uid = seed_uid;
         sr_register_uid_type(t0->uid, SR_TMID_THREAD);
         t0->stack_start = base;
-        t0->stack_size = k0 + 0x100 - base;
+        t0->stack_size = stack_size;
+        memcpy(&t0->saved, s_cpu, sizeof(CpuState));
     } else {
-        /* No oracle k0 block: give it a default stack block and keep the seeded sp. */
-        uint32_t size = 0x40000;
-        uint32_t start = sr_ba_alloc(sr_kmem_user(), &size, 1, "stack/module_start");
+        uint32_t size = 0x400;
         t0->uid = sr_alloc_uid_type(SR_TMID_THREAD);
-        t0->stack_start = start == SR_BA_FAIL ? 0 : start;
-        t0->stack_size = start == SR_BA_FAIL ? 0 : size;
-        fprintf(stderr, "sched_run: no start-thread k0 block in the seed; stack at 0x%08x\n", t0->stack_start);
+        uint32_t start = sr_ba_alloc(sr_kmem_user(), &size, 1, "stack/module_start");
+        if (start == SR_BA_FAIL) {
+            fprintf(stderr, "sched_run: no memory for module_start stack\n");
+            abort();
+        }
+        t0->stack_start = start;
+        t0->stack_size = size;
+        start_reset(t0, arglen, argp);
+        t0->saved.r[31] = 0x08000030u;
+        fprintf(stderr,
+                "standalone module_start: uid=0x%x stack=%08x-%08x k0=%08x sp=%08x "
+                "a0=%u a1=%08x ra=%08x\n",
+                t0->uid, t0->stack_start, t0->stack_start + t0->stack_size,
+                t0->saved.r[26], t0->saved.r[29], t0->saved.r[4], t0->saved.r[5],
+                t0->saved.r[31]);
     }
     if (getenv("SR_THLOG")) fprintf(stderr, "entry thread uid=0x%x stack=%08x-%08x\n",
                                     t0->uid, t0->stack_start, t0->stack_start + t0->stack_size);
-    memcpy(&t0->saved, s_cpu, sizeof(CpuState));
-    t0->arglen = s_cpu->r[4]; t0->argp = s_cpu->r[5];
+    t0->arglen = t0->saved.r[4]; t0->argp = t0->saved.r[5];
     t0->state = TH_READY;
-    (void)arglen; (void)argp;
 
     static const char *stn[] = {"DORMANT", "READY", "RUNNING", "WAIT_DELAY", "WAIT_OBJ"};
     unsigned long long iters = 0;

@@ -77,6 +77,15 @@ mingw32-make GAME_NAME=mygame GAME_ELF=<path_to_eboot.elf> GAME_BASE=0x08804000 
 
 The output executable will land at `build/mygame/mygame.exe`.
 
+### KZL Standalone Boot
+
+The KZL branch can boot its pre-relocated `prxload.py` image without a PPSSPP trace:
+```bash
+<driver> --boot <image.bin> 08804000 08804000 none --gui
+```
+`--boot` enables the scheduler, creates the PSP-compatible `module_start` thread, and supplies KZL's
+`"modulename"` argument. Keep using `--image` with a PPSSPP reference trace for differential tracing.
+
 ### 5. Setup Game Assets & Run
 1. Place your dumped game UMD ISO in the directory containing `mygame.exe` (name it `game.iso`, or set the `PSP_ISO` environment variable to point to the ISO path).
 2. Run the game from a command prompt:

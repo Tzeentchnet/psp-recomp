@@ -1,12 +1,12 @@
-/* Bring-up driver for the recompiled C (Phase 3 differential).
+/* Driver for differential traces and standalone recompiled-image boot.
  *
- * Loads a statically-linked PSP ELF into guest memory, seeds the CpuState from the entry
- * register state the PPSSPP reference trace recorded ("# init" line in the trace), registers
- * every generated function, and runs the entry function with tracing on. Execution stops
- * cleanly at the first HLE call (sr_hle_call longjmps), exactly where the reference trace is
- * truncated for comparison.
+ * Differential mode seeds the entry state from a PPSSPP trace. Standalone mode maps a
+ * pre-relocated image and creates the module_start thread with the state BOOT.BIN and the PSP
+ * kernel would provide.
  *
  * Usage: driver <elf> <ref-trace> <out-trace>
+ *        driver --image <image.bin> <base-hex> <entry-hex> <ref-trace> <out-trace>
+ *        driver --boot <image.bin> <base-hex> <entry-hex> <out-trace>
  */
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -129,9 +129,25 @@ static void seed_from_init(const char *trace_path, CpuState *s) {
 
 int main(int argc, char **argv) {
     uint32_t entry;
-    const char *ref_trace, *out;
+    uint32_t boot_arglen = 0, boot_argp = 0;
+    const char *ref_trace = NULL, *out;
+    int standalone = 0;
 
     SetUnhandledExceptionFilter(sr_crash_filter);
+
+    /* Normal runtime path: the generated image is already rebased and relocated by prxload.py.
+     * The KZL bootloader passes module_start one argument block: "modulename\0". */
+    if (argc >= 6 && strcmp(argv[1], "--boot") == 0) {
+        long len;
+        uint8_t *img = read_file(argv[2], &len);
+        uint32_t base = (uint32_t)strtoul(argv[3], NULL, 16);
+        entry = (uint32_t)strtoul(argv[4], NULL, 16);
+        out = argv[5];
+        standalone = 1;
+        sr_mem_init();
+        sr_load_segment(base, img, (uint32_t)len);
+        goto have_image;
+    }
 
     /* Image mode: a pre-relocated flat image (e.g. a rebased PRX from tools/prxload.py) is
      * loaded at <base> and run from <entry>. Required for relocatable PRXs, which must be
@@ -150,7 +166,8 @@ int main(int argc, char **argv) {
     }
     if (argc < 4) {
         fprintf(stderr, "usage: driver <elf> <ref-trace> <out-trace>\n"
-                        "       driver --image <image.bin> <base-hex> <entry-hex> <ref-trace> <out-trace>\n");
+                        "       driver --image <image.bin> <base-hex> <entry-hex> <ref-trace> <out-trace>\n"
+                        "       driver --boot <image.bin> <base-hex> <entry-hex> <out-trace>\n");
         return 2;
     }
     {
@@ -167,7 +184,18 @@ have_image:;
     s.vfpuCtrl[0] = 0xe4;  /* SPREFIX = identity */
     s.vfpuCtrl[1] = 0xe4;  /* TPREFIX = identity */
     s.vfpuCtrl[2] = 0;     /* DPREFIX = none */
-    seed_from_init(ref_trace, &s);
+    if (standalone) {
+        static const char boot_arg[] = "modulename";
+        boot_arglen = (uint32_t)sizeof(boot_arg);
+        boot_argp = 0x08800000u;  /* reserved usersystemlib range; copied before guest code runs */
+        for (uint32_t i = 0; i < boot_arglen; i++) sr_w8(boot_argp + i, (uint8_t)boot_arg[i]);
+        /* BOOT.BIN and the kernel consumed 0x110..0x11b before creating module_start (F-050). */
+        sr_set_next_uid(0x11cu);
+    } else {
+        seed_from_init(ref_trace, &s);
+        boot_arglen = s.r[4];
+        boot_argp = s.r[5];
+    }
     s.pc = entry;
 
     sr_register_all();
@@ -180,7 +208,7 @@ have_image:;
     RecompFn fn = sr_lookup(entry);
     if (!fn) { fprintf(stderr, "no recompiled function at entry 0x%08x\n", entry); return 2; }
 
-    int use_sched = 0;
+    int use_sched = standalone;
     for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--sched") == 0) use_sched = 1;
     for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--gui") == 0) { gui_init("PSP Recomp"); use_sched = 1; }
 
@@ -190,7 +218,7 @@ have_image:;
          * runs; it returns when no thread is runnable, or the process exits at an unimplemented
          * import inside a thread fiber. */
         sched_init(&s);
-        sched_run(entry, s.r[4], s.r[5]);
+        sched_run(entry, boot_arglen, boot_argp, standalone);
     } else if (setjmp(g_hle_jmp) == 0) {
         fn(&s);
     }
