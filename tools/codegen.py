@@ -354,7 +354,10 @@ def vfpu_effect(addr, w):
     if op == 0x36 or op == 0x3e:
         vt = ((w >> 16) & 0x1F) | ((w & 1) << 5)
         idx = vreg_indices(vt, 4)
-        base = f"({R(rs(w))} + {simm(w)})"
+        # Bits 0-1 of the immediate are not offset bits (bit 0 = vt high bit, bit 1 = a flag), so the
+        # offset is imm & 0xFFFC, as in PPSSPP. Using the raw immediate put 53 KZL accesses 1-3 bytes off.
+        off = s16(w & 0xFFFC)
+        base = f"({R(rs(w))} + 0x{off & 0xFFFFFFFF:08x}u)"
         if op == 0x36:  # lv.q
             parts = " ".join(f"s->vi[{idx[i]}] = MEM_R32(_a + {i*4});" for i in range(4))
             return f"{{ uint32_t _a = {base}; {parts} }}", None, 0
