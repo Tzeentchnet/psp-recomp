@@ -63,9 +63,11 @@ static uint32_t load_elf(const uint8_t *elf) {
     for (uint16_t i = 0; i < phnum; i++) {
         const uint8_t *ph = elf + e_phoff + (uint32_t)i * phentsize;
         uint32_t p_type = rd32(ph + 0), p_off = rd32(ph + 4), p_vaddr = rd32(ph + 8);
-        uint32_t p_filesz = rd32(ph + 16);
+        uint32_t p_filesz = rd32(ph + 16), p_memsz = rd32(ph + 20);
         if (p_type == 1 && p_filesz)  /* PT_LOAD */
             sr_load_segment(p_vaddr, elf + p_off, p_filesz);
+        if (p_type == 1 && p_memsz)   /* BSS is part of the module's memory block */
+            sr_note_loaded(p_vaddr, p_memsz);
     }
     return e_entry;
 }

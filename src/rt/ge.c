@@ -442,6 +442,8 @@ static int thru_ztest(void) {
     return ge.ztest_enable && !no2dz;
 }
 
+uint32_t ge_get_frame(void) { return s_ge_frame; }
+
 void ge_set_frame(uint32_t frame) {
     s_ge_frame = frame;
     if (s_stat_on < 0) s_stat_on = getenv("SR_GESTAT") ? 1 : 0;
@@ -2126,13 +2128,12 @@ unsigned long g_ge_list_sig=0, g_ge_prim_count=0;
 /* Per-list write accounting for SR_GEWATCH: shows whether a list that cleared a buffer
  * also drew non-black content into it, and which buffer it targeted. */
 unsigned long g_list_writes=0, g_list_nonblack=0, g_list_clearpx=0;
-static void ge_run_list_inner(uint32_t addr);
-
-void ge_run_list(uint32_t addr) {
-    unsigned long t0 = wall_ms();
-    ge_run_list_inner(addr);
-    s_ge_ms_acc += wall_ms() - t0;
-}
+/* Display-list control flow (stall, JUMP/CALL/RET, SIGNAL/FINISH/END, queueing) lives in
+ * gelist.c, a port of PPSSPP's GPUCommon list manager. It calls ge_list_begin when a list
+ * starts, ge_execute_op for every other command, and ge_list_end when the list finishes. */
+static uint32_t s_list_addr;
+static unsigned long s_list_sig, s_list_prims, s_list_start_nz, s_list_t0;
+static int s_list_snap = -1;
 
 /* GE block transfer (the "memcpy engine"): rectangle copy between guest buffers, used for
  * framebuffer effects (pause capture, blur, scene transitions). Decode masks follow PPSSPP
@@ -2160,26 +2161,44 @@ static void ge_block_transfer(uint32_t startdata) {
                       ((h - 1) * dstStride + w) * bpp);
 }
 
-static void ge_run_list_inner(uint32_t addr) {
+uint32_t ge_rel(uint32_t data) { return ge_rel_addr(data); }
+
+void ge_list_begin(uint32_t list_addr) {
     if (!s_ge_inited) ge_state_init();
-    static int snap=-1; if(snap<0) snap=(getenv("SR_FBDUMP")||getenv("SR_GEDUMP"))?1:0;
-    uint32_t list_addr=addr;
-    g_list_writes=0; g_list_nonblack=0; g_list_clearpx=0;
-    extern unsigned long g_tex_nonzero; unsigned long start_nz=g_tex_nonzero;
-    unsigned long sig=0; unsigned long prims=0;
-    uint32_t stack_pc[32], stack_offset[32]; int sp=0;
-    int pending_signal=0;
-    for (int guard=0; guard<(1<<20); guard++) {
-        uint32_t op=MEM_R32(addr); addr+=4;
-        uint32_t cmd=op>>24, data=op&0xFFFFFF;
-        sig=sig*1000003ul+op;
+    if (s_list_snap < 0) s_list_snap = (getenv("SR_FBDUMP") || getenv("SR_GEDUMP")) ? 1 : 0;
+    extern unsigned long g_tex_nonzero;
+    s_list_addr = list_addr;
+    g_list_writes = 0; g_list_nonblack = 0; g_list_clearpx = 0;
+    s_list_start_nz = g_tex_nonzero;
+    s_list_sig = 0; s_list_prims = 0;
+    s_list_t0 = wall_ms();
+}
+
+void ge_list_end(void) {
+    extern unsigned long g_tex_nonzero;
+    if (s_gpu && s_gpu->flush) s_gpu->flush("listend");
+    if (s_list_snap > 0 && g_tex_nonzero > s_list_start_nz) ge_snapshot("fb_content.ppm");
+    g_ge_list_sig = s_list_sig; g_ge_prim_count = s_list_prims;
+    if (s_gewatch > 0 && s_ge_frame >= (uint32_t)s_gewatch_after)
+        fprintf(stderr, "GELIST f=%u list=0x%08x fbp=0x%08x prims=%lu writes=%lu nonblack=%lu clearpx=%lu\n",
+                s_ge_frame, s_list_addr, ge_fb_addr(), s_list_prims,
+                g_list_writes, g_list_nonblack, g_list_clearpx);
+    s_ge_ms_acc += wall_ms() - s_list_t0;
+}
+
+/* Executes one non-flow GE command. pc is the command's own address (ORIGIN reads it). */
+void ge_execute_op(uint32_t op, uint32_t pc) {
+    if (!s_ge_inited) ge_state_init();
+    uint32_t cmd=op>>24, data=op&0xFFFFFF;
+    s_list_sig=s_list_sig*1000003ul+op;
+    {
         switch (cmd) {
             case GE_NOP: case 0xFF: break;   /* 0xFF = GE_CMD_NOP_FF (padding, PPSSPP) */
             case GE_VADDR:    ge.vaddr=ge_rel_addr(data); break;
             case GE_IADDR:    ge.iaddr=ge_rel_addr(data); break;
             case GE_BASE:     ge.base=data; break;
             case GE_OFFSETADDR: ge.offset=data<<8; break;
-            case GE_ORIGIN:   ge.offset=addr-4; break;
+            case GE_ORIGIN:   ge.offset=pc; break;
             case GE_VERTEXTYPE: ge.vtype=data; break;
 
             case GE_FRAMEBUFPTR:   ge.fbp=(ge.fbp&0xFF000000)|data;
@@ -2402,34 +2421,11 @@ static void ge_run_list_inner(uint32_t addr) {
             case GE_TRANSFERSIZE:   ge.xf_size = data; break;
             case GE_TRANSFERSTART:  ge_block_transfer(data); break;
 
-            case GE_PRIM: prims++; draw_prim(op); break;
-            case GE_JUMP: addr=ge_rel_addr(data&0x00FFFFFCu); break;
-            case GE_BJUMP: break;  /* no bounding-box test result kept; draw everything */
+            case GE_PRIM: s_list_prims++; draw_prim(op); break;
+            /* The bounding-box test result is kept by gelist.c (BJUMP); nothing to draw. */
             case GE_BOUNDINGBOX: break;
-            case GE_CALL:
-                if (sp<(int)(sizeof(stack_pc)/sizeof(stack_pc[0]))) {
-                    stack_pc[sp]=addr; stack_offset[sp]=ge.offset; sp++;
-                    addr=ge_rel_addr(data&0x00FFFFFCu);
-                }
-                break;
-            case GE_RET:
-                if (sp>0) { sp--; addr=stack_pc[sp]&0x0FFFFFFFu; ge.offset=stack_offset[sp]; }
-                break;
-            case GE_SIGNAL:
-                /* SIGNAL is paired with an END; the list continues afterwards. The HLE layer
-                 * does not register signal handlers, so the payload is dropped. */
-                pending_signal=1; break;
-            case GE_FINISH: pending_signal=0; break;  /* END that follows terminates the list */
-            case GE_END:
-                if (pending_signal) { pending_signal=0; break; }
-                if (s_gpu && s_gpu->flush) s_gpu->flush("listend");
-                if (snap && g_tex_nonzero>start_nz) ge_snapshot("fb_content.ppm");
-                g_ge_list_sig=sig; g_ge_prim_count=prims;
-                if (s_gewatch > 0 && s_ge_frame >= (uint32_t)s_gewatch_after)
-                    fprintf(stderr, "GELIST f=%u list=0x%08x fbp=0x%08x prims=%lu writes=%lu nonblack=%lu clearpx=%lu\n",
-                            s_ge_frame, list_addr, ge_fb_addr(), prims,
-                            g_list_writes, g_list_nonblack, g_list_clearpx);
-                return;
+            /* SIGNAL and FINISH only take effect at the END that follows (gelist.c). */
+            case GE_SIGNAL: case GE_FINISH: break;
             default:
                 ge_note_unhandled_cmd(cmd, op);
                 break;

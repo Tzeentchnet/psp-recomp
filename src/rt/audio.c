@@ -23,7 +23,7 @@
 
 static int32_t  s_accL[RING_FRAMES], s_accR[RING_FRAMES];
 static uint64_t s_play = 0;               /* feeder (read) cursor, frames */
-static uint64_t s_chw[8];                 /* per-channel write cursors, frames */
+static uint64_t s_chw[9];                 /* per-channel write cursors, frames (8 = sceAudioOutput2 SRC) */
 static CRITICAL_SECTION s_lock;
 static HWAVEOUT s_wo = NULL;
 static WAVEHDR  s_hdr[NUM_BLOCKS];
@@ -95,7 +95,7 @@ int sr_audio_init(void) {
 void sr_audio_push(int ch, const int16_t *lr, int nframes, int volL, int volR) {
     if (!sr_audio_init() || nframes <= 0) return;
     if (ch < 0) ch = 0;
-    ch &= 7;
+    if (ch > 8) ch = 8;
     EnterCriticalSection(&s_lock);
     uint64_t w = s_chw[ch];
     if (w < s_play) w = s_play;                            /* channel fell behind: snap to now */
@@ -115,7 +115,7 @@ void sr_audio_push(int ch, const int16_t *lr, int nframes, int volL, int volR) {
  * accumulating (an open-loop sleep of the buffer duration always runs slightly slow). */
 int sr_audio_queued(int ch) {
     if (!s_ok) return -1;
-    ch &= 7;
+    if (ch > 8) ch = 8;
     EnterCriticalSection(&s_lock);
     uint64_t w = s_chw[ch], p = s_play;
     LeaveCriticalSection(&s_lock);

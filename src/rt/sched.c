@@ -34,6 +34,8 @@ typedef struct {
     uint32_t uid;
     int      state;
     int      priority;
+    int      initial_priority;
+    int32_t  exit_status;
     uint32_t entry, arglen, argp;
     void    *fiber;
     int      started;            /* fiber has begun running its body */
@@ -42,21 +44,36 @@ typedef struct {
     int      wakeups;            /* pending sceKernelWakeupThread count (sleep/wakeup semantics) */
     int      sleeping;           /* 1 while blocked in sceKernelSleepThread[CB] */
     uint64_t vbl_seen;           /* s_vbl_count this thread last consumed (vblank latch) */
-    uint32_t sp_init, k0_init;   /* initial sp/k0 (to re-seed registers on a restart) */
+    char     name[32];
+    uint32_t attr;
+    uint32_t stack_start, stack_size;   /* block in the user partition (kmem.c); 0 = none */
+    int      deleted;            /* slot free for reuse once its fiber is gone */
+    int      delete_on_exit;     /* the module start thread: deleted when its entry returns */
+    int      cb_wait;            /* in a ...CB wait: notified callbacks run on this thread */
+    int      cb_woken;           /* readied only to run callbacks; the wait resumes afterwards */
+    SrHleThreadFn hle_entry;      /* host HLE helper body, instead of a recompiled guest entry */
+    uint32_t hle_arg;
     CpuState saved;              /* register file while not running */
 } TCB;
 
+/* PSP thread attributes that change the stack (PPSSPP sceKernelThread.h). */
+#define THREAD_ATTR_NO_FILLSTACK 0x00100000u
+#define THREAD_ATTR_CLEAR_STACK  0x00200000u
+#define THREAD_ATTR_LOW_STACK    0x00400000u
+
 static TCB      s_tcb[MAXTHREADS];
+static int cb_wake_handled(TCB *t);
 static int      s_ntcb = 0;
 static int      s_cur = -1;      /* index of running thread, -1 = scheduler */
 static void    *s_sched_fiber = NULL;
 static CpuState *s_cpu = NULL;
 static uint64_t s_tick = 0;
 static uint32_t s_gp = 0;        /* module global pointer, inherited by created threads */
-static uint32_t s_stack_top = 0x09f00000;  /* sibling thread stacks grow down from here */
+
+static void switch_to_scheduler(void);
 
 static TCB *tcb_by_uid(uint32_t uid) {
-    for (int i = 0; i < s_ntcb; i++) if (s_tcb[i].uid == uid) return &s_tcb[i];
+    for (int i = 0; i < s_ntcb; i++) if (!s_tcb[i].deleted && s_tcb[i].uid == uid) return &s_tcb[i];
     return NULL;
 }
 
@@ -87,11 +104,36 @@ void sched_dump_threads(void) {
     }
 }
 
-/* Run the game's VBLANK interrupt handler (a guest function) on a dedicated interrupt context.
- * It usually calls sceKernelWakeupThread, readying the game thread. Called by the scheduler
- * when no thread is runnable (i.e. once per simulated frame). */
-uint32_t sr_vblank_handler(void);
-uint32_t sr_vblank_arg(void);
+/* Interrupt context. A guest interrupt handler (vblank, GE signal/finish) runs on the
+ * dedicated interrupt stack with s_cur = -1, so SR_YIELD cannot switch threads and blocking
+ * calls return at once; the interrupted register file is saved and restored around it. An
+ * interrupt raised while one runs (e.g. sceGeContinue inside the vblank handler) is queued by
+ * its source and delivered when the outer handler has returned, as PPSSPP does. */
+static int s_intr_depth = 0;
+int sched_in_interrupt(void) { return s_intr_depth > 0; }
+
+void sched_run_interrupt(CpuState *s, uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2) {
+    CpuState save;
+    memcpy(&save, s, sizeof(CpuState));
+    int32_t save_slice = sr_timeslice;
+    memset(s, 0, sizeof(CpuState));
+    s->r[29] = sr_hle_stack_top(0);      /* dedicated interrupt stack in kernel memory */
+    s->r[28] = s_gp ? s_gp : save.r[28];
+    s->r[4] = a0;
+    s->r[5] = a1;
+    s->r[6] = a2;
+    s->r[31] = 0;
+    s->vfpuCtrl[0] = 0xe4; s->vfpuCtrl[1] = 0xe4;
+    int save_cur = s_cur; s_cur = -1;
+    s_intr_depth++;
+    sr_timeslice = TIMESLICE;
+    dispatch(s, fn);
+    s_intr_depth--;
+    s_cur = save_cur;
+    sr_timeslice = save_slice;
+    memcpy(s, &save, sizeof(CpuState));
+}
+
 /* Threads blocked in sceDisplayWaitVblankStart wait on this object; deliver_vblank readies
  * them, so the render loop draws exactly once per delivered vblank instead of spinning. */
 #define VBLANK_WAIT_OBJ 0x56424c4bu   /* "VBLK" */
@@ -210,104 +252,233 @@ static uint64_t vblank_due_us(void) {
     return (uint64_t)((s_vbl_next - (double)now.QuadPart) * 1000000.0 / (double)s_qfreq.QuadPart);
 }
 
+/* One vblank: pace to real time, release sceDisplayWaitVblankStart waiters, run every enabled
+ * vblank sub-interrupt handler (they usually wake the game thread), then any GE interrupt those
+ * handlers raised (KZL's calls sceGeContinue). */
 static void deliver_vblank(void) {
     vblank_pace();
     s_vbl_count++;
-    uint32_t h = sr_vblank_handler();
     static unsigned long long vb = 0;
-    if (getenv("SR_VBLOG") && (++vb % 1) == 0) fprintf(stderr, "vblank #%llu (handler=0x%x)\n", vb, h);
+    if (getenv("SR_VBLOG") && (++vb % 1) == 0) fprintf(stderr, "vblank #%llu\n", vb);
     sched_wake(VBLANK_WAIT_OBJ);
-    if (!h) return;
     if (getenv("SR_PCSAMPLE")) {
         static unsigned long n = 0;
         if ((n++ % 30) == 0) fprintf(stderr, "PCSAMPLE frame=%lu interrupted_pc=0x%08x ra=0x%08x\n",
                                      n, s_cpu->pc, s_cpu->r[31]);
     }
-    CpuState save;
-    memcpy(&save, s_cpu, sizeof(CpuState));
-    memset(s_cpu, 0, sizeof(CpuState));
-    s_cpu->r[29] = 0x09df0000;          /* dedicated interrupt stack (below thread stacks) */
-    s_cpu->r[28] = s_gp;
-    s_cpu->r[4] = sr_vblank_arg();       /* a0 = registered arg */
-    s_cpu->r[31] = 0;
-    s_cpu->vfpuCtrl[0] = 0xe4; s_cpu->vfpuCtrl[1] = 0xe4;
-    int save_cur = s_cur; s_cur = -1;    /* interrupt context: SR_YIELD must not switch */
-    dispatch(s_cpu, h);
-    s_cur = save_cur;
-    memcpy(s_cpu, &save, sizeof(CpuState));
+    sr_intr_run_vblank(s_cpu);
+    sr_ge_run_interrupts(s_cpu);
     extern void sr_vblank_tick(void);
     sr_vblank_tick();
+}
+
+static void free_stack(TCB *t) {
+    if (!t->stack_start) return;
+    if (t->attr & THREAD_ATTR_CLEAR_STACK)
+        for (uint32_t i = 0; i < t->stack_size; i++) MEM_W8(t->stack_start + i, 0);
+    sr_ba_free(sr_kmem_user(), t->stack_start);
+    t->stack_start = 0;
+}
+
+/* Frees the thread's stack and its slot. The fiber of a thread deleting itself is still running,
+ * so the scheduler loop deletes it once the thread has switched away. */
+static void delete_tcb(TCB *t, int is_current) {
+    if (getenv("SR_THLOG")) fprintf(stderr, "delete thread uid=0x%x %s\n", t->uid, t->name);
+    sr_unregister_uid(t->uid);
+    free_stack(t);
+    t->state = TH_DORMANT;
+    t->sleeping = 0; t->wait_obj = 0; t->wake = 0;
+    t->deleted = 1;
+    if (!is_current && t->fiber) { DeleteFiber(t->fiber); t->fiber = NULL; }
 }
 
 static void CALLBACK fiber_proc(void *param) {
     TCB *t = (TCB *)param;
     for (;;) {
-        /* Entry into the thread body: set up args and the standard return address (0). */
-        s_cpu->r[4] = t->arglen;
-        s_cpu->r[5] = t->argp;
-        s_cpu->r[31] = 0;
-        dispatch(s_cpu, t->entry);    /* runs until the thread returns or exits */
+        /* Registers, args and ra were set when the thread was started (start_reset). */
+        if (t->hle_entry)
+            t->hle_entry(t->hle_arg);
+        else
+            dispatch(s_cpu, t->entry);    /* runs until the thread returns or exits */
         /* Returned without calling sceKernelExitThread: treat as exit. */
+        t->exit_status = (int32_t)s_cpu->r[2];
         t->state = TH_DORMANT;
+        sched_wake(t->uid);           /* release threads in sceKernelWaitThreadEnd on this thread */
+        if (t->delete_on_exit) delete_tcb(t, 1);
         SwitchToFiber(s_sched_fiber); /* back to scheduler; fiber may be reused if restarted */
     }
 }
 
-uint32_t sched_create_thread(uint32_t entry, int priority, uint32_t stack_size) {
-    if (s_ntcb >= MAXTHREADS) {
-        fprintf(stderr, "sched_create_thread: MAXTHREADS(%d) exhausted (entry=0x%08x)\n", MAXTHREADS, entry);
-        return 0;
-    }
-    if (getenv("SR_THLOG")) fprintf(stderr, "create thread #%d entry=0x%08x pri=%d stack=%u\n", s_ntcb, entry, priority, stack_size);
-    TCB *t = &s_tcb[s_ntcb++];
-    memset(t, 0, sizeof(*t));
-    t->uid = sr_alloc_uid();
-    t->state = TH_DORMANT;
-    t->priority = priority;
-    t->entry = entry;
-    t->started = 0;
-    t->fiber = NULL;
-    /* Give the thread a stack, the module gp, and a per-thread k0 (r26) area. The PSP kernel
-     * sets k0 to a small per-thread control region near the top of the thread stack, and the
-     * game's thread bodies use it as a base pointer (e.g. sw r21,4(k0)); leaving it 0 faults.
-     * (The entry thread's saved state is overwritten with the driver's seed in sched_run.) */
-    uint32_t sz = stack_size ? stack_size : 0x40000;
-    s_stack_top -= (sz + 0xFFu) & ~0xFFu;
-    uint32_t top = (s_stack_top + sz) & ~0xFu;
-    uint32_t k0 = (top - 0x800) & ~0xFu;           /* reserved k0/TLS region below the top */
-    t->k0_init = k0;
-    t->sp_init = (k0 - 0x10) & ~0xFu;              /* sp grows down below the k0 region */
-    t->saved.r[26] = t->k0_init;
-    t->saved.r[29] = t->sp_init;
-    t->saved.r[28] = s_gp;
-    t->saved.vfpuCtrl[0] = 0xe4; t->saved.vfpuCtrl[1] = 0xe4; t->saved.vfpuCtrl[2] = 0;
-    return t->uid;
+/* PPSSPP PSPThreadContext::reset: the register file every PSP thread starts with (F-048). */
+static void context_reset(CpuState *c) {
+    memset(c, 0, sizeof(*c));
+    for (int i = 1; i < 32; i++) c->r[i] = 0xDEADBEEFu;
+    for (int i = 0; i < 32; i++) c->fi[i] = 0x7f800001u;
+    for (int i = 0; i < 128; i++) c->vi[i] = 0x7f800001u;
+    c->vfpuCtrl[0] = 0xe4;          /* S prefix: neutral */
+    c->vfpuCtrl[1] = 0xe4;          /* T prefix: neutral */
+    c->vfpuCtrl[2] = 0;             /* D prefix */
+    c->vfpuCtrl[3] = 0x3f;          /* CC */
+    c->vfpuCtrl[7] = 0x7772ceab;    /* REV */
+    c->vfpuCtrl[8] = 0x3f800001; c->vfpuCtrl[9] = 0x3f800002;
+    c->vfpuCtrl[10] = 0x3f800004; c->vfpuCtrl[11] = 0x3f800008;
+    c->vfpuCtrl[12] = c->vfpuCtrl[13] = c->vfpuCtrl[14] = c->vfpuCtrl[15] = 0x3f800000;
+    c->fcr31 = 0x00000e00;
+    c->hi = c->lo = 0xDEADBEEFu;
 }
 
-void sched_start_thread(uint32_t uid, uint32_t arglen, uint32_t argp) {
+/* What sceKernelStartThread does to a thread (PPSSPP __KernelResetThread, FillStack and
+ * __KernelStartThread): reset the registers, fill the stack with 0xFF, build the 256-byte k0
+ * block at the top, copy the argument block below it, then reserve 64 bytes holding the
+ * thread-return stub that ra points at. */
+static void start_reset(TCB *t, uint32_t arglen, uint32_t argp) {
+    CpuState *c = &t->saved;
+    context_reset(c);
+    c->pc = t->entry;
+    c->r[28] = s_gp;
+    if (!(t->attr & THREAD_ATTR_NO_FILLSTACK))
+        for (uint32_t i = 0; i < t->stack_size; i++) MEM_W8(t->stack_start + i, 0xFF);
+    uint32_t sp = t->stack_start + t->stack_size - 256;
+    uint32_t k0 = sp;
+    for (uint32_t i = 0; i < 0x100; i++) MEM_W8(k0 + i, 0);
+    MEM_W32(k0 + 0xc0, t->uid);
+    MEM_W32(k0 + 0xc8, t->stack_start);
+    MEM_W32(k0 + 0xf8, 0xFFFFFFFFu);
+    MEM_W32(k0 + 0xfc, 0xFFFFFFFFu);
+    MEM_W32(t->stack_start, t->uid);
+    c->r[26] = k0;
+    if (argp && (int32_t)arglen > 0) {
+        sp -= (arglen + 0xF) & ~0xFu;
+        c->r[4] = arglen;
+        c->r[5] = sp;
+        if (sr_inrange(argp)) memmove(SR_HOST(sp), SR_HOST(argp), arglen);
+    } else {
+        c->r[4] = 0;
+        c->r[5] = 0;
+    }
+    sp -= 64;
+    MEM_W32(sp + 0, 0x03E00008u);   /* jr ra */
+    MEM_W32(sp + 4, 0x0000000Cu);   /* syscall (PPSSPP: its thread-return HLE call) */
+    MEM_W32(sp + 8, 0x1000FFFFu);   /* b -1 */
+    MEM_W32(sp + 12, 0);            /* nop */
+    c->r[29] = sp;
+    c->r[30] = sp;
+    c->r[31] = sp;
+    t->exit_status = (int32_t)0x800201a4u;   /* NOT_DORMANT until the thread exits */
+}
+
+/* A free thread slot: a deleted one whose fiber is gone, or a new one. */
+static TCB *tcb_slot(void) {
+    for (int i = 0; i < s_ntcb; i++) if (s_tcb[i].deleted && !s_tcb[i].fiber) return &s_tcb[i];
+    if (s_ntcb >= MAXTHREADS) return NULL;
+    return &s_tcb[s_ntcb++];
+}
+
+/* sceKernelCreateThread. The stack comes from the user partition, from the top unless the
+ * thread asks for a low stack, exactly as PPSSPP allocates it (PSPThread::AllocateStack). */
+uint32_t sched_create_thread(const char *name, uint32_t entry, int priority, uint32_t stack_size,
+                             uint32_t attr) {
+    if (stack_size < 0x200) return 0x80020194u;                  /* ILLEGAL_STACK_SIZE */
+    if (priority < 0x08 || priority > 0x77) return 0x80020193u;  /* ILLEGAL_PRIORITY */
+    TCB *t = tcb_slot();
+    if (!t) {
+        fprintf(stderr, "sched_create_thread: MAXTHREADS(%d) exhausted (entry=0x%08x)\n", MAXTHREADS, entry);
+        return 0x80020190u;                                      /* NO_MEMORY */
+    }
+    int fresh = (t == &s_tcb[s_ntcb - 1]) && !t->deleted;
+    uint32_t uid = sr_alloc_uid_type(SR_TMID_THREAD);   /* PPSSPP creates the object before the stack */
+    char tag[40];
+    snprintf(tag, sizeof(tag), "stack/%s", name);
+    uint32_t size = stack_size;
+    uint32_t start = sr_ba_alloc(sr_kmem_user(), &size, !(attr & THREAD_ATTR_LOW_STACK), tag);
+    if (start == SR_BA_FAIL) {
+        fprintf(stderr, "sched_create_thread: no memory for a 0x%x stack (%s)\n", stack_size, name);
+        sr_unregister_uid(uid);
+        if (fresh) s_ntcb--;                                     /* give the new slot back */
+        return 0x80020190u;                                      /* NO_MEMORY */
+    }
+    memset(t, 0, sizeof(*t));
+    t->uid = uid;
+    snprintf(t->name, sizeof(t->name), "%s", name);
+    t->attr = attr;
+    t->state = TH_DORMANT;
+    t->priority = priority;
+    t->initial_priority = priority;
+    t->exit_status = (int32_t)0x800201a4u;
+    t->entry = entry;
+    t->stack_start = start;
+    t->stack_size = size;
+    if (getenv("SR_THLOG")) fprintf(stderr, "create thread uid=0x%x %s entry=0x%08x pri=%d stack=%08x-%08x\n",
+                                    uid, t->name, entry, priority, start, start + size);
+    return uid;
+}
+
+uint32_t sched_create_hle_thread(const char *name, int priority, uint32_t stack_size,
+                                 SrHleThreadFn entry, uint32_t arg) {
+    uint32_t uid = sched_create_thread(name, 0, priority, stack_size, 0);
+    if ((int32_t)uid < 0) return uid;
     TCB *t = tcb_by_uid(uid);
-    if (!t) return;
+    t->hle_entry = entry;
+    t->hle_arg = arg;
+    uint32_t result = sched_start_thread(uid, 0, 0);
+    if ((int32_t)result < 0) {
+        delete_tcb(t, 0);
+        return result;
+    }
+    return uid;
+}
+
+int sched_delete_hle_thread(uint32_t uid) {
+    TCB *t = tcb_by_uid(uid);
+    if (!t) return (int)0x80020198u;
+    if (!t->hle_entry || uid == sched_current_uid()) return (int)0x800201a4u;
+    delete_tcb(t, 0);
+    return 0;
+}
+
+/* sceKernelStartThread: 0, or a kernel error for an unknown or running thread. */
+uint32_t sched_start_thread(uint32_t uid, uint32_t arglen, uint32_t argp) {
+    TCB *t = tcb_by_uid(uid);
+    if (!t) return 0x80020198u;                                  /* UNKNOWN_THID */
+    if (t->state != TH_DORMANT) return 0x800201a4u;              /* NOT_DORMANT */
     if (getenv("SR_THLOG")) fprintf(stderr, "start thread uid=0x%x entry=0x%08x pri=%d arglen=%u%s\n",
                                     t->uid, t->entry, t->priority, arglen, t->started ? " (restart)" : "");
     /* PSP semantics: starting a DORMANT thread that ran before restarts it from its entry.
      * The old fiber is parked wherever the thread last gave up the CPU -- for a thread that
      * exited via sceKernelExitThread that is deep inside the exit syscall, so resuming it
      * would fall through past the exit into garbage (this stranded the BGM streamer thread
-     * and with it the mission scene-switch fade). Throw the old fiber away and re-seed the
-     * register file so the scheduler re-enters the body fresh. */
-    if (t->started && t->state == TH_DORMANT) {
+     * and with it the mission scene-switch fade). Throw the old fiber away so the scheduler
+     * re-enters the body fresh. */
+    if (t->started) {
         if (t->fiber) { DeleteFiber(t->fiber); t->fiber = NULL; }
         t->started = 0;
         t->wakeups = 0; t->sleeping = 0; t->wait_obj = 0; t->wake = 0;
-        memset(&t->saved, 0, sizeof(t->saved));
-        t->saved.r[26] = t->k0_init;
-        t->saved.r[29] = t->sp_init;
-        t->saved.r[28] = s_gp;
-        t->saved.vfpuCtrl[0] = 0xe4; t->saved.vfpuCtrl[1] = 0xe4; t->saved.vfpuCtrl[2] = 0;
-        t->saved.pc = t->entry;
     }
+    start_reset(t, arglen, argp);
     t->arglen = arglen; t->argp = argp;
     t->state = TH_READY;
+    return 0;
+}
+
+/* sceKernelDeleteThread: only a dormant thread other than the caller. */
+int sched_delete_thread(uint32_t uid) {
+    if (uid == 0 || uid == sched_current_uid()) return (int)0x800201a4u;   /* NOT_DORMANT */
+    TCB *t = tcb_by_uid(uid);
+    if (!t) return (int)0x80020198u;                                      /* UNKNOWN_THID */
+    if (t->state != TH_DORMANT) return (int)0x800201a4u;
+    delete_tcb(t, 0);
+    return 0;
+}
+
+/* sceKernelExitDeleteThread: exit, free the stack, and give the slot back. */
+void sched_exit_delete_current(int32_t status) {
+    if (s_cur < 0) return;
+    TCB *t = &s_tcb[s_cur];
+    t->exit_status = status;
+    t->state = TH_DORMANT;
+    sched_wake(t->uid);          /* release threads in sceKernelWaitThreadEnd on this thread */
+    delete_tcb(t, 1);
+    switch_to_scheduler();
 }
 
 /* Pick the highest-priority runnable thread (lowest priority number). Wakes delayed threads
@@ -408,22 +579,57 @@ void sched_delay_current(uint32_t usec) {
     TCB *t = &s_tcb[s_cur];
     if (usec > 2000000u && getenv("SR_DELAYLOG"))   /* > 2s: catch a bogus huge delay */
         fprintf(stderr, "BIG DELAY uid=0x%x entry=0x%08x usec=%u (%.1fs)\n", t->uid, t->entry, usec, usec / 1e6);
-    memcpy(&t->saved, s_cpu, sizeof(CpuState));
-    t->state = TH_WAIT_DELAY;
     /* Real microseconds of virtual time; any positive delay yields at least once. */
     vtime_refresh();
-    t->wake = s_vtime_us + (usec ? usec : 1);
-    switch_to_scheduler();
+    uint64_t deadline = s_vtime_us + (usec ? usec : 1);
+    do {
+        memcpy(&t->saved, s_cpu, sizeof(CpuState));
+        t->state = TH_WAIT_DELAY;
+        t->wake = deadline;
+        switch_to_scheduler();
+    } while (cb_wake_handled(t) && (vtime_refresh(), s_vtime_us < deadline));
+}
+
+/* Callbacks during a ...CB wait. A thread waiting with callbacks enabled runs its notified
+ * callbacks when the wait starts, and is woken (cb_woken) to run any notified during the wait.
+ * sched_block_on/_timeout then return without the object being signalled, so their callers
+ * re-check their condition (they all loop); delays and sleeps resume waiting themselves. */
+int sr_cb_run_pending(CpuState *s, uint32_t thread_uid);
+int sr_cb_pending(uint32_t thread_uid);
+
+void sched_cb_wait(int on) {
+    if (s_cur < 0) return;
+    s_tcb[s_cur].cb_wait = on;
+    if (on) sr_cb_run_pending(s_cpu, s_tcb[s_cur].uid);
+}
+
+void sched_cb_notify_thread(uint32_t uid) {
+    TCB *t = tcb_by_uid(uid);
+    if (!t || !t->cb_wait) return;
+    if (t->state == TH_WAIT_OBJ || t->state == TH_WAIT_DELAY) {
+        t->cb_woken = 1;
+        t->state = TH_READY;
+    }
+}
+
+/* After a wait returns: run callbacks if the thread was woken for them. 1 if it was. */
+static int cb_wake_handled(TCB *t) {
+    if (!t->cb_woken) return 0;
+    t->cb_woken = 0;
+    sr_cb_run_pending(s_cpu, t->uid);
+    return 1;
 }
 
 void sched_block_on(uint32_t obj) {
     if (s_cur < 0) return;
     TCB *t = &s_tcb[s_cur];
+    if (t->cb_wait && sr_cb_run_pending(s_cpu, t->uid)) return;
     memcpy(&t->saved, s_cpu, sizeof(CpuState));
     t->state = TH_WAIT_OBJ;
     t->wait_obj = obj;
     t->wake = (uint64_t)-1;     /* infinite: only sched_wake releases it */
     switch_to_scheduler();
+    cb_wake_handled(t);
 }
 
 /* Block on obj, but also wake after usec of virtual time (a timed sema/event wait). Returns 1
@@ -433,19 +639,25 @@ int sched_block_on_timeout(uint32_t obj, uint32_t usec) {
     TCB *t = &s_tcb[s_cur];
     vtime_refresh();
     uint64_t deadline = s_vtime_us + (usec ? usec : 1);
+    if (t->cb_wait && sr_cb_run_pending(s_cpu, t->uid)) return 0;
     memcpy(&t->saved, s_cpu, sizeof(CpuState));
     t->state = TH_WAIT_OBJ;
     t->wait_obj = obj;
     t->wake = deadline;
     switch_to_scheduler();
+    if (cb_wake_handled(t)) return 0;
     vtime_refresh();
     return s_vtime_us >= deadline;   /* resumed: timed out if the deadline has passed */
 }
 
-void sched_wake(uint32_t obj) {
+int sched_wake(uint32_t obj) {
+    int n = 0;
     for (int i = 0; i < s_ntcb; i++)
-        if (s_tcb[i].state == TH_WAIT_OBJ && s_tcb[i].wait_obj == obj)
+        if (s_tcb[i].state == TH_WAIT_OBJ && s_tcb[i].wait_obj == obj) {
             s_tcb[i].state = TH_READY;
+            n++;
+        }
+    return n;
 }
 
 /* sceKernelSleepThread[CB]: PSP wakeup-count semantics. If a wakeup is already pending, consume it
@@ -455,13 +667,16 @@ void sched_wake(uint32_t obj) {
 void sched_thread_sleep(void) {
     if (s_cur < 0) return;
     TCB *t = &s_tcb[s_cur];
-    if (t->wakeups > 0) { t->wakeups--; return; }   /* pending wakeup: don't block */
-    t->sleeping = 1;
-    memcpy(&t->saved, s_cpu, sizeof(CpuState));
-    t->state = TH_WAIT_OBJ;
-    t->wait_obj = t->uid;       /* sleep marker: woken only by sched_thread_wakeup(uid) */
-    t->wake = (uint64_t)-1;
-    switch_to_scheduler();
+    for (;;) {
+        if (t->wakeups > 0) { t->wakeups--; return; }   /* pending wakeup: don't block */
+        t->sleeping = 1;
+        memcpy(&t->saved, s_cpu, sizeof(CpuState));
+        t->state = TH_WAIT_OBJ;
+        t->wait_obj = t->uid;   /* sleep marker: woken only by sched_thread_wakeup(uid) */
+        t->wake = (uint64_t)-1;
+        switch_to_scheduler();
+        if (!cb_wake_handled(t)) return;
+    }
 }
 
 /* sceKernelWakeupThread(uid): wake a sleeping thread, or bank a pending wakeup if it is not
@@ -524,11 +739,61 @@ int sched_thread_run_status(uint32_t uid, SrThreadRunStatus *out) {
     return 0;
 }
 
-void sched_exit_current(void) {
+int sched_thread_status(uint32_t uid, SrThreadStatus *out) {
+    uid = resolve_thread_uid(uid);
+    TCB *t = tcb_by_uid(uid);
+    if (!t || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    memcpy(out->name, t->name, sizeof(out->name));
+    out->attr = t->attr;
+    out->status = psp_thread_status(t);
+    out->entry = t->entry;
+    out->stack = t->stack_start;
+    out->stackSize = t->stack_size;
+    out->gpReg = s_gp;
+    out->initialPriority = t->initial_priority;
+    out->currentPriority = t->priority;
+    out->waitType = psp_wait_type(t);
+    out->waitId = (t->state == TH_WAIT_DELAY) ? uid : t->wait_obj;
+    out->wakeupCount = t->wakeups;
+    out->exitStatus = t->exit_status;
+    out->runClocksLow = (uint32_t)s_tick;
+    out->runClocksHigh = (uint32_t)(s_tick >> 32);
+    return 0;
+}
+
+int32_t sched_thread_exit_status(uint32_t uid) {
+    uid = resolve_thread_uid(uid);
+    TCB *t = tcb_by_uid(uid);
+    if (!t) return (int32_t)0x80020198u;   /* UNKNOWN_THID */
+    if (t->state != TH_DORMANT) return (int32_t)0x800201a4u;
+    return t->exit_status;
+}
+
+uint32_t sched_thread_id_list(uint32_t type, uint32_t *out, uint32_t capacity) {
+    uint32_t total = 0;
+    for (int i = 0; i < s_ntcb; i++) {
+        TCB *t = &s_tcb[i];
+        if (t->deleted) continue;
+        int include = type == 64 ? (t->state == TH_WAIT_OBJ && t->sleeping && t->wait_obj == t->uid) :
+                      type == 65 ? t->state == TH_WAIT_DELAY :
+                      type == 66 ? 0 :
+                      type == 67 ? t->state == TH_DORMANT : 0;
+        if (include) {
+            if (out && total < capacity) out[total] = t->uid;
+            total++;
+        }
+    }
+    return total;
+}
+
+void sched_exit_current(int32_t status) {
     if (s_cur < 0) return;
-    uint32_t uid = s_tcb[s_cur].uid;
+    TCB *t = &s_tcb[s_cur];
+    uint32_t uid = t->uid;
     if (getenv("SR_SYSLOG")) fprintf(stderr, "thr 0x%x EXIT (entry 0x%08x)\n", uid, s_tcb[s_cur].entry);
-    s_tcb[s_cur].state = TH_DORMANT;
+    t->exit_status = status;
+    t->state = TH_DORMANT;
     sched_wake(uid);             /* release threads in sceKernelWaitThreadEnd on this thread */
     switch_to_scheduler();
 }
@@ -546,10 +811,11 @@ void sched_set_priority(uint32_t uid, int priority) {
  * its entry (the restart path resets registers/fiber). Terminating yourself exits. The old h_ok
  * stub left the "killed" thread running. */
 void sched_terminate_thread(uint32_t uid) {
-    if (s_cur >= 0 && s_tcb[s_cur].uid == uid) { sched_exit_current(); return; }
+    if (s_cur >= 0 && s_tcb[s_cur].uid == uid) { sched_exit_current((int32_t)0x800201acu); return; }
     TCB *t = tcb_by_uid(uid);
     if (!t || t->state == TH_DORMANT) return;
     if (getenv("SR_SYSLOG")) fprintf(stderr, "thr 0x%x TERMINATED (entry 0x%08x)\n", uid, t->entry);
+    t->exit_status = (int32_t)0x800201acu;
     t->state = TH_DORMANT;
     t->sleeping = 0; t->wait_obj = 0; t->wake = 0;
     sched_wake(uid);             /* release threads in sceKernelWaitThreadEnd on this thread */
@@ -563,13 +829,44 @@ int sched_is_dormant(uint32_t uid) {
 /* The scheduler loop. Runs on the main (converted) fiber. Creates the entry thread, then keeps
  * resuming the highest-priority ready thread until none remain runnable. */
 void sched_run(uint32_t entry, uint32_t arglen, uint32_t argp) {
-    uint32_t uid = sched_create_thread(entry, 32, 0);
-    TCB *t0 = tcb_by_uid(uid);
-    /* The entry (module_start) keeps the driver-seeded state -- real sp, gp, and module args
-     * -- rather than the synthetic thread stack. */
+    /* The entry thread (module_start) was created and started by the oracle's kernel: the driver
+     * seeded its registers and the top of its stack. PPSSPP's FillStack left the thread UID at
+     * k0+0xc0 and the stack base at k0+0xc8, so adopt that UID and reserve that exact stack block
+     * in the user partition. The kernel deletes this thread when module_start returns, which
+     * frees the stack for the game's later allocations. */
+    TCB *t0 = tcb_slot();
+    memset(t0, 0, sizeof(*t0));
+    snprintf(t0->name, sizeof(t0->name), "module_start");
+    t0->priority = 32;
+    t0->initial_priority = 32;
+    t0->exit_status = (int32_t)0x800201a4u;
+    t0->attr = 0x80000000u;
+    t0->entry = entry;
+    t0->delete_on_exit = 1;
+    uint32_t k0 = s_cpu->r[26];
+    uint32_t base = sr_inrange(k0) ? MEM_R32(k0 + 0xc8) : 0;
+    uint32_t seed_uid = sr_inrange(k0) ? MEM_R32(k0 + 0xc0) : 0;
+    if (base && base < k0 && k0 + 0x100 - base <= 0x100000 && seed_uid >= 0x100 &&
+        sr_ba_alloc_at(sr_kmem_user(), base, k0 + 0x100 - base, "stack/module_start") == base) {
+        t0->uid = seed_uid;
+        sr_register_uid_type(t0->uid, SR_TMID_THREAD);
+        t0->stack_start = base;
+        t0->stack_size = k0 + 0x100 - base;
+    } else {
+        /* No oracle k0 block: give it a default stack block and keep the seeded sp. */
+        uint32_t size = 0x40000;
+        uint32_t start = sr_ba_alloc(sr_kmem_user(), &size, 1, "stack/module_start");
+        t0->uid = sr_alloc_uid_type(SR_TMID_THREAD);
+        t0->stack_start = start == SR_BA_FAIL ? 0 : start;
+        t0->stack_size = start == SR_BA_FAIL ? 0 : size;
+        fprintf(stderr, "sched_run: no start-thread k0 block in the seed; stack at 0x%08x\n", t0->stack_start);
+    }
+    if (getenv("SR_THLOG")) fprintf(stderr, "entry thread uid=0x%x stack=%08x-%08x\n",
+                                    t0->uid, t0->stack_start, t0->stack_start + t0->stack_size);
     memcpy(&t0->saved, s_cpu, sizeof(CpuState));
-    arglen = s_cpu->r[4]; argp = s_cpu->r[5];
-    sched_start_thread(uid, arglen, argp);
+    t0->arglen = s_cpu->r[4]; t0->argp = s_cpu->r[5];
+    t0->state = TH_READY;
+    (void)arglen; (void)argp;
 
     static const char *stn[] = {"DORMANT", "READY", "RUNNING", "WAIT_DELAY", "WAIT_OBJ"};
     unsigned long long iters = 0;
@@ -625,6 +922,7 @@ void sched_run(uint32_t entry, uint32_t arglen, uint32_t argp) {
             t->fiber = CreateFiberEx((SIZE_T)1 << 18, (SIZE_T)64 << 20, 0, fiber_proc, t);
         }
         SwitchToFiber(t->fiber);           /* run until it yields/blocks/exits */
+        if (t->deleted && t->fiber) { DeleteFiber(t->fiber); t->fiber = NULL; }   /* deleted itself */
         s_cur = -1;
         s_tick++;
     }

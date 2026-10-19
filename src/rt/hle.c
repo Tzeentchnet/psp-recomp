@@ -4,11 +4,10 @@
  * resolves it and the codegen emits sr_syscall(s, NID) in each stub. A handler reads its
  * arguments from $a0-$a3 (and the stack for further args) and returns the $v0 value.
  *
- * The kernel object identifiers (thread/block UIDs) and allocation addresses PPSSPP returns
- * come from its own boot-time allocators, so they are not reproducible here without simulating
- * PPSSPP's whole kernel. This HLE is instead internally consistent: it hands out its own UIDs
- * and allocates from its own bump pointer, and the game uses those values uniformly. Functional
- * equivalence is checked by the sequence of import calls (by NID), not by UID values.
+ * Kernel object UIDs come from one counter, like PPSSPP's KernelObjectPool, and the driver
+ * continues it from the reference trace's "# kernel next_uid". Memory comes from a port of
+ * PPSSPP's BlockAllocator (kmem.c), so partition blocks, FPLs and thread stacks land at the
+ * addresses PPSSPP gives for the same call sequence.
  *
  * After each handler, the caller-saved temp registers are poisoned to 0xDEADBEEF exactly as
  * PPSSPP's SetDeadbeefRegs does, so traces stay aligned on the registers the game actually
@@ -26,7 +25,11 @@
 #include <string.h>
 #include <wchar.h>
 #include <setjmp.h>
-#include <direct.h>   /* _mkdir for the writable fs/ scratch dir */
+#include <direct.h>
+#include <io.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <time.h>
 
 uint32_t sr_last_nid = 0;
 
@@ -62,62 +65,72 @@ static uint32_t stack_arg(CpuState *s, int idx) {
     return idx < 4 ? s->r[8 + idx] : MEM_R32(s->r[29] + (uint32_t)(idx - 4) * 4);
 }
 
-/* ---- kernel object UID + user-memory bump allocator ---- */
+/* ---- kernel object UIDs ---- */
 
 /* Single shared UID pool matching PPSSPP: uid = 0x110, 0x111, ... incrementing by 1. */
 static uint32_t s_uid = 0x110;
+typedef struct { uint32_t uid, type; } UidObject;
+static UidObject *s_uid_objects;
+static uint32_t s_uid_object_count, s_uid_object_capacity;
+
 uint32_t sr_alloc_uid(void) { return s_uid++; }
+void sr_register_uid_type(uint32_t uid, uint32_t type) {
+    for (uint32_t i = 0; i < s_uid_object_count; i++) {
+        if (s_uid_objects[i].uid == uid) {
+            s_uid_objects[i].type = type;
+            return;
+        }
+    }
+    if (s_uid_object_count == s_uid_object_capacity) {
+        uint32_t next = s_uid_object_capacity ? s_uid_object_capacity * 2 : 256;
+        UidObject *objects = (UidObject *)realloc(s_uid_objects, (size_t)next * sizeof(*objects));
+        if (!objects) {
+            fprintf(stderr, "kernel UID registry: out of host memory\n");
+            abort();
+        }
+        s_uid_objects = objects;
+        s_uid_object_capacity = next;
+    }
+    s_uid_objects[s_uid_object_count].uid = uid;
+    s_uid_objects[s_uid_object_count].type = type;
+    s_uid_object_count++;
+}
+uint32_t sr_alloc_uid_type(uint32_t type) {
+    uint32_t uid = sr_alloc_uid();
+    sr_register_uid_type(uid, type);
+    return uid;
+}
+void sr_unregister_uid(uint32_t uid) {
+    for (uint32_t i = 0; i < s_uid_object_count; i++)
+        if (s_uid_objects[i].uid == uid) {
+            s_uid_objects[i].type = 0;
+            return;
+        }
+}
+uint32_t sr_uid_list(uint32_t type, uint32_t *out, uint32_t capacity) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < s_uid_object_count; i++)
+        if (s_uid_objects[i].type == type) {
+            if (out && total < capacity) out[total] = s_uid_objects[i].uid;
+            total++;
+        }
+    return total;
+}
 /* Continue UID numbering where the oracle's kernel is (trace header "# kernel next_uid="), so
  * handles returned to the game match the reference trace. */
 void sr_set_next_uid(uint32_t next) { s_uid = next; }
 
-/* User-partition bump allocator. The kernel hands the game one user partition; the first
- * sceKernelAllocPartitionMemory Low block sits immediately after the loaded module (like
- * PPSSPP's loader, which places it at the module end rather than a round boundary). Starting at
- * the real module end keeps the game's internal sub-allocator producing stable addresses.
- *
- * Generic defaults: the heap base is the loaded module's end (BSS included, from the flat
- * image) rounded up to 4 KB, and the partition runs to a conventional PSP user-memory ceiling.
- * Both are overridable as hex via SR_HEAP_BASE / SR_PARTITION_TOP for a game that needs an exact
- * PSP layout to reproduce reference addresses bit-for-bit. The free size the game queries is
- * (top - bump pointer) and shrinks as it allocates -- not a fixed fake. */
-static uint32_t s_heap = 0;              /* bump pointer in user RAM; 0 = not yet initialised */
-static uint32_t s_part_top = 0;
-
-static void user_partition_init(void) {
-    if (s_heap) return;
-    const char *eb = getenv("SR_HEAP_BASE");
-    const char *et = getenv("SR_PARTITION_TOP");
-    uint32_t base = eb ? (uint32_t)strtoul(eb, NULL, 16)
-                       : ((sr_loaded_end() + 0xFFFu) & ~0xFFFu);   /* 4 KB above module end */
-    if (base < SR_RAM_BASE) base = SR_RAM_BASE;                    /* never below user RAM */
-    s_heap = base;
-    s_part_top = et ? (uint32_t)strtoul(et, NULL, 16) : 0x0A000000u;
-}
-
-typedef struct { uint32_t uid, addr, size; } Block;
-static Block s_blocks[256];
-static int s_nblocks = 0;
-
-static uint32_t alloc_block(uint32_t size) {
-    user_partition_init();
-    uint32_t addr = (s_heap + 0xFFu) & ~0xFFu;   /* 256-byte align */
-    s_heap = addr + size;
-    uint32_t uid = sr_alloc_uid();
-    if (s_nblocks < 256) { s_blocks[s_nblocks].uid = uid; s_blocks[s_nblocks].addr = addr; s_blocks[s_nblocks].size = size; s_nblocks++; }
-    return uid;
-}
-static uint32_t block_addr(uint32_t uid) {
-    for (int i = 0; i < s_nblocks; i++) if (s_blocks[i].uid == uid) return s_blocks[i].addr;
-    return 0;
-}
+/* User memory, partition blocks, FPLs and thread stacks live in kmem.c (PPSSPP's BlockAllocator). */
 
 /* ---- handlers ---- */
 
-static uint32_t g_sdk_version = 0;
+uint32_t g_sdk_version = 0;   /* read by gelist.c (SDK-dependent GE behaviour) */
 
 static uint32_t h_GetCompiledSdkVersion(CpuState *s) { (void)s; return g_sdk_version; }
 static uint32_t h_SetCompiledSdkVersion(CpuState *s) { g_sdk_version = A0; return 0; }
+/* sceKernelSetCompilerVersion is a separate value; it must not overwrite the SDK version. */
+static uint32_t g_compiler_version = 0;
+static uint32_t h_SetCompilerVersion(CpuState *s) { g_compiler_version = A0; return 0; }
 
 /* sceUtilityGetSystemParamInt(id, int *out): write the system setting and return 0. PPSSPP's
  * defaults (Core/HLE/sceUtility.cpp registry): English (1), Western button order, 24h clock.
@@ -148,39 +161,35 @@ static uint32_t h_CtrlGetIdleCancelThreshold(CpuState *s) {
     return 0;
 }
 
-/* SysMemUserForUser */
-static uint32_t h_AllocPartitionMemory(CpuState *s) {
-    /* a0=partition, a1=name, a2=type, a3=size, [sp+16]=addr. Returns a block UID. */
-    uint32_t size = A3;
-    return alloc_block(size ? size : 16);
-}
-static uint32_t h_GetBlockHeadAddr(CpuState *s) { return block_addr(A0); }
-static uint32_t h_FreePartitionMemory(CpuState *s) { (void)s; return 0; }
-static uint32_t partition_free(void) {
-    user_partition_init();
-    return s_heap < s_part_top ? s_part_top - s_heap : 0u;
-}
-/* A small accounting tail (the kernel keeps block headers per allocation) so the figure is not
- * the exact arithmetic free; PPSSPP reports e.g. 0x1a0b00 with several blocks live. */
-static uint32_t h_TotalFreeMemSize(CpuState *s) { (void)s; uint32_t f = partition_free(); return f > (uint32_t)s_nblocks*0x100u ? f - (uint32_t)s_nblocks*0x100u : f; }
-static uint32_t h_MaxFreeMemSize(CpuState *s) { (void)s; return partition_free(); }
-
 /* ThreadManForUser, backed by the fiber scheduler (src/rt/sched.c). */
 static uint32_t h_CreateThread(CpuState *s) {
-    /* a0=name, a1=entry, a2=priority, a3=stackSize. Returns a UID bound to the entry. */
-    return sched_create_thread(A1, (int)A2, A3);
+    /* a0=name, a1=entry, a2=priority, a3=stackSize, t0=attr, t1=option. Returns the thread UID or
+     * an error; the stack comes from the user partition (kmem.c). */
+    if (!A0) return 0x80020001u;                      /* SCE_KERNEL_ERROR_ERROR: no name */
+    char name[32];
+    int i = 0;
+    for (; i < 31 && MEM_R8(A0 + (uint32_t)i); i++) name[i] = (char)MEM_R8(A0 + (uint32_t)i);
+    name[i] = 0;
+    return sched_create_thread(name, A1, (int)A2, A3, s->r[8]);
 }
 static uint32_t h_StartThread(CpuState *s) {
     /* a0=thid, a1=arglen, a2=argp. Mark ready, then preempt if it is higher priority -- PSP
      * runs a higher-priority started thread immediately. */
-    sched_start_thread(A0, A1, A2);
+    uint32_t rc = sched_start_thread(A0, A1, A2);
+    if (rc) return rc;
     sched_preempt();
     return 0;
 }
-static uint32_t h_ExitThread(CpuState *s) { (void)s; sched_exit_current(); return 0; }
+static uint32_t h_ExitThread(CpuState *s) { sched_exit_current((int32_t)A0); return 0; }
+static uint32_t h_ExitDeleteThread(CpuState *s) { sched_exit_delete_current((int32_t)A0); return 0; }
+static uint32_t h_DeleteThread(CpuState *s) { return (uint32_t)sched_delete_thread(A0); }
 static uint32_t h_DelayThread(CpuState *s) { sched_delay_current(A0); return 0; }
 static uint32_t h_ChangeThreadPriority(CpuState *s) { sched_set_priority(A0, (int)A1); return 0; }
-static uint32_t h_TerminateDeleteThread(CpuState *s) { sched_terminate_thread(A0); return 0; }
+static uint32_t h_TerminateDeleteThread(CpuState *s) {
+    if (A0 == 0 || A0 == sched_current_uid()) return 0x80020197u;   /* ILLEGAL_THID */
+    sched_terminate_thread(A0);
+    return (uint32_t)sched_delete_thread(A0);
+}
 static uint32_t h_GetThreadIdSched(CpuState *s) { (void)s; return sched_current_uid(); }
 static uint32_t h_GetThreadPriority(CpuState *s) { (void)s; return (uint32_t)sched_current_priority(); }
 static uint32_t h_SleepThread(CpuState *s) { (void)s;
@@ -223,7 +232,96 @@ static uint32_t h_ReferThreadRunStatus(CpuState *s) {
     }
     return 0;
 }
+static void hle_buf_w32(uint8_t *buf, uint32_t off, uint32_t value) {
+    memcpy(buf + off, &value, sizeof(value));
+}
+static uint32_t h_ReferThreadStatus(CpuState *s) {
+    uint32_t out = A1;
+    if (!sr_inrange(out)) return 0x800200d3u;   /* ILLEGAL_ADDR */
+    uint32_t wanted = MEM_R32(out);
+    uint32_t native_size = g_sdk_version > 0x02060010u ? 108u : 104u;
+    if (wanted > native_size) return 0x800201bcu;   /* ILLEGAL_SIZE */
+
+    SrThreadStatus ts;
+    if (sched_thread_status(A0, &ts) < 0) return 0x80020198u;   /* UNKNOWN_THID */
+
+    uint8_t buf[108] = {0};
+    hle_buf_w32(buf, 0x00, native_size);
+    memcpy(buf + 0x04, ts.name, sizeof(ts.name));
+    hle_buf_w32(buf, 0x24, ts.attr);
+    hle_buf_w32(buf, 0x28, ts.status);
+    hle_buf_w32(buf, 0x2c, ts.entry);
+    hle_buf_w32(buf, 0x30, ts.stack);
+    hle_buf_w32(buf, 0x34, ts.stackSize);
+    hle_buf_w32(buf, 0x38, ts.gpReg);
+    hle_buf_w32(buf, 0x3c, (uint32_t)ts.initialPriority);
+    hle_buf_w32(buf, 0x40, (uint32_t)ts.currentPriority);
+    hle_buf_w32(buf, 0x44, ts.waitType);
+    hle_buf_w32(buf, 0x48, ts.waitId);
+    hle_buf_w32(buf, 0x4c, (uint32_t)ts.wakeupCount);
+    hle_buf_w32(buf, 0x50, (uint32_t)ts.exitStatus);
+    hle_buf_w32(buf, 0x54, ts.runClocksLow);
+    hle_buf_w32(buf, 0x58, ts.runClocksHigh);
+    hle_buf_w32(buf, 0x5c, ts.intrPreemptCount);
+    hle_buf_w32(buf, 0x60, ts.threadPreemptCount);
+    hle_buf_w32(buf, 0x64, ts.releaseCount);
+    for (uint32_t i = 0; i < wanted; i++) MEM_W8(out + i, buf[i]);
+    return 0;
+}
+static uint32_t h_GetThreadExitStatus(CpuState *s) {
+    return (uint32_t)sched_thread_exit_status(A0);
+}
+static uint32_t h_GetThreadmanIdList(CpuState *s) {
+    uint32_t type = A0, out = A1, capacity = A2, count_out = A3;
+    if (capacity >= 0x08000000u) return 0x800200d3u;   /* ILLEGAL_ADDR */
+    if (capacity) {
+        uint64_t last = (uint64_t)out + (uint64_t)capacity * 4u - 1u;
+        if (last > UINT32_MAX || !sr_inrange(out) || !sr_inrange((uint32_t)last))
+            return 0x800200d2u;   /* ILLEGAL_ARGUMENT */
+    }
+
+    uint32_t total;
+    if (type >= 1 && type <= 14)
+        total = sr_uid_list(type, NULL, 0);
+    else if (type >= 64 && type <= 67)
+        total = sched_thread_id_list(type, NULL, 0);
+    else
+        return 0x800201bbu;       /* ILLEGAL_TYPE */
+
+    uint32_t written = total < capacity ? total : capacity;
+    uint32_t *ids = written ? (uint32_t *)malloc((size_t)written * sizeof(*ids)) : NULL;
+    if (written && !ids) {
+        fprintf(stderr, "sceKernelGetThreadmanIdList: out of host memory\n");
+        abort();
+    }
+    if (type >= 1 && type <= 14)
+        sr_uid_list(type, ids, written);
+    else
+        sched_thread_id_list(type, ids, written);
+    for (uint32_t i = 0; i < written; i++) MEM_W32(out + i * 4u, ids[i]);
+    free(ids);
+    if (count_out && sr_inrange(count_out)) MEM_W32(count_out, total);
+    return written;
+}
+static uint32_t h_SysClock2USec(CpuState *s) {
+    if (!sr_inrange(A0) || !sr_inrange(A0 + 7u)) return 0x800200d3u;
+    uint64_t clock = (uint64_t)MEM_R32(A0) | ((uint64_t)MEM_R32(A0 + 4u) << 32);
+    if (A1 && sr_inrange(A1)) MEM_W32(A1, (uint32_t)(clock / 1000000u));
+    if (A2 && sr_inrange(A2)) MEM_W32(A2, (uint32_t)(clock % 1000000u));
+    return 0;
+}
 static uint32_t h_ok(CpuState *s) { (void)s; return 0; }
+
+/* ...CB variants: the same wait, with the thread's notified callbacks run during it. */
+static uint32_t with_callbacks(CpuState *s, HleFn fn) {
+    sched_cb_wait(1);
+    uint32_t r = fn(s);
+    sched_cb_wait(0);
+    return r;
+}
+static uint32_t h_DelayThreadCB(CpuState *s) { return with_callbacks(s, h_DelayThread); }
+static uint32_t h_SleepThreadCB(CpuState *s) { return with_callbacks(s, h_SleepThread); }
+static uint32_t h_WaitThreadEndCB(CpuState *s) { return with_callbacks(s, h_WaitThreadEnd); }
 
 /* ModuleMgrForUser */
 static uint32_t h_module_uid(CpuState *s) { (void)s; return sr_alloc_uid(); }
@@ -440,6 +538,7 @@ uint32_t mpeg_malloc_avc_es_buf(uint32_t mpegAddr);
 uint32_t mpeg_free_avc_es_buf(uint32_t mpegAddr, uint32_t esBuf);
 uint32_t mpeg_init_au(uint32_t mpegAddr, uint32_t esBuffer, uint32_t auAddr);
 uint32_t mpeg_query_atrac_es_size(uint32_t mpegAddr, uint32_t esSizeAddr, uint32_t outSizeAddr);
+uint32_t mpeg_avc_decode_mode(uint32_t mpegAddr, uint32_t modeAddr);
 
 static uint32_t h_MpegInit(CpuState *s) { (void)s; return mpeg_init(); }
 static uint32_t h_MpegMallocAvcEsBuf(CpuState *s) { return mpeg_malloc_avc_es_buf(A0); }
@@ -447,6 +546,7 @@ static uint32_t h_MpegFreeAvcEsBuf(CpuState *s) { return mpeg_free_avc_es_buf(A0
 static uint32_t h_MpegInitAu(CpuState *s) { return mpeg_init_au(A0, A1, A2); }
 static uint32_t h_MpegQueryAtracEsSize(CpuState *s) { return mpeg_query_atrac_es_size(A0, A1, A2); }
 static uint32_t h_MpegFinish(CpuState *s) { (void)s; return mpeg_finish(); }
+static uint32_t h_MpegAvcDecodeMode(CpuState *s) { return mpeg_avc_decode_mode(A0, A1); }
 /* sceMpegQueryMemSize() takes no args and RETURNS the context size in v0 (PPSSPP MpegRequiredMem:
  * 0x10000 for lib version >= 0x0105, which ACX uses). The earlier wrapper wrote it to a pointer and
  * returned 0, so the game allocated a 0-byte mpeg buffer and sceMpegCreate failed with NO_MEMORY. */
@@ -717,16 +817,6 @@ static uint32_t h_OskGetStatus(CpuState *s) {
 static uint32_t h_OskUpdate(CpuState *s) { (void)s; return 0; }
 static uint32_t h_OskShutdown(CpuState *s) { (void)s; if (s_osk_status) s_osk_status = 4; return 0; }
 
-/* sceWlanGetEtherAddr: 6-byte MAC out through a0. Fixed value so save/profile stamps stay
- * stable across runs. */
-static uint32_t h_WlanGetEtherAddr(CpuState *s) {
-    static const uint8_t mac[6] = { 0x00, 0x13, 0x37, 0xAC, 0xC5, 0x10 };
-    if (!A0) return 0x80000103u;              /* SCE_KERNEL_ERROR_ILLEGAL_ADDR */
-    for (int i = 0; i < 6; i++) MEM_W8(A0 + (uint32_t)i, mac[i]);
-    return 0;
-}
-static uint32_t h_WlanOn(CpuState *s) { (void)s; return 1; }   /* powered on / switch up */
-
 static uint32_t h_VolatileMemLock(CpuState *s) {
     /* sceKernelVolatileMemLock(type, void **paddr, int *psize): hand the app the 4MB volatile
      * partition. PPSSPP returns base 0x08400000, size 0x00400000; the game uses it as the
@@ -737,18 +827,6 @@ static uint32_t h_VolatileMemLock(CpuState *s) {
     return 0;
 }
 static uint32_t h_UmdDriveStat(CpuState *s) { (void)s; return 0x32; }     /* PRESENT|READY|READABLE (matches PPSSPP reference) */
-
-/* VBLANK sub-interrupt handler the game registers; delivered once per frame by the scheduler
- * (it typically wakes the sleeping game thread). PSP_VBLANK_INT = 30. */
-static uint32_t g_vbl_handler = 0, g_vbl_arg = 0; static int g_vbl_on = 0;
-static uint32_t h_RegisterSubIntr(CpuState *s) {
-    /* a0=intno, a1=no, a2=handler, a3=arg. */
-    if (A0 == 30) { g_vbl_handler = A2; g_vbl_arg = A3; }
-    return 0;
-}
-static uint32_t h_EnableSubIntr(CpuState *s) { if (A0 == 30) g_vbl_on = 1; return 0; }
-uint32_t sr_vblank_handler(void) { return g_vbl_on ? g_vbl_handler : 0; }
-uint32_t sr_vblank_arg(void) { return g_vbl_arg; }
 
 static uint32_t s_vcount_fwd;  /* mirror of s_vcount for clock/input timing (set in sr_vblank_tick) */
 /* Virtual microsecond clock. It is anchored to the frame (VBLANK) counter so it advances at the
@@ -771,7 +849,39 @@ static uint32_t h_LibcTime(CpuState *s) {
     return t;
 }
 static uint32_t h_LibcClock(CpuState *s) { (void)s; return (uint32_t)now_usec(); }
-static uint32_t h_RtcGetCurrentTick(CpuState *s) { uint64_t t = now_usec(); if (A0) { MEM_W32(A0, (uint32_t)t); MEM_W32(A0 + 4, (uint32_t)(t >> 32)); } return 0; }
+/* sceKernelGetSystemTime(SceKernelSysClock *): microseconds since boot. */
+static uint32_t h_GetSystemTime(CpuState *s) { uint64_t t = now_usec(); if (A0) { MEM_W32(A0, (uint32_t)t); MEM_W32(A0 + 4, (uint32_t)(t >> 32)); } return 0; }
+/* sceRtcGetCurrentTick(u64 *): microseconds since 0001-01-01, like PPSSPP's __RtcGetCurrentTick
+ * (host time at start + time since boot). */
+#define RTC_MAGIC_OFFSET 62135596800000000ull   /* 0001-01-01 to 1970-01-01 in microseconds */
+static uint64_t rtc_base_us(void) {
+    static uint64_t base = 0;
+    if (!base) base = (uint64_t)time(NULL) * 1000000ull + RTC_MAGIC_OFFSET;
+    return base;
+}
+static uint32_t h_RtcGetCurrentTick(CpuState *s) {
+    uint64_t t = rtc_base_us() + now_usec();
+    if (A0) { MEM_W32(A0, (uint32_t)t); MEM_W32(A0 + 4, (uint32_t)(t >> 32)); }
+    return 0;
+}
+/* sceRtcGetTime_t(const pspTime *date, u32 *time): the date as seconds since 1970 (UTC). */
+static int64_t days_from_civil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+static uint32_t h_RtcGetTime_t(CpuState *s) {
+    uint32_t in = A0, out = A1;
+    if (!in || !out) return 0;
+    int year = MEM_R16(in), month = MEM_R16(in + 2), day = MEM_R16(in + 4);
+    int hour = MEM_R16(in + 6), minute = MEM_R16(in + 8), sec = MEM_R16(in + 10);
+    int64_t t = days_from_civil(year, (unsigned)month, (unsigned)day) * 86400 + hour * 3600 + minute * 60 + sec;
+    MEM_W32(out, (uint32_t)t);
+    return 0;
+}
 /* sceRtcGetWin32FileTime(pspTime *in, u64 *out): out gets 100ns FILETIME units; only deltas
  * matter to the game, so the virtual clock scaled by 10 suffices. The input struct is const. */
 static uint32_t h_RtcGetWin32FileTime(CpuState *s) {
@@ -832,24 +942,159 @@ static uint32_t h_KernelPrintf(CpuState *s) {
     return 0;
 }
 
-typedef struct { int used; uint32_t lba, size, off; int64_t async_res; FILE *host; } Fd;
-static Fd s_fds[64];
+typedef enum {
+    IO_ASYNC_NONE,
+    IO_ASYNC_OPEN,
+    IO_ASYNC_READ,
+    IO_ASYNC_SEEK,
+    IO_ASYNC_CLOSE,
+} IoAsyncOp;
 
-/* Map a guest path to a host scratch file under the writable fs/ directory (storage the
- * read-only ISO cannot provide -- ms0: saves, the game's registry file, etc.). The directory
- * is "fs" by default, overridable with SR_FSDIR, and created on first use. The path is
- * flattened so subdirectories collapse into one filename. */
-static void host_path(const char *guest, char *out, int max) {
-    const char *dir = getenv("SR_FSDIR");
-    if (!dir) dir = "fs";
-    static int made = 0;
-    if (!made) { _mkdir(dir); made = 1; }
-    int n = snprintf(out, (size_t)max, "%s/", dir);
-    for (int i = 0; guest[i] && n < max - 1; i++) {
-        char c = guest[i];
-        out[n++] = (char)((c=='/'||c==':'||c=='\\'||c==' ') ? '_' : c);
+typedef struct {
+    int used;
+    uint32_t lba, size, off;
+    FILE *host;
+    IoAsyncOp async_op;
+    uint32_t async_addr, async_size;
+    int64_t async_offset;
+    uint32_t async_whence, async_delay;
+    int64_t async_res;
+    int async_pending, async_ready, close_pending;
+    int async_priority;
+    uint32_t async_thread;
+} Fd;
+static Fd s_fds[64];
+static int s_async_default_priority = -1;
+
+#define IO_ASYNC_RESULT_OBJ(fd) (0x494f0000u + (fd))
+#define IO_ASYNC_START_OBJ(fd)  (0x494f0100u + (fd))
+#define SCE_KERNEL_ERROR_BADF       0x80020323u
+#define SCE_KERNEL_ERROR_ASYNC_BUSY 0x80020329u
+#define SCE_KERNEL_ERROR_NOASYNC    0x8002032au
+
+static int io_find_slot(void) {
+    for (int i = 3; i < 64; i++) if (!s_fds[i].used) return i;
+    return -1;
+}
+
+static int io_async_busy(const Fd *f) {
+    return f->async_pending || f->async_ready;
+}
+
+static void io_release_fd(uint32_t fd) {
+    if (fd >= 64 || !s_fds[fd].used) return;
+    Fd *f = &s_fds[fd];
+    if (f->host) fclose(f->host);
+    if (f->async_thread) sched_delete_hle_thread(f->async_thread);
+    memset(f, 0, sizeof(*f));
+}
+
+static int host_root(char *out, int max) {
+    const char *override = getenv("SR_FSDIR");
+    int n;
+    if (override && override[0]) {
+        n = snprintf(out, (size_t)max, "%s", override);
+    } else {
+        const char *local = getenv("LOCALAPPDATA");
+        if (!local || !local[0]) {
+            static int warned;
+            if (!warned++) fprintf(stderr, "VFS: LOCALAPPDATA is unset; set SR_FSDIR to override the writable root\n");
+            return -1;
+        }
+        n = snprintf(out, (size_t)max, "%s\\KZLRecomp", local);
+    }
+    if (n < 0 || n >= max) {
+        fprintf(stderr, "VFS: writable root path is too long\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int is_disc_path(const char *path) {
+    return _strnicmp(path, "disc0:", 6) == 0 || _strnicmp(path, "umd0:", 5) == 0 ||
+           strstr(path, "sce_lbn") != NULL;
+}
+
+/* Writable devices preserve their directory hierarchy below SR_FSDIR when set, otherwise below
+ * %LOCALAPPDATA%\KZLRecomp. fatms0: and cache: alias ms0:, matching KZL's PSP device setup. */
+static int host_path(const char *guest, char *out, int max) {
+    char root[512];
+    if (host_root(root, sizeof(root)) != 0) return -1;
+    int n = snprintf(out, (size_t)max, "%s", root);
+    if (n < 0 || n >= max) return -1;
+    while (n > 0 && (out[n - 1] == '\\' || out[n - 1] == '/')) n--;
+    out[n] = 0;
+
+    const char *p = guest;
+    const char *colon = strchr(guest, ':');
+    char device[32] = "root";
+    if (colon) {
+        int len = (int)(colon - guest);
+        if (len <= 0 || len >= (int)sizeof(device)) return -1;
+        memcpy(device, guest, (size_t)len);
+        device[len] = 0;
+        if (_stricmp(device, "fatms0") == 0 || _stricmp(device, "cache") == 0)
+            strcpy(device, "ms0");
+        p = colon + 1;
+    }
+    if (n + 1 + (int)strlen(device) >= max) return -1;
+    out[n++] = '\\';
+    for (int i = 0; device[i]; i++) out[n++] = device[i];
+
+    while (*p) {
+        while (*p == '/' || *p == '\\') p++;
+        if (!*p) break;
+        const char *end = p;
+        while (*end && *end != '/' && *end != '\\') end++;
+        int len = (int)(end - p);
+        if (len == 1 && p[0] == '.') { p = end; continue; }
+        if (len == 2 && p[0] == '.' && p[1] == '.') return -1;
+        if (n + 1 + len >= max) return -1;
+        out[n++] = '\\';
+        for (int i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)p[i];
+            out[n++] = (char)(c < 0x20 || strchr("<>:\"|?*", c) ? '_' : c);
+        }
+        p = end;
     }
     out[n] = 0;
+    return 0;
+}
+
+/* Compatibility with scratch files produced before the VFS preserved directories. */
+static int legacy_host_path(const char *guest, char *out, int max) {
+    char root[512];
+    if (host_root(root, sizeof(root)) != 0) return -1;
+    int n = snprintf(out, (size_t)max, "%s\\", root);
+    if (n < 0 || n >= max) return -1;
+    for (int i = 0; guest[i] && n < max - 1; i++) {
+        char c = guest[i];
+        out[n++] = (char)((c == '/' || c == ':' || c == '\\' || c == ' ') ? '_' : c);
+    }
+    out[n] = 0;
+    return guest[0] && n < max ? 0 : -1;
+}
+
+static void host_make_parents(char *path) {
+    for (char *p = path; *p; p++) {
+        if (*p != '\\' && *p != '/') continue;
+        if (p == path + 2 && path[1] == ':') continue;
+        char save = *p;
+        *p = 0;
+        if (path[0]) _mkdir(path);
+        *p = save;
+    }
+}
+
+static int host_existing_path(const char *guest, char *out, int max, struct _stat64 *st) {
+    if (host_path(guest, out, max) != 0) return -1;
+    if (_stat64(out, st) == 0) return 0;
+    char legacy[512];
+    if (legacy_host_path(guest, legacy, sizeof(legacy)) == 0 && _stat64(legacy, st) == 0) {
+        snprintf(out, (size_t)max, "%s", legacy);
+        return 0;
+    }
+    return -1;
 }
 
 static uint32_t h_IoOpen(CpuState *s) {
@@ -867,18 +1112,27 @@ static uint32_t h_IoOpen(CpuState *s) {
             fprintf(stderr, "\n");
         }
     }
-    int slot = -1;
-    for (int i = 1; i < 64; i++) if (!s_fds[i].used) { slot = i; break; }
+    int slot = io_find_slot();
     if (slot < 0) return 0x80010018;  /* too many open files */
 
     int writing = (flags & 0x0002) != 0;        /* WRONLY or RDWR */
     int creating = (flags & 0x0200) != 0;
     uint32_t lba, size;
-    int in_iso = (iso_lookup(path, &lba, &size) == 0);
+    int in_iso = (is_disc_path(path) || strchr(path, ':') == NULL) &&
+                 iso_lookup(path, &lba, &size) == 0;
 
     if (writing || creating || !in_iso) {
         /* Host-backed file (writable storage). */
-        char hp[512]; host_path(path, hp, sizeof(hp));
+        if ((writing || creating) && is_disc_path(path)) return 0x8001001eu;  /* read-only */
+        char hp[512];
+        if (host_path(path, hp, sizeof(hp)) != 0) return 0x80010016u;
+        struct _stat64 st;
+        if (_stat64(hp, &st) != 0) {
+            char legacy[512];
+            if (legacy_host_path(path, legacy, sizeof(legacy)) == 0 && _stat64(legacy, &st) == 0)
+                snprintf(hp, sizeof(hp), "%s", legacy);
+        }
+        if (writing || creating) host_make_parents(hp);
         const char *mode;
         if (flags & 0x0400) mode = "w+b";            /* TRUNC */
         else if (flags & 0x0100) mode = "a+b";       /* APPEND */
@@ -892,21 +1146,27 @@ static uint32_t h_IoOpen(CpuState *s) {
             return 0x80010002;
         }
         fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
-        s_fds[slot].used = 1; s_fds[slot].host = fp; s_fds[slot].lba = 0;
-        s_fds[slot].size = (uint32_t)(sz < 0 ? 0 : sz); s_fds[slot].off = 0;
+        Fd *f = &s_fds[slot];
+        memset(f, 0, sizeof(*f));
+        f->used = 1; f->host = fp; f->lba = 0;
+        f->size = (uint32_t)(sz < 0 ? 0 : sz); f->off = 0;
+        f->async_priority = s_async_default_priority;
         return (uint32_t)slot;
     }
 from_iso:
+    memset(&s_fds[slot], 0, sizeof(s_fds[slot]));
     s_fds[slot].used = 1; s_fds[slot].host = NULL;
     s_fds[slot].lba = lba; s_fds[slot].size = size; s_fds[slot].off = 0;
+    s_fds[slot].async_priority = s_async_default_priority;
     return (uint32_t)slot;
 }
 static uint32_t h_IoWrite(CpuState *s) {
     /* a0=fd, a1=src, a2=count. Returns bytes written. */
     uint32_t fd = A0, src = A1, count = A2;
-    if (fd < 2) return count;                        /* stdout/stderr: pretend-consumed */
+    if (fd == 1 || fd == 2) return count;            /* stdout/stderr: pretend-consumed */
     if (fd >= 64 || !s_fds[fd].used) return 0x80010009;
     Fd *f = &s_fds[fd];
+    if (io_async_busy(f)) return SCE_KERNEL_ERROR_ASYNC_BUSY;
     if (!f->host) return 0x80010013;                 /* read-only (ISO) fd: not writable */
     fseek(f->host, (long)f->off, SEEK_SET);
     uint8_t tmp[4096]; uint32_t done = 0;
@@ -920,9 +1180,7 @@ static uint32_t h_IoWrite(CpuState *s) {
     f->off += done; if (f->off > f->size) f->size = f->off;
     return done;
 }
-static uint32_t h_IoRead(CpuState *s) {
-    /* a0=fd, a1=dst, a2=count. Returns bytes read. */
-    uint32_t fd = A0, dst = A1, count = A2;
+static uint32_t io_read(uint32_t fd, uint32_t dst, uint32_t count) {
     if (fd >= 64 || !s_fds[fd].used) return 0x80010009;
     Fd *f = &s_fds[fd];
     if (f->off + count > f->size) count = f->size - f->off;
@@ -946,15 +1204,31 @@ static uint32_t h_IoRead(CpuState *s) {
     }
     return done;
 }
+
+static uint32_t h_IoRead(CpuState *s) {
+    /* a0=fd, a1=dst, a2=count. Returns bytes read. */
+    uint32_t fd = A0;
+    if (fd >= 64 || !s_fds[fd].used) return 0x80010009;
+    if (io_async_busy(&s_fds[fd])) return SCE_KERNEL_ERROR_ASYNC_BUSY;
+    return io_read(fd, A1, A2);
+}
+
+static int64_t io_seek(Fd *f, int64_t off, uint32_t whence) {
+    int64_t base = whence == 1 ? f->off : (whence == 2 ? f->size : 0);
+    int64_t pos = base + off;
+    if (pos < 0) pos = 0;
+    if (pos > f->size) pos = f->size;
+    f->off = (uint32_t)pos;
+    return pos;
+}
+
 static uint32_t h_IoLseek32(CpuState *s) {
     /* a0=fd, a1=offset, a2=whence. Returns new position (32-bit). */
     uint32_t fd = A0; int32_t off = (int32_t)A1; uint32_t whence = A2;
     if (fd >= 64 || !s_fds[fd].used) return 0x80010009;
     Fd *f = &s_fds[fd];
-    int64_t base = whence == 1 ? f->off : (whence == 2 ? f->size : 0);
-    int64_t np = base + off; if (np < 0) np = 0; if (np > f->size) np = f->size;
-    f->off = (uint32_t)np;
-    return f->off;
+    if (io_async_busy(f)) return SCE_KERNEL_ERROR_ASYNC_BUSY;
+    return (uint32_t)io_seek(f, off, whence);
 }
 static uint32_t h_IoLseek(CpuState *s) {
     /* a0=fd, [a2:a3]=64-bit offset, [sp+16]=whence. Returns 64-bit pos in v0:v1. */
@@ -963,58 +1237,194 @@ static uint32_t h_IoLseek(CpuState *s) {
     uint32_t whence = stack_arg(s, 0);
     if (fd >= 64 || !s_fds[fd].used) { s->r[3] = 0xFFFFFFFF; return 0x80010009; }
     Fd *f = &s_fds[fd];
-    int64_t base = whence == 1 ? f->off : (whence == 2 ? f->size : 0);
-    int64_t np = base + off; if (np < 0) np = 0; if (np > f->size) np = f->size;
-    f->off = (uint32_t)np;
-    s->r[3] = (uint32_t)((uint64_t)np >> 32);
-    return (uint32_t)np;
+    if (io_async_busy(f)) { s->r[3] = 0xFFFFFFFF; return SCE_KERNEL_ERROR_ASYNC_BUSY; }
+    int64_t pos = io_seek(f, off, whence);
+    s->r[3] = (uint32_t)((uint64_t)pos >> 32);
+    return (uint32_t)pos;
 }
 static uint32_t h_IoClose(CpuState *s) {
     uint32_t fd = A0;
-    if (fd < 64 && s_fds[fd].used) { if (s_fds[fd].host) fclose(s_fds[fd].host); s_fds[fd].host = NULL; s_fds[fd].used = 0; }
+    if (fd >= 64 || !s_fds[fd].used) return SCE_KERNEL_ERROR_BADF;
+    io_release_fd(fd);
     return 0;
 }
-/* Async IO: the operation completes synchronously and its result is stashed per-fd for the
- * matching sceIoWaitAsync/PollAsync to return (the game streams data this way). */
+
+static void io_async_execute(uint32_t fd, uint32_t *delay) {
+    Fd *f = &s_fds[fd];
+    *delay = f->async_delay;
+    switch (f->async_op) {
+        case IO_ASYNC_OPEN:
+            break;
+        case IO_ASYNC_READ: {
+            uint32_t result = io_read(fd, f->async_addr, f->async_size);
+            f->async_res = (int64_t)(int32_t)result;
+            *delay = f->async_size / 100u;
+            if (*delay < 100u) *delay = 100u;
+            if (getenv("SR_IOLOG"))
+                fprintf(stderr, "ReadAsync fd=%u dst=0x%x size=%u -> %d\n",
+                        fd, f->async_addr, f->async_size, (int32_t)result);
+            break;
+        }
+        case IO_ASYNC_SEEK:
+            f->async_res = io_seek(f, f->async_offset, f->async_whence);
+            *delay = 100;
+            break;
+        case IO_ASYNC_CLOSE:
+            f->async_res = 0;
+            *delay = 0;
+            break;
+        default:
+            f->async_res = -1;
+            *delay = 0;
+            break;
+    }
+    f->async_op = IO_ASYNC_NONE;
+}
+
+static void io_async_worker(uint32_t fd) {
+    for (;;) {
+        if (fd >= 64 || !s_fds[fd].used) {
+            sched_exit_delete_current(0);
+            return;
+        }
+        uint32_t delay;
+        io_async_execute(fd, &delay);
+        sched_delay_current(delay);
+        if (!s_fds[fd].used) {
+            sched_exit_delete_current(0);
+            return;
+        }
+        s_fds[fd].async_pending = 0;
+        s_fds[fd].async_ready = 1;
+        sched_wake(IO_ASYNC_RESULT_OBJ(fd));
+        sched_block_on(IO_ASYNC_START_OBJ(fd));
+    }
+}
+
+static uint32_t io_async_start(uint32_t fd) {
+    Fd *f = &s_fds[fd];
+    f->async_pending = 1;
+    f->async_ready = 0;
+    if (!sr_sched_on) {
+        uint32_t delay;
+        io_async_execute(fd, &delay);
+        f->async_pending = 0;
+        f->async_ready = 1;
+        return 0;
+    }
+
+    int priority = f->async_priority == -1 ? sched_current_priority() : f->async_priority;
+    if (!f->async_thread) {
+        uint32_t uid = sched_create_hle_thread("SceIoAsync", priority, 0x200, io_async_worker, fd);
+        if ((int32_t)uid < 0) {
+            f->async_pending = 0;
+            f->async_op = IO_ASYNC_NONE;
+            return uid;
+        }
+        f->async_thread = uid;
+    } else {
+        sched_set_priority(f->async_thread, priority);
+        sched_wake(IO_ASYNC_START_OBJ(fd));
+    }
+    sched_preempt();
+    return 0;
+}
+
 static uint32_t h_IoOpenAsync(CpuState *s) {
-    uint32_t fd = h_IoOpen(s);
-    if (fd < 64) s_fds[fd].async_res = (int64_t)(int32_t)fd;   /* open result */
+    char path[256];
+    guest_cstr(A0, path, sizeof(path));
+    uint32_t result = h_IoOpen(s);
+    uint32_t fd = result;
+    if ((int32_t)result < 0) {
+        int slot = io_find_slot();
+        if (slot < 0) return result;
+        fd = (uint32_t)slot;
+        memset(&s_fds[fd], 0, sizeof(s_fds[fd]));
+        s_fds[fd].used = 1;
+        s_fds[fd].close_pending = 1;
+        s_fds[fd].async_priority = s_async_default_priority;
+        s_fds[fd].async_res = (int64_t)(int32_t)result;
+    } else {
+        s_fds[fd].async_res = (int64_t)(int32_t)fd;
+    }
+    Fd *f = &s_fds[fd];
+    f->async_op = IO_ASYNC_OPEN;
+    f->async_delay = strstr(path, "sce_lbn") ? 80u :
+                     (is_disc_path(path) ? ((int32_t)result < 0 ? 6000u : 4000u) : 10000u);
+    uint32_t start = io_async_start(fd);
+    if ((int32_t)start < 0) {
+        io_release_fd(fd);
+        return start;
+    }
     return fd;
 }
 static uint32_t h_IoReadAsync(CpuState *s) {
     uint32_t fd = A0;
-    uint32_t off = (fd < 64) ? s_fds[fd].off : 0;
-    uint32_t n = h_IoRead(s);
-    if (getenv("SR_IOLOG")) fprintf(stderr, "ReadAsync fd=%u dst=0x%x size=%u (file off was %u) -> %u; first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-        fd, A1, A2, off, n, MEM_R8(A1), MEM_R8(A1+1), MEM_R8(A1+2), MEM_R8(A1+3), MEM_R8(A1+4), MEM_R8(A1+5), MEM_R8(A1+6), MEM_R8(A1+7));
-    if (fd < 64 && s_fds[fd].used) s_fds[fd].async_res = (int64_t)(uint64_t)n;
-    return 0;
+    if (fd >= 64 || !s_fds[fd].used) return SCE_KERNEL_ERROR_BADF;
+    Fd *f = &s_fds[fd];
+    if (io_async_busy(f)) return SCE_KERNEL_ERROR_ASYNC_BUSY;
+    f->async_op = IO_ASYNC_READ;
+    f->async_addr = A1;
+    f->async_size = A2;
+    return io_async_start(fd);
 }
+/* sceIoLseekAsync(fd, s64 offset, whence): the same arguments as sceIoLseek (offset in a2:a3,
+ * whence in t0), not sceIoLseek32's. Using the 32-bit decoder read the offset from a1, so every
+ * seek went to 0 and KZL re-read the start of PSP.DAT for each 64 KB block. */
 static uint32_t h_IoLseekAsync(CpuState *s) {
     uint32_t fd = A0;
-    uint32_t pos = h_IoLseek32(s);
-    if (fd < 64 && s_fds[fd].used) s_fds[fd].async_res = (int64_t)(uint64_t)pos;
+    int64_t offset = (int64_t)(((uint64_t)A3 << 32) | A2);
+    uint32_t whence = stack_arg(s, 0);
+    if (fd >= 64 || !s_fds[fd].used) return SCE_KERNEL_ERROR_BADF;
+    if (whence > 2) return 0x80010016u;
+    Fd *f = &s_fds[fd];
+    if (io_async_busy(f)) return SCE_KERNEL_ERROR_ASYNC_BUSY;
+    f->async_op = IO_ASYNC_SEEK;
+    f->async_offset = offset;
+    f->async_whence = whence;
+    return io_async_start(fd);
+}
+
+static uint32_t io_async_result(CpuState *s, int poll) {
+    uint32_t fd = A0, resp = A1;
+    if (fd >= 64 || !s_fds[fd].used) return SCE_KERNEL_ERROR_BADF;
+    Fd *f = &s_fds[fd];
+    if (f->async_pending) {
+        if (poll) return 1;
+        do {
+            sched_block_on(IO_ASYNC_RESULT_OBJ(fd));
+        } while (f->used && f->async_pending);
+        if (!f->used) return SCE_KERNEL_ERROR_BADF;
+    }
+    if (!f->async_ready) return SCE_KERNEL_ERROR_NOASYNC;
+    int64_t result = f->async_res;
+    if (resp && sr_inrange(resp) && sr_inrange(resp + 7u)) {
+        MEM_W32(resp, (uint32_t)result);
+        MEM_W32(resp + 4, (uint32_t)((uint64_t)result >> 32));
+    }
+    int close_pending = f->close_pending;
+    f->async_ready = 0;
+    if (close_pending) io_release_fd(fd);
     return 0;
 }
-/* Result of the most recent async close per fd slot, so the customary
- * sceIoCloseAsync -> sceIoWaitAsync sequence reads 0 (success), not -1, after the slot is freed. */
-static int64_t s_closed_res[64];
+
 static uint32_t h_IoWaitAsync(CpuState *s) {
-    uint32_t fd = A0, resp = A1;
-    int64_t r = -1;
-    if (fd < 64) r = s_fds[fd].used ? s_fds[fd].async_res : s_closed_res[fd];
-    if (resp) { MEM_W32(resp, (uint32_t)r); MEM_W32(resp + 4, (uint32_t)((uint64_t)r >> 32)); }
-    return 0;   /* completed */
+    if (sched_in_interrupt()) return 0x80020064u;
+    return io_async_result(s, 0);
 }
+
+static uint32_t h_IoPollAsync(CpuState *s) {
+    return io_async_result(s, 1);
+}
+
 static uint32_t h_IoCloseAsync(CpuState *s) {
     uint32_t fd = A0;
-    if (fd < 64) {
-        if (s_fds[fd].host) { fclose(s_fds[fd].host); s_fds[fd].host = NULL; }
-        s_fds[fd].async_res = 0;
-        s_fds[fd].used = 0;
-        s_closed_res[fd] = 0;
-    }
-    return 0;
+    if (fd >= 64 || !s_fds[fd].used) return SCE_KERNEL_ERROR_BADF;
+    Fd *f = &s_fds[fd];
+    if (io_async_busy(f)) return SCE_KERNEL_ERROR_ASYNC_BUSY;
+    f->close_pending = 1;
+    f->async_op = IO_ASYNC_CLOSE;
+    return io_async_start(fd);
 }
 static uint32_t h_IoGetstat(CpuState *s) {
     /* a0=path, a1=SceIoStat*. SceIoStat layout: mode(+0), attr(+4), size(+8,64-bit),
@@ -1022,18 +1432,370 @@ static uint32_t h_IoGetstat(CpuState *s) {
      * fills st_private[0] (+0x40) with the file's starting LBN; the game reads that to build
      * a raw "sce_lbn0x<LBN>" path. Omitting it made the game read garbage and fetch the wrong
      * sector (e.g. REGFILE.CDI at LBN 0x5f20 was read as 0x80). */
-    char path[256]; guest_cstr(A0, path, sizeof(path));
-    uint32_t lba, size, st = A1;
-    if (iso_lookup(path, &lba, &size) != 0) {
-        if (getenv("SR_STATLOG")) fprintf(stderr, "Getstat(%s) -> NOT FOUND\n", path);
-        return 0x80010002;
+    char path[256];
+    guest_cstr(A0, path, sizeof(path));
+    uint32_t st = A1;
+    if (!sr_inrange(st) || !sr_inrange(st + 0x57u)) return 0x800200d3u;
+
+    uint32_t lba = 0, size = 0;
+    int is_dir = 0, host = 0;
+    time_t ctime_value = 0, atime_value = 0, mtime_value = 0;
+    if ((is_disc_path(path) || strchr(path, ':') == NULL) &&
+        iso_lookup_info(path, &lba, &size, &is_dir) == 0) {
+        if (getenv("SR_STATLOG")) fprintf(stderr, "Getstat(%s) -> lba=0x%x size=0x%x\n", path, lba, size);
+    } else {
+        char hp[512];
+        struct _stat64 info;
+        if (host_existing_path(path, hp, sizeof(hp), &info) != 0) {
+            if (getenv("SR_STATLOG")) fprintf(stderr, "Getstat(%s) -> NOT FOUND\n", path);
+            return 0x80010002u;
+        }
+        host = 1;
+        is_dir = (info.st_mode & _S_IFDIR) != 0;
+        size = (uint32_t)info.st_size;
+        ctime_value = info.st_ctime;
+        atime_value = info.st_atime;
+        mtime_value = info.st_mtime;
     }
-    if (getenv("SR_STATLOG")) fprintf(stderr, "Getstat(%s) -> lba=0x%x size=0x%x\n", path, lba, size);
+
     for (int i = 0; i < 0x58; i++) MEM_W8(st + (uint32_t)i, 0);
-    MEM_W32(st + 0, 0x2000 | 0x0124);          /* mode: regular file, r-x */
-    MEM_W32(st + 4, 0x0004 | 0x0001);          /* attr: file */
-    MEM_W32(st + 8, size);                      /* size low (SceOff is 64-bit at +8) */
-    MEM_W32(st + 0x40, lba);                    /* st_private[0]: UMD start sector (LBN) */
+    MEM_W32(st + 0, (is_dir ? 0x1000u : 0x2000u) | (host ? 0777u : 0555u));
+    MEM_W32(st + 4, is_dir ? 0x10u : 0x20u);
+    MEM_W32(st + 8, size);
+    MEM_W32(st + 12, 0);
+    time_t times[3] = { ctime_value, atime_value, mtime_value };
+    for (int i = 0; i < 3; i++) {
+        struct tm fallback = {0};
+        fallback.tm_year = 104; fallback.tm_mon = 0; fallback.tm_mday = 1;
+        struct tm *tmv = times[i] ? localtime(&times[i]) : &fallback;
+        uint32_t p = st + 0x10u + (uint32_t)i * 0x10u;
+        MEM_W16(p + 0, (uint16_t)(tmv->tm_year + 1900));
+        MEM_W16(p + 2, (uint16_t)(tmv->tm_mon + 1));
+        MEM_W16(p + 4, (uint16_t)tmv->tm_mday);
+        MEM_W16(p + 6, (uint16_t)tmv->tm_hour);
+        MEM_W16(p + 8, (uint16_t)tmv->tm_min);
+        MEM_W16(p + 10, (uint16_t)tmv->tm_sec);
+        MEM_W32(p + 12, 0);
+    }
+    MEM_W32(st + 0x40, lba);
+    return 0;
+}
+
+typedef struct DirEntry {
+    char name[256];
+    uint32_t lba, size;
+    int is_dir, host;
+    time_t ctime_value, atime_value, mtime_value;
+} DirEntry;
+typedef struct DirHandle {
+    int used;
+    uint32_t uid;
+    DirEntry *entries;
+    int count, index;
+} DirHandle;
+#define DIR_HANDLE_CAP 64
+static DirHandle s_dirs[DIR_HANDLE_CAP];
+
+static int dir_add(DirHandle *dir, const char *name, uint32_t lba, uint32_t size, int is_dir,
+                   int host, time_t ctime_value, time_t atime_value, time_t mtime_value) {
+    DirEntry *entries = (DirEntry *)realloc(dir->entries, (size_t)(dir->count + 1) * sizeof(*entries));
+    if (!entries) return -1;
+    dir->entries = entries;
+    DirEntry *entry = &dir->entries[dir->count++];
+    memset(entry, 0, sizeof(*entry));
+    snprintf(entry->name, sizeof(entry->name), "%s", name);
+    entry->lba = lba;
+    entry->size = size;
+    entry->is_dir = is_dir;
+    entry->host = host;
+    entry->ctime_value = ctime_value;
+    entry->atime_value = atime_value;
+    entry->mtime_value = mtime_value;
+    return 0;
+}
+
+static int load_iso_dir(const char *path, DirHandle *dir) {
+    int count = 0;
+    if (iso_list(path, NULL, 0, &count) != 0) return -1;
+    IsoDirEntry *entries = count ? (IsoDirEntry *)malloc((size_t)count * sizeof(*entries)) : NULL;
+    if (count && !entries) return -1;
+    if (iso_list(path, entries, count, &count) != 0) { free(entries); return -1; }
+    for (int i = 0; i < count; i++)
+        if (dir_add(dir, entries[i].name, entries[i].lba, entries[i].size, entries[i].is_dir,
+                    0, 0, 0, 0) != 0) {
+            free(entries);
+            return -1;
+        }
+    free(entries);
+    return 0;
+}
+
+static int dir_has_name(const DirHandle *dir, const char *name) {
+    for (int i = 0; i < dir->count; i++)
+        if (_stricmp(dir->entries[i].name, name) == 0) return 1;
+    return 0;
+}
+
+static int load_legacy_host_dir(const char *path, DirHandle *dir) {
+    char mapped[512], pattern[512], root[512];
+    if (legacy_host_path(path, mapped, sizeof(mapped)) != 0) return -1;
+    if (host_root(root, sizeof(root)) != 0) return -1;
+    char *base = strrchr(mapped, '\\');
+    base = base ? base + 1 : mapped;
+    char prefix[300];
+    int prefix_len = snprintf(prefix, sizeof(prefix), "%s_", base);
+    if (prefix_len <= 1 || prefix_len >= (int)sizeof(prefix)) return -1;
+    if (snprintf(pattern, sizeof(pattern), "%s\\*", root) >= (int)sizeof(pattern)) return -1;
+
+    struct _finddata_t data;
+    intptr_t find = _findfirst(pattern, &data);
+    if (find == -1) return -1;
+    int found = 0;
+    do {
+        if (_strnicmp(data.name, prefix, (size_t)prefix_len) != 0) continue;
+        const char *rest = data.name + prefix_len;
+        if (!rest[0]) continue;
+        const char *sep = strchr(rest, '_');
+        int len = sep ? (int)(sep - rest) : (int)strlen(rest);
+        if (len <= 0 || len > 255) continue;
+        char name[256];
+        memcpy(name, rest, (size_t)len);
+        name[len] = 0;
+        if (dir_has_name(dir, name)) continue;
+        if (dir_add(dir, name, 0, sep ? 0u : (uint32_t)data.size, sep != NULL, 1,
+                    data.time_create, data.time_access, data.time_write) != 0) {
+            _findclose(find);
+            return -1;
+        }
+        found = 1;
+    } while (_findnext(find, &data) == 0);
+    _findclose(find);
+    return found ? 0 : -1;
+}
+
+static int load_host_dir(const char *path, DirHandle *dir) {
+    char hp[512], pattern[520];
+    if (host_path(path, hp, sizeof(hp)) != 0) return -1;
+    struct _stat64 st;
+    if (_stat64(hp, &st) != 0) return load_legacy_host_dir(path, dir);
+    if (!(st.st_mode & _S_IFDIR)) return -1;
+    if (snprintf(pattern, sizeof(pattern), "%s\\*", hp) >= (int)sizeof(pattern)) return -1;
+
+    struct _finddata_t data;
+    intptr_t find = _findfirst(pattern, &data);
+    if (find == -1) return errno == ENOENT ? 0 : -1;
+    do {
+        if (!strcmp(data.name, ".") || !strcmp(data.name, "..")) continue;
+        if (dir_add(dir, data.name, 0, (uint32_t)data.size, (data.attrib & _A_SUBDIR) != 0, 1,
+                    data.time_create, data.time_access, data.time_write) != 0) {
+            _findclose(find);
+            return -1;
+        }
+    } while (_findnext(find, &data) == 0);
+    _findclose(find);
+    return 0;
+}
+
+static DirHandle *dir_find(uint32_t uid) {
+    for (int i = 0; i < DIR_HANDLE_CAP; i++)
+        if (s_dirs[i].used && s_dirs[i].uid == uid) return &s_dirs[i];
+    return NULL;
+}
+
+static void write_dir_stat(uint32_t out, const DirEntry *entry) {
+    for (uint32_t i = 0; i < 0x58; i++) MEM_W8(out + i, 0);
+    MEM_W32(out + 0, (entry->is_dir ? 0x1000u : 0x2000u) | (entry->host ? 0777u : 0555u));
+    MEM_W32(out + 4, entry->is_dir ? 0x10u : 0x20u);
+    MEM_W32(out + 8, entry->size);
+    MEM_W32(out + 12, 0);
+    time_t times[3] = { entry->ctime_value, entry->atime_value, entry->mtime_value };
+    for (int i = 0; i < 3; i++) {
+        struct tm fallback = {0};
+        fallback.tm_year = 104; fallback.tm_mon = 0; fallback.tm_mday = 1;
+        struct tm *tmv = times[i] ? localtime(&times[i]) : &fallback;
+        uint32_t p = out + 0x10u + (uint32_t)i * 0x10u;
+        MEM_W16(p + 0, (uint16_t)(tmv->tm_year + 1900));
+        MEM_W16(p + 2, (uint16_t)(tmv->tm_mon + 1));
+        MEM_W16(p + 4, (uint16_t)tmv->tm_mday);
+        MEM_W16(p + 6, (uint16_t)tmv->tm_hour);
+        MEM_W16(p + 8, (uint16_t)tmv->tm_min);
+        MEM_W16(p + 10, (uint16_t)tmv->tm_sec);
+        MEM_W32(p + 12, 0);
+    }
+    MEM_W32(out + 0x40, entry->lba);
+}
+
+static uint32_t h_IoDopen(CpuState *s) {
+    char path[256];
+    guest_cstr(A0, path, sizeof(path));
+    DirHandle loaded = {0};
+    int disc = is_disc_path(path);
+    int result = (disc || strchr(path, ':') == NULL) ? load_iso_dir(path, &loaded) : -1;
+    if (result != 0 && !disc) result = load_host_dir(path, &loaded);
+    if (result != 0) { free(loaded.entries); return 0x80010002u; }
+
+    DirHandle *slot = NULL;
+    for (int i = 0; i < DIR_HANDLE_CAP; i++)
+        if (!s_dirs[i].used) { slot = &s_dirs[i]; break; }
+    if (!slot) { free(loaded.entries); return 0x80010018u; }
+    *slot = loaded;
+    slot->used = 1;
+    slot->uid = sr_alloc_uid();
+    return slot->uid;
+}
+
+static uint32_t h_IoDread(CpuState *s) {
+    DirHandle *dir = dir_find(A0);
+    if (!dir) return 0x80010009u;
+    uint32_t out = A1;
+    if (!sr_inrange(out) || !sr_inrange(out + 0x15bu)) return 0x800200d3u;
+    if (dir->index >= dir->count) {
+        MEM_W8(out + 0x58, 0);
+        return 0;
+    }
+    DirEntry *entry = &dir->entries[dir->index++];
+    for (uint32_t i = 0; i < 0x15c; i++) MEM_W8(out + i, 0);
+    write_dir_stat(out, entry);
+    for (uint32_t i = 0; i < 255 && entry->name[i]; i++) MEM_W8(out + 0x58u + i, entry->name[i]);
+    return 1;
+}
+
+static uint32_t h_IoDclose(CpuState *s) {
+    DirHandle *dir = dir_find(A0);
+    if (!dir) return 0x80010009u;
+    free(dir->entries);
+    memset(dir, 0, sizeof(*dir));
+    return 0;
+}
+
+static uint32_t h_IoRemove(CpuState *s) {
+    char path[256], hp[512];
+    guest_cstr(A0, path, sizeof(path));
+    if (is_disc_path(path)) return 0x8001001eu;
+    struct _stat64 st;
+    if (host_existing_path(path, hp, sizeof(hp), &st) != 0 || (st.st_mode & _S_IFDIR))
+        return 0x80010002u;
+    return _unlink(hp) == 0 ? 0 : 0x80010002u;
+}
+
+static uint32_t h_IoRmdir(CpuState *s) {
+    char path[256], hp[512];
+    guest_cstr(A0, path, sizeof(path));
+    if (is_disc_path(path)) return 0x8001001eu;
+    if (host_path(path, hp, sizeof(hp)) != 0) return 0x80010016u;
+    if (_rmdir(hp) == 0) return 0;
+    return errno == ENOTEMPTY || errno == EEXIST ? 0x8001005au : 0x80010002u;
+}
+
+/* sceIoDevctl, after PPSSPP sceIo.cpp: the UMD commands, and the memory stick ones for
+ * mscmhc0:/ms0:/memstick: and fatms0:. The memory stick is always inserted and its FAT assigned,
+ * and a registered insert/eject callback is notified with that state at once, as PPSSPP does.
+ * a0=device, a1=cmd, a2=arg, a3=arglen, t0=out, t1=outlen. */
+#define MS_FAKE_FREE_SPACE ((1024u + 512u) * 1024u * 1024u)
+static uint32_t s_ms_callbacks[32], s_ms_fat_callbacks[32];
+static int s_ms_ncb = 0, s_ms_nfatcb = 0;
+static int cb_list_remove(uint32_t *list, int *n, uint32_t id) {
+    for (int i = 0; i < *n; i++)
+        if (list[i] == id) { memmove(&list[i], &list[i + 1], (size_t)(*n - i - 1) * sizeof(uint32_t)); (*n)--; return 1; }
+    return 0;
+}
+static void ms_write_device_size(uint32_t argAddr) {
+    uint32_t p = MEM_R32(argAddr);
+    if (!sr_inrange(p)) return;
+    uint32_t sectorSize = 0x200, sectorCount = (32 * 1024) / sectorSize;
+    uint32_t maxClusters = (uint32_t)(((uint64_t)MS_FAKE_FREE_SPACE * 95 / 100) / (sectorSize * sectorCount));
+    MEM_W32(p + 0, maxClusters);
+    MEM_W32(p + 4, maxClusters);
+    MEM_W32(p + 8, maxClusters);
+    MEM_W32(p + 12, sectorSize);
+    MEM_W32(p + 16, sectorCount);
+}
+static uint32_t h_IoDevctl(CpuState *s) {
+    char name[32];
+    guest_cstr(A0, name, sizeof name);
+    uint32_t cmd = A1, argAddr = A2, argLen = A3, outPtr = stack_arg(s, 0), outLen = stack_arg(s, 1);
+    if (getenv("SR_IOLOG")) fprintf(stderr, "sceIoDevctl(\"%s\", %08x, %08x, %u, %08x, %u)\n", name, cmd, argAddr, argLen, outPtr, outLen);
+    const uint32_t BAD_PARAMS = 0x80220081u, ERR_EINVAL = 0x80010016u;
+    switch (cmd) {   /* UMD */
+    case 0x01F20001: if (sr_inrange(outPtr) && outLen >= 8) { MEM_W32(outPtr + 4, 0x10); return 0; } return BAD_PARAMS;
+    case 0x01F20002: if (sr_inrange(outPtr) && outLen >= 4) { MEM_W32(outPtr, 0x10); return 0; } return BAD_PARAMS;
+    case 0x01F100A3: case 0x01F100A4: case 0x01F300A7: case 0x01F300A8: case 0x01F300A9:
+        return (sr_inrange(argAddr) && argLen >= 4) ? 0 : BAD_PARAMS;
+    case 0x01F300A5: if (sr_inrange(argAddr) && argLen >= 4) { MEM_W32(outPtr, 1); return 0; } return BAD_PARAMS;
+    case 0x01F100A6: case 0x01F100A8: case 0x01F100A9: return 0;
+    }
+    if (!strcmp(name, "mscmhc0:") || !strcmp(name, "ms0:") || !strcmp(name, "memstick:")) {
+        switch (cmd) {
+        case 0x02025801:   /* driver status: device inserted */
+            if (sr_inrange(outPtr) && outLen >= 4) { MEM_W32(outPtr, 4); return 0; }
+            return BAD_PARAMS;
+        case 0x02015804:   /* register insert/eject callback; notified at once with "inserted" */
+            if (sr_inrange(argAddr) && outPtr == 0 && argLen >= 4) {
+                uint32_t cb = MEM_R32(argAddr);
+                if (s_ms_ncb < 32 && sr_cb_notify(cb, 1)) { s_ms_callbacks[s_ms_ncb++] = cb; return 0; }
+                return ERR_EINVAL;
+            }
+            return BAD_PARAMS;
+        case 0x02015805:
+            if (sr_inrange(argAddr) && argLen >= 4)
+                return cb_list_remove(s_ms_callbacks, &s_ms_ncb, MEM_R32(argAddr)) ? 0 : ERR_EINVAL;
+            return BAD_PARAMS;
+        case 0x02025806:   /* inserted */
+            if (sr_inrange(outPtr) && outLen >= 4) { MEM_W32(outPtr, 1); return 0; }
+            return BAD_PARAMS;
+        case 0x02425818:   /* capacity */
+            if (sr_inrange(argAddr) && argLen >= 4) { ms_write_device_size(argAddr); return 0; }
+            return BAD_PARAMS;
+        case 0x02425824:   /* write protected: no */
+            if (sr_inrange(outPtr) && outLen == 4) { MEM_W32(outPtr, 0); return 0; }
+            return 0xFFFFFFFFu;
+        }
+    }
+    if (!strcmp(name, "fatms0:")) {
+        switch (cmd) {
+        case 0x0240d81e: break;   /* invalidate the driver's file table cache: falls to UNSUP */
+        case 0x02415821:   /* register insert/eject callback; notified at once with FAT assigned */
+            if (sr_inrange(argAddr) && argLen >= 4) {
+                uint32_t cb = MEM_R32(argAddr);
+                if (s_ms_nfatcb < 32 && sr_cb_notify(cb, 1)) { s_ms_fat_callbacks[s_ms_nfatcb++] = cb; return 0; }
+            }
+            return ERR_EINVAL;
+        case 0x02415822:
+            if (sr_inrange(argAddr) && argLen >= 4)
+                return cb_list_remove(s_ms_fat_callbacks, &s_ms_nfatcb, MEM_R32(argAddr)) ? 0 : ERR_EINVAL;
+            break;
+        case 0x02415823:   /* set FAT state */
+            return (sr_inrange(argAddr) && argLen == 4) ? 0 : 0xFFFFFFFFu;
+        case 0x02425823:   /* FAT enabled: 1 */
+            if ((int32_t)(outPtr + outLen) < (int32_t)outPtr) return 0x800200d3u;
+            if (!sr_inrange(outPtr)) return ERR_EINVAL;
+            MEM_W32(outPtr, 1);
+            return 0;
+        case 0x02425824:
+            if (sr_inrange(outPtr) && outLen == 4) { MEM_W32(outPtr, 0); return 0; }
+            return 0xFFFFFFFFu;
+        case 0x02425818:
+            if (sr_inrange(argAddr) && argLen >= 4) { ms_write_device_size(argAddr); return 0; }
+            return BAD_PARAMS;
+        }
+    }
+    fprintf(stderr, "HLE: unimplemented sceIoDevctl(\"%s\", %08x, %08x, %u, %08x, %u)\n", name, cmd, argAddr, argLen, outPtr, outLen);
+    return 0x80020325u;   /* SCE_KERNEL_ERROR_UNSUP */
+}
+
+/* sceIoChangeAsyncPriority(fd, priority): -1 means the caller's current priority. */
+static uint32_t h_IoChangeAsyncPriority(CpuState *s) {
+    int32_t fd = (int32_t)A0, pri = (int32_t)A1;
+    if (pri != -1 && (pri < 0x08 || pri > 0x77)) return 0x80020193u;   /* ILLEGAL_PRIORITY */
+    if (fd == -1) {
+        s_async_default_priority = pri;
+        return 0;
+    }
+    if (fd < 0 || fd >= 64 || !s_fds[fd].used) return SCE_KERNEL_ERROR_BADF;
+    Fd *f = &s_fds[fd];
+    f->async_priority = pri;
+    if (f->async_thread)
+        sched_set_priority(f->async_thread, pri == -1 ? sched_current_priority() : pri);
     return 0;
 }
 
@@ -1047,8 +1809,8 @@ static uint32_t h_IoGetstat(CpuState *s) {
  * so a no-op return makes the audio thread monopolise the CPU. Here it yields the thread for
  * the buffer's duration AND forwards the samples to the host waveOut backend (audio.c). */
 extern void sr_audio_push(int ch, const int16_t *lr, int nframes, int volL, int volR);
-static int s_audio_ch[8], s_audio_fmt[8];   /* fmt: 0=stereo, 1=mono */
-static uint32_t s_audio_len[8];
+static int s_audio_ch[9], s_audio_fmt[9];   /* fmt: 0=stereo, 1=mono; [8] = Output2 SRC channel */
+static uint32_t s_audio_len[9];
 static uint32_t h_AudioChReserve(CpuState *s) {
     int ch = (int)A0;
     if (ch < 0) { for (int i = 0; i < 8; i++) if (!s_audio_ch[i]) { ch = i; break; } }
@@ -1069,10 +1831,10 @@ static uint32_t h_AudioSetChannelDataLen(CpuState *s) {
  * behind (voice lagging subtitles) and underran (crackle). */
 extern int sr_audio_queued(int ch);
 static uint32_t audio_output(CpuState *s, uint32_t ch, uint32_t buf, int voll, int volr) {
-    uint32_t n = ch < 8 ? s_audio_len[ch] : 1024;
+    uint32_t n = ch < 9 ? s_audio_len[ch] : 1024;
     if (buf && n > 0 && n <= 65536) {
         static int16_t lr[65536 * 2];
-        int mono = ch < 8 ? s_audio_fmt[ch] : 0;
+        int mono = ch < 9 ? s_audio_fmt[ch] : 0;
         for (uint32_t i = 0; i < n; i++) {
             if (mono) { int16_t v = (int16_t)MEM_R16(buf + i * 2); lr[i*2] = v; lr[i*2+1] = v; }
             else { lr[i*2] = (int16_t)MEM_R16(buf + i * 4); lr[i*2+1] = (int16_t)MEM_R16(buf + i * 4 + 2); }
@@ -1097,6 +1859,75 @@ static uint32_t h_AudioOutputPannedBlocking(CpuState *s) {
     return audio_output(s, A0, A3, (int)(A1 & 0xFFFF), (int)(A2 & 0xFFFF));
 }
 static uint32_t h_AudioRestLen(CpuState *s) { (void)s; return 0; }         /* never backed up */
+
+/* sceAudioOutput2*: the SRC channel (PPSSPP sceAudio.cpp), stereo at 44.1 kHz here. */
+#define AUDIO_SRC_CH 8
+#define ERR_AUDIO_CHANNEL_NOT_RESERVED     0x80260008u
+#define ERR_AUDIO_CHANNEL_ALREADY_RESERVED 0x80268002u
+#define ERR_AUDIO_INVALID_VOLUME           0x8026000Bu
+static uint32_t h_AudioOutput2Reserve(CpuState *s) {
+    uint32_t n = A0 & 0x7FFFFFFFu;
+    if (n < 17 || n > 4111) return 0x80000104u;   /* INVALID_SIZE */
+    if (s_audio_ch[AUDIO_SRC_CH]) return ERR_AUDIO_CHANNEL_ALREADY_RESERVED;
+    s_audio_ch[AUDIO_SRC_CH] = 1; s_audio_len[AUDIO_SRC_CH] = n; s_audio_fmt[AUDIO_SRC_CH] = 0;
+    return 0;
+}
+static uint32_t h_AudioOutput2OutputBlocking(CpuState *s) {
+    if (A0 > 0xFFFFF) return ERR_AUDIO_INVALID_VOLUME;
+    if (!s_audio_ch[AUDIO_SRC_CH]) return ERR_AUDIO_CHANNEL_NOT_RESERVED;
+    return audio_output(s, AUDIO_SRC_CH, A1, (int)A0, (int)A0);
+}
+static uint32_t h_AudioOutput2ChangeLength(CpuState *s) {
+    if (!s_audio_ch[AUDIO_SRC_CH]) return ERR_AUDIO_CHANNEL_NOT_RESERVED;
+    s_audio_len[AUDIO_SRC_CH] = A0;
+    return 0;
+}
+static uint32_t h_AudioOutput2Release(CpuState *s) {
+    (void)s;
+    if (!s_audio_ch[AUDIO_SRC_CH]) return ERR_AUDIO_CHANNEL_NOT_RESERVED;
+    s_audio_ch[AUDIO_SRC_CH] = 0;
+    return 0;
+}
+
+/* sceImpose language/button (PPSSPP sceImpose.cpp): English, cross = enter, matching
+ * sceUtilityGetSystemParamInt. SetLanguageMode stores both. */
+static uint32_t s_impose_lang = 1, s_impose_btn = 1;
+static uint32_t h_ImposeGetLanguageMode(CpuState *s) {
+    if (sr_inrange(A0)) MEM_W32(A0, s_impose_lang);
+    if (sr_inrange(A1)) MEM_W32(A1, s_impose_btn);
+    return 0;
+}
+static uint32_t h_ImposeSetLanguageMode(CpuState *s) { s_impose_lang = A0; s_impose_btn = A1; return 0; }
+
+/* sceCtrlSetSamplingCycle: returns the previous cycle; 0 means sample at vblank. */
+static uint32_t s_ctrl_cycle = 0;
+static uint32_t h_CtrlSetSamplingCycle(CpuState *s) {
+    uint32_t c = A0;
+    if ((c > 0 && c < 5555) || c > 20000) return 0x800001FEu;   /* INVALID_VALUE */
+    uint32_t prev = s_ctrl_cycle;
+    s_ctrl_cycle = c;
+    return prev;
+}
+
+/* sceUmd callback (PPSSPP sceUmd.cpp): Activate notifies it with PRESENT|READABLE|READY and
+ * Deactivate with PRESENT|READY. */
+static uint32_t s_umd_cb = 0;
+static uint32_t h_UmdRegisterUMDCallBack(CpuState *s) { s_umd_cb = A0; return 0; }
+static uint32_t h_UmdUnRegisterUMDCallBack(CpuState *s) {
+    if (A0 != s_umd_cb) return 0x80010016u;   /* ERRNO_INVALID_ARGUMENT */
+    s_umd_cb = 0;
+    return g_sdk_version > 0x3000000 ? 0 : A0;
+}
+static uint32_t h_UmdActivate(CpuState *s) {
+    (void)s;
+    if (s_umd_cb) sr_cb_notify(s_umd_cb, 0x02 | 0x20 | (g_sdk_version ? 0x10 : 0));
+    return 0;
+}
+static uint32_t h_UmdDeactivate(CpuState *s) {
+    (void)s;
+    if (s_umd_cb) sr_cb_notify(s_umd_cb, 0x02 | 0x10);
+    return 0;
+}
 
 /* SR_CALLCOUNT instrumentation: per-NID call tallies, dumped at the capture point. */
 static struct { uint32_t nid; const char *nm; unsigned long n; } g_cc[512];
@@ -1227,6 +2058,7 @@ static uint32_t ctrl_fill(uint32_t buf, uint32_t count, int negate) {
     return ctrl_fill_n(buf, count, negate, 0);
 }
 static uint32_t h_CtrlReadBuffer(CpuState *s) { return ctrl_fill(A0, A1, 0); }
+static uint32_t h_CtrlPeekBuffer(CpuState *s) { return ctrl_fill_n(A0, A1, 0, 1); }
 
 /* sceDisplay: remember the framebuffer; vblank waits block until the next delivered vblank. */
 static void dump_fb_fmt(const char *path, uint32_t fbaddr, int fmt, uint32_t stride);
@@ -1368,102 +2200,6 @@ static uint32_t hcount_intra(void) {
 static uint32_t h_DisplayGetCurrentHcount(CpuState *s) { (void)s; return hcount_intra(); }
 static uint32_t h_DisplayGetAccumulatedHcount(CpuState *s) { (void)s; return s_vcount * 286u + hcount_intra(); }
 
-/* sceGe_user: pretend the GE finishes immediately (DrawSync returns done). eDRAM at 0x04000000. */
-typedef struct {
-    int used;
-    uint32_t signal_func, signal_arg;
-    uint32_t finish_func, finish_arg;
-} GeCallback;
-static GeCallback s_ge_cb[16];
-static uint32_t s_ge_list_next = 0;
-
-static void ge_call_guest(CpuState *s, uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2) {
-    if (!fn) return;
-    CpuState save;
-    memcpy(&save, s, sizeof(CpuState));
-    int32_t save_slice = sr_timeslice;
-    memset(s, 0, sizeof(CpuState));
-    s->r[4] = a0;
-    s->r[5] = a1;
-    s->r[6] = a2;
-    s->r[28] = save.r[28];
-    s->r[29] = 0x09df8000u;
-    s->r[31] = 0;
-    s->vfpuCtrl[0] = 0xe4; s->vfpuCtrl[1] = 0xe4;
-    sr_timeslice = 20000;
-    dispatch(s, fn);
-    memcpy(s, &save, sizeof(CpuState));
-    sr_timeslice = save_slice;
-}
-
-static void ge_finish_callback(CpuState *s, uint32_t cbid, uint32_t list_id, uint32_t user_arg) {
-    if (cbid >= (uint32_t)(sizeof(s_ge_cb) / sizeof(s_ge_cb[0]))) return;
-    GeCallback *cb = &s_ge_cb[cbid];
-    if (!cb->used || !cb->finish_func) return;
-    if (getenv("SR_GELOG")) fprintf(stderr, "sceGe finish cbid=%u list=0x%08x fn=0x%08x arg=0x%08x\n",
-                                    cbid, list_id, cb->finish_func, cb->finish_arg);
-    ge_call_guest(s, cb->finish_func, list_id, cb->finish_arg ? cb->finish_arg : user_arg, cbid);
-}
-
-static uint32_t h_GeListEnQueue(CpuState *s) {
-    /* a0=list ptr, a1=stall, a2=cbid, a3=arg. With SR_GEDUMP set, log the first list's commands
-     * once (bring-up aid for the GE display-list interpreter). */
-    uint32_t list_id = 0x35000000u | (s_ge_list_next++ & 0x00ffffffu);
-    static int dumped = 0;
-    if (!dumped && getenv("SR_GEDUMP")) {
-        dumped = 1;
-        uint32_t list = A0;
-        fprintf(stderr, "sceGeListEnQueue list=0x%08x stall=0x%08x cbid=0x%x\n", A0, A1, A2);
-        for (int i = 0; i < 48; i++) {
-            uint32_t w = MEM_R32(list + (uint32_t)i * 4);
-            fprintf(stderr, "  [%02d] cmd=0x%02x data=0x%06x\n", i, w >> 24, w & 0xFFFFFF);
-        }
-    }
-    if (getenv("SR_GEDUMP2")) {
-        static int dumped = 0;
-        if (!dumped && s_vcount >= 120) {
-            dumped = 1; uint32_t list = A0;
-            fprintf(stderr, "=== GE list dump at frame %u (list=0x%08x) ===\n", s_vcount, list);
-            for (int i = 0; i < 200; i++) {
-                uint32_t w = MEM_R32(list + (uint32_t)i*4); uint32_t cmd = w>>24;
-                fprintf(stderr, "  [%02d] cmd=0x%02x data=0x%06x\n", i, cmd, w & 0xFFFFFF);
-                if (cmd == 0x0C || cmd == 0x0F) break;   /* END/FINISH */
-            }
-        }
-    }
-    ge_run_list(A0);   /* process the list now (sets GE state, rasterises any PRIM) */
-    ge_finish_callback(s, A2, list_id, A3);
-    if (getenv("SR_GESIG")) {
-        extern unsigned long g_ge_list_sig, g_ge_prim_count;
-        static unsigned long last_sig = 0; static int call = 0;
-        if (g_ge_list_sig != last_sig) {
-            fprintf(stderr, "GEsig call=%d frame=%u sig=0x%lx prims=%lu\n", call, s_vcount, g_ge_list_sig, g_ge_prim_count);
-            last_sig = g_ge_list_sig;
-        }
-        call++;
-    }
-    return list_id;
-}
-static uint32_t h_GeDrawSync(CpuState *s) { (void)s; return 0; }
-static uint32_t h_GeEdramGetAddr(CpuState *s) { (void)s; return 0x04000000; }
-static uint32_t h_GeSetCallback(CpuState *s) {
-    uint32_t info = A0;
-    for (uint32_t i = 0; i < (uint32_t)(sizeof(s_ge_cb) / sizeof(s_ge_cb[0])); i++) {
-        if (!s_ge_cb[i].used) {
-            s_ge_cb[i].used = 1;
-            s_ge_cb[i].signal_func = info ? MEM_R32(info + 0) : 0;
-            s_ge_cb[i].signal_arg  = info ? MEM_R32(info + 4) : 0;
-            s_ge_cb[i].finish_func = info ? MEM_R32(info + 8) : 0;
-            s_ge_cb[i].finish_arg  = info ? MEM_R32(info + 12) : 0;
-            if (getenv("SR_GELOG")) fprintf(stderr, "sceGeSetCallback cbid=%u sig=0x%08x/0x%08x fin=0x%08x/0x%08x\n",
-                                            i, s_ge_cb[i].signal_func, s_ge_cb[i].signal_arg,
-                                            s_ge_cb[i].finish_func, s_ge_cb[i].finish_arg);
-            return i;
-        }
-    }
-    return 0xffffffffu;
-}
-
 /* ---- sceSasCore: real voice mixing (VAG ADPCM), pitch resampling, per-voice volumes ----
  * Mixes into the guest buffer that the game then submits via sceAudioOutput*Blocking (which
  * forwards to the host waveOut backend in audio.c). The envelope is simplified to a gate:
@@ -1590,19 +2326,28 @@ static Sync *sync_find(uint32_t uid) {
     for (int i = 0; i < 128; i++) if (s_sync[i].used && s_sync[i].uid == uid) return &s_sync[i];
     return NULL;
 }
-static Sync *sync_new(void) {
-    for (int i = 0; i < 128; i++) if (!s_sync[i].used) { s_sync[i].used = 1; s_sync[i].uid = sr_alloc_uid(); return &s_sync[i]; }
+static Sync *sync_new(uint32_t type) {
+    for (int i = 0; i < 128; i++) if (!s_sync[i].used) {
+        memset(&s_sync[i], 0, sizeof(s_sync[i]));
+        s_sync[i].used = 1;
+        s_sync[i].uid = sr_alloc_uid_type(type);
+        return &s_sync[i];
+    }
     return NULL;
 }
 
 static uint32_t h_CreateSema(CpuState *s) {
     /* a0=name, a1=attr, a2=initCount, a3=maxCount. */
-    Sync *m = sync_new(); if (!m) return 0x80020000;
+    Sync *m = sync_new(SR_TMID_SEMAPHORE); if (!m) return 0x80020000;
     m->count = (int)A2; m->maxc = (int)A3;
     if (getenv("SR_SEMALOG")) fprintf(stderr, "CreateSema uid=0x%x init=%d max=%d\n", m->uid, (int)A2, (int)A3);
     return m->uid;
 }
-static uint32_t h_DeleteSema(CpuState *s) { Sync *m = sync_find(A0); if (m) m->used = 0; return 0; }
+static uint32_t h_DeleteSema(CpuState *s) {
+    Sync *m = sync_find(A0);
+    if (m) { sr_unregister_uid(m->uid); m->used = 0; }
+    return 0;
+}
 static uint32_t h_WaitSema(CpuState *s) {
     /* a0=semaid, a1=signal, a2=timeout ptr (0=infinite, else *a2 = microseconds). */
     uint32_t uid = A0; int need = (int)A1; uint32_t toptr = A2;
@@ -1637,11 +2382,15 @@ static uint32_t h_PollSema(CpuState *s) {
 
 static uint32_t h_CreateEventFlag(CpuState *s) {
     /* a0=name, a1=attr, a2=initPattern, a3=opt. */
-    Sync *m = sync_new(); if (!m) return 0x80020000;
+    Sync *m = sync_new(SR_TMID_EVENT_FLAG); if (!m) return 0x80020000;
     m->pattern = A2;
     return m->uid;
 }
-static uint32_t h_DeleteEventFlag(CpuState *s) { Sync *m = sync_find(A0); if (m) m->used = 0; return 0; }
+static uint32_t h_DeleteEventFlag(CpuState *s) {
+    Sync *m = sync_find(A0);
+    if (m) { sr_unregister_uid(m->uid); m->used = 0; }
+    return 0;
+}
 static uint32_t h_SetEventFlag(CpuState *s) {
     Sync *m = sync_find(A0); if (!m) return 0x80020000;
     m->pattern |= A1; sched_wake(A0); sched_preempt(); return 0;
@@ -1692,6 +2441,10 @@ static uint32_t h_ReferEventFlagStatus(CpuState *s) {
     return 0;
 }
 
+static uint32_t h_WaitSemaCB(CpuState *s) { return with_callbacks(s, h_WaitSema); }
+static uint32_t h_WaitEventFlagCB(CpuState *s) { return with_callbacks(s, h_WaitEventFlag); }
+static uint32_t h_IoWaitAsyncCB(CpuState *s) { return with_callbacks(s, h_IoWaitAsync); }
+
 void sr_hle_init(void) {
     if (s_hle_n) return;
     g_callcount = getenv("SR_CALLCOUNT") ? 1 : 0;
@@ -1700,36 +2453,37 @@ void sr_hle_init(void) {
      * the registers happen to hold for the REAL function's signature (the VolatileMemUnlock
      * mixup sprayed two wild words per asset load and zeroed the model-slot counter). */
     sr_hle_register(0x7591c7db, "sceKernelSetCompiledSdkVersion", h_SetCompiledSdkVersion);
-    sr_hle_register(0xf77d77cb, "sceKernelSetCompilerVersion", h_SetCompiledSdkVersion);
-    sr_hle_register(0x237dbd4f, "sceKernelAllocPartitionMemory", h_AllocPartitionMemory);
-    sr_hle_register(0x9d9a5ba1, "sceKernelGetBlockHeadAddr", h_GetBlockHeadAddr);
-    sr_hle_register(0xb6d61d02, "sceKernelFreePartitionMemory", h_FreePartitionMemory);
-    sr_hle_register(0xf919f628, "sceKernelTotalFreeMemSize", h_TotalFreeMemSize);
-    sr_hle_register(0xa291f107, "sceKernelMaxFreeMemSize", h_MaxFreeMemSize);
+    sr_hle_register(0xf77d77cb, "sceKernelSetCompilerVersion", h_SetCompilerVersion);
+    sr_kmem_register();   /* partition memory, free-size queries, FPLs */
     sr_hle_register(0x446d8de6, "sceKernelCreateThread", h_CreateThread);
     sr_hle_register(0xf475845d, "sceKernelStartThread", h_StartThread);
     sr_hle_register(0xaa73c935, "sceKernelExitThread", h_ExitThread);
-    sr_hle_register(0x809ce29b, "sceKernelExitDeleteThread", h_ExitThread);
-    sr_hle_register(0xe81caf8f, "sceKernelCreateCallback", h_module_uid);
+    sr_hle_register(0x809ce29b, "sceKernelExitDeleteThread", h_ExitDeleteThread);
+    sr_cb_register();     /* callbacks, sceKernelCheckCallback, scePower callbacks */
     sr_hle_register(0xceadeb47, "sceKernelDelayThread", h_DelayThread);
     sr_hle_register(0x94aa61ee, "sceKernelGetThreadCurrentPriority", h_GetThreadPriority);
     sr_hle_register(0x9ace131e, "sceKernelSleepThread", h_SleepThread);
     sr_hle_register(0xd59ead2f, "sceKernelWakeupThread", h_WakeupThread);
     sr_hle_register(0xfccfad26, "sceKernelCancelWakeupThread", h_CancelWakeupThread);
     sr_hle_register(0x278c0df5, "sceKernelWaitThreadEnd", h_WaitThreadEnd);
-    sr_hle_register(0x840e8133, "sceKernelWaitThreadEndCB", h_WaitThreadEnd);
+    sr_hle_register(0x840e8133, "sceKernelWaitThreadEndCB", h_WaitThreadEndCB);
     sr_hle_register(0x71bc9871, "sceKernelChangeThreadPriority", h_ChangeThreadPriority);
     sr_hle_register(0x383f7bcc, "sceKernelTerminateDeleteThread", h_TerminateDeleteThread);
-    sr_hle_register(0x9fa03cd3, "sceKernelDeleteThread", h_ok);
+    sr_hle_register(0x9fa03cd3, "sceKernelDeleteThread", h_DeleteThread);
     sr_hle_register(0xa66b0120, "sceKernelReferEventFlagStatus", h_ReferEventFlagStatus);
     sr_hle_register(0xffc36a14, "sceKernelReferThreadRunStatus", h_ReferThreadRunStatus);
+    sr_hle_register(0x17c1684e, "sceKernelReferThreadStatus", h_ReferThreadStatus);
+    sr_hle_register(0x3b183e26, "sceKernelGetThreadExitStatus", h_GetThreadExitStatus);
+    sr_hle_register(0x94416130, "sceKernelGetThreadmanIdList", h_GetThreadmanIdList);
+    sr_hle_register(0xba6b92e2, "sceKernelSysClock2USec", h_SysClock2USec);
     sr_hle_register(0xd8b73127, "sceKernelGetModuleIdByAddress", h_GetModuleId);
     sr_hle_register(0x092968f4, "sceKernelCpuSuspendIntr", h_CpuSuspendIntr);
     sr_hle_register(0x5f10d406, "sceKernelCpuResumeIntr", h_ok);
     /* Boot setup batch (return success / reference value). */
     sr_hle_register(0x4ac57943, "sceKernelRegisterExitCallback", h_ok);
     sr_hle_register(0xa5da2406, "sceUtilityGetSystemParamInt", h_GetSystemParamInt);
-    sr_hle_register(0x36aa6e91, "sceImposeSetLanguageMode", h_ok);
+    sr_hle_register(0x36aa6e91, "sceImposeSetLanguageMode", h_ImposeSetLanguageMode);
+    sr_hle_register(0x24fd7bcf, "sceImposeGetLanguageMode", h_ImposeGetLanguageMode);
     /* sceUtility dialogs (OSK / savedata / netconf): no dialog active -> status 0, calls ok. */
     sr_hle_register(0xf3f76017, "sceUtilityOskGetStatus", h_OskGetStatus);
     sr_hle_register(0x4b85c861, "sceUtilityOskUpdate", h_OskUpdate);
@@ -1743,17 +2497,14 @@ void sr_hle_init(void) {
     sr_hle_register(0x8874dbe0, "sceUtilitySavedataGetStatus", h_DlgGetStatus);
     sr_hle_register(0xd4b95ffb, "sceUtilitySavedataUpdate", h_SavedataUpdate);
     sr_hle_register(0x64d50c56, "sceUtilityUnloadNetModule", h_ok);
-    /* sceWlan: the game stamps saves/profiles with the console's MAC. A stable fake works
-     * (PPSSPP behaviour); low 2 bits of byte 0 must be clear (locally-administered/multicast
-     * OUI bits confuse some games -- PPSSPP masks them too). */
-    sr_hle_register(0x0c622081, "sceWlanGetEtherAddr", h_WlanGetEtherAddr);
-    sr_hle_register(0x93440b11, "sceWlanDevIsPowerOn", h_WlanOn);
-    sr_hle_register(0xd7763699, "sceWlanGetSwitchState", h_WlanOn);
-    sr_hle_register(0x04b7766e, "scePowerRegisterCallback", h_ok);
+    sr_net_register();    /* deterministic offline networking and stable identity */
     sr_hle_register(0x293b45b8, "sceKernelGetThreadId", h_GetThreadIdSched);
-    sr_hle_register(0x82826f70, "sceKernelSleepThreadCB", h_SleepThread);
+    sr_hle_register(0x82826f70, "sceKernelSleepThreadCB", h_SleepThreadCB);
+    sr_hle_register(0x68da9e36, "sceKernelDelayThreadCB", h_DelayThreadCB);
     sr_hle_register(0x46ebb729, "sceUmdCheckMedium", h_UmdCheckMedium);
-    sr_hle_register(0xc6183d47, "sceUmdActivate", h_ok);
+    sr_hle_register(0xc6183d47, "sceUmdActivate", h_UmdActivate);
+    sr_hle_register(0xe83742ba, "sceUmdDeactivate", h_UmdDeactivate);
+    sr_hle_register(0x87533940, "sceUmdReplaceProhibit", h_ok);
     sr_hle_register(0x8ef08fce, "sceUmdWaitDriveStat", h_ok);
     sr_hle_register(0x617f3fe6, "sceDmacMemcpy", h_DmacMemcpy);
     /* sceMpeg: faithful port (src/rt/mpeg.c). Drives the PSMF intro to completion. */
@@ -1777,6 +2528,7 @@ void sr_hle_init(void) {
     sr_hle_register(0x800c44df, "sceMpegAtracDecode", h_MpegAtracDecode);
     sr_hle_register(0x740fccd1, "sceMpegAvcDecodeStop", h_MpegAvcDecodeStop);
     sr_hle_register(0x4571cc64, "sceMpegAvcDecodeFlush", h_ok);
+    sr_hle_register(0xa11c7026, "sceMpegAvcDecodeMode", h_MpegAvcDecodeMode);
     sr_hle_register(0xa780cf7e, "sceMpegMallocAvcEsBuf", h_MpegMallocAvcEsBuf);
     sr_hle_register(0xceb870b1, "sceMpegFreeAvcEsBuf", h_MpegFreeAvcEsBuf);
     sr_hle_register(0x167afd9e, "sceMpegInitAu", h_MpegInitAu);
@@ -1804,7 +2556,8 @@ void sr_hle_init(void) {
     sr_hle_register(0x099ef33c, "sceFontFindOptimumFont", h_FontFindOptimumFont);
     sr_hle_register(0x3aea8cb6, "sceFontClose", h_ok);
     sr_hle_register(0xd97f94d8, "sceDmacTryMemcpy", h_DmacMemcpy);
-    sr_hle_register(0xaee7404d, "sceUmdRegisterUMDCallBack", h_ok);
+    sr_hle_register(0xaee7404d, "sceUmdRegisterUMDCallBack", h_UmdRegisterUMDCallBack);
+    sr_hle_register(0xbd2bde07, "sceUmdUnRegisterUMDCallBack", h_UmdUnRegisterUMDCallBack);
     sr_hle_register(0x6af9b50a, "sceUmdCancelWaitDriveStat", h_ok);
     sr_hle_register(0x6b4a146c, "sceUmdGetDriveStat", h_UmdDriveStat);
     sr_hle_register(0x20628e6f, "sceUmdGetErrorStat", h_ok);
@@ -1826,14 +2579,20 @@ void sr_hle_init(void) {
     sr_hle_register(0x27eb27b8, "sceIoLseek", h_IoLseek);
     sr_hle_register(0x810c4bc3, "sceIoClose", h_IoClose);
     sr_hle_register(0xace946e8, "sceIoGetstat", h_IoGetstat);
+    sr_hle_register(0xb29ddf9c, "sceIoDopen", h_IoDopen);
+    sr_hle_register(0xe3eb004c, "sceIoDread", h_IoDread);
+    sr_hle_register(0xeb092469, "sceIoDclose", h_IoDclose);
+    sr_hle_register(0xf27a9c51, "sceIoRemove", h_IoRemove);
+    sr_hle_register(0x1117c65f, "sceIoRmdir", h_IoRmdir);
     sr_hle_register(0x89aa9906, "sceIoOpenAsync", h_IoOpenAsync);
     sr_hle_register(0xa0b5a7c2, "sceIoReadAsync", h_IoReadAsync);
     sr_hle_register(0x71b19e77, "sceIoLseekAsync", h_IoLseekAsync);
     sr_hle_register(0xe23eec33, "sceIoWaitAsync", h_IoWaitAsync);
-    sr_hle_register(0x35dbd746, "sceIoWaitAsyncCB", h_IoWaitAsync);
-    sr_hle_register(0x3251ea56, "sceIoPollAsync", h_IoWaitAsync);
+    sr_hle_register(0x35dbd746, "sceIoWaitAsyncCB", h_IoWaitAsyncCB);
+    sr_hle_register(0x3251ea56, "sceIoPollAsync", h_IoPollAsync);
     sr_hle_register(0xff5940b6, "sceIoCloseAsync", h_IoCloseAsync);
-    sr_hle_register(0x54f5fb11, "sceIoDevctl", h_ok);
+    sr_hle_register(0x54f5fb11, "sceIoDevctl", h_IoDevctl);
+    sr_hle_register(0xb293727f, "sceIoChangeAsyncPriority", h_IoChangeAsyncPriority);
     /* sceAudio */
     sr_hle_register(0x5ec81c55, "sceAudioChReserve", h_AudioChReserve);
     sr_hle_register(0x6fc46853, "sceAudioChRelease", h_AudioChRelease);
@@ -1844,10 +2603,16 @@ void sr_hle_init(void) {
     sr_hle_register(0xb011922f, "sceAudioGetChannelRestLength", h_AudioRestLen);
     sr_hle_register(0xb7e1d8e7, "sceAudioChangeChannelVolume", h_ok);
     sr_hle_register(0xcb2e439e, "sceAudioSetChannelDataLen", h_AudioSetChannelDataLen);
+    sr_hle_register(0x01562ba3, "sceAudioOutput2Reserve", h_AudioOutput2Reserve);
+    sr_hle_register(0x2d53f36e, "sceAudioOutput2OutputBlocking", h_AudioOutput2OutputBlocking);
+    sr_hle_register(0x63f2889c, "sceAudioOutput2ChangeLength", h_AudioOutput2ChangeLength);
+    sr_hle_register(0x43196845, "sceAudioOutput2Release", h_AudioOutput2Release);
     /* sceCtrl */
     sr_hle_register(0x1f4011e6, "sceCtrlSetSamplingMode", h_ok);
     sr_hle_register(0xa7144800, "sceCtrlSetIdleCancelThreshold", h_ok);
     sr_hle_register(0x1f803938, "sceCtrlReadBufferPositive", h_CtrlReadBuffer);
+    sr_hle_register(0x3a622550, "sceCtrlPeekBufferPositive", h_CtrlPeekBuffer);
+    sr_hle_register(0x6a2774f3, "sceCtrlSetSamplingCycle", h_CtrlSetSamplingCycle);
     /* 0x687660fa is GetIdleCancelThreshold(int*,int*), NOT ReadBufferNegative -- the pad
      * handler used pointer a1 as a buffer count and wrote up to a ring of SceCtrlData
      * through a1's 4-byte int (and could block the caller on the input ring). */
@@ -1862,11 +2627,8 @@ void sr_hle_init(void) {
     sr_hle_register(0x210eab3a, "sceDisplayGetAccumulatedHcount", h_DisplayGetAccumulatedHcount);
     sr_hle_register(0x4d4e10ec, "sceDisplayIsVblank", h_ok);
     sr_hle_register(0xdba6c4c4, "sceDisplayGetFramePerSec", h_ok);
-    /* sceGe_user */
-    sr_hle_register(0xab49e76a, "sceGeListEnQueue", h_GeListEnQueue);
-    sr_hle_register(0xb287bd61, "sceGeDrawSync", h_GeDrawSync);
-    sr_hle_register(0xe47e40e4, "sceGeEdramGetAddr", h_GeEdramGetAddr);
-    sr_hle_register(0xa4fc06a4, "sceGeSetCallback", h_GeSetCallback);
+    /* sceGe_user: display lists and GE interrupts (gelist.c) */
+    sr_ge_register();
     /* sceSasCore: real VAG voice mixing (see sas_mix above). */
     sr_hle_register(0x68a46b95, "__sceSasGetEndFlag", h_SasGetEndFlag);
     sr_hle_register(0xa3589d81, "__sceSasCore", h_SasCore);
@@ -1887,8 +2649,9 @@ void sr_hle_init(void) {
     /* time / rtc / libc clock */
     sr_hle_register(0x369ed59d, "sceKernelGetSystemTimeLow", h_GetSystemTimeLow);
     sr_hle_register(0x82bc5777, "sceKernelGetSystemTimeWide", h_GetSystemTimeWide);
-    sr_hle_register(0xdb738f35, "sceKernelGetSystemTime", h_RtcGetCurrentTick);
-    sr_hle_register(0x6ff40acc, "sceRtcGetTick", h_RtcGetCurrentTick);
+    sr_hle_register(0xdb738f35, "sceKernelGetSystemTime", h_GetSystemTime);
+    sr_hle_register(0x3f7ad767, "sceRtcGetCurrentTick", h_RtcGetCurrentTick);
+    sr_hle_register(0x27c4594c, "sceRtcGetTime_t", h_RtcGetTime_t);
     sr_hle_register(0xcf561893, "sceRtcGetWin32FileTime", h_RtcGetWin32FileTime);
     sr_hle_register(0xe7c27d1b, "sceRtcGetCurrentClockLocalTime", h_RtcGetCurrentClock);
     sr_hle_register(0x91e4f6a7, "sceKernelLibcClock", h_LibcClock);
@@ -1897,6 +2660,9 @@ void sr_hle_init(void) {
     /* cache / misc UtilsForUser: no-ops are fine without a real cache. */
     sr_hle_register(0x79d1c3fa, "sceKernelDcacheWritebackAll", h_ok);
     sr_hle_register(0x3ee30821, "sceKernelDcacheWritebackRange", h_ok);
+    sr_hle_register(0x34b9fa9e, "sceKernelDcacheWritebackInvalidateRange", h_ok);
+    sr_hle_register(0xb435dec5, "sceKernelDcacheWritebackInvalidateAll", h_ok);
+    sr_hle_register(0x37fb5c42, "sceKernelGetGPI", h_ok);
     sr_hle_register(0x6ad345d7, "sceKernelSetGPO", h_ok);
     /* Stdio std handles. */
     sr_hle_register(0x13a5abef, "sceKernelPrintf", h_KernelPrintf);
@@ -1915,16 +2681,13 @@ void sr_hle_init(void) {
      * which silently killed every .PMD model lookup, e.g. the hangar aircraft). */
     sr_hle_register(0xa569e425, "sceKernelVolatileMemUnlock", h_ok);
     sr_hle_register(0x05572a5f, "sceKernelExitGame", h_ok);   /* returning lets the app idle on */
-    /* InterruptManager: record the VBLANK handler; the scheduler delivers it per frame. */
-    sr_hle_register(0xca04a2b9, "sceKernelRegisterSubIntrHandler", h_RegisterSubIntr);
-    sr_hle_register(0xd61e6961, "sceKernelReleaseSubIntrHandler", h_ok);
-    sr_hle_register(0xfb8e22ec, "sceKernelEnableSubIntr", h_EnableSubIntr);
-    sr_hle_register(0x8a389411, "sceKernelDisableSubIntr", h_ok);
+    /* InterruptManager: sub-interrupt handlers (intr.c); the scheduler delivers vblank. */
+    sr_intr_register();
     /* semaphores */
     sr_hle_register(0xd6da4ba1, "sceKernelCreateSema", h_CreateSema);
     sr_hle_register(0x28b6489c, "sceKernelDeleteSema", h_DeleteSema);
     sr_hle_register(0x4e3a1105, "sceKernelWaitSema", h_WaitSema);
-    sr_hle_register(0x6d212bac, "sceKernelWaitSemaCB", h_WaitSema);
+    sr_hle_register(0x6d212bac, "sceKernelWaitSemaCB", h_WaitSemaCB);
     sr_hle_register(0x3f53e640, "sceKernelSignalSema", h_SignalSema);
     sr_hle_register(0x58b1f937, "sceKernelPollSema", h_PollSema);
     /* event flags */
@@ -1933,7 +2696,7 @@ void sr_hle_init(void) {
     sr_hle_register(0x1fb15a32, "sceKernelSetEventFlag", h_SetEventFlag);
     sr_hle_register(0x812346e4, "sceKernelClearEventFlag", h_ClearEventFlag);
     sr_hle_register(0x402fcf22, "sceKernelWaitEventFlag", h_WaitEventFlag);
-    sr_hle_register(0x328c546a, "sceKernelWaitEventFlagCB", h_WaitEventFlag);
+    sr_hle_register(0x328c546a, "sceKernelWaitEventFlagCB", h_WaitEventFlagCB);
     sr_hle_register(0x30fd48f0, "sceKernelPollEventFlag", h_PollEventFlag);
 }
 
@@ -1945,7 +2708,7 @@ void sr_syscall(CpuState *s, uint32_t nid) {
     if (getenv("SR_NIDLOG")) {
         static FILE *nf = NULL; static unsigned long nc = 0;
         if (!nf) nf = fopen("nidseq_mine.txt", "w");
-        if (nf) { fprintf(nf, "0x%08x\n", nid); if ((++nc & 0x3f) == 0) fflush(nf); }
+        if (nf) { fprintf(nf, "0x%08x %x\n", nid, sched_current_uid()); fflush(nf); nc++; }
     }
     HleEntry *e = hle_find(nid);
     if (!e) {

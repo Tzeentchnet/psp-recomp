@@ -100,6 +100,7 @@ static int dir_find(uint32_t lba, uint32_t size, const char *comp, int complen,
                     uint32_t *out_lba, uint32_t *out_size, int *out_isdir) {
     uint32_t nbytes = ((size + SECTOR - 1) / SECTOR) * SECTOR;
     unsigned char *buf = (unsigned char *)malloc(nbytes);
+    if (!buf) return 0;
     read_sectors(lba, buf, nbytes);
     uint32_t o = 0;
     int found = 0;
@@ -124,22 +125,8 @@ static int dir_find(uint32_t lba, uint32_t size, const char *comp, int complen,
     return found;
 }
 
-int iso_lookup(const char *guest_path, uint32_t *out_lba, uint32_t *out_size) {
-    if (iso_init() != 0) return -1;
-
-    /* Raw UMD sector access: "sce_lbn<lbn>_size<size>" reads <size> bytes from sector <lbn>.
-     * Both fields may be decimal or 0x-hex. The game uses this to stream data by LBN. */
-    const char *lbn = strstr(guest_path, "sce_lbn");
-    if (lbn) {
-        lbn += 7;
-        char *e;
-        unsigned long L = strtoul(lbn, &e, 0);
-        const char *sz = strstr(e, "_size");
-        unsigned long S = sz ? strtoul(sz + 5, NULL, 0) : SECTOR;
-        *out_lba = (uint32_t)L; *out_size = (uint32_t)S;
-        return 0;
-    }
-
+static int resolve_path(const char *guest_path, uint32_t *out_lba, uint32_t *out_size,
+                        int *out_is_dir) {
     unsigned char pvd[SECTOR];
     read_sectors(16, pvd, SECTOR);
     if (pvd[0] != 1 || memcmp(pvd + 1, "CD001", 5) != 0) return -1;
@@ -159,7 +146,80 @@ int iso_lookup(const char *guest_path, uint32_t *out_lba, uint32_t *out_size) {
         p = slash;
         while (*p == '/' || *p == '\\') p++;
     }
-    *out_lba = lba; *out_size = size;
+    *out_lba = lba;
+    *out_size = size;
+    if (out_is_dir) *out_is_dir = isdir;
+    return 0;
+}
+
+int iso_lookup_info(const char *guest_path, uint32_t *out_lba, uint32_t *out_size, int *out_is_dir) {
+    if (iso_init() != 0) return -1;
+
+    /* Raw UMD sector access: "sce_lbn<lbn>_size<size>" reads <size> bytes from sector <lbn>.
+     * Both fields may be decimal or 0x-hex. The game uses this to stream data by LBN. */
+    const char *lbn = strstr(guest_path, "sce_lbn");
+    if (lbn) {
+        lbn += 7;
+        char *e;
+        unsigned long L = strtoul(lbn, &e, 0);
+        const char *sz = strstr(e, "_size");
+        unsigned long S = sz ? strtoul(sz + 5, NULL, 0) : SECTOR;
+        *out_lba = (uint32_t)L;
+        *out_size = (uint32_t)S;
+        if (out_is_dir) *out_is_dir = 0;
+        return 0;
+    }
+    return resolve_path(guest_path, out_lba, out_size, out_is_dir);
+}
+
+int iso_lookup(const char *guest_path, uint32_t *out_lba, uint32_t *out_size) {
+    return iso_lookup_info(guest_path, out_lba, out_size, NULL);
+}
+
+int iso_list(const char *guest_path, IsoDirEntry *entries, int capacity, int *out_count) {
+    if (iso_init() != 0 || capacity < 0) return -1;
+    uint32_t lba, size;
+    int is_dir = 0;
+    if (resolve_path(guest_path, &lba, &size, &is_dir) != 0 || !is_dir) return -1;
+
+    uint32_t nbytes = ((size + SECTOR - 1) / SECTOR) * SECTOR;
+    unsigned char *buf = (unsigned char *)malloc(nbytes);
+    if (!buf) return -1;
+    read_sectors(lba, buf, nbytes);
+
+    int total = 0;
+    uint32_t o = 0;
+    while (o < size) {
+        unsigned char record_len = buf[o];
+        if (record_len == 0) {
+            o = ((o / SECTOR) + 1) * SECTOR;
+            continue;
+        }
+        if (o + record_len > nbytes || record_len < 34) break;
+        uint32_t entry_lba, entry_size;
+        memcpy(&entry_lba, buf + o + 2, 4);
+        memcpy(&entry_size, buf + o + 10, 4);
+        unsigned char flags = buf[o + 25];
+        unsigned char name_len = buf[o + 32];
+        const unsigned char *name = buf + o + 33;
+        if (!(name_len == 1 && (name[0] == 0 || name[0] == 1))) {
+            if (entries && total < capacity) {
+                IsoDirEntry *entry = &entries[total];
+                int len = name_len;
+                if (len >= 2 && name[len - 2] == ';') len -= 2;
+                if (len > 255) len = 255;
+                memcpy(entry->name, name, (size_t)len);
+                entry->name[len] = 0;
+                entry->lba = entry_lba;
+                entry->size = entry_size;
+                entry->is_dir = (flags & 2) != 0;
+            }
+            total++;
+        }
+        o += record_len;
+    }
+    free(buf);
+    if (out_count) *out_count = total;
     return 0;
 }
 

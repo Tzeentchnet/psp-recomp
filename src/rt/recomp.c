@@ -44,14 +44,21 @@ void sr_mem_init(void) {
     }
 }
 
-static uint32_t g_loaded_end = 0;   /* highest guest address written by the loader */
+static uint32_t g_loaded_start = 0xFFFFFFFFu;   /* lowest guest address the loader wrote */
+static uint32_t g_loaded_end = 0;               /* highest guest address written by the loader */
 
+uint32_t sr_loaded_start(void) { return g_loaded_start; }
 uint32_t sr_loaded_end(void) { return g_loaded_end; }
+
+void sr_note_loaded(uint32_t vaddr, uint32_t memsz) {
+    if (vaddr < g_loaded_start) g_loaded_start = vaddr;
+    if (vaddr + memsz > g_loaded_end) g_loaded_end = vaddr + memsz;
+}
 
 void sr_load_segment(uint32_t vaddr, const void *data, uint32_t len) {
     sr_mem_init();
     memcpy(SR_HOST(vaddr), data, len);
-    if (vaddr + len > g_loaded_end) g_loaded_end = vaddr + len;
+    sr_note_loaded(vaddr, len);
 }
 
 /* Unaligned word access. Little-endian merge, identical to PPSSPP's interpreter. */

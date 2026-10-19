@@ -106,7 +106,7 @@ static uint32_t call_guest3(CpuState *s, uint32_t fn, uint32_t a0, uint32_t a1, 
     s->r[5] = a1;
     s->r[6] = a2;
     s->r[28] = save.r[28];
-    s->r[29] = 0x09df8000u;
+    s->r[29] = sr_hle_stack_top(1);
     s->r[31] = 0;
     s->vfpuCtrl[0] = 0xe4; s->vfpuCtrl[1] = 0xe4;
     sr_timeslice = 20000;
@@ -231,6 +231,17 @@ uint32_t mpeg_create(uint32_t mpegAddr, uint32_t dataPtr, uint32_t size, uint32_
     ctx->used = 1; ctx->handle = h; ctx->ringAddr = ringAddr;
     ctx->defaultFrameWidth = (int)frameWidth; ctx->pixelMode = 3; ctx->isAnalyzed = 0;
     ctx->h264 = -1;
+    return 0;
+}
+
+/* sceMpegAvcDecodeMode(mpeg, mode*): mode[1] is the output pixel format (GE 5650..8888). */
+uint32_t mpeg_avc_decode_mode(uint32_t mpegAddr, uint32_t modeAddr) {
+    if (!sr_inrange(modeAddr)) return (uint32_t)-1;
+    Mpeg *ctx = mpeg_find(mpegAddr);
+    if (!ctx) return (uint32_t)-1;
+    int pixelMode = (int)MEM_R32(modeAddr + 4);
+    if (pixelMode >= 0 && pixelMode <= 3) ctx->pixelMode = pixelMode;
+    else fprintf(stderr, "sceMpegAvcDecodeMode: unknown pixel mode %d\n", pixelMode);
     return 0;
 }
 

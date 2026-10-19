@@ -66,7 +66,9 @@ static inline void sr_w32(uint32_t a, uint32_t v) { if (sr_inrange(a)) *(uint32_
 
 void  sr_mem_init(void);
 void  sr_load_segment(uint32_t vaddr, const void *data, uint32_t len);
+uint32_t sr_loaded_start(void); /* lowest guest address the loader wrote (module start) */
 uint32_t sr_loaded_end(void);   /* highest guest address the loader wrote (module end incl. BSS) */
+void  sr_note_loaded(uint32_t vaddr, uint32_t memsz);   /* extend the loaded range (e.g. BSS) */
 
 /* Unaligned word access (MIPS LWL/LWR/SWL/SWR), little-endian, matching PPSSPP's
  * interpreter. The load forms take the current rt and the effective address and return the
@@ -137,9 +139,49 @@ extern int sr_hit_hle;
 uint32_t sr_alloc_uid(void);
 void     sr_set_next_uid(uint32_t next);
 
-/* sceGe display-list GPU (src/rt/ge.c): execute a GE command list, rasterising into VRAM. */
-void ge_run_list(uint32_t addr);
+/* Kernel memory (src/rt/kmem.c): PPSSPP's BlockAllocator and the partitions built on it.
+ * Allocation returns SR_BA_FAIL when no free block fits; *size is rounded up to the grain. */
+#define SR_BA_FAIL 0xFFFFFFFFu
+typedef struct SrBlockAlloc SrBlockAlloc;
+void     sr_ba_init(SrBlockAlloc *a, uint32_t start, uint32_t size);
+void     sr_ba_shutdown(SrBlockAlloc *a);
+uint32_t sr_ba_alloc(SrBlockAlloc *a, uint32_t *size, int from_top, const char *tag);
+uint32_t sr_ba_alloc_aligned(SrBlockAlloc *a, uint32_t *size, uint32_t size_grain, uint32_t grain,
+                             int from_top, const char *tag);
+uint32_t sr_ba_alloc_at(SrBlockAlloc *a, uint32_t position, uint32_t size, const char *tag);
+int      sr_ba_free(SrBlockAlloc *a, uint32_t position);
+uint32_t sr_ba_largest_free(const SrBlockAlloc *a);
+uint32_t sr_ba_total_free(const SrBlockAlloc *a);
+uint32_t sr_ba_block_start(const SrBlockAlloc *a, uint32_t addr);
+uint32_t sr_ba_block_size(const SrBlockAlloc *a, uint32_t addr);
+void     sr_ba_list(const SrBlockAlloc *a);
+void          sr_kmem_init(void);       /* partitions, usersystemlib, module block (idempotent) */
+SrBlockAlloc *sr_kmem_user(void);       /* user partition 0x08800000..0x0A000000 */
+SrBlockAlloc *sr_kmem_kernel(void);     /* kernel partition 0x08000000..0x08400000 */
+uint32_t      sr_kmem_user_end(void);
+uint32_t      sr_hle_stack_top(int which);   /* 0 = interrupt, 1 = callback stack (kernel memory) */
+void          sr_kmem_register(void);   /* SysMemUserForUser partition calls and FPLs */
+
+/* GE command interpreter (src/rt/ge.c): GE state and rasterising into VRAM. gelist.c owns the
+ * display lists and their control flow and feeds every other command to ge_execute_op. */
+void     ge_list_begin(uint32_t list_addr);
+void     ge_execute_op(uint32_t op, uint32_t pc);
+void     ge_list_end(void);
+uint32_t ge_rel(uint32_t data);         /* (offset + BASE-extended data) & 0x0FFFFFFF */
 uint32_t ge_framebuffer(void);
+uint32_t ge_get_frame(void);           /* vblank count the GE last saw (sr_vblank_tick) */
+/* sceGe display lists (src/rt/gelist.c, PPSSPP GPUCommon port). */
+void     sr_ge_register(void);          /* sceGe_user HLE handlers */
+void     sr_ge_run_interrupts(CpuState *s);  /* deliver pending GE interrupts (outside interrupts) */
+/* Sub-interrupt handlers (src/rt/intr.c, PPSSPP sceKernelInterrupt port). */
+#define SR_INTR_GE     25
+#define SR_INTR_VBLANK 30
+void     sr_intr_register(void);        /* InterruptManager HLE handlers */
+int      sr_intr_get(uint32_t intr, uint32_t sub, uint32_t *addr, uint32_t *arg);   /* 1 if registered */
+void     sr_intr_set(uint32_t intr, uint32_t sub, uint32_t addr, uint32_t arg, int enable);
+void     sr_intr_release(uint32_t intr, uint32_t sub);
+void     sr_intr_run_vblank(CpuState *s);   /* every enabled vblank sub-handler, in order */
+extern uint32_t g_sdk_version;          /* sceKernelSetCompiledSdkVersion (hle.c) */
 
 /* Interactive window front-end (src/rt/gui.c, Win32). gui_init opens the window; gui_present is
  * called from sceDisplaySetFrameBuf to show a frame, pump messages, and sample the keyboard;
@@ -154,8 +196,21 @@ void     gui_present(uint32_t fbaddr, int fmt, uint32_t stride);
 typedef uint32_t (*HleFn)(CpuState *s);
 void     sr_hle_register(uint32_t nid, const char *name, HleFn fn);
 void     sr_hle_init(void);     /* registers all built-in handlers (idempotent) */
+void     sr_net_register(void);  /* offline networking HLE (src/rt/net.c) */
 void     sr_syscall(CpuState *s, uint32_t nid);
 extern uint32_t sr_last_nid;
+enum {
+    SR_TMID_THREAD = 1,
+    SR_TMID_SEMAPHORE = 2,
+    SR_TMID_EVENT_FLAG = 3,
+    SR_TMID_FPL = 6,
+    SR_TMID_CALLBACK = 8,
+};
+uint32_t sr_alloc_uid(void);
+uint32_t sr_alloc_uid_type(uint32_t type);
+void     sr_register_uid_type(uint32_t uid, uint32_t type);
+void     sr_unregister_uid(uint32_t uid);
+uint32_t sr_uid_list(uint32_t type, uint32_t *out, uint32_t capacity);
 
 /* Cooperative scheduler with preemptive yield points (src/rt/sched.c). The recompiled code
  * calls SR_YIELD at function entry and loop back-edges; when the scheduler is active and the
@@ -168,21 +223,56 @@ void sr_yield(CpuState *s);
 #define SR_YIELD(s) do { if (sr_sched_on && --sr_timeslice <= 0) sr_yield(s); } while (0)
 
 /* Scheduler API used by the thread HLE handlers and the driver. */
+typedef void (*SrHleThreadFn)(uint32_t arg);
 void     sched_init(CpuState *cpu);                 /* CpuState the running thread reads/writes */
-uint32_t sched_create_thread(uint32_t entry, int priority, uint32_t stack_size);
-void     sched_start_thread(uint32_t uid, uint32_t arglen, uint32_t argp);
-void     sched_exit_current(void);                  /* current thread is done */
+uint32_t sched_create_thread(const char *name, uint32_t entry, int priority, uint32_t stack_size,
+                             uint32_t attr);                /* uid, or a kernel error (bit 31) */
+uint32_t sched_create_hle_thread(const char *name, int priority, uint32_t stack_size,
+                                 SrHleThreadFn entry, uint32_t arg);
+int      sched_delete_hle_thread(uint32_t uid);
+int      sched_delete_thread(uint32_t uid);         /* sceKernelDeleteThread: 0 or a kernel error */
+void     sched_exit_delete_current(int32_t status); /* sceKernelExitDeleteThread */
+uint32_t sched_start_thread(uint32_t uid, uint32_t arglen, uint32_t argp);  /* 0 or a kernel error */
+void     sched_exit_current(int32_t status);        /* current thread is done */
 void     sched_delay_current(uint32_t usec);        /* block current thread for usec */
 void     sched_preempt(void);                       /* yield now if a higher-priority thread is ready */
 void     sched_block_on(uint32_t obj);              /* block current thread until sched_wake(obj) */
 void     sched_wait_vblank(void);                   /* block current thread until the next delivered vblank */
 int      sched_block_on_timeout(uint32_t obj, uint32_t usec);  /* returns 1 if timed out */
-void     sched_wake(uint32_t obj);                  /* ready all threads blocked on obj */
+int      sched_wake(uint32_t obj);                  /* ready all threads blocked on obj; returns how many */
+void     sched_run_interrupt(CpuState *s, uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2);
+int      sched_in_interrupt(void);                  /* 1 while a guest interrupt handler runs */
+void     sched_cb_wait(int on);                     /* current thread enters/leaves a ...CB wait */
+void     sched_cb_notify_thread(uint32_t uid);      /* a callback of uid was notified */
+/* Kernel callbacks (src/rt/callback.c). */
+void     sr_cb_register(void);                      /* callback and scePower callback HLE */
+int      sr_cb_notify(uint32_t uid, uint32_t arg);  /* 1 if uid is a callback */
+int      sr_cb_run_pending(CpuState *s, uint32_t thread_uid);
 void     sched_thread_sleep(void);                  /* sceKernelSleepThread[CB] (wakeup-count) */
 void     sched_thread_wakeup(uint32_t uid);         /* sceKernelWakeupThread (banks if not asleep) */
 void     sched_set_priority(uint32_t uid, int priority);   /* sceKernelChangeThreadPriority */
 void     sched_terminate_thread(uint32_t uid);      /* sceKernelTerminate[Delete]Thread */
 int      sched_thread_cancel_wakeup(uint32_t uid);  /* sceKernelCancelWakeupThread; uid 0=current */
+typedef struct SrThreadStatus {
+    char name[32];
+    uint32_t attr;
+    uint32_t status;
+    uint32_t entry;
+    uint32_t stack;
+    uint32_t stackSize;
+    uint32_t gpReg;
+    int32_t initialPriority;
+    int32_t currentPriority;
+    uint32_t waitType;
+    uint32_t waitId;
+    int32_t wakeupCount;
+    int32_t exitStatus;
+    uint32_t runClocksLow;
+    uint32_t runClocksHigh;
+    uint32_t intrPreemptCount;
+    uint32_t threadPreemptCount;
+    uint32_t releaseCount;
+} SrThreadStatus;
 typedef struct SrThreadRunStatus {
     uint32_t size;
     uint32_t status;
@@ -196,7 +286,10 @@ typedef struct SrThreadRunStatus {
     uint32_t threadPreemptCount;
     uint32_t releaseCount;
 } SrThreadRunStatus;
+int      sched_thread_status(uint32_t uid, SrThreadStatus *out);
 int      sched_thread_run_status(uint32_t uid, SrThreadRunStatus *out);
+int32_t  sched_thread_exit_status(uint32_t uid);
+uint32_t sched_thread_id_list(uint32_t type, uint32_t *out, uint32_t capacity);
 int      sched_current_priority(void);
 int      sched_is_dormant(uint32_t uid);
 uint32_t sched_current_uid(void);

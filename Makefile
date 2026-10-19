@@ -25,6 +25,11 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/vfpu_interp.c \
               src/rt/vfpu_asin.c \
               src/rt/hle.c \
+              src/rt/net.c \
+              src/rt/kmem.c \
+              src/rt/intr.c \
+              src/rt/gelist.c \
+              src/rt/callback.c \
               src/rt/sched.c \
               src/rt/iso.c \
               src/rt/mpeg.c \
