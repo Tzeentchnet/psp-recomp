@@ -73,9 +73,10 @@ typedef struct {
     int avcRegistered, atracRegistered;
     int isAnalyzed;
     int64_t videoPts, audioPts;  /* media-engine timestamp model */
-    int videoEnd, audioEnd;
+    int videoEnd, audioEnd, videoTailBuffered;
     uint32_t totalPackets;       /* streamSize/packetSize: whole-movie packet count */
     uint32_t fedPackets;         /* cumulative packets the game has put into the ring */
+    uint32_t consumedPackets;    /* packets consumed by timestamp-proportional demux */
     uint32_t headerAddr;         /* guest address of the PSMF header passed to QueryStreamOffset */
     int h264;                    /* SDL3 build: Media Foundation H.264 decoder id (-1 = none) */
     int h264Init, h264Frames;
@@ -121,10 +122,26 @@ static uint32_t call_guest3(CpuState *s, uint32_t fn, uint32_t a0, uint32_t a1, 
 static uint32_t be32(uint32_t a) {
     return ((uint32_t)MEM_R8(a) << 24) | ((uint32_t)MEM_R8(a+1) << 16) | ((uint32_t)MEM_R8(a+2) << 8) | MEM_R8(a+3);
 }
-/* PSMF 6-byte timestamp (big-endian, 33-bit-ish packed as PPSSPP getMpegTimeStamp) */
+/* PSMF 6-byte timestamp, matching PPSSPP MediaEngine.h::getMpegTimeStamp(). */
 static int64_t mpeg_ts(uint32_t a) {
-    return ((int64_t)MEM_R8(a) << 32) | ((int64_t)MEM_R8(a+1) << 24) | ((int64_t)MEM_R8(a+2) << 16) |
-           ((int64_t)MEM_R8(a+3) << 8) | (int64_t)MEM_R8(a+4);
+    return (int64_t)MEM_R8(a + 5) | ((int64_t)MEM_R8(a + 4) << 8) |
+           ((int64_t)MEM_R8(a + 3) << 16) | ((int64_t)MEM_R8(a + 2) << 24) |
+           ((int64_t)MEM_R8(a + 1) << 32) | ((int64_t)MEM_R8(a) << 36);
+}
+
+/* MPEG-2 pack SCR_base (90 kHz). */
+static int64_t mpeg_scr(uint32_t a) {
+    if (MEM_R8(a) != 0 || MEM_R8(a + 1) != 0 || MEM_R8(a + 2) != 1 ||
+        MEM_R8(a + 3) != 0xba) {
+        return -1;
+    }
+    uint8_t b0 = MEM_R8(a + 4), b1 = MEM_R8(a + 5), b2 = MEM_R8(a + 6);
+    uint8_t b3 = MEM_R8(a + 7), b4 = MEM_R8(a + 8);
+    if ((b0 & 0xc4) != 0x44 || (b2 & 0x04) == 0 || (b4 & 0x04) == 0) return -1;
+    return ((int64_t)(b0 & 0x38) << 27) | ((int64_t)(b0 & 0x03) << 28) |
+           ((int64_t)b1 << 20) | ((int64_t)(b2 & 0xf8) << 12) |
+           ((int64_t)(b2 & 0x03) << 13) | ((int64_t)b3 << 5) |
+           ((int64_t)(b4 & 0xf8) >> 3);
 }
 
 static int getMpegVersion(uint32_t raw) {
@@ -146,11 +163,15 @@ static void analyze(uint32_t buffer, Mpeg *ctx) {
     ctx->firstTimestamp = mpeg_ts(buffer + PSMF_FIRST_TIMESTAMP_OFFSET);
     ctx->lastTimestamp = mpeg_ts(buffer + PSMF_LAST_TIMESTAMP_OFFSET);
     ctx->videoPts = 0; ctx->audioPts = 0; ctx->videoEnd = 0; ctx->audioEnd = 0;
+    ctx->videoTailBuffered = 0;
     ctx->fedPackets = 0;
-    /* Whole-movie packet count from the PSMF stream size; the movie ends when the game has fed
-     * this many packets into the ring and they have been consumed (real EOF, not a header
-     * timestamp which only covers the first segment). */
+    ctx->consumedPackets = 0;
     ctx->totalPackets = ctx->streamSize / 2048u;
+    if (getenv("SR_MPEGLOG"))
+        fprintf(stderr, "MpegAnalyze offset=%u size=%u packets=%u timestamps=%lld..%lld duration=%.3fs\n",
+                ctx->offset, ctx->streamSize, ctx->totalPackets,
+                (long long)ctx->firstTimestamp, (long long)ctx->lastTimestamp,
+                (double)(ctx->lastTimestamp - ctx->firstTimestamp) / (double)mpegTimestampPerSecond);
 }
 
 /* ---- SceMpegAu (auAddr): pts/dts stored as 32-bit-word-swapped s64 ---- */
@@ -353,6 +374,11 @@ uint32_t mpeg_ringbuffer_put(CpuState *s, uint32_t ring, uint32_t numPackets, ui
     uint32_t addWanted = numPackets;
     if (addWanted > available) addWanted = available;
     if (avail + addWanted > total) addWanted = total - avail;
+    if (ctx && ctx->totalPackets) {
+        uint32_t remaining = ctx->fedPackets < ctx->totalPackets ?
+                             ctx->totalPackets - ctx->fedPackets : 0;
+        if (addWanted > remaining) addWanted = remaining;
+    }
     if (addWanted == 0) return 0;
 
     uint32_t cb = rb_get(ring, RB_callback_addr);
@@ -384,6 +410,21 @@ uint32_t mpeg_ringbuffer_put(CpuState *s, uint32_t ring, uint32_t numPackets, ui
         }
         if (got > chunk) got = chunk;
         if (got == 0) break;
+
+        if (ctx && packetSize >= 9 && ctx->lastTimestamp > ctx->firstTimestamp) {
+            int64_t duration = ctx->lastTimestamp - ctx->firstTimestamp;
+            uint32_t firstPacket = ctx->fedPackets + addedTotal;
+            for (uint32_t i = 0; i < got; i++) {
+                int64_t scr = mpeg_scr(dst + i * packetSize);
+                if (!ctx->videoTailBuffered && scr >= duration - videoTimestampStep) {
+                    ctx->videoTailBuffered = 1;
+                    if (getenv("SR_MPEGLOG"))
+                        fprintf(stderr, "MpegVideoTail packet=%u/%u scr=%lld duration=%lld\n",
+                                firstPacket + i + 1, ctx->totalPackets,
+                                (long long)scr, (long long)duration);
+                }
+            }
+        }
 
 #ifdef SR_SDL3VK
         if (ctx && got) {
@@ -431,12 +472,17 @@ uint32_t mpeg_get_avc_au(uint32_t mpegAddr, uint32_t sid, uint32_t auAddr, uint3
     if (!ctx) return (uint32_t)-1;
     uint32_t ring = ctx->ringAddr;
     if (!ring) return (uint32_t)-1;
-    /* Real end-of-stream: the game has fed the whole movie (fedPackets >= totalPackets) and the
-     * ring has drained. This mirrors PPSSPP's mediaengine->IsVideoEnd() without ffmpeg -- the movie
-     * runs for the full file then ends, instead of stopping at the (segment-only) header timestamp. */
-    if (ctx->totalPackets && ctx->fedPackets >= ctx->totalPackets && rb_get(ring, RB_packetsAvail) == 0)
-        ctx->videoEnd = 1;
-    if (rb_get(ring, RB_packetsRead) == 0 || rb_get(ring, RB_packetsAvail) == 0) {
+    if (ctx->videoEnd) {
+        g_mpeg_nodata++;
+        int64_t pts = ctx->videoPts + ctx->firstTimestamp;
+        au_write_pts(auAddr, 0, pts);
+        au_write_pts(auAddr, 8, pts - videoTimestampStep);
+        rb_set(ring, RB_packetsAvail, 0);
+        if (attrAddr) MEM_W32(attrAddr, 1);
+        return SCE_MPEG_ERROR_NO_DATA;
+    }
+    if (rb_get(ring, RB_packetsRead) == 0 ||
+        (rb_get(ring, RB_packetsAvail) == 0 && !ctx->videoTailBuffered)) {
         g_mpeg_nodata++;
         au_write_pts(auAddr, 0, -1); au_write_pts(auAddr, 8, -1);
         return SCE_MPEG_ERROR_NO_DATA;
@@ -447,8 +493,6 @@ uint32_t mpeg_get_avc_au(uint32_t mpegAddr, uint32_t sid, uint32_t auAddr, uint3
     au_write_pts(auAddr, 0, pts);
     au_write_pts(auAddr, 8, pts - videoTimestampStep);
     MEM_W32(auAddr + 16, (uint32_t)num);            /* esBuffer abused as stream num */
-    uint32_t avail = rb_get(ring, RB_packetsAvail);
-    if (avail > 0) rb_set(ring, RB_packetsAvail, avail - 1);   /* consume one packet */
     if (attrAddr) MEM_W32(attrAddr, 1);
     if (getenv("SR_MPEGLOG")) {
         static int n = 0;
@@ -456,7 +500,6 @@ uint32_t mpeg_get_avc_au(uint32_t mpegAddr, uint32_t sid, uint32_t auAddr, uint3
             fprintf(stderr, "MpegGetAvcAu #%d pts=%lld avail=%u end=%d\n",
                     n, (long long)pts, rb_get(ring, RB_packetsAvail), ctx->videoEnd);
     }
-    if (ctx->videoEnd) return SCE_MPEG_ERROR_NO_DATA;
     return 0;
 }
 
@@ -465,6 +508,7 @@ uint32_t mpeg_get_atrac_au(uint32_t mpegAddr, uint32_t sid, uint32_t auAddr, uin
     if (!ctx) return (uint32_t)-1;
     uint32_t ring = ctx->ringAddr;
     if (!ring) return (uint32_t)-1;
+    if (rb_get(ring, RB_packetsAvail) == 0) return SCE_MPEG_ERROR_NO_DATA;
     int needsReset = 0, num = 0;
     au_stream(mpegAddr, sid, &needsReset, &num);
     int64_t pts = ctx->audioPts + ctx->firstTimestamp;
@@ -487,6 +531,27 @@ static void clear_video_buffer(uint32_t ptr, uint32_t frameWidth, int pixelMode)
     for (uint32_t i = 0; i < bytes; i++) MEM_W8(ptr + i, 0);
 }
 
+static void consume_stream_for_video_pts(Mpeg *ctx) {
+    if (!ctx->ringAddr || !ctx->totalPackets || ctx->lastTimestamp <= ctx->firstTimestamp) return;
+    uint64_t duration = (uint64_t)(ctx->lastTimestamp - ctx->firstTimestamp);
+    uint64_t elapsed = ctx->videoPts > 0 ? (uint64_t)ctx->videoPts : 0;
+    if (elapsed > duration) elapsed = duration;
+    uint32_t target = elapsed == duration ? ctx->totalPackets :
+                      (uint32_t)(((uint64_t)ctx->totalPackets * elapsed) / duration);
+    if (target > ctx->consumedPackets) {
+        uint32_t take = target - ctx->consumedPackets;
+        uint32_t avail = rb_get(ctx->ringAddr, RB_packetsAvail);
+        if (take > avail) take = avail;
+        rb_set(ctx->ringAddr, RB_packetsAvail, avail - take);
+        ctx->consumedPackets += take;
+    }
+    if (elapsed == duration &&
+        (ctx->videoTailBuffered ||
+         (ctx->fedPackets >= ctx->totalPackets && ctx->consumedPackets >= ctx->totalPackets))) {
+        ctx->videoEnd = 1;
+    }
+}
+
 /* AvcDecode(mpeg, auAddr, frameWidth, bufferAddr, initAddr): decode one AVC frame into
  * *bufferAddr. The SDL3 build decodes through Media Foundation (h264_mf.c); otherwise the
  * timestamp-only model runs and leaves the frame blank. */
@@ -500,6 +565,7 @@ uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth
     uint32_t buffer = bufferAddr ? MEM_R32(bufferAddr) : 0;
 
     ctx->videoPts += videoTimestampStep;
+    consume_stream_for_video_pts(ctx);
     /* Report "a frame was produced" (1) every decode; the game keeps feeding/decoding until it has
      * read the whole file, then stops on its own. */
     int gotFrame = 0;
@@ -524,8 +590,9 @@ uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth
     if (getenv("SR_MPEGLOG")) {
         static int n = 0;
         if (n++ < 32 || (n & 0xFF) == 0)
-            fprintf(stderr, "MpegAvcDecode #%d buf=0x%x fw=%u pts=%lld dec=%d frames=%d\n",
-                    n, buffer, frameWidth, (long long)ctx->videoPts, gotFrame, ctx->h264Frames);
+            fprintf(stderr, "MpegAvcDecode #%d buf=0x%x fw=%u pts=%lld packets=%u/%u dec=%d frames=%d end=%d\n",
+                    n, buffer, frameWidth, (long long)ctx->videoPts,
+                    ctx->consumedPackets, ctx->totalPackets, gotFrame, ctx->h264Frames, ctx->videoEnd);
     }
     return 0;
 }
