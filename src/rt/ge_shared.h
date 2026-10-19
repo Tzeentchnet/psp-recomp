@@ -92,7 +92,8 @@ typedef struct GeVtx { float x, y, z, rw; float u, v; float fog; int r, g, b, a;
  * always take it. flush(reason) is called at GE sync points ("listend", "loadclut");
  * the backend decides what each requires. vram_dirty(addr,bytes) tells the backend the
  * CPU wrote guest memory directly (movie decode, DMA) so any GPU framebuffer caching
- * that range must be invalidated. */
+ * that range must be invalidated. present returns 1 when shown, 0 for a user-requested
+ * close, -1 when the frontend should upload guest VRAM, and -2 for a fatal backend error. */
 typedef struct GeBackend {
     const char *name;
     int  (*init)(void);

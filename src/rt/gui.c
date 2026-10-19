@@ -8,6 +8,9 @@
 #include "gpu_sdl3vk/sdl3vk.h"
 #include "gpu_sdl3vk/ge_gpu.h"
 #endif
+#ifdef SR_D3D12
+#include "gpu_d3d12/device.h"
+#endif
 #include <windows.h>
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
@@ -20,8 +23,13 @@
 #define PSP_H 272
 
 static int      s_on = 0;
-static int      s_sdl3 = 0;            /* SDL3+Vulkan presenter active (src/rt/gpu_sdl3vk) */
 #ifdef SR_SDL3VK
+static int      s_sdl3 = 0;            /* SDL3+Vulkan presenter active (src/rt/gpu_sdl3vk) */
+#endif
+#ifdef SR_D3D12
+static int      s_d3d12 = 0;
+#endif
+#if defined(SR_SDL3VK) || defined(SR_D3D12)
 static const GeBackend *s_ge_backend;
 #endif
 static HWND     s_hwnd;
@@ -175,14 +183,14 @@ int gui_init(const char *title) {
     const char *requested = getenv("SR_GPU");
     int explicit_gpu = requested && requested[0];
     int want_vk = 0;
+    int want_d3d12 = 0;
     if (explicit_gpu) {
         if (strcmp(requested, "vk") == 0) {
             want_vk = 1;
         } else if (strcmp(requested, "sw") == 0) {
             want_vk = 0;
         } else if (strcmp(requested, "d3d12") == 0) {
-            fprintf(stderr, "gui_init: SR_GPU=d3d12 is not available in this build\n");
-            return 0;
+            want_d3d12 = 1;
         } else {
             fprintf(stderr, "gui_init: invalid SR_GPU=%s (expected d3d12, vk, or sw)\n", requested);
             return 0;
@@ -191,6 +199,40 @@ int gui_init(const char *title) {
         const char *legacy = getenv("SR_GPU_GE");
         want_vk = legacy && legacy[0] && strcmp(legacy, "0") != 0;
     }
+
+#ifdef SR_D3D12
+    if (want_d3d12) {
+        const char *video = getenv("SR_VIDEO");
+        if (video && strcmp(video, "gdi") == 0) {
+            fprintf(stderr, "gui_init: SR_GPU=d3d12 cannot be combined with SR_VIDEO=gdi\n");
+            return 0;
+        }
+        if (!ged3d12_window_init(title)) {
+            fprintf(stderr, "gui_init: D3D12 SDL3 window initialization failed\n");
+            return 0;
+        }
+        s_ge_backend = ged3d12_backend();
+        if (!s_ge_backend || !s_ge_backend->init || !s_ge_backend->init()) {
+            fprintf(stderr, "gui_init: D3D12 GE backend initialization failed\n");
+            if (s_ge_backend && s_ge_backend->shutdown) s_ge_backend->shutdown();
+            else ged3d12_window_shutdown();
+            s_ge_backend = NULL;
+            return 0;
+        }
+        ge_set_backend(s_ge_backend);
+        s_d3d12 = 1;
+        QueryPerformanceFrequency(&s_freq);
+        QueryPerformanceCounter(&s_last);
+        s_on = 1;
+        fprintf(stderr, "gui_init: GE backend %s\n", s_ge_backend->name);
+        return 1;
+    }
+#else
+    if (want_d3d12) {
+        fprintf(stderr, "gui_init: SR_GPU=d3d12 is not available in this build\n");
+        return 0;
+    }
+#endif
 
 #ifdef SR_SDL3VK
     /* SDL3+Vulkan presentation remains the default in this build even for SR_GPU=sw.
@@ -313,13 +355,44 @@ void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
     if (!s_on) return;
     if (stride == 0) stride = 512;
 
+#ifdef SR_D3D12
+    if (s_d3d12) {
+        int shown = s_ge_backend->present(fbaddr, fmt, stride);
+        if (shown < 0) {
+            fprintf(stderr, "gui_present: D3D12 backend failed\n");
+            if (s_ge_backend->shutdown) s_ge_backend->shutdown();
+            ge_set_backend(NULL);
+            s_ge_backend = NULL;
+            _Exit(2);
+        }
+        if (shown == 0) {
+            if (s_ge_backend->shutdown) s_ge_backend->shutdown();
+            ge_set_backend(NULL);
+            s_ge_backend = NULL;
+            _Exit(0);
+        }
+        s_buttons = ged3d12_buttons();
+        ged3d12_analog(&s_lx, &s_ly);
+        s_pad_present = ged3d12_pad_present();
+        goto pace;
+    }
+#endif
+
 #ifdef SR_SDL3VK
     if (s_sdl3) {
         /* GPU-resident framebuffer: blit straight from the GE's target image. Falls back
          * to the guest-VRAM convert for CPU-written frames (movies) or pure software GE. */
         int shown = s_ge_backend && s_ge_backend->present
             ? s_ge_backend->present(fbaddr, fmt, stride) : -1;
-        if (shown < 0) {
+        if (shown < -1) {
+            fprintf(stderr, "gui_present: Vulkan backend failed\n");
+            if (s_ge_backend && s_ge_backend->shutdown) s_ge_backend->shutdown();
+            ge_set_backend(NULL);
+            s_ge_backend = NULL;
+            sdl3vk_shutdown();
+            _Exit(2);
+        }
+        if (shown == -1) {
             convert_fb(fbaddr, fmt, stride);
             shown = sdl3vk_present_rgba(s_px);
         }
@@ -354,7 +427,7 @@ void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
                   s_px, &s_bmi, DIB_RGB_COLORS, SRCCOPY);
     ReleaseDC(s_hwnd, dc);
 
-#ifdef SR_SDL3VK
+#if defined(SR_SDL3VK) || defined(SR_D3D12)
 pace:
 #endif
     /* Pace to ~60 Hz so the intro/menus play at a watchable speed. Skipped when the scheduler

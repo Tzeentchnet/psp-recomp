@@ -13,14 +13,17 @@ GAME_BASE  ?= 0x08804000
 GAME_ENTRY ?= 0x08804000
 
 CC         ?= gcc
+CXX        ?= g++
 PYTHON     ?= python
-CFLAGS     ?= -O1 -foptimize-sibling-calls -Isrc/rt -DSR_SDL3VK -Wall -Wextra
+CFLAGS     ?= -O1 -foptimize-sibling-calls -Isrc/rt -DSR_SDL3VK -DSR_D3D12 -Wall -Wextra
+CXXFLAGS   ?= -std=c++17 -O1 -Isrc/rt -DSR_D3D12 -Wall -Wextra -fno-exceptions -fno-rtti
 LDFLAGS    ?= -fuse-ld=lld
-LIBS       ?= -lSDL3 -lvulkan-1 -lmfplat -lgdi32 -ldinput8 -ldxguid -lole32 -lwinmm
+LIBS       ?= -lSDL3 -lvulkan-1 -ld3d12 -ldxgi -lmfplat -lgdi32 -ldinput8 -ldxguid -lole32 -lwinmm
 
 BUILD_DIR  ?= build/$(GAME_NAME)
 
 RT_GE_O    := $(BUILD_DIR)/ge.o
+RT_D3D12_O := $(BUILD_DIR)/gpu_d3d12_device.o
 RT_SRCS    := src/rt/recomp.c \
               src/rt/vfpu_interp.c \
               src/rt/vfpu_asin.c \
@@ -66,14 +69,19 @@ $(RT_GE_O): src/rt/ge.c src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) -O2 -fno-math-errno -Wall -Wextra -Isrc/rt -c src/rt/ge.c -o $@
 
+$(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h src/rt/ge_shared.h src/rt/recomp.h
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/device.cpp -o $@
+
 # Generated C code gets huge. Cache the compiled object to avoid rebuilding it on runtime changes.
 $(BUILD_DIR)/$(GAME_NAME)_recomp.o: $(BUILD_DIR)/$(GAME_NAME)_recomp.c src/rt/recomp.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O)
+compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_D3D12_O)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(GAME_NAME).exe \
 		$(BUILD_DIR)/$(GAME_NAME)_recomp.o \
 		$(RT_GE_O) \
+		$(RT_D3D12_O) \
 		$(RT_SRCS) \
 		$(LIBS)
 	@cp SDL3.dll $(BUILD_DIR)/ 2>/dev/null || cp ../SDL3.dll $(BUILD_DIR)/ 2>/dev/null || true

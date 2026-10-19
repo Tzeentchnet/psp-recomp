@@ -1,0 +1,817 @@
+/* D3D12 device and presentation foundation.
+ *
+ * GE primitives continue through the software rasterizer until the shader/PSO stages are
+ * implemented. Its finished 480x272 framebuffer is uploaded through the same per-frame ring
+ * that later draw data will use, making the device layer independently testable now. */
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+
+#include <SDL3/SDL.h>
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "device.h"
+extern "C" {
+#include "../recomp.h"
+}
+
+#define PSP_W 480
+#define PSP_H 272
+#define FRAME_COUNT 3u
+#define SRV_DESCRIPTOR_COUNT 4095u
+#define RTV_DESCRIPTOR_COUNT 256u
+#define DSV_DESCRIPTOR_COUNT 64u
+#define UPLOAD_BYTES_PER_FRAME (8ull * 1024ull * 1024ull)
+#define UPLOAD_BYTES (FRAME_COUNT * UPLOAD_BYTES_PER_FRAME)
+
+#define RELEASE_COM(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
+
+struct FrameContext {
+    ID3D12CommandAllocator *allocator;
+    UINT64 fence_value;
+    UINT64 upload_begin;
+    UINT64 upload_cursor;
+    UINT64 upload_end;
+    UINT srv_begin;
+    UINT srv_cursor;
+    UINT srv_end;
+};
+
+static SDL_Window *s_window;
+static SDL_Gamepad *s_pad;
+static HWND s_hwnd;
+static int s_sdl_initialized;
+
+static ID3D12Device *s_device;
+static ID3D12CommandQueue *s_graphics_queue;
+static ID3D12CommandQueue *s_copy_queue;
+static ID3D12Fence *s_graphics_fence;
+static ID3D12Fence *s_copy_fence;
+static HANDLE s_graphics_event;
+static HANDLE s_copy_event;
+static UINT64 s_next_graphics_fence = 1;
+static UINT64 s_next_copy_fence = 1;
+
+static IDXGISwapChain3 *s_swapchain;
+static ID3D12Resource *s_backbuffers[FRAME_COUNT];
+static ID3D12DescriptorHeap *s_srv_heap;
+static ID3D12DescriptorHeap *s_rtv_heap;
+static ID3D12DescriptorHeap *s_dsv_heap;
+static UINT s_srv_stride;
+static UINT s_rtv_stride;
+static UINT s_dsv_stride;
+static uint8_t s_rtv_used[RTV_DESCRIPTOR_COUNT];
+static uint8_t s_dsv_used[DSV_DESCRIPTOR_COUNT];
+
+static FrameContext s_frames[FRAME_COUNT];
+static ID3D12GraphicsCommandList *s_command_list;
+static UINT s_active_frame = UINT32_MAX;
+
+static ID3D12Resource *s_upload;
+static uint8_t *s_upload_map;
+
+static uint32_t s_buttons;
+static uint8_t s_lx = 128, s_ly = 128;
+static int s_pad_present;
+
+static int env_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static int check_hr(HRESULT hr, const char *operation) {
+    if (SUCCEEDED(hr)) return 1;
+    fprintf(stderr, "ged3d12: %s failed (HRESULT 0x%08lx)\n",
+            operation, (unsigned long)hr);
+    return 0;
+}
+
+static UINT64 align_up(UINT64 value, UINT64 alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static int wait_for_fence(ID3D12Fence *fence, UINT64 value, HANDLE event_handle,
+                          const char *operation) {
+    if (!value || fence->GetCompletedValue() >= value) return 1;
+    if (!check_hr(fence->SetEventOnCompletion(value, event_handle), operation)) return 0;
+    DWORD wait = WaitForSingleObject(event_handle, 30000);
+    if (wait != WAIT_OBJECT_0) {
+        fprintf(stderr, "ged3d12: %s timed out or failed (wait=%lu, error=%lu)\n",
+                operation, (unsigned long)wait, (unsigned long)GetLastError());
+        return 0;
+    }
+    return 1;
+}
+
+static int wait_queue_idle(ID3D12CommandQueue *queue, ID3D12Fence *fence,
+                           UINT64 *next_value, HANDLE event_handle, const char *operation) {
+    if (!queue || !fence || !event_handle) return 1;
+    UINT64 value = (*next_value)++;
+    if (!check_hr(queue->Signal(fence, value), operation)) return 0;
+    return wait_for_fence(fence, value, event_handle, operation);
+}
+
+static void release_device(void) {
+    if (s_swapchain) s_swapchain->SetFullscreenState(FALSE, nullptr);
+    wait_queue_idle(s_graphics_queue, s_graphics_fence, &s_next_graphics_fence,
+                    s_graphics_event, "wait for graphics queue");
+    wait_queue_idle(s_copy_queue, s_copy_fence, &s_next_copy_fence,
+                    s_copy_event, "wait for copy queue");
+
+    if (s_upload && s_upload_map) {
+        D3D12_RANGE written = {0, 0};
+        s_upload->Unmap(0, &written);
+    }
+    s_upload_map = nullptr;
+    RELEASE_COM(s_upload);
+
+    for (UINT i = 0; i < FRAME_COUNT; i++) {
+        RELEASE_COM(s_backbuffers[i]);
+        RELEASE_COM(s_frames[i].allocator);
+        memset(&s_frames[i], 0, sizeof(s_frames[i]));
+    }
+    RELEASE_COM(s_command_list);
+    RELEASE_COM(s_swapchain);
+    RELEASE_COM(s_srv_heap);
+    RELEASE_COM(s_rtv_heap);
+    RELEASE_COM(s_dsv_heap);
+    RELEASE_COM(s_graphics_fence);
+    RELEASE_COM(s_copy_fence);
+    RELEASE_COM(s_graphics_queue);
+    RELEASE_COM(s_copy_queue);
+    RELEASE_COM(s_device);
+
+    if (s_graphics_event) CloseHandle(s_graphics_event);
+    if (s_copy_event) CloseHandle(s_copy_event);
+    s_graphics_event = nullptr;
+    s_copy_event = nullptr;
+    s_next_graphics_fence = 1;
+    s_next_copy_fence = 1;
+    s_active_frame = UINT32_MAX;
+    s_srv_stride = 0;
+    s_rtv_stride = 0;
+    s_dsv_stride = 0;
+    memset(s_rtv_used, 0, sizeof(s_rtv_used));
+    memset(s_dsv_used, 0, sizeof(s_dsv_used));
+}
+
+void ged3d12_window_shutdown(void) {
+    if (s_pad) SDL_CloseGamepad(s_pad);
+    s_pad = nullptr;
+    if (s_window) SDL_DestroyWindow(s_window);
+    s_window = nullptr;
+    s_hwnd = nullptr;
+    if (s_sdl_initialized) SDL_Quit();
+    s_sdl_initialized = 0;
+    s_buttons = 0;
+    s_lx = s_ly = 128;
+    s_pad_present = 0;
+}
+
+int ged3d12_window_init(const char *title) {
+    if (s_window) {
+        fprintf(stderr, "ged3d12: window already initialized\n");
+        return 0;
+    }
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+        fprintf(stderr, "ged3d12: SDL_Init failed: %s\n", SDL_GetError());
+        return 0;
+    }
+    s_sdl_initialized = 1;
+    s_window = SDL_CreateWindow(title ? title : "PSP Recomp", PSP_W * 2, PSP_H * 2, 0);
+    if (!s_window) {
+        fprintf(stderr, "ged3d12: SDL_CreateWindow failed: %s\n", SDL_GetError());
+        ged3d12_window_shutdown();
+        return 0;
+    }
+    SDL_PropertiesID properties = SDL_GetWindowProperties(s_window);
+    s_hwnd = (HWND)SDL_GetPointerProperty(
+        properties, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    if (!s_hwnd) {
+        fprintf(stderr, "ged3d12: SDL window has no Win32 HWND: %s\n", SDL_GetError());
+        ged3d12_window_shutdown();
+        return 0;
+    }
+
+    if (SDL_HasGamepad()) {
+        int count = 0;
+        SDL_JoystickID *ids = SDL_GetGamepads(&count);
+        if (ids && count > 0) s_pad = SDL_OpenGamepad(ids[0]);
+        SDL_free(ids);
+    }
+    return 1;
+}
+
+static int enable_debug_layer(UINT *factory_flags) {
+    if (!env_enabled("SR_D3D12_DEBUG")) return 1;
+
+    ID3D12Debug *debug = nullptr;
+    if (!check_hr(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)),
+                  "D3D12GetDebugInterface")) {
+        return 0;
+    }
+    debug->EnableDebugLayer();
+    if (env_enabled("SR_D3D12_GPU_VALIDATION")) {
+        ID3D12Debug1 *debug1 = nullptr;
+        if (!check_hr(debug->QueryInterface(IID_PPV_ARGS(&debug1)),
+                      "query ID3D12Debug1")) {
+            RELEASE_COM(debug);
+            return 0;
+        }
+        debug1->SetEnableGPUBasedValidation(TRUE);
+        RELEASE_COM(debug1);
+    }
+    RELEASE_COM(debug);
+    *factory_flags |= DXGI_CREATE_FACTORY_DEBUG;
+    return 1;
+}
+
+static int choose_adapter(IDXGIFactory4 *factory, DXGI_ADAPTER_DESC1 *selected_desc) {
+    if (env_enabled("SR_D3D12_WARP")) {
+        IDXGIAdapter *warp = nullptr;
+        if (!check_hr(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)), "EnumWarpAdapter"))
+            return 0;
+        HRESULT hr = D3D12CreateDevice(
+            warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&s_device));
+        IDXGIAdapter1 *warp1 = nullptr;
+        if (SUCCEEDED(warp->QueryInterface(IID_PPV_ARGS(&warp1)))) {
+            warp1->GetDesc1(selected_desc);
+            RELEASE_COM(warp1);
+        }
+        RELEASE_COM(warp);
+        return check_hr(hr, "D3D12CreateDevice (WARP)");
+    }
+
+    IDXGIFactory6 *factory6 = nullptr;
+    factory->QueryInterface(IID_PPV_ARGS(&factory6));
+    for (UINT index = 0; ; index++) {
+        IDXGIAdapter1 *adapter = nullptr;
+        HRESULT enum_hr = factory6
+            ? factory6->EnumAdapterByGpuPreference(
+                index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter))
+            : factory->EnumAdapters1(index, &adapter);
+        if (enum_hr == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(enum_hr)) {
+            RELEASE_COM(factory6);
+            return check_hr(enum_hr, "enumerate DXGI adapters");
+        }
+
+        DXGI_ADAPTER_DESC1 desc = {};
+        adapter->GetDesc1(&desc);
+        if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            HRESULT device_hr = D3D12CreateDevice(
+                adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&s_device));
+            if (SUCCEEDED(device_hr)) {
+                *selected_desc = desc;
+                RELEASE_COM(adapter);
+                RELEASE_COM(factory6);
+                return 1;
+            }
+        }
+        RELEASE_COM(adapter);
+    }
+    RELEASE_COM(factory6);
+    fprintf(stderr, "ged3d12: no hardware adapter supports D3D12 feature level 11_0\n");
+    return 0;
+}
+
+static int create_queues_and_fences(void) {
+    D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (!check_hr(s_device->CreateCommandQueue(
+            &queue_desc, IID_PPV_ARGS(&s_graphics_queue)),
+            "create graphics queue")) {
+        return 0;
+    }
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    if (!check_hr(s_device->CreateCommandQueue(
+            &queue_desc, IID_PPV_ARGS(&s_copy_queue)),
+            "create copy queue")) {
+        return 0;
+    }
+    if (!check_hr(s_device->CreateFence(
+            0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s_graphics_fence)),
+            "create graphics fence") ||
+        !check_hr(s_device->CreateFence(
+            0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s_copy_fence)),
+            "create copy fence")) {
+        return 0;
+    }
+    s_graphics_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    s_copy_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!s_graphics_event || !s_copy_event) {
+        fprintf(stderr, "ged3d12: CreateEventW failed (error %lu)\n",
+                (unsigned long)GetLastError());
+        return 0;
+    }
+    return 1;
+}
+
+static int create_descriptor_heaps(void) {
+    D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    desc.NumDescriptors = SRV_DESCRIPTOR_COUNT;
+    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (!check_hr(s_device->CreateDescriptorHeap(
+            &desc, IID_PPV_ARGS(&s_srv_heap)), "create CBV/SRV/UAV heap")) {
+        return 0;
+    }
+    desc = {};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    desc.NumDescriptors = RTV_DESCRIPTOR_COUNT;
+    if (!check_hr(s_device->CreateDescriptorHeap(
+            &desc, IID_PPV_ARGS(&s_rtv_heap)), "create RTV heap")) {
+        return 0;
+    }
+    desc = {};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    desc.NumDescriptors = DSV_DESCRIPTOR_COUNT;
+    if (!check_hr(s_device->CreateDescriptorHeap(
+            &desc, IID_PPV_ARGS(&s_dsv_heap)), "create DSV heap")) {
+        return 0;
+    }
+    s_srv_stride = s_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    s_rtv_stride = s_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    s_dsv_stride = s_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    for (UINT i = 0; i < FRAME_COUNT; i++) s_rtv_used[i] = 1;
+    return 1;
+}
+
+static int create_frame_resources(void) {
+    const UINT descriptors_per_frame = SRV_DESCRIPTOR_COUNT / FRAME_COUNT;
+    for (UINT i = 0; i < FRAME_COUNT; i++) {
+        if (!check_hr(s_device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_frames[i].allocator)),
+                "create frame command allocator")) {
+            return 0;
+        }
+        s_frames[i].upload_begin = i * UPLOAD_BYTES_PER_FRAME;
+        s_frames[i].upload_cursor = s_frames[i].upload_begin;
+        s_frames[i].upload_end = s_frames[i].upload_begin + UPLOAD_BYTES_PER_FRAME;
+        s_frames[i].srv_begin = i * descriptors_per_frame;
+        s_frames[i].srv_cursor = s_frames[i].srv_begin;
+        s_frames[i].srv_end = s_frames[i].srv_begin + descriptors_per_frame;
+    }
+    if (!check_hr(s_device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_frames[0].allocator, nullptr,
+            IID_PPV_ARGS(&s_command_list)), "create graphics command list") ||
+        !check_hr(s_command_list->Close(), "close initial graphics command list")) {
+        return 0;
+    }
+
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC resource = {};
+    resource.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    resource.Width = UPLOAD_BYTES;
+    resource.Height = 1;
+    resource.DepthOrArraySize = 1;
+    resource.MipLevels = 1;
+    resource.SampleDesc.Count = 1;
+    resource.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (!check_hr(s_device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &resource,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&s_upload)), "create upload ring")) {
+        return 0;
+    }
+    D3D12_RANGE read_range = {0, 0};
+    if (!check_hr(s_upload->Map(
+            0, &read_range, reinterpret_cast<void **>(&s_upload_map)),
+            "map upload ring")) {
+        return 0;
+    }
+    return 1;
+}
+
+static int create_swapchain(IDXGIFactory4 *factory) {
+    DXGI_SWAP_CHAIN_DESC1 desc = {};
+    desc.Width = PSP_W;
+    desc.Height = PSP_H;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = FRAME_COUNT;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+
+    IDXGISwapChain1 *swapchain1 = nullptr;
+    if (!check_hr(factory->CreateSwapChainForHwnd(
+            s_graphics_queue, s_hwnd, &desc, nullptr, nullptr, &swapchain1),
+            "create HWND flip-model swapchain")) {
+        return 0;
+    }
+    HRESULT query_hr = swapchain1->QueryInterface(IID_PPV_ARGS(&s_swapchain));
+    RELEASE_COM(swapchain1);
+    if (!check_hr(query_hr, "query IDXGISwapChain3") ||
+        !check_hr(factory->MakeWindowAssociation(
+            s_hwnd, DXGI_MWA_NO_ALT_ENTER), "disable DXGI Alt+Enter")) {
+        return 0;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+        s_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < FRAME_COUNT; i++) {
+        if (!check_hr(s_swapchain->GetBuffer(
+                i, IID_PPV_ARGS(&s_backbuffers[i])), "get swapchain buffer")) {
+            return 0;
+        }
+        s_device->CreateRenderTargetView(s_backbuffers[i], nullptr, rtv);
+        rtv.ptr += s_rtv_stride;
+    }
+    return 1;
+}
+
+static const char *feature_level_name(D3D_FEATURE_LEVEL level) {
+    switch (level) {
+#ifdef D3D_FEATURE_LEVEL_12_2
+    case D3D_FEATURE_LEVEL_12_2: return "12_2";
+#endif
+    case D3D_FEATURE_LEVEL_12_1: return "12_1";
+    case D3D_FEATURE_LEVEL_12_0: return "12_0";
+    default: return "11_0";
+    }
+}
+
+static int device_init(void) {
+    if (!s_window || !s_hwnd) {
+        fprintf(stderr, "ged3d12: SDL3 window must be initialized first\n");
+        return 0;
+    }
+    if (s_device) {
+        fprintf(stderr, "ged3d12: device already initialized\n");
+        return 0;
+    }
+
+    UINT factory_flags = 0;
+    if (!enable_debug_layer(&factory_flags)) return 0;
+    IDXGIFactory4 *factory = nullptr;
+    if (!check_hr(CreateDXGIFactory2(
+            factory_flags, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2")) {
+        return 0;
+    }
+
+    DXGI_ADAPTER_DESC1 adapter_desc = {};
+    int ok = choose_adapter(factory, &adapter_desc) &&
+             create_queues_and_fences() &&
+             create_descriptor_heaps() &&
+             create_frame_resources() &&
+             create_swapchain(factory);
+    RELEASE_COM(factory);
+    if (!ok) {
+        release_device();
+        return 0;
+    }
+
+    D3D_FEATURE_LEVEL requested_levels[] = {
+#ifdef D3D_FEATURE_LEVEL_12_2
+        D3D_FEATURE_LEVEL_12_2,
+#endif
+        D3D_FEATURE_LEVEL_12_1,
+        D3D_FEATURE_LEVEL_12_0,
+        D3D_FEATURE_LEVEL_11_0,
+    };
+    D3D12_FEATURE_DATA_FEATURE_LEVELS levels = {};
+    levels.NumFeatureLevels = (UINT)(sizeof(requested_levels) / sizeof(requested_levels[0]));
+    levels.pFeatureLevelsRequested = requested_levels;
+    levels.MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+    s_device->CheckFeatureSupport(
+        D3D12_FEATURE_FEATURE_LEVELS, &levels, sizeof(levels));
+
+    char adapter_name[256] = {};
+    WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1,
+                        adapter_name, sizeof(adapter_name), nullptr, nullptr);
+    fprintf(stderr,
+            "ged3d12: using %s (feature level %s, %u buffers, "
+            "descriptors=%u/%u/%u, upload=%llu MiB, gamepad=%s)\n",
+            adapter_name[0] ? adapter_name : "<unnamed adapter>",
+            feature_level_name(levels.MaxSupportedFeatureLevel),
+            FRAME_COUNT, SRV_DESCRIPTOR_COUNT, RTV_DESCRIPTOR_COUNT,
+            DSV_DESCRIPTOR_COUNT, (unsigned long long)(UPLOAD_BYTES / (1024 * 1024)),
+            s_pad ? "yes" : "no");
+    return 1;
+}
+
+static int begin_frame(UINT *frame_index) {
+    UINT index = s_swapchain->GetCurrentBackBufferIndex();
+    FrameContext *frame = &s_frames[index];
+    if (!wait_for_fence(s_graphics_fence, frame->fence_value, s_graphics_event,
+                        "wait for frame fence")) {
+        return 0;
+    }
+    frame->upload_cursor = frame->upload_begin;
+    frame->srv_cursor = frame->srv_begin;
+    if (!check_hr(frame->allocator->Reset(), "reset frame command allocator") ||
+        !check_hr(s_command_list->Reset(frame->allocator, nullptr),
+                  "reset graphics command list")) {
+        return 0;
+    }
+    s_active_frame = index;
+    *frame_index = index;
+    return 1;
+}
+
+bool ged3d12_upload_alloc(UINT64 size, UINT64 alignment, GeD3D12UploadSlice *out) {
+    if (!out || s_active_frame >= FRAME_COUNT || !size ||
+        !alignment || (alignment & (alignment - 1)) != 0) {
+        return false;
+    }
+    FrameContext *frame = &s_frames[s_active_frame];
+    UINT64 offset = align_up(frame->upload_cursor, alignment);
+    if (offset > frame->upload_end || size > frame->upload_end - offset) {
+        fprintf(stderr, "ged3d12: frame upload ring exhausted (%llu bytes requested)\n",
+                (unsigned long long)size);
+        return false;
+    }
+    frame->upload_cursor = offset + size;
+    out->cpu = s_upload_map + offset;
+    out->gpu = s_upload->GetGPUVirtualAddress() + offset;
+    out->offset = offset;
+    out->size = size;
+    return true;
+}
+
+bool ged3d12_srv_alloc(UINT count, GeD3D12DescriptorSlice *out) {
+    if (!out || s_active_frame >= FRAME_COUNT || !count) return false;
+    FrameContext *frame = &s_frames[s_active_frame];
+    if (count > frame->srv_end - frame->srv_cursor) {
+        fprintf(stderr, "ged3d12: frame CBV/SRV/UAV descriptor ring exhausted "
+                        "(%u descriptors requested)\n", count);
+        return false;
+    }
+    UINT index = frame->srv_cursor;
+    frame->srv_cursor += count;
+    out->cpu = s_srv_heap->GetCPUDescriptorHandleForHeapStart();
+    out->cpu.ptr += (SIZE_T)index * s_srv_stride;
+    out->gpu = s_srv_heap->GetGPUDescriptorHandleForHeapStart();
+    out->gpu.ptr += (UINT64)index * s_srv_stride;
+    out->count = count;
+    return true;
+}
+
+static bool cpu_descriptor_alloc(ID3D12DescriptorHeap *heap, UINT stride,
+                                 uint8_t *used, UINT count, UINT first,
+                                 const char *name, GeD3D12CpuDescriptor *out) {
+    if (!out || !heap) return false;
+    for (UINT index = first; index < count; index++) {
+        if (!used[index]) {
+            used[index] = 1;
+            out->cpu = heap->GetCPUDescriptorHandleForHeapStart();
+            out->cpu.ptr += (SIZE_T)index * stride;
+            out->index = index;
+            return true;
+        }
+    }
+    fprintf(stderr, "ged3d12: %s descriptor pool exhausted\n", name);
+    return false;
+}
+
+static bool cpu_descriptor_free(uint8_t *used, UINT count, UINT first,
+                                UINT index, const char *name) {
+    if (index < first || index >= count || !used[index]) {
+        fprintf(stderr, "ged3d12: invalid %s descriptor free (index %u)\n",
+                name, index);
+        return false;
+    }
+    used[index] = 0;
+    return true;
+}
+
+bool ged3d12_rtv_alloc(GeD3D12CpuDescriptor *out) {
+    return cpu_descriptor_alloc(
+        s_rtv_heap, s_rtv_stride, s_rtv_used, RTV_DESCRIPTOR_COUNT,
+        FRAME_COUNT, "RTV", out);
+}
+
+bool ged3d12_dsv_alloc(GeD3D12CpuDescriptor *out) {
+    return cpu_descriptor_alloc(
+        s_dsv_heap, s_dsv_stride, s_dsv_used, DSV_DESCRIPTOR_COUNT,
+        0, "DSV", out);
+}
+
+bool ged3d12_rtv_free(UINT index) {
+    return cpu_descriptor_free(
+        s_rtv_used, RTV_DESCRIPTOR_COUNT, FRAME_COUNT, index, "RTV");
+}
+
+bool ged3d12_dsv_free(UINT index) {
+    return cpu_descriptor_free(
+        s_dsv_used, DSV_DESCRIPTOR_COUNT, 0, index, "DSV");
+}
+
+static void poll_input(int *quit) {
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        switch (event.type) {
+        case SDL_EVENT_QUIT:
+            *quit = 1;
+            break;
+        case SDL_EVENT_KEY_DOWN:
+            if (event.key.key == SDLK_ESCAPE) *quit = 1;
+            break;
+        case SDL_EVENT_GAMEPAD_ADDED:
+            if (!s_pad) s_pad = SDL_OpenGamepad(event.gdevice.which);
+            break;
+        case SDL_EVENT_GAMEPAD_REMOVED:
+            if (s_pad && SDL_GetGamepadID(s_pad) == event.gdevice.which) {
+                SDL_CloseGamepad(s_pad);
+                s_pad = nullptr;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
+    uint32_t buttons = 0;
+    const bool *keys = SDL_GetKeyboardState(nullptr);
+    if (keys[SDL_SCANCODE_RETURN]) buttons |= 0x0008;
+    if (keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT]) buttons |= 0x0001;
+    if (keys[SDL_SCANCODE_X]) buttons |= 0x4000;
+    if (keys[SDL_SCANCODE_Z]) buttons |= 0x2000;
+    if (keys[SDL_SCANCODE_A]) buttons |= 0x8000;
+    if (keys[SDL_SCANCODE_S]) buttons |= 0x1000;
+    if (keys[SDL_SCANCODE_Q]) buttons |= 0x0100;
+    if (keys[SDL_SCANCODE_W]) buttons |= 0x0200;
+    if (keys[SDL_SCANCODE_UP]) buttons |= 0x0010;
+    if (keys[SDL_SCANCODE_DOWN]) buttons |= 0x0040;
+    if (keys[SDL_SCANCODE_LEFT]) buttons |= 0x0080;
+    if (keys[SDL_SCANCODE_RIGHT]) buttons |= 0x0020;
+
+    uint8_t lx = 128, ly = 128;
+    s_pad_present = s_pad != nullptr;
+    if (s_pad) {
+#define PAD_BUTTON(sdl_button, psp_button) \
+        do { if (SDL_GetGamepadButton(s_pad, sdl_button)) buttons |= (psp_button); } while (0)
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_SOUTH, 0x4000);
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_EAST, 0x2000);
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_WEST, 0x8000);
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_NORTH, 0x1000);
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_START, 0x0008);
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_BACK, 0x0001);
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0x0100);
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 0x0200);
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_DPAD_UP, 0x0010);
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_DPAD_DOWN, 0x0040);
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_DPAD_LEFT, 0x0080);
+        PAD_BUTTON(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 0x0020);
+#undef PAD_BUTTON
+        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8192)
+            buttons |= 0x0100;
+        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8192)
+            buttons |= 0x0200;
+        int ax = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTX);
+        int ay = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTY);
+        if (ax < -7849 || ax > 7849) lx = (uint8_t)((ax + 32768) * 255 / 65535);
+        if (ay < -7849 || ay > 7849) ly = (uint8_t)((ay + 32768) * 255 / 65535);
+    }
+    s_buttons = buttons;
+    s_lx = lx;
+    s_ly = ly;
+}
+
+static void convert_framebuffer(uint8_t *destination, UINT row_pitch,
+                                uint32_t fbaddr, int format, uint32_t stride) {
+    for (int y = 0; y < PSP_H; y++) {
+        uint32_t *row = reinterpret_cast<uint32_t *>(destination + (UINT64)y * row_pitch);
+        for (int x = 0; x < PSP_W; x++) {
+            uint32_t index = (uint32_t)y * stride + (uint32_t)x;
+            int red, green, blue;
+            if (format == 3) {
+                uint32_t pixel = sr_r32(fbaddr + index * 4);
+                red = pixel & 0xff;
+                green = (pixel >> 8) & 0xff;
+                blue = (pixel >> 16) & 0xff;
+            } else {
+                uint16_t pixel = sr_r16(fbaddr + index * 2);
+                if (format == 1) {
+                    red = (pixel & 0x1f) << 3;
+                    green = ((pixel >> 5) & 0x1f) << 3;
+                    blue = ((pixel >> 10) & 0x1f) << 3;
+                } else if (format == 2) {
+                    red = (pixel & 0xf) << 4;
+                    green = ((pixel >> 4) & 0xf) << 4;
+                    blue = ((pixel >> 8) & 0xf) << 4;
+                } else {
+                    red = (pixel & 0x1f) << 3;
+                    green = ((pixel >> 5) & 0x3f) << 2;
+                    blue = ((pixel >> 11) & 0x1f) << 3;
+                }
+            }
+            row[x] = 0xff000000u | ((uint32_t)red << 16) |
+                     ((uint32_t)green << 8) | (uint32_t)blue;
+        }
+    }
+}
+
+static void transition(ID3D12GraphicsCommandList *command_list, ID3D12Resource *resource,
+                       D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    command_list->ResourceBarrier(1, &barrier);
+}
+
+static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
+    int quit = 0;
+    poll_input(&quit);
+    if (quit) return 0;
+
+    UINT frame_index;
+    if (!begin_frame(&frame_index)) return -2;
+
+    const UINT row_pitch = (PSP_W * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+                           ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    const UINT64 upload_size = (UINT64)row_pitch * PSP_H;
+    GeD3D12UploadSlice upload = {};
+    if (!ged3d12_upload_alloc(
+            upload_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, &upload)) {
+        return -2;
+    }
+    memset(upload.cpu, 0, (size_t)upload_size);
+    convert_framebuffer(static_cast<uint8_t *>(upload.cpu), row_pitch,
+                        fbaddr, format, stride);
+
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = s_upload;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint.Offset = upload.offset;
+    source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    source.PlacedFootprint.Footprint.Width = PSP_W;
+    source.PlacedFootprint.Footprint.Height = PSP_H;
+    source.PlacedFootprint.Footprint.Depth = 1;
+    source.PlacedFootprint.Footprint.RowPitch = row_pitch;
+
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = s_backbuffers[frame_index];
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = 0;
+
+    transition(s_command_list, s_backbuffers[frame_index],
+               D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+    s_command_list->CopyTextureRegion(
+        &destination, 0, 0, 0, &source, nullptr);
+    transition(s_command_list, s_backbuffers[frame_index],
+               D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+    if (!check_hr(s_command_list->Close(), "close graphics command list"))
+        return -2;
+
+    ID3D12CommandList *lists[] = {s_command_list};
+    s_graphics_queue->ExecuteCommandLists(1, lists);
+    HRESULT present_hr = s_swapchain->Present(0, 0);
+
+    UINT64 fence_value = s_next_graphics_fence++;
+    HRESULT signal_hr = s_graphics_queue->Signal(s_graphics_fence, fence_value);
+    s_frames[frame_index].fence_value = fence_value;
+    s_active_frame = UINT32_MAX;
+    if (!check_hr(signal_hr, "signal frame fence")) return -2;
+    if (FAILED(present_hr)) {
+        check_hr(present_hr, "present swapchain");
+        HRESULT removed = s_device->GetDeviceRemovedReason();
+        if (FAILED(removed)) check_hr(removed, "D3D12 device removed reason");
+        return -2;
+    }
+    return 1;
+}
+
+static void device_shutdown(void) {
+    release_device();
+    ged3d12_window_shutdown();
+}
+
+static const GeBackend k_backend = {
+    "d3d12", device_init, device_present, device_shutdown,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+extern "C" const GeBackend *ged3d12_backend(void) { return &k_backend; }
+extern "C" uint32_t ged3d12_buttons(void) { return s_buttons; }
+extern "C" void ged3d12_analog(uint8_t *lx, uint8_t *ly) {
+    if (lx) *lx = s_lx;
+    if (ly) *ly = s_ly;
+}
+extern "C" int ged3d12_pad_present(void) { return s_pad_present; }
+
+ID3D12Device *ged3d12_device(void) { return s_device; }
+ID3D12GraphicsCommandList *ged3d12_command_list(void) { return s_command_list; }
+ID3D12CommandQueue *ged3d12_graphics_queue(void) { return s_graphics_queue; }
+ID3D12CommandQueue *ged3d12_copy_queue(void) { return s_copy_queue; }
+ID3D12DescriptorHeap *ged3d12_srv_heap(void) { return s_srv_heap; }
+ID3D12DescriptorHeap *ged3d12_rtv_heap(void) { return s_rtv_heap; }
+ID3D12DescriptorHeap *ged3d12_dsv_heap(void) { return s_dsv_heap; }
