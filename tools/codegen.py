@@ -12,6 +12,13 @@ import struct
 import sys
 
 from analyze import Elf, exec_ranges, in_ranges, analyze
+import codegen_ext as cx
+
+# Per-game hints, loaded by main() from --jumptables / --overrides (see codegen_ext):
+# jr address -> {"targets": [...]} for switch tables and computed gotos, and the set of
+# `jal .+8` (get-PC) sites that must link without calling.
+JUMPTABLES = {}
+JAL_NEXT = set()
 
 R = lambda i: "0u" if i == 0 else f"s->r[{i}]"           # read GPR (r0 is constant 0)
 F = lambda i: f"s->f[{i}]"
@@ -82,6 +89,9 @@ class Unsupported(Exception):
 
 # Effect of a non-control instruction -> (c_statement, store_addr_expr_or_None, store_size).
 def effect(addr, w):
+    ext = cx.effect(addr, w)  # encodings added for KZL (BSHFL, cache, VFPU7/9, vf2i, vi2f, vmscl)
+    if ext is not None:
+        return ext
     op = w >> 26
     if op == 0:
         fn = funct(w)
@@ -320,7 +330,7 @@ def vfpu_effect(addr, w):
         _TRANS = {16: "sr_vfpu_rcp(_s[_i])", 17: "sr_vfpu_rsqrt(_s[_i])",
                   18: "sr_vfpu_sin(_s[_i])", 19: "sr_vfpu_cos(_s[_i])",
                   20: "sr_vfpu_exp2(_s[_i])",
-                  22: "sr_vfpu_sqrt(_s[_i])",
+                  22: "sr_vfpu_sqrt(_s[_i])", 23: "sr_vfpu_asin(_s[_i])",
                   24: "-sr_vfpu_rcp(_s[_i])", 26: "-sr_vfpu_sin(_s[_i])"}
         if optype in _TRANS:
             si = vreg_indices(vs, n)
@@ -563,11 +573,13 @@ def fpu_effect(addr, w):
 
 def is_cond_branch(w):
     op = w >> 26
-    return op in (4, 5, 6, 7, 20, 21, 22, 23) or op == 1 or (op == 0x11 and rs(w) == 8)
+    return op in (4, 5, 6, 7, 20, 21, 22, 23) or op == 1 or (op == 0x11 and rs(w) == 8) or cx.is_vbranch(w)
 
 
 def cond_expr(w):
     op = w >> 26
+    if cx.is_vbranch(w):
+        return cx.vbranch_cond(w)                             # bvf/bvt/bvfl/bvtl
     if op == 4: return f"({R(rs(w))} == {R(rt(w))})"          # beq
     if op == 5: return f"({R(rs(w))} != {R(rt(w))})"          # bne
     if op == 6: return f"((int32_t){R(rs(w))} <= 0)"          # blez
@@ -588,7 +600,8 @@ def cond_expr(w):
 
 def is_likely(w):
     op = w >> 26
-    return op in (20, 21, 22, 23) or (op == 1 and rt(w) in (2, 3)) or (op == 0x11 and rs(w) == 8 and ((w >> 17) & 1))
+    return op in (20, 21, 22, 23) or (op == 1 and rt(w) in (2, 3)) or (op == 0x11 and rs(w) == 8 and ((w >> 17) & 1)) \
+        or (cx.is_vbranch(w) and cx.vbranch_likely(w))
 
 
 def is_link(w):  # branch that also writes $ra
@@ -645,6 +658,12 @@ def function_flow(elf, start, ranges, known):
             if op == 0 and fn == 0x08:  # jr: return / computed / tail
                 insns.add(pc + 4)
                 seen.add(pc + 4)
+                # A recovered switch table or computed goto: its targets are code of this
+                # function (unless they are known entries, which become tail calls).
+                for t in cx.switch_labels(JUMPTABLES[pc], known) if pc in JUMPTABLES else ():
+                    labels.add(t)
+                    if in_ranges(t, ranges):
+                        stack.append(t)
                 break
             if op == 0 and fn == 0x0C:  # syscall: HLE boundary
                 break
@@ -700,6 +719,9 @@ def emit_function(elf, start, ranges, known):
         consumed.add(ds)
         ds_is_syscall = dsw is not None and (dsw >> 26) == 0 and (dsw & 0x3F) == 0x0C
 
+        if op == 3 and addr in JAL_NEXT:  # jal .+8: get-PC idiom, link and fall through
+            out.extend(cx.emit_jal_next(addr, w, normal_line(ds, dsw)))
+            continue
         if op == 3:  # jal
             target = jump_target(addr, w)
             out.append(f"    sr_begin(s, 0x{addr:08x}u, 0x{w:08x}u); s->r[31] = 0x{(addr + 8) & 0xFFFFFFFF:08x}u; sr_end(s, 0u, 0);")
@@ -710,23 +732,30 @@ def emit_function(elf, start, ranges, known):
                 out.append(f"    dispatch(s, 0x{target:08x}u);")
             continue
         if op == 0 and fn == 0x09:  # jalr rd, rs
+            # The target is read before the link and the delay slot, either of which may
+            # overwrite rs.
             d, a = rd(w), rs(w)
             link = f"s->r[{d}] = 0x{(addr + 8) & 0xFFFFFFFF:08x}u; " if d != 0 else ""
+            out.append(f"    {{ uint32_t _t = {R(a)};")
             out.append(f"    sr_begin(s, 0x{addr:08x}u, 0x{w:08x}u); {link}sr_end(s, 0u, 0);")
             out.append(normal_line(ds, dsw))
-            out.append(f"    {{ uint32_t _t = {R(a)}; dispatch(s, _t); }}")
+            out.append("    dispatch(s, _t); }")
+            continue
+        if op == 0 and fn == 0x08 and addr in JUMPTABLES and not ds_is_syscall:  # switch / computed goto
+            out.extend(cx.emit_switch_jr(addr, w, normal_line(ds, dsw), JUMPTABLES[addr], known))
             continue
         if op == 0 and fn == 0x08:  # jr rs
             a = rs(w)
             out.append(f"    sr_begin(s, 0x{addr:08x}u, 0x{w:08x}u); sr_end(s, 0u, 0);")
             if ds_is_syscall:
                 out.append(f"    sr_hle_call(s, 0x{(dsw >> 6) & 0xFFFFF:x}u); return;")
-            else:
+            elif a == 31:
                 out.append(normal_line(ds, dsw))
-                if a == 31:
-                    out.append("    return;")
-                else:
-                    out.append(f"    {{ uint32_t _t = {R(a)}; dispatch(s, _t); return; }}")
+                out.append("    return;")
+            else:  # computed tail call: read the target before the delay slot can change it
+                out.append(f"    {{ uint32_t _t = {R(a)};")
+                out.append(normal_line(ds, dsw))
+                out.append("    dispatch(s, _t); return; }")
             continue
         if op == 2:  # j
             target = jump_target(addr, w)
@@ -772,16 +801,26 @@ def main(argv):
     args = [a for a in argv[1:] if not a.startswith("--")]
     opts = [a for a in argv[1:] if a.startswith("--")]
     if len(args) < 2:
-        sys.stderr.write("usage: codegen.py <elf> <out.c> [--base=HEX]\n")
+        sys.stderr.write("usage: codegen.py <elf> <out.c> [--base=HEX] [--jumptables=TOML] [--overrides=TOML]\n")
         return 2
     base = None
     for o in opts:
         if o.startswith("--base="):
             base = int(o.split("=", 1)[1], 16)
+        elif o.startswith("--jumptables="):
+            JUMPTABLES.update(cx.load_jumptables(o.split("=", 1)[1]))
+        elif o.startswith("--overrides="):
+            gotos, jal_next = cx.load_overrides(o.split("=", 1)[1])
+            JUMPTABLES.update(gotos)
+            JAL_NEXT.update(jal_next)
     elf = Elf(args[0], base=base)
     ranges = exec_ranges(elf)
     known, _ = analyze(elf)
     known = set(a for a in known if in_ranges(a, ranges))
+    # A jal .+8 target is the rest of the same function, not an entry point.
+    known -= {a + 8 for a in JAL_NEXT}
+    if JUMPTABLES or JAL_NEXT:
+        print(f"hints: {len(JUMPTABLES)} jump tables / computed gotos, {len(JAL_NEXT)} jal .+8 sites")
 
     # Import stubs live in .sceStub.text. In the file each is "jr $ra; <placeholder>"; the
     # syscall is written into the delay slot by the loader at run time, so we cannot read it
@@ -801,21 +840,15 @@ def main(argv):
         except Exception as e:
             sys.stderr.write(f"warning: import table parse failed: {e}\n")
 
-    out = [
-        "/* Generated by tools/codegen.py. Do not edit by hand. */",
-        '#include "recomp.h"',
-        "#include <math.h>",
-        "#include <string.h>",
-        "",
-        SR_TO_W,
-        "",
-    ]
-    for a in sorted(known):
-        out.append(f"void f_{a:08x}(CpuState *s);")
-    out.append("")
+    includes = ['#include "recomp.h"', "#include <math.h>", "#include <string.h>"]
+    helpers = [SR_TO_W, "", cx.PREAMBLE, ""]
+    protos = [f"void f_{a:08x}(CpuState *s);" for a in sorted(known)]
+    funcs = []     # one list of lines per guest function, in address order
     emitted = []
     stubbed = []
     for a in sorted(known):
+        out = []
+        funcs.append(out)
         if is_stub(a):
             w0 = read32(elf, a) or 0x03E00008          # jr $ra
             w1 = read32(elf, a + 4) or 0               # delay slot (PPSSPP patches a syscall)
@@ -852,16 +885,46 @@ def main(argv):
             emitted.append(a)
             stubbed.append((a, reason))
             sys.stderr.write(f"skip 0x{a:08x}: {e}\n")
-    out.append("void sr_register_all(void) {")
-    for a in emitted:
-        out.append(f"    sr_register(0x{a:08x}u, f_{a:08x});")
-    out.append("}")
-    out.append("")
-    with open(args[1], "w", encoding="ascii", newline="\n") as f:
-        f.write("\n".join(out))
-    print(f"wrote {args[1]}: {len(emitted)}/{len(known)} functions ({len(stubbed)} trapping stubs)")
+    register = ["void sr_register_all(void) {"]
+    register += [f"    sr_register(0x{a:08x}u, f_{a:08x});" for a in emitted]
+    register += ["}", ""]
+    banner = "/* Generated by tools/codegen.py. Do not edit by hand. */"
+    split = next((o for o in opts if o == "--split" or o.startswith("--split=")), None)
+    import os
+    if split is None:
+        with open(args[1], "w", encoding="ascii", newline="\n") as f:
+            f.write("\n".join([banner] + includes + [""] + helpers + protos + [""]
+                              + [ln for fn in funcs for ln in fn] + register))
+        print(f"wrote {args[1]}: {len(emitted)}/{len(known)} functions ({len(stubbed)} trapping stubs)")
+    else:
+        # --split[=MB]: <stem>.h (prototypes), <stem>_NNN.c (about MB of functions each, so no
+        # translation unit is too big for the compiler or linker) and <stem>_register.c.
+        chunk = int(float(split.split("=", 1)[1]) * 1e6) if "=" in split else 1000000
+        out_dir = os.path.dirname(args[1]) or "."
+        stem = os.path.splitext(os.path.basename(args[1]))[0]
+        os.makedirs(out_dir, exist_ok=True)
+        guard = f"{stem.upper()}_H"
+        with open(os.path.join(out_dir, f"{stem}.h"), "w", encoding="ascii", newline="\n") as f:
+            f.write("\n".join([banner, f"#ifndef {guard}", f"#define {guard}"] + includes + protos
+                              + ["void sr_register_all(void);", "#endif", ""]))
+        tu_head = [banner, f'#include "{stem}.h"', ""] + helpers
+        parts, cur, size = [], [], 0
+        for fn in funcs:
+            cur.append(fn)
+            size += sum(len(ln) + 1 for ln in fn)
+            if size >= chunk:
+                parts.append(cur)
+                cur, size = [], 0
+        if cur:
+            parts.append(cur)
+        for i, part in enumerate(parts):
+            with open(os.path.join(out_dir, f"{stem}_{i:03d}.c"), "w", encoding="ascii", newline="\n") as f:
+                f.write("\n".join(tu_head + [ln for fn in part for ln in fn]) + "\n")
+        with open(os.path.join(out_dir, f"{stem}_register.c"), "w", encoding="ascii", newline="\n") as f:
+            f.write("\n".join([banner, f'#include "{stem}.h"', ""] + register))
+        print(f"wrote {out_dir}/{stem}.h + {len(parts)} TUs + {stem}_register.c: "
+              f"{len(emitted)}/{len(known)} functions ({len(stubbed)} trapping stubs)")
     if stubbed:
-        import os
         sp = os.path.join(os.path.dirname(args[1]) or ".", "stubs.txt")
         with open(sp, "w", encoding="ascii", newline="\n") as f:
             for a, r in stubbed:

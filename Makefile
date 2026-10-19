@@ -23,6 +23,7 @@ BUILD_DIR  ?= build/$(GAME_NAME)
 RT_GE_O    := $(BUILD_DIR)/ge.o
 RT_SRCS    := src/rt/recomp.c \
               src/rt/vfpu_interp.c \
+              src/rt/vfpu_asin.c \
               src/rt/hle.c \
               src/rt/sched.c \
               src/rt/iso.c \

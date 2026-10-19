@@ -92,6 +92,7 @@ float sr_vfpu_sqrt(float x);
 float sr_vfpu_sin(float x);
 float sr_vfpu_cos(float x);
 float sr_vfpu_exp2(float x);
+float sr_vfpu_asin(float x);   /* vfpu_asin.c: result in units of pi/2 */
 
 /* Single-instruction VFPU interpreter (src/rt/vfpu_interp.c). Returns SR_VFPU_COMPUTE for a
  * value-producing op (compare v[]/f[] to the reference trace), SR_VFPU_STATE for a prefix/control op

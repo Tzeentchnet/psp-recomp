@@ -169,6 +169,25 @@ def trace_function(elf, start, ranges, covered, calls):
             pc += 4
 
 
+def _gpr_written(w):
+    """GPR an instruction writes (0 if none). Calls clobber ra; the caller-saved registers they
+    also clobber are left alone, as before."""
+    op, fn = w >> 26, w & 0x3F
+    if op == 0:
+        if fn in (0x08, 0x0C, 0x0D, 0x0F, 0x11, 0x13, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x2E, 0x2F):
+            return 0
+        return (w >> 11) & 0x1F
+    if op in (0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26):
+        return (w >> 16) & 0x1F
+    if op == 0x03:
+        return 31
+    if op == 0x1F:
+        return (w >> 11) & 0x1F if fn == 0x20 else (w >> 16) & 0x1F
+    if (op == 0x11 and (w >> 21) & 0x1F in (0, 2)) or (op == 0x12 and (w >> 21) & 0x1F == 3):
+        return (w >> 16) & 0x1F
+    return 0
+
+
 def analyze(elf):
     ranges = exec_ranges(elf)
     text = elf.sec(".text")
@@ -247,6 +266,14 @@ def analyze(elf):
                     val = hireg[rs] | (word & 0xFFFF)
                     if in_text(val):
                         hc.add(val)
+            # Any other write to a register ends its lui value (checked after the use above, so
+            # `lui at, hi; addiu at, at, lo` still pairs). Without this, a later unrelated
+            # `addiu rt, rs, imm` on a reused register paired with a stale lui and produced
+            # bogus "functions" such as 0x08940004 in KZL, some of them inside delay slots.
+            if op != 0x0F:
+                written = _gpr_written(word)
+                if written:
+                    hireg.pop(written, None)
 
     # Trace each function's extent from the high-confidence seeds, following discovered calls.
     # `covered` ends up holding every instruction that belongs to some known function, so the
