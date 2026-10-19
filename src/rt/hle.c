@@ -67,6 +67,9 @@ static uint32_t stack_arg(CpuState *s, int idx) {
 /* Single shared UID pool matching PPSSPP: uid = 0x110, 0x111, ... incrementing by 1. */
 static uint32_t s_uid = 0x110;
 uint32_t sr_alloc_uid(void) { return s_uid++; }
+/* Continue UID numbering where the oracle's kernel is (trace header "# kernel next_uid="), so
+ * handles returned to the game match the reference trace. */
+void sr_set_next_uid(uint32_t next) { s_uid = next; }
 
 /* User-partition bump allocator. The kernel hands the game one user partition; the first
  * sceKernelAllocPartitionMemory Low block sits immediately after the loaded module (like

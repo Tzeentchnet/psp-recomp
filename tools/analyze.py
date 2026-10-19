@@ -103,13 +103,20 @@ def section_bytes(elf, s):
     return elf.data[s["off"]:s["off"] + s["size"]]
 
 
+def stub_ranges(elf):
+    # Import stubs live in ".sceStub.text", or in one section per library such as
+    # ".sceStub.text.sceNetResolver" (KZL, and SDK builds that keep library section names).
+    return [(s["addr"], s["addr"] + s["size"]) for s in elf.sections
+            if s.get("nm", "").startswith(".sceStub.text") and s["size"]]
+
+
 def exec_ranges(elf):
     ranges = []
     for name in EXEC_SECTIONS:
         s = elf.sec(name)
-        if s and s["size"]:
+        if s and s["size"] and name != ".sceStub.text":
             ranges.append((s["addr"], s["addr"] + s["size"]))
-    return ranges
+    return ranges + stub_ranges(elf)
 
 
 def in_ranges(addr, ranges):

@@ -135,6 +135,7 @@ extern int sr_hit_hle;
  * index their own per-object tables by (uid - 0x100), so the base and a single shared counter
  * matter. */
 uint32_t sr_alloc_uid(void);
+void     sr_set_next_uid(uint32_t next);
 
 /* sceGe display-list GPU (src/rt/ge.c): execute a GE command list, rasterising into VRAM. */
 void ge_run_list(uint32_t addr);

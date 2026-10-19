@@ -31,6 +31,11 @@ def parse_step_line(line, lineno, path):
     return step, pc, op, writes
 
 
+def is_syscall(op_hex):
+    w = int(op_hex, 16)
+    return (w & 0xFC00003F) == 0x0000000C
+
+
 def fail(msg):
     sys.stderr.write(msg + "\n")
     sys.exit(2)
@@ -69,7 +74,9 @@ def diff(path_a, path_b):
             return (i, pc_a, f"step index {step_a} vs {step_b}")
         if pc_a != pc_b:
             return (i, pc_a, f"pc {pc_a} vs {pc_b}")
-        if op_a != op_b:
+        if op_a != op_b and not (is_syscall(op_a) or is_syscall(op_b)):
+            # Import-stub delay slots hold whatever syscall word each loader patched in
+            # (PPSSPP uses its own numbering), so a syscall on either side matches any word.
             return (i, pc_a, f"op {op_a} vs {op_b}")
         if w_a != w_b:
             only_a = {k: v for k, v in w_a.items() if w_b.get(k) != v}

@@ -70,33 +70,59 @@ static uint32_t load_elf(const uint8_t *elf) {
     return e_entry;
 }
 
+static int hexval(int c) {
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+/* Reads the reference trace's header: "# init" (register state at the first traced step: r, hi,
+ * lo, f, fcr31, fpcond, v, vc) and any "# mem <addr> <hex bytes>" lines (guest memory the oracle's
+ * kernel prepared, e.g. the start thread's stack and argp copy). Must run after the image is
+ * loaded, since the memory lines are written into guest RAM. Stops at the first step line. */
 static void seed_from_init(const char *trace_path, CpuState *s) {
     FILE *f = fopen(trace_path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", trace_path); exit(2); }
-    char buf[8192];
-    int found = 0;
+    static char buf[16384];
+    int found = 0, mem_lines = 0;
     while (fgets(buf, sizeof(buf), f)) {
-        if (strncmp(buf, "# init", 6) != 0)
+        if (buf[0] != '#')
+            break;
+        if (strncmp(buf, "# mem ", 6) == 0) {
+            char *p = buf + 6;
+            uint32_t addr = (uint32_t)strtoul(p, &p, 16);
+            while (*p == ' ') p++;
+            for (; hexval(p[0]) >= 0 && hexval(p[1]) >= 0; p += 2, addr++)
+                sr_w8(addr, (uint8_t)(hexval(p[0]) * 16 + hexval(p[1])));
+            mem_lines++;
+            continue;
+        }
+        if (strncmp(buf, "# kernel next_uid=", 18) == 0) {
+            sr_set_next_uid((uint32_t)strtoul(buf + 18, NULL, 16));
+            continue;
+        }
+        if (strncmp(buf, "# init", 6) != 0 || found)
             continue;
         found = 1;
-        char *tok = strtok(buf + 6, " \t\n");
+        char *tok = strtok(buf + 6, " \t\r\n");
         while (tok) {
             char *eq = strchr(tok, '=');
             if (eq) {
                 *eq = 0;
                 uint32_t val = (uint32_t)strtoul(eq + 1, NULL, 16);
-                if (tok[0] == 'r') s->r[atoi(tok + 1)] = val;
-                else if (tok[0] == 'f' && tok[1] >= '0' && tok[1] <= '9') s->fi[atoi(tok + 1)] = val;
+                if (tok[0] == 'r') s->r[atoi(tok + 1) & 31] = val;
+                else if (tok[0] == 'f' && tok[1] >= '0' && tok[1] <= '9') s->fi[atoi(tok + 1) & 31] = val;
+                else if (tok[0] == 'v' && tok[1] == 'c') s->vfpuCtrl[atoi(tok + 2) & 15] = val;
+                else if (tok[0] == 'v' && tok[1] >= '0' && tok[1] <= '9') s->vi[atoi(tok + 1) & 127] = val;
                 else if (strcmp(tok, "hi") == 0) s->hi = val;
                 else if (strcmp(tok, "lo") == 0) s->lo = val;
                 else if (strcmp(tok, "fcr31") == 0) s->fcr31 = val;
+                else if (strcmp(tok, "fpcond") == 0) s->fpcond = val;
             }
-            tok = strtok(NULL, " \t\n");
+            tok = strtok(NULL, " \t\r\n");
         }
-        break;
     }
     fclose(f);
     if (!found) { fprintf(stderr, "no '# init' in %s\n", trace_path); exit(2); }
+    if (mem_lines) fprintf(stderr, "seed: %d memory lines from %s\n", mem_lines, trace_path);
 }
 
 int main(int argc, char **argv) {

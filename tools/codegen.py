@@ -11,7 +11,7 @@
 import struct
 import sys
 
-from analyze import Elf, exec_ranges, in_ranges, analyze
+from analyze import Elf, exec_ranges, in_ranges, analyze, stub_ranges
 import codegen_ext as cx
 
 # Per-game hints, loaded by main() from --jumptables / --overrides (see codegen_ext):
@@ -832,9 +832,9 @@ def main(argv):
     # syscall is written into the delay slot by the loader at run time, so we cannot read it
     # from the file. The codegen emits the jr line (which is recorded in the trace) and then an HLE
     # boundary call, stopping the traced run exactly where the reference trace reaches its syscall.
-    stub = elf.sec(".sceStub.text")
+    stubs = stub_ranges(elf)   # ".sceStub.text" or one ".sceStub.text.<lib>" per library
     def is_stub(a):
-        return stub is not None and stub["addr"] <= a < stub["addr"] + stub["size"]
+        return in_ranges(a, stubs)
 
     # Resolve each import stub to its NID from the PRX import table (only meaningful for a
     # relocated PRX). The stub then dispatches to the HLE handler for that NID.
