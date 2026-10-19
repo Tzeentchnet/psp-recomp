@@ -565,8 +565,11 @@ def fpu_effect(addr, w):
             return f"s->fi[{fdv}] = sr_to_w({F(fs)}, 0x{fn:02x});", None, 0
         if fn >= 0x30:
             cond = fn & 0xF
+            # The condition bits are known here, so only the terms they select are emitted
+            # (same result as testing (cond & k) at run time, without constant-operand warnings).
+            terms = [t for bit, t in ((1, "_u"), (2, "_e"), (4, "_l")) if cond & bit] or ["0"]
             return (f"{{ float _a={F(fs)},_b={F(ft)}; int _u=isnan(_a)||isnan(_b); int _l=!_u&&_a<_b; int _e=!_u&&_a==_b; "
-                    f"s->fpcond = ((_u&&({cond}&1))||(_e&&({cond}&2))||(_l&&({cond}&4)))?1u:0u; }}"), None, 0
+                    f"(void)_u; (void)_l; (void)_e; s->fpcond = ({'||'.join(terms)})?1u:0u; }}"), None, 0
     if fmt == 0x14 and funct(w) == 0x20: return f"{F(fdv)} = (float)(int32_t)s->fi[{fs}];", None, 0  # cvt.s.w
     raise Unsupported(f"COP1 fmt 0x{fmt:02x} funct 0x{funct(w):02x} at 0x{addr:08x}")
 
@@ -651,7 +654,7 @@ def function_flow(elf, start, ranges, known):
                 t = jump_target(pc, w)
                 insns.add(pc + 4)
                 seen.add(pc + 4)
-                if t not in known and in_ranges(t, ranges):  # intra goto
+                if (t not in known or t == start) and in_ranges(t, ranges):  # intra goto (j to own entry = loop)
                     labels.add(t)
                     stack.append(t)
                 break
@@ -761,7 +764,7 @@ def emit_function(elf, start, ranges, known):
             target = jump_target(addr, w)
             out.append(f"    sr_begin(s, 0x{addr:08x}u, 0x{w:08x}u); sr_end(s, 0u, 0);")
             out.append(normal_line(ds, dsw))
-            if target in known:
+            if target in known and target != start:
                 out.append(f"    f_{target:08x}(s); return;")
             else:
                 y = "SR_YIELD(s); " if target <= addr else ""   # backward j: loop edge
@@ -783,7 +786,7 @@ def emit_function(elf, start, ranges, known):
     return out
 
 
-SR_TO_W = """static uint32_t sr_to_w(float x, uint32_t fn) {
+SR_TO_W = """static inline uint32_t sr_to_w(float x, uint32_t fn) {
     if (isnan(x) || isinf(x)) return (isinf(x) && x < 0.0f) ? 0x80000000u : 0x7FFFFFFFu;
     int32_t r;
     switch (fn) {
@@ -905,9 +908,10 @@ def main(argv):
         os.makedirs(out_dir, exist_ok=True)
         guard = f"{stem.upper()}_H"
         with open(os.path.join(out_dir, f"{stem}.h"), "w", encoding="ascii", newline="\n") as f:
-            f.write("\n".join([banner, f"#ifndef {guard}", f"#define {guard}"] + includes + protos
-                              + ["void sr_register_all(void);", "#endif", ""]))
-        tu_head = [banner, f'#include "{stem}.h"', ""] + helpers
+            # The static inline helpers live in the header, so TUs that do not use them stay quiet.
+            f.write("\n".join([banner, f"#ifndef {guard}", f"#define {guard}"] + includes + [""] + helpers
+                              + protos + ["void sr_register_all(void);", "#endif", ""]))
+        tu_head = [banner, f'#include "{stem}.h"', ""]
         parts, cur, size = [], [], 0
         for fn in funcs:
             cur.append(fn)
