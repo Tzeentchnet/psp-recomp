@@ -56,6 +56,9 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/driver.c \
               src/rt/gpu_sdl3vk/sdl3vk.c \
               src/rt/gpu_sdl3vk/ge_gpu.c
+AT3_NAMES  := atrac atrac3 atrac3plus atrac3plusdec atrac3plusdsp get_bits compat fft mem
+AT3_OBJS   := $(addprefix $(BUILD_DIR)/at3_,$(addsuffix .o,$(AT3_NAMES))) \
+              $(BUILD_DIR)/atrac_decode.o
 
 DXC        ?= dxc
 
@@ -81,6 +84,15 @@ $(BUILD_DIR)/$(GAME_NAME)_imports.toml: $(GAME_ELF) tools/imports.py tools/analy
 $(RT_GE_O): src/rt/ge.c src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) -O2 -fno-math-errno -Wall -Wextra -Isrc/rt -c src/rt/ge.c -o $@
+
+$(BUILD_DIR)/at3_%.o: third_party/at3_standalone/%.cpp
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -Ithird_party/at3_standalone -c $< -o $@
+
+$(BUILD_DIR)/atrac_decode.o: src/rt/atrac_decode.cpp src/rt/atrac_decode.h \
+                            third_party/at3_standalone/at3_decoders.h
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -Ithird_party/at3_standalone -c $< -o $@
 
 $(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h \
                src/rt/gpu_d3d12/framebuffer.h \
@@ -192,7 +204,7 @@ compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_D3D12_O) \
          $(RT_D3D12_VERTEX_O) $(RT_D3D12_PIPELINE_O) $(RT_D3D12_PIPELINE_KEY_O) \
          $(RT_D3D12_PRESENT_O) $(RT_D3D12_PRESENT_LAYOUT_O) \
          $(RT_D3D12_SHADER_STATE_O) \
-         $(RT_D3D12_TEXTURE_O) $(RT_D3D12_TEXTURE_KEY_O)
+         $(RT_D3D12_TEXTURE_O) $(RT_D3D12_TEXTURE_KEY_O) $(AT3_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(GAME_NAME).exe \
 		$(BUILD_DIR)/$(GAME_NAME)_recomp.o \
 		$(RT_GE_O) \
@@ -207,8 +219,9 @@ compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_D3D12_O) \
 		$(RT_D3D12_SHADER_STATE_O) \
 		$(RT_D3D12_TEXTURE_O) \
 		$(RT_D3D12_TEXTURE_KEY_O) \
+		$(AT3_OBJS) \
 		$(RT_SRCS) \
-		$(LIBS)
+		$(LIBS) -lstdc++ -lm
 	@cp SDL3.dll $(BUILD_DIR)/ 2>/dev/null || cp ../SDL3.dll $(BUILD_DIR)/ 2>/dev/null || true
 	@cp -r font $(BUILD_DIR)/ 2>/dev/null || cp -r ../font $(BUILD_DIR)/ 2>/dev/null || true
 	@echo "Build finished: $(BUILD_DIR)/$(GAME_NAME).exe"

@@ -16,6 +16,7 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
+#include "atrac_decode.h"
 #include "iso.h"
 #include "pgf.h"
 #include "sas_reverb.h"
@@ -616,81 +617,417 @@ static uint32_t h_MpegAtracDecode(CpuState *s) {
 }
 static uint32_t h_MpegAvcDecodeStop(CpuState *s) { return mpeg_avc_decode_stop(A0, A1, A2, A3); }
 
-/* sceAtrac3plus: control-flow model (no real ATRAC3 decode -- output is silence). Enough for the
- * audio thread to run an ATRAC clip (e.g. the title BGM) to its loop/end without trapping or
- * spinning. SetDataAndGetID parses the RIFF/"fact" sample count; DecodeData hands back a frame of
- * silence and advances; GetRemainFrame reports PSP_ATRAC_ALLDATA_IS_ON_MEMORY (-1) so the game does
- * not wait for streamed data. ATRAC3plus frame = 2048 samples. Ported semantics from PPSSPP
- * Core/HLE/sceAtrac.cpp (decode bookkeeping), minus the media engine. */
+/* sceAtrac3plus: RIFF bookkeeping plus the standalone PPSSPP/FFmpeg decoder. */
 #define ATRAC_SAMPLES_PER_FRAME 2048
-typedef struct { int used; uint32_t buf, size; int endSample, posSample, loopNum; } Atrac;
+#define ATRAC3_SAMPLES_PER_FRAME 1024
+#define ATRAC_CODEC_PLUS 0x1000
+#define ATRAC_CODEC_AT3  0x1001
+#define ATRAC_INTERNAL_DECODE_ERROR 0x807f00fdu
+
+typedef struct {
+    int used;
+    uint32_t buf, size, fileSize;
+    int endSample, posSample, loopNum;
+    int codec, channels, blockAlign;
+    uint32_t dataOffset, dataBytes, frameOffset;
+    int firstSampleOffset, skipSamples, primeFrames;
+    int loopStart, loopEnd;
+    uint32_t internalError;
+    int reportedAudio;
+    int streamed;
+    uint32_t ringRead, ringWrite, buffered, fileReadOffset;
+    uint32_t resetFileOffset, lastWritable;
+    int resetSample;
+    SrAtracDecoder *decoder;
+} Atrac;
+
 static Atrac s_atrac[8];
-static int atrac_riff_samples(uint32_t buf, uint32_t size) {
-    /* Scan the RIFF for the "fact" chunk; its first u32 is the total sample count. */
-    if (size < 44 || MEM_R32(buf) != 0x46464952u /* 'RIFF' */) return 0;
-    uint32_t p = buf + 12, end = buf + (size < 0x100000u ? size : 0x100000u);
-    while (p + 8 <= end) {
-        uint32_t id = MEM_R32(p), sz = MEM_R32(p + 4);
-        if (id == 0x74636166u /* 'fact' */) return (int)MEM_R32(p + 8);
-        p += 8 + ((sz + 1u) & ~1u);
+static int16_t s_atrac_decode[ATRAC_SAMPLES_PER_FRAME * 2];
+static uint8_t s_atrac_frame[0x4000];
+
+static int atrac_log(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("SR_ATRACLOG") ? 1 : 0;
+    return enabled;
+}
+
+static int atrac_samples_per_frame(const Atrac *a) {
+    return a->codec == ATRAC_CODEC_AT3
+        ? ATRAC3_SAMPLES_PER_FRAME : ATRAC_SAMPLES_PER_FRAME;
+}
+
+static int atrac_first_sample_full(const Atrac *a) {
+    return a->firstSampleOffset +
+        (a->codec == ATRAC_CODEC_AT3 ? 0x45 : 0x170);
+}
+
+static int atrac_target_frame(const Atrac *a, int sample) {
+    return 1 + (a->firstSampleOffset + sample) / atrac_samples_per_frame(a);
+}
+
+static uint32_t atrac_file_offset_for_sample(const Atrac *a, int sample) {
+    int frame = atrac_target_frame(a, sample);
+    if (frame > 0) frame--;
+    return a->dataOffset + (uint32_t)frame * (uint32_t)a->blockAlign;
+}
+
+static void atrac_destroy_decoder(Atrac *a) {
+    sr_atrac_decoder_destroy(a->decoder);
+    a->decoder = NULL;
+}
+
+static uint32_t atrac_parse_riff(Atrac *a) {
+    if (a->size < 72 || !sr_inrange(a->buf) ||
+        a->buf > UINT32_MAX - (a->size - 1u) ||
+        !sr_inrange(a->buf + a->size - 1u))
+        return 0x80630011u;
+    if (MEM_R32(a->buf) != 0x46464952u || MEM_R32(a->buf + 8) != 0x45564157u)
+        return 0x80630006u;
+
+    a->fileSize = MEM_R32(a->buf + 4) + 8u;
+    uint32_t offset = 12;
+    int found_format = 0;
+    int found_data = 0;
+    while (offset <= a->size - 8u) {
+        uint32_t id = MEM_R32(a->buf + offset);
+        uint32_t raw_size = MEM_R32(a->buf + offset + 4u);
+        uint32_t chunk_size = (raw_size + 1u) & ~1u;
+        uint32_t data = offset + 8u;
+        if (data > a->size || chunk_size > a->size - data) {
+            if (id == 0x61746164u) {
+                a->dataOffset = data;
+                a->dataBytes = raw_size;
+                found_data = 1;
+            }
+            break;
+        }
+
+        if (id == 0x20746d66u && raw_size >= 16) {
+            uint32_t fmt = MEM_R16(a->buf + data);
+            a->codec = fmt == 0x0270u ? ATRAC_CODEC_AT3 :
+                fmt == 0xfffeu ? ATRAC_CODEC_PLUS : 0;
+            a->channels = MEM_R16(a->buf + data + 2u);
+            uint32_t sample_rate = MEM_R32(a->buf + data + 4u);
+            a->blockAlign = MEM_R16(a->buf + data + 12u);
+            if (!a->codec || (a->channels != 1 && a->channels != 2) ||
+                sample_rate != 44100 || !a->blockAlign)
+                return 0x80630008u;
+            found_format = 1;
+        } else if (id == 0x74636166u && raw_size >= 4) {
+            a->endSample = (int)MEM_R32(a->buf + data);
+            if (raw_size >= 8)
+                a->firstSampleOffset = (int)MEM_R32(a->buf + data + 4u);
+        } else if (id == 0x6c706d73u && raw_size >= 56 &&
+                   MEM_R32(a->buf + data + 28u) != 0) {
+            a->loopStart = (int)MEM_R32(a->buf + data + 44u);
+            a->loopEnd = (int)MEM_R32(a->buf + data + 48u);
+        } else if (id == 0x61746164u) {
+            a->dataOffset = data;
+            a->dataBytes = raw_size;
+            found_data = 1;
+            break;
+        }
+        offset = data + chunk_size;
     }
+
+    if (!found_format || !found_data) return 0x80630006u;
+    if (a->dataOffset >= a->size ||
+        (uint32_t)a->blockAlign > a->size - a->dataOffset)
+        return 0x80630011u;
+    if (a->endSample <= 0) {
+        uint32_t frames = a->dataBytes / (uint32_t)a->blockAlign;
+        int samples = (int)frames * atrac_samples_per_frame(a) -
+            atrac_first_sample_full(a);
+        a->endSample = samples > 0 ? samples : atrac_samples_per_frame(a);
+    }
+    if (a->loopStart >= 0 && a->loopEnd >= 0) {
+        int first_sample = atrac_first_sample_full(a);
+        a->loopStart = a->loopStart > first_sample
+            ? a->loopStart - first_sample : 0;
+        a->loopEnd = a->loopEnd > first_sample
+            ? a->loopEnd - first_sample : 0;
+    }
+    if (a->loopStart >= a->loopEnd) a->loopStart = a->loopEnd = -1;
     return 0;
 }
+
+static const uint8_t *atrac_frame_data(Atrac *a) {
+    uint32_t frame_bytes = (uint32_t)a->blockAlign;
+    if (frame_bytes > sizeof(s_atrac_frame)) return NULL;
+    if (!a->streamed) {
+        if (a->frameOffset > a->size || frame_bytes > a->size - a->frameOffset)
+            return NULL;
+        return (const uint8_t *)SR_HOST(a->buf + a->frameOffset);
+    }
+    if (a->buffered < frame_bytes) return NULL;
+    if (a->ringRead + frame_bytes <= a->size)
+        return (const uint8_t *)SR_HOST(a->buf + a->ringRead);
+    uint32_t first = a->size - a->ringRead;
+    memcpy(s_atrac_frame, SR_HOST(a->buf + a->ringRead), first);
+    memcpy(s_atrac_frame + first, SR_HOST(a->buf), frame_bytes - first);
+    return s_atrac_frame;
+}
+
+static void atrac_consume_frame(Atrac *a) {
+    uint32_t frame_bytes = (uint32_t)a->blockAlign;
+    if (!a->streamed) {
+        a->frameOffset += frame_bytes;
+        return;
+    }
+    a->ringRead = (a->ringRead + frame_bytes) % a->size;
+    a->buffered -= frame_bytes;
+    a->frameOffset = a->ringRead;
+}
+
+static uint32_t atrac_prepare_decoder(Atrac *a, int sample) {
+    atrac_destroy_decoder(a);
+    a->decoder = sr_atrac_decoder_create(a->codec, a->channels, a->blockAlign);
+    if (!a->decoder) {
+        a->internalError = ATRAC_INTERNAL_DECODE_ERROR;
+        return 0x80630008u;
+    }
+
+    int samples_per_frame = atrac_samples_per_frame(a);
+    int source_sample = a->firstSampleOffset + sample;
+    int target_frame = 1 + source_sample / samples_per_frame;
+    a->skipSamples =
+        (atrac_first_sample_full(a) + sample) % samples_per_frame;
+    if (a->streamed) {
+        a->frameOffset = a->ringRead;
+        a->primeFrames = sample == 0 ? target_frame : 1;
+    } else {
+        int first_prime = sample == 0 ? 0 : target_frame > 0 ? target_frame - 1 : 0;
+        a->frameOffset =
+            a->dataOffset + (uint32_t)first_prime * (uint32_t)a->blockAlign;
+        a->primeFrames = target_frame - first_prime;
+    }
+    a->posSample = sample;
+    a->internalError = 0;
+    return 0;
+}
+
 static uint32_t h_AtracSetDataAndGetID(CpuState *s) {
     int id = -1; for (int i = 0; i < 8; i++) if (!s_atrac[i].used) { id = i; break; }
     if (id < 0) return 0xFFFFFFFFu;
     Atrac *a = &s_atrac[id];
-    a->used = 1; a->buf = A0; a->size = A1; a->posSample = 0; a->loopNum = 0;
-    a->endSample = atrac_riff_samples(A0, A1);
-    if (a->endSample <= 0) a->endSample = ATRAC_SAMPLES_PER_FRAME * 1024;   /* unknown: long clip */
+    atrac_destroy_decoder(a);
+    memset(a, 0, sizeof(*a));
+    a->used = 1;
+    a->buf = A0;
+    a->size = A1;
+    a->loopStart = a->loopEnd = -1;
+    uint32_t result = atrac_parse_riff(a);
+    if (!result &&
+        (a->fileSize > a->size || a->dataBytes > a->size - a->dataOffset)) {
+        a->streamed = 1;
+        a->ringRead = a->dataOffset;
+        a->ringWrite = 0;
+        a->buffered = a->size - a->dataOffset;
+        a->fileReadOffset = a->size;
+        a->frameOffset = a->ringRead;
+    }
+    if (!result) result = atrac_prepare_decoder(a, 0);
+    if (result) {
+        atrac_destroy_decoder(a);
+        memset(a, 0, sizeof(*a));
+        return result;
+    }
+    if (atrac_log())
+        fprintf(stderr,
+                "ATRAC: set id=%d codec=0x%x channels=%d frame=%d "
+                "buffer=0x%08x bytes=%u data=%u/%u samples=%d loop=%d..%d%s\n",
+                id, a->codec, a->channels, a->blockAlign, a->buf, a->size,
+                a->dataOffset, a->dataBytes, a->endSample, a->loopStart, a->loopEnd,
+                a->streamed ? " streamed" : "");
     return (uint32_t)id;
 }
 static Atrac *atrac_of(uint32_t id) { return id < 8 && s_atrac[id].used ? &s_atrac[id] : 0; }
-static uint32_t h_AtracReleaseAtracID(CpuState *s) { Atrac *a = atrac_of(A0); if (a) a->used = 0; return 0; }
+static uint32_t h_AtracReleaseAtracID(CpuState *s) {
+    Atrac *a = atrac_of(A0);
+    if (a) {
+        atrac_destroy_decoder(a);
+        memset(a, 0, sizeof(*a));
+    }
+    return 0;
+}
+
 static uint32_t h_AtracDecodeData(CpuState *s) {
     /* a0=id, a1=outSamples, a2=*decodedSamples, a3=*finishFlag, sp+16=*remainFrames. */
     Atrac *a = atrac_of(A0); if (!a) return 0x80630002u;   /* bad ID */
     uint32_t out = A1, decAddr = A2, finAddr = A3, remAddr = stack_arg(s, 0);
-    int n = ATRAC_SAMPLES_PER_FRAME;
-    if (out) for (int i = 0; i < n * 2; i++) MEM_W16(out + (uint32_t)i * 2, 0);  /* stereo silence */
+    int decoded = 0;
+    if (!a->decoder) return 0x80630024u;
+    while (a->primeFrames > 0) {
+        const uint8_t *frame = atrac_frame_data(a);
+        if (!frame) {
+            a->internalError = 0x80630023u;
+            return 0x80630023u;
+        }
+        int primed_samples = 0;
+        int primed = sr_atrac_decoder_decode(
+            a->decoder, frame, a->blockAlign, s_atrac_decode, 2,
+            ATRAC_SAMPLES_PER_FRAME, &primed_samples);
+        if (primed < 0) {
+            a->internalError = (uint32_t)primed;
+            return 0x80630024u;
+        }
+        atrac_consume_frame(a);
+        a->primeFrames--;
+    }
+    const uint8_t *frame = atrac_frame_data(a);
+    if (!frame) {
+        a->internalError = 0x80630023u;
+        return 0x80630023u;
+    }
+
+    int consumed = sr_atrac_decoder_decode(
+        a->decoder, frame, a->blockAlign, s_atrac_decode, 2,
+        ATRAC_SAMPLES_PER_FRAME, &decoded);
+    if (consumed < 0) {
+        a->internalError = (uint32_t)consumed;
+        if (atrac_log())
+            fprintf(stderr, "ATRAC: decode error id=%u frame=0x%x code=%d\n",
+                    A0, a->frameOffset, consumed);
+        return 0x80630024u;
+    }
+    atrac_consume_frame(a);
+
+    int skip = a->skipSamples < decoded ? a->skipSamples : decoded;
+    a->skipSamples -= skip;
+    int n = decoded - skip;
+    if (n > a->endSample - a->posSample) n = a->endSample - a->posSample;
+    if (n < 0) n = 0;
+    if (out && n > 0) {
+        uint32_t bytes = (uint32_t)n * 4u;
+        if (out > UINT32_MAX - (bytes - 1u) ||
+            !sr_inrange(out) || !sr_inrange(out + bytes - 1u))
+            return 0x800200d3u;
+        int peak = 0;
+        for (int i = 0; i < n; i++) {
+            int16_t left = s_atrac_decode[(i + skip) * 2];
+            int16_t right = s_atrac_decode[(i + skip) * 2 + 1];
+            MEM_W16(out + (uint32_t)i * 4u, (uint16_t)left);
+            MEM_W16(out + (uint32_t)i * 4u + 2u, (uint16_t)right);
+            int left_abs = left < 0 ? -(int)left : left;
+            int right_abs = right < 0 ? -(int)right : right;
+            if (left_abs > peak) peak = left_abs;
+            if (right_abs > peak) peak = right_abs;
+        }
+        if (peak >= 256 && !a->reportedAudio) {
+            a->reportedAudio = 1;
+            if (atrac_log())
+                fprintf(stderr, "ATRAC: audible id=%u peak=%d sample=%d\n",
+                        A0, peak, a->posSample);
+        }
+    }
     a->posSample += n;
     int finished = 0;
     if (a->posSample >= a->endSample) {
-        if (a->loopNum == 0) finished = 1;
-        else { a->posSample = 0; if (a->loopNum > 0) a->loopNum--; }
+        if (a->loopNum == 0 || a->loopStart < 0) {
+            finished = 1;
+            if (atrac_log()) fprintf(stderr, "ATRAC: end id=%u samples=%d\n", A0, a->endSample);
+        } else {
+            if (a->streamed) {
+                a->ringRead = a->ringWrite = a->buffered = 0;
+                a->fileReadOffset = atrac_file_offset_for_sample(a, a->loopStart);
+                a->frameOffset = 0;
+                a->lastWritable = 0;
+            }
+            uint32_t loop_result = atrac_prepare_decoder(a, a->loopStart);
+            if (loop_result) return loop_result;
+            if (a->loopNum > 0) a->loopNum--;
+            if (atrac_log())
+                fprintf(stderr, "ATRAC: loop id=%u remaining=%d\n", A0, a->loopNum);
+        }
     }
     if (decAddr) MEM_W32(decAddr, (uint32_t)n);
     if (finAddr) MEM_W32(finAddr, (uint32_t)finished);
     if (remAddr) MEM_W32(remAddr, 0xFFFFFFFFu);            /* ALLDATA_IS_ON_MEMORY */
     return 0;
 }
-static uint32_t h_AtracGetRemainFrame(CpuState *s) { if (A1) MEM_W32(A1, 0xFFFFFFFFu); return 0; }
-static uint32_t h_AtracGetStreamDataInfo(CpuState *s) {
-    /* a1=*writePointer, a2=*writableBytes, a3=*readOffset. No streaming needed: nothing writable. */
-    if (A1) MEM_W32(A1, atrac_of(A0) ? s_atrac[A0].buf : 0);
-    if (A2) MEM_W32(A2, 0); if (A3) MEM_W32(A3, 0);
+static uint32_t h_AtracGetRemainFrame(CpuState *s) {
+    Atrac *a = atrac_of(A0);
+    if (!a) return 0x80630002u;
+    uint32_t frames = a->streamed
+        ? a->buffered / (uint32_t)a->blockAlign : 0xFFFFFFFFu;
+    if (A1) MEM_W32(A1, frames);
     return 0;
 }
-static uint32_t h_AtracAddStreamData(CpuState *s) { (void)s; return 0; }
+static uint32_t h_AtracGetStreamDataInfo(CpuState *s) {
+    Atrac *a = atrac_of(A0);
+    if (!a) return 0x80630002u;
+    uint32_t writable = 0;
+    uint32_t write_pointer = a->buf;
+    uint32_t read_offset = 0;
+    if (a->streamed && a->fileReadOffset < a->fileSize) {
+        uint32_t free_bytes = a->size - a->buffered;
+        uint32_t contiguous = a->size - a->ringWrite;
+        uint32_t remaining = a->fileSize - a->fileReadOffset;
+        writable = free_bytes < contiguous ? free_bytes : contiguous;
+        if (writable > remaining) writable = remaining;
+        write_pointer = a->buf + a->ringWrite;
+        read_offset = a->fileReadOffset;
+    }
+    a->lastWritable = writable;
+    if (A1) MEM_W32(A1, write_pointer);
+    if (A2) MEM_W32(A2, writable);
+    if (A3) MEM_W32(A3, read_offset);
+    if (atrac_log() && a->streamed)
+        fprintf(stderr, "ATRAC: stream id=%u write=0x%08x bytes=%u file=%u\n",
+                A0, write_pointer, writable, read_offset);
+    return 0;
+}
+static uint32_t h_AtracAddStreamData(CpuState *s) {
+    Atrac *a = atrac_of(A0);
+    if (!a) return 0x80630002u;
+    if (!a->streamed) return 0x80630009u;
+    uint32_t bytes = A1;
+    if (bytes > a->lastWritable || bytes > a->size - a->buffered)
+        return 0x80630018u;
+    a->ringWrite = (a->ringWrite + bytes) % a->size;
+    a->buffered += bytes;
+    a->fileReadOffset += bytes;
+    a->lastWritable = 0;
+    if (atrac_log())
+        fprintf(stderr, "ATRAC: add id=%u bytes=%u buffered=%u file=%u\n",
+                A0, bytes, a->buffered, a->fileReadOffset);
+    return 0;
+}
 static uint32_t h_AtracGetNextDecodePosition(CpuState *s) {
     Atrac *a = atrac_of(A0); if (!a) return 0x80630002u;
-    if (a->posSample >= a->endSample) return 0x80630022u;   /* ALLDATA_DECODED */
+    if (a->posSample >= a->endSample) return 0x80630024u;
     if (A1) MEM_W32(A1, (uint32_t)a->posSample);
     return 0;
 }
 static uint32_t h_AtracGetSoundSample(CpuState *s) {
     Atrac *a = atrac_of(A0); if (!a) return 0x80630002u;
-    if (A1) MEM_W32(A1, (uint32_t)a->endSample);          /* end sample */
-    if (A2) MEM_W32(A2, 0xFFFFFFFFu);                     /* loop start (-1 = none) */
-    if (A3) MEM_W32(A3, 0xFFFFFFFFu);                     /* loop end */
+    if (A1) MEM_W32(A1, (uint32_t)a->endSample);
+    if (A2) MEM_W32(A2, (uint32_t)a->loopStart);
+    if (A3) MEM_W32(A3, (uint32_t)a->loopEnd);
     return 0;
 }
 static uint32_t h_AtracGetLoopStatus(CpuState *s) {
-    if (A1) MEM_W32(A1, atrac_of(A0) ? (uint32_t)s_atrac[A0].loopNum : 0);
-    if (A2) MEM_W32(A2, 0);
+    Atrac *a = atrac_of(A0);
+    if (!a) return 0x80630002u;
+    if (A1) MEM_W32(A1, (uint32_t)a->loopNum);
+    if (A2) MEM_W32(A2, a->loopStart >= 0 ? 1u : 0u);
     return 0;
 }
-static uint32_t h_AtracSetLoopNum(CpuState *s) { Atrac *a = atrac_of(A0); if (a) a->loopNum = (int)A1; return 0; }
+static uint32_t h_AtracSetLoopNum(CpuState *s) {
+    Atrac *a = atrac_of(A0);
+    if (!a) return 0x80630002u;
+    if (a->loopStart < 0 && A1 != 0) return 0x80630021u;
+    a->loopNum = (int)A1;
+    if (atrac_log()) fprintf(stderr, "ATRAC: set loop id=%u count=%d\n", A0, a->loopNum);
+    return 0;
+}
+static uint32_t h_AtracGetInternalErrorInfo(CpuState *s) {
+    Atrac *a = atrac_of(A0);
+    if (!a) return 0x80630002u;
+    if (A1 && A1 <= UINT32_MAX - 3u && sr_inrange(A1) && sr_inrange(A1 + 3u))
+        MEM_W32(A1, a->internalError);
+    return 0;
+}
 static uint32_t h_AtracGetBufferInfoForResetting(CpuState *s) {
     Atrac *a = atrac_of(A0);
     if (!a) return 0x80630002u;
@@ -698,13 +1035,51 @@ static uint32_t h_AtracGetBufferInfoForResetting(CpuState *s) {
     if (!A2 || A2 > UINT32_MAX - 31u || !sr_inrange(A2) || !sr_inrange(A2 + 31u))
         return 0x800200d3u;
 
-    /* SetDataAndGetID models an all-data-loaded buffer, so neither reset buffer needs refilling. */
     for (uint32_t off = 0; off < 32u; off += 4u) MEM_W32(A2 + off, 0);
-    MEM_W32(A2 + 0, a->buf);
-    MEM_W32(A2 + 16, a->buf);
+    if (a->streamed) {
+        uint32_t file_offset = atrac_file_offset_for_sample(a, (int)A1);
+        uint32_t writable =
+            file_offset < a->fileSize ? a->fileSize - file_offset : 0;
+        if (writable > a->size) writable = a->size;
+        uint32_t minimum = writable < (uint32_t)a->blockAlign
+            ? writable : (uint32_t)a->blockAlign;
+        MEM_W32(A2 + 0, a->buf);
+        MEM_W32(A2 + 4, writable);
+        MEM_W32(A2 + 8, minimum);
+        MEM_W32(A2 + 12, file_offset);
+        a->resetFileOffset = file_offset;
+        a->resetSample = (int)A1;
+    } else {
+        MEM_W32(A2 + 0, a->buf);
+        MEM_W32(A2 + 16, a->buf);
+    }
+    if (atrac_log())
+        fprintf(stderr, "ATRAC: reset info id=%u sample=%u file=%u writable=%u\n",
+                A0, A1, MEM_R32(A2 + 12), MEM_R32(A2 + 4));
     return 0;
 }
-static uint32_t h_AtracResetPlayPosition(CpuState *s) { Atrac *a = atrac_of(A0); if (a) a->posSample = (int)A1; return 0; }
+static uint32_t h_AtracResetPlayPosition(CpuState *s) {
+    Atrac *a = atrac_of(A0);
+    if (!a) return 0x80630002u;
+    if (A1 > (uint32_t)a->endSample) return 0x80630015u;
+    if (a->streamed) {
+        if (a->resetSample != (int)A1 || A2 > a->size ||
+            a->resetFileOffset > a->fileSize ||
+            A2 > a->fileSize - a->resetFileOffset)
+            return 0x80630016u;
+        a->ringRead = 0;
+        a->ringWrite = A2 % a->size;
+        a->buffered = A2;
+        a->fileReadOffset = a->resetFileOffset + A2;
+        a->frameOffset = 0;
+        a->lastWritable = 0;
+    }
+    uint32_t result = atrac_prepare_decoder(a, (int)A1);
+    if (atrac_log())
+        fprintf(stderr, "ATRAC: reset id=%u sample=%d result=0x%08x\n",
+                A0, a->posSample, result);
+    return result;
+}
 
 /* sceUtility dialogs (savedata/msg/osk). Faithful to PPSSPP's PSPDialog status machine
  * (Core/Dialog/PSPDialog.cpp): status enum NONE=0, INITIALIZE=1, RUNNING=2, FINISHED=3,
@@ -3233,6 +3608,7 @@ void sr_hle_init(void) {
     sr_hle_register(0xa2bba8be, "sceAtracGetSoundSample", h_AtracGetSoundSample);
     sr_hle_register(0xfaa4f89b, "sceAtracGetLoopStatus", h_AtracGetLoopStatus);
     sr_hle_register(0x868120b5, "sceAtracSetLoopNum", h_AtracSetLoopNum);
+    sr_hle_register(0xe88f759b, "sceAtracGetInternalErrorInfo", h_AtracGetInternalErrorInfo);
     sr_hle_register(0x2dd3e298, "sceAtracGetBufferInfoForResetting", h_AtracGetBufferInfoForResetting);
     sr_hle_register(0x644e5607, "sceAtracResetPlayPosition", h_AtracResetPlayPosition);
     sr_hle_register(0x707b7629, "sceMpegFlushAllStream", h_ok);

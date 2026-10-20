@@ -68,6 +68,20 @@ Where this project's code is "PPSSPP rewritten in C" (HLE kernel behaviour,
 sceGe handling, media engine glue, etc.), it is still a derivative of GPL'd
 PPSSPP code and is covered by the same license.
 
+## FFmpeg standalone ATRAC3/ATRAC3+ decoder
+
+- **Location:** `third_party/at3_standalone/`
+- **Origin:** PPSSPP v1.20.4 (`fa50bb1`), `ext/at3_standalone`, extracted from FFmpeg by PPSSPP contributors.
+- **License:** LGPL-2.1-or-later; see
+  [`third_party/at3_standalone/COPYING.LGPLv2.1`](third_party/at3_standalone/COPYING.LGPLv2.1)
+  and the copyright/license header in each source file.
+- **Local changes:** removed PPSSPP logging and allocator dependencies, retained portable aligned allocation,
+  selected SIMD from compiler architecture macros, and fixed warning-clean portability issues. The C ABI adapter
+  is `src/rt/atrac_decode.cpp`.
+
+The decoder remains separately available under the LGPL even though the complete linked runtime is distributed
+under GPL-2.0-or-later.
+
 ## Translated / ported code from PPSSPP (specifics)
 
 The following files are direct translations/ports of PPSSPP C++ into C, or are
@@ -77,6 +91,7 @@ relative to `third_party/ppsspp/`.
 | File in this project | Translated/derived from (PPSSPP) | Nature |
 | --- | --- | --- |
 | `src/rt/mpeg.c`, `mpeg` wrappers in `src/rt/hle.c` | `Core/HLE/sceMpeg.cpp` (rev 4e109dd6) | Faithful port of PSMF header analysis, ring-buffer accounting, MPEG context/handle creation, stream registration, and AU getters. Excludes the ffmpeg-based MediaEngine sample decode. |
+| `src/rt/atrac_decode.cpp`, Atrac wrappers in `src/rt/hle.c` | `Core/HW/Atrac3Standalone.cpp`, `Core/Util/AtracTrack.cpp`, `Core/HLE/AtracCtx.cpp` | C ABI and PSP RIFF/buffer/loop integration around the separately attributed LGPL standalone decoder above. |
 | `src/rt/pgf.c`, `src/rt/pgf.h` | `Core/Font/PGF.cpp` | C port of the PGF font reader: PGF parse, `PGFFontInfo`/`PGFCharInfo`/`GlyphImage` layouts, glyph rasterisation. |
 | `src/rt/vfpu_interp.c`; VFPU prefix + transcendental helpers behind `src/rt/recomp.h`/`recomp.c` | `Core/MIPS/MIPS.cpp` and PPSSPP's VFPU kernels | Exact ports of the table-based VFPU transcendentals and the `vcst` constant table; source/destination prefix application ported from PPSSPP. |
 | `src/rt/ge.c` (software GE rasterizer) | `GPU/Software/*` (`Clipper`, `TransformUnit`, `Sampler.cpp`, `Lighting.cpp`, `DrawPixel.cpp`, `SoftGpu.cpp`), `GPU/Common/VertexDecoder*`, `GPU/ge_constants.h` / `GECommands.h`, `GPU/Common/TextureCacheCommon` | Algorithm-for-algorithm reimplementation of PPSSPP's software renderer: vertex decode, T&L, near-clipping, primitive acceptance, culling-by-submission-order, sampler/CLUT offsets, depth/fog semantics, command decode. |
