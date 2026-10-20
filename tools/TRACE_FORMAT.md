@@ -52,3 +52,9 @@ before the first step:
 
 The runtime restores both counters before executing guest code. This keeps kernel handles
 and `sceGeListEnQueue` IDs aligned even when a skipped bootloader consumed objects first.
+
+`tracediff.py` reads step lines incrementally, so trace size does not determine memory use.
+Scheduler comparisons may pass repeatable `--ignore-pc-range` values for native kernel or
+bootloader execution that the recompiled runtime replaces, plus `--ignore-syscall-writes`
+for PPSSPP syscall lines that cross thread contexts. Every retained guest instruction,
+opcode, register delta, and memory delta is still compared in order.

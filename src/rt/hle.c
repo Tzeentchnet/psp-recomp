@@ -9,9 +9,8 @@
  * PPSSPP's BlockAllocator (kmem.c), so partition blocks, FPLs and thread stacks land at the
  * addresses PPSSPP gives for the same call sequence.
  *
- * After each handler, the caller-saved temp registers are poisoned to 0xDEADBEEF exactly as
- * PPSSPP's SetDeadbeefRegs does, so traces stay aligned on the registers the game actually
- * keeps (it never relies on caller-saved registers surviving a call).
+ * After handlers, caller-saved temps are poisoned to 0xDEADBEEF like PPSSPP's
+ * SetDeadbeefRegs. Calls that reschedule use PPSSPP's hleSkipDeadbeef behavior.
  */
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -144,6 +143,7 @@ void sr_boot_uid_delay_checkpoint(void) {
 /* ---- handlers ---- */
 
 uint32_t g_sdk_version = 0;   /* read by gelist.c (SDK-dependent GE behaviour) */
+static int s_skip_deadbeef;
 
 static uint32_t h_GetCompiledSdkVersion(CpuState *s) { (void)s; return g_sdk_version; }
 static uint32_t h_SetCompiledSdkVersion(CpuState *s) { g_sdk_version = A0; return 0; }
@@ -218,6 +218,7 @@ static uint32_t h_DeleteThread(CpuState *s) { return (uint32_t)sched_delete_thre
 static uint32_t h_DelayThread(CpuState *s) {
     sr_boot_uid_delay_checkpoint();
     sched_delay_current(A0);
+    s_skip_deadbeef = 1;
     return 0;
 }
 static uint32_t h_ChangeThreadPriority(CpuState *s) { sched_set_priority(A0, (int)A1); return 0; }
@@ -1292,7 +1293,20 @@ static uint64_t rtc_base_us(void) {
     return base;
 }
 static uint32_t h_RtcGetCurrentTick(CpuState *s) {
-    uint64_t t = rtc_base_us() + now_usec();
+    uint64_t t;
+    const char *fixed = getenv("SR_RTC_FIXED_TICK");
+    if (fixed && fixed[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(fixed, &end, 0);
+        if (errno || end == fixed || *end != '\0') {
+            fprintf(stderr, "SR_RTC_FIXED_TICK is invalid: %s\n", fixed);
+            abort();
+        }
+        t = (uint64_t)parsed;
+    } else {
+        t = rtc_base_us() + now_usec();
+    }
     if (A0) { MEM_W32(A0, (uint32_t)t); MEM_W32(A0 + 4, (uint32_t)(t >> 32)); }
     return 0;
 }
@@ -3849,12 +3863,15 @@ void sr_syscall(CpuState *s, uint32_t nid) {
         if (j == g_ncc && g_ncc < 512) { g_cc[j].nid = nid; g_cc[j].nm = e->name; g_cc[j].n = 0; g_ncc++; }
         if (j < 512) g_cc[j].n++;
     }
+    s_skip_deadbeef = 0;
     uint32_t ret = e->fn(s);
     /* Poison caller-saved temps exactly like PPSSPP SetDeadbeefRegs: r1, r4-r15, r24, r25,
      * hi, lo. The return value in v0 (and v1) is written afterward and survives. */
-    s->r[1] = 0xDEADBEEFu;
-    for (int i = 4; i <= 15; i++) s->r[i] = 0xDEADBEEFu;
-    s->r[24] = 0xDEADBEEFu; s->r[25] = 0xDEADBEEFu;
-    s->hi = 0xDEADBEEFu; s->lo = 0xDEADBEEFu;
+    if (!s_skip_deadbeef) {
+        s->r[1] = 0xDEADBEEFu;
+        for (int i = 4; i <= 15; i++) s->r[i] = 0xDEADBEEFu;
+        s->r[24] = 0xDEADBEEFu; s->r[25] = 0xDEADBEEFu;
+        s->hi = 0xDEADBEEFu; s->lo = 0xDEADBEEFu;
+    }
     s->r[2] = ret;
 }

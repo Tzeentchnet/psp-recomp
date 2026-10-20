@@ -213,7 +213,12 @@ have_image:;
     sr_register_all();
     /* "none" as the out path disables tracing -- much faster for HLE bring-up, where the goal
      * is to reach the next unimplemented import rather than diff a trace. */
-    if (strcmp(out, "none") != 0 && sr_trace_open(out, "cgtest", entry) != 0) {
+    uint32_t trace_start = entry;
+    for (int i = 1; i < argc; i++)
+        if (strncmp(argv[i], "--trace-start=", 14) == 0)
+            trace_start = (uint32_t)strtoul(argv[i] + 14, NULL, 16);
+    if (strcmp(out, "none") != 0 &&
+        sr_trace_open(out, "cgtest", trace_start) != 0) {
         fprintf(stderr, "cannot open out trace %s\n", out);
         return 2;
     }

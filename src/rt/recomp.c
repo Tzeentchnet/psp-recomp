@@ -467,6 +467,11 @@ void sr_unimplemented(uint32_t pc, const char *reason) {
 static FILE *s_fp = NULL;
 static uint32_t s_r[32], s_fi[32], s_vi[128], s_hi, s_lo, s_fcr31, s_pc, s_op;
 static unsigned long long s_step = 0;
+static unsigned long long s_trace_limit = 0;
+static uint32_t s_trace_start_pc = 0;
+static int s_trace_active = 0;
+static int s_trace_step_active = 0;
+static char s_trace_path[1024];
 
 int sr_trace_open(const char *path, const char *target, uint32_t start_pc) {
     s_fp = fopen(path, "wb");
@@ -474,6 +479,35 @@ int sr_trace_open(const char *path, const char *target, uint32_t start_pc) {
     fprintf(s_fp, "# psp-recomp trace v1 oracle=recomp target=%s start_pc=0x%08x\n",
             target ? target : "unknown", start_pc);
     s_step = 0;
+    s_trace_start_pc = start_pc;
+    s_trace_active = 0;
+    s_trace_step_active = 0;
+    s_trace_limit = 0;
+    int n = snprintf(s_trace_path, sizeof(s_trace_path), "%s", path);
+    if (n < 0 || (size_t)n >= sizeof(s_trace_path)) {
+        fprintf(stderr, "sr_trace_open: path is too long\n");
+        sr_trace_close();
+        return -1;
+    }
+    const char *limit_setting = getenv("SR_TRACE_STEPS");
+    if (limit_setting && limit_setting[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(limit_setting, &end, 10);
+        if (errno || end == limit_setting || *end != '\0' ||
+            parsed == 0 || parsed > 50000000ULL) {
+            fprintf(
+                stderr,
+                "SR_TRACE_STEPS must be an integer from 1 to 50000000, got '%s'\n",
+                limit_setting);
+            sr_trace_close();
+            return -1;
+        }
+        s_trace_limit = parsed;
+        char done_path[sizeof(s_trace_path) + 6];
+        snprintf(done_path, sizeof(done_path), "%s.done", s_trace_path);
+        remove(done_path);
+    }
     return 0;
 }
 
@@ -505,7 +539,14 @@ void sr_begin(const CpuState *s, uint32_t pc, uint32_t op) {
         } else if (v != last_val) last_val = v;
         last_pc = pc;
     }
+    s_trace_step_active = 0;
     if (!s_fp) return;
+    if (!s_trace_active) {
+        if (pc != s_trace_start_pc) return;
+        s_trace_active = 1;
+        fprintf(stderr, "trace: started at 0x%08x\n", pc);
+    }
+    s_trace_step_active = 1;
     memcpy(s_r, s->r, sizeof(s_r));
     memcpy(s_fi, s->fi, sizeof(s_fi));
     memcpy(s_vi, s->vi, sizeof(s_vi));
@@ -514,7 +555,8 @@ void sr_begin(const CpuState *s, uint32_t pc, uint32_t op) {
 }
 
 void sr_end(const CpuState *s, uint32_t mem_addr, int mem_size) {
-    if (!s_fp) return;
+    if (!s_fp || !s_trace_step_active) return;
+    s_trace_step_active = 0;
     char line[4096];
     int n = snprintf(line, sizeof(line), "%llu pc=0x%08x op=0x%08x", s_step, s_pc, s_op);
     for (int i = 1; i < 32; i++)
@@ -538,6 +580,21 @@ void sr_end(const CpuState *s, uint32_t mem_addr, int mem_size) {
     line[n] = '\n';
     fwrite(line, 1, n + 1, s_fp);
     s_step++;
+    if (s_trace_limit && s_step == s_trace_limit) {
+        char done_path[sizeof(s_trace_path) + 6];
+        snprintf(done_path, sizeof(done_path), "%s.done", s_trace_path);
+        sr_trace_close();
+        FILE *done = fopen(done_path, "wb");
+        if (!done ||
+            fprintf(done, "%llu\n", s_trace_limit) < 0 ||
+            fclose(done) != 0) {
+            fprintf(stderr, "trace: cannot write completion marker %s\n", done_path);
+            abort();
+        }
+        fprintf(stderr, "trace: completed %llu steps\n", s_trace_limit);
+        fflush(stderr);
+        _Exit(0);
+    }
     /* Safety: a correct run stops at the HLE boundary. An unbounded trace means the
      * generated code is looping (a codegen bug) -- fail loudly instead of filling the disk. */
     if (s_step > 50000000ULL) {
