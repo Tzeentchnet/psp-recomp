@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "device.h"
+#include "vertex.h"
 extern "C" {
 #include "../recomp.h"
 }
@@ -94,6 +95,12 @@ static uint8_t *s_upload_map;
 static uint32_t s_buttons;
 static uint8_t s_lx = 128, s_ly = 128;
 static int s_pad_present;
+static int s_vertex_log;
+static UINT64 s_vertex_frames;
+static UINT64 s_vertex_total;
+static UINT64 s_vertex_batches;
+static UINT64 s_vertex_primitives[GE_D3D12_PRIMITIVE_COUNT];
+static UINT s_vertex_max;
 
 static int env_enabled(const char *name) {
     const char *value = getenv(name);
@@ -133,6 +140,7 @@ static int wait_queue_idle(ID3D12CommandQueue *queue, ID3D12Fence *fence,
 }
 
 static void release_device(void) {
+    ged3d12_vertex_capture_shutdown();
     if (s_swapchain) s_swapchain->SetFullscreenState(FALSE, nullptr);
     wait_queue_idle(s_graphics_queue, s_graphics_fence, &s_next_graphics_fence,
                     s_graphics_event, "wait for graphics queue");
@@ -639,6 +647,16 @@ static int device_init(void) {
         release_device();
         return 0;
     }
+    if (!ged3d12_vertex_capture_init()) {
+        release_device();
+        return 0;
+    }
+    s_vertex_log = env_enabled("SR_D3D12_VERTEX_LOG");
+    s_vertex_frames = 0;
+    s_vertex_total = 0;
+    s_vertex_batches = 0;
+    s_vertex_max = 0;
+    memset(s_vertex_primitives, 0, sizeof(s_vertex_primitives));
 
     D3D_FEATURE_LEVEL requested_levels[] = {
 #ifdef D3D_FEATURE_LEVEL_12_2
@@ -929,6 +947,23 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     UINT frame_index;
     if (!begin_frame(&frame_index)) return -2;
 
+    GeD3D12VertexFrame vertices = {};
+    if (!ged3d12_vertex_upload_pending(&vertices)) return -2;
+    s_vertex_frames++;
+    s_vertex_total += vertices.vertex_count;
+    s_vertex_batches += vertices.batch_count;
+    if (vertices.vertex_count > s_vertex_max) s_vertex_max = vertices.vertex_count;
+    for (UINT i = 0; i < GE_D3D12_PRIMITIVE_COUNT; i++)
+        s_vertex_primitives[i] += vertices.primitive_count[i];
+    if (s_vertex_log && (s_vertex_frames <= 3 || s_vertex_frames % 120 == 0)) {
+        fprintf(stderr,
+                "ged3d12: vertex present=%llu vertices=%u batches=%u hash=%016llx "
+                "max=%u\n",
+                (unsigned long long)s_vertex_frames,
+                vertices.vertex_count, vertices.batch_count,
+                (unsigned long long)vertices.hash, s_vertex_max);
+    }
+
     const UINT row_pitch = (PSP_W * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
                            ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     const UINT64 upload_size = (UINT64)row_pitch * PSP_H;
@@ -984,13 +1019,28 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
 }
 
 static void device_shutdown(void) {
+    if (s_vertex_log) {
+        fprintf(stderr,
+                "ged3d12: vertex capture presents=%llu vertices=%llu batches=%llu "
+                "max=%u tri=%llu sprite=%llu line=%llu point=%llu\n",
+                (unsigned long long)s_vertex_frames,
+                (unsigned long long)s_vertex_total,
+                (unsigned long long)s_vertex_batches,
+                s_vertex_max,
+                (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_TRIANGLE],
+                (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_SPRITE],
+                (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_LINE],
+                (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_POINT]);
+    }
     release_device();
     ged3d12_window_shutdown();
 }
 
 static const GeBackend k_backend = {
     "d3d12", device_init, device_present, device_shutdown,
-    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    ged3d12_vertex_capture_tri, ged3d12_vertex_capture_sprite,
+    ged3d12_vertex_capture_line, ged3d12_vertex_capture_point,
+    nullptr, nullptr, nullptr,
 };
 
 extern "C" const GeBackend *ged3d12_backend(void) { return &k_backend; }

@@ -11,6 +11,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     uint32_t base, offset;    /* GE_BASE raw data and GE_OFFSETADDR << 8 */
     uint32_t fbp, fbw, fbfmt; /* framebuffer ptr/stride/format (0=5650,1=5551,2=4444,3=8888) */
@@ -127,5 +131,9 @@ uint32_t  ge_zbuf_stride(void);
  * sampler path the software rasterizer uses (swizzle + CLUT + format). out must hold
  * tex_w*tex_h words; layout is row-major, r|g<<8|b<<16|a<<24. */
 void      ge_decode_tex_rgba(uint32_t *out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* GE_SHARED_H */
