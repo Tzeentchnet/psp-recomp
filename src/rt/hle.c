@@ -18,6 +18,7 @@
 #include "recomp.h"
 #include "iso.h"
 #include "pgf.h"
+#include "sas_reverb.h"
 #include "nid_names.h"   /* sr_nid_name(): names unknown NIDs in the trap below */
 
 #include <stdio.h>
@@ -2431,28 +2432,213 @@ static uint32_t hcount_intra(void) {
 static uint32_t h_DisplayGetCurrentHcount(CpuState *s) { (void)s; return hcount_intra(); }
 static uint32_t h_DisplayGetAccumulatedHcount(CpuState *s) { (void)s; return s_vcount * 286u + hcount_intra(); }
 
-/* ---- sceSasCore: real voice mixing (VAG ADPCM), pitch resampling, per-voice volumes ----
- * Mixes into the guest buffer that the game then submits via sceAudioOutput*Blocking (which
- * forwards to the host waveOut backend in audio.c). The envelope is simplified to a gate:
- * KeyOn plays the VAG stream at SetVolume level until its end block or KeyOff -- ACX drives
- * SFX with SetSimpleADSR where attack/release are short next to the 256-sample grain. */
+/* ---- sceSasCore: VAG/noise voices, ADSR, effect sends and preset reverb ---- */
 #define SAS_VOICES 32
+#define SAS_GRAIN_MAX 1024
+#define SAS_ENVELOPE_MAX 0x40000000LL
+
+#define SCE_SAS_ERROR_INVALID_VOICE           0x80420010u
+#define SCE_SAS_ERROR_INVALID_NOISE_FREQ      0x80420011u
+#define SCE_SAS_ERROR_INVALID_PITCH           0x80420012u
+#define SCE_SAS_ERROR_INVALID_ADSR_CURVE_MODE 0x80420013u
+#define SCE_SAS_ERROR_VOICE_PAUSED            0x80420016u
+#define SCE_SAS_ERROR_INVALID_VOLUME          0x80420018u
+#define SCE_SAS_ERROR_INVALID_ADSR_RATE       0x80420019u
+#define SCE_SAS_ERROR_REV_INVALID_TYPE        0x80420020u
+#define SCE_SAS_ERROR_REV_INVALID_FEEDBACK    0x80420021u
+#define SCE_SAS_ERROR_REV_INVALID_DELAY       0x80420022u
+#define SCE_SAS_ERROR_REV_INVALID_VOLUME      0x80420023u
+
+enum {
+    SAS_VOICE_OFF,
+    SAS_VOICE_VAG,
+    SAS_VOICE_NOISE,
+};
+
+enum {
+    SAS_ENV_KEYON_STEP = -42,
+    SAS_ENV_KEYON = -2,
+    SAS_ENV_OFF = -1,
+    SAS_ENV_ATTACK,
+    SAS_ENV_DECAY,
+    SAS_ENV_SUSTAIN,
+    SAS_ENV_RELEASE,
+};
+
 typedef struct {
-    int on;                       /* keyed on and stream not exhausted */
+    int attack_rate, decay_rate, sustain_rate, release_rate;
+    int attack_type, decay_type, sustain_type, release_type;
+    int sustain_level;
+    int state;
+    int64_t height;
+} SasEnvelope;
+
+typedef struct {
+    int playing, keyed, paused, type;
     uint32_t vag, vag_size;       /* VAG stream base and byte size */
     uint32_t pos;                 /* byte offset of the next 16-byte block */
     int loop_start;               /* block offset to loop to (-1 = none) */
     int hist1, hist2;             /* ADPCM filter state */
     int pitch;                    /* 0x1000 = native 44.1 kHz */
-    int voll, volr;               /* 0..0x1000 */
+    int voll, volr, effl, effr;   /* signed dry/effect volumes, -0x1000..0x1000 */
     int16_t buf[28]; int bufn, bufi;
     uint32_t frac;                /* 12-bit fixed-point resample remainder */
+    int noise_freq, noise_count;
+    uint16_t noise_lfsr;
+    int16_t noise_sample;
+    SasEnvelope envelope;
 } SasVoice;
+
+typedef struct {
+    int type, delay, feedback;
+    int voll, volr;
+    int dry, wet;
+} SasEffect;
+
 static SasVoice s_sasv[SAS_VOICES];
 static int s_sas_grain = 256;
+static SasEffect s_sas_effect;
+static SrSasReverb s_sas_reverb;
+static int32_t s_sas_mixl[SAS_GRAIN_MAX], s_sas_mixr[SAS_GRAIN_MAX];
+static int32_t s_sas_sendl[SAS_GRAIN_MAX], s_sas_sendr[SAS_GRAIN_MAX];
+static int16_t s_sas_reverb_in[SAS_GRAIN_MAX];
+static int16_t s_sas_reverb_out[SAS_GRAIN_MAX * 2];
 
 static const int vag_f0[5] = { 0, 60, 115,  98, 122 };
 static const int vag_f1[5] = { 0,  0, -52, -55, -60 };
+
+static int sas_voice_valid(uint32_t voice) {
+    return (int32_t)voice >= 0 && voice < SAS_VOICES;
+}
+
+static void sas_envelope_init(SasEnvelope *env) {
+    memset(env, 0, sizeof(*env));
+    env->attack_type = 0;
+    env->decay_type = 1;
+    env->sustain_type = 1;
+    env->release_type = 1;
+    env->state = SAS_ENV_OFF;
+}
+
+static void sas_envelope_set_state(SasEnvelope *env, int state) {
+    if (env->height > SAS_ENVELOPE_MAX) env->height = SAS_ENVELOPE_MAX;
+    env->state = state;
+}
+
+static void sas_envelope_walk(SasEnvelope *env, int type, int rate) {
+    int64_t delta;
+    switch (type) {
+    case 0:
+        env->height += rate;
+        break;
+    case 1:
+        env->height -= rate;
+        break;
+    case 2:
+        env->height += env->height <= SAS_ENVELOPE_MAX * 3 / 4 ? rate : rate / 4;
+        break;
+    case 3:
+        delta = env->height - SAS_ENVELOPE_MAX;
+        delta += (-delta * rate) >> 32;
+        env->height = delta + SAS_ENVELOPE_MAX - ((uint32_t)rate + 3u) / 4u;
+        break;
+    case 4:
+        delta = env->height - SAS_ENVELOPE_MAX;
+        delta += (-delta * rate) >> 32;
+        env->height = delta + 0x4000 + SAS_ENVELOPE_MAX;
+        break;
+    case 5:
+        env->height = rate;
+        break;
+    }
+}
+
+static void sas_envelope_step(SasEnvelope *env) {
+    switch (env->state) {
+    case SAS_ENV_ATTACK:
+        sas_envelope_walk(env, env->attack_type, env->attack_rate);
+        if (env->height >= SAS_ENVELOPE_MAX || env->height < 0)
+            sas_envelope_set_state(env, SAS_ENV_DECAY);
+        break;
+    case SAS_ENV_DECAY:
+        sas_envelope_walk(env, env->decay_type, env->decay_rate);
+        if (env->height < env->sustain_level)
+            sas_envelope_set_state(env, SAS_ENV_SUSTAIN);
+        break;
+    case SAS_ENV_SUSTAIN:
+        sas_envelope_walk(env, env->sustain_type, env->sustain_rate);
+        if (env->height <= 0) {
+            env->height = 0;
+            sas_envelope_set_state(env, SAS_ENV_RELEASE);
+        }
+        break;
+    case SAS_ENV_RELEASE:
+        sas_envelope_walk(env, env->release_type, env->release_rate);
+        if (env->height <= 0) {
+            env->height = 0;
+            sas_envelope_set_state(env, SAS_ENV_OFF);
+        }
+        break;
+    case SAS_ENV_KEYON:
+        env->height = 0;
+        sas_envelope_set_state(env, SAS_ENV_KEYON_STEP);
+        break;
+    case SAS_ENV_KEYON_STEP:
+        env->height++;
+        if (env->height >= 31) {
+            env->height = 0;
+            sas_envelope_set_state(env, SAS_ENV_ATTACK);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static uint32_t sas_envelope_height(const SasEnvelope *env) {
+    int64_t height = env->height;
+    if (height > SAS_ENVELOPE_MAX) height = SAS_ENVELOPE_MAX;
+    return (uint32_t)height;
+}
+
+static int sas_simple_rate(uint32_t value) {
+    uint32_t n = value & 0x7Fu;
+    if (n == 0x7F) return 0;
+    uint32_t rate = ((7u - (n & 3u)) << 26) >> (n >> 2);
+    return rate ? (int)rate : 1;
+}
+
+static int sas_exponent_rate(uint32_t value) {
+    uint32_t n = value & 0x7Fu;
+    if (n == 0x7F) return 0;
+    uint32_t rate = ((7u - (n & 3u)) << 24) >> (n >> 2);
+    return rate ? (int)rate : 1;
+}
+
+static void sas_envelope_set_simple(SasEnvelope *env, uint32_t env1, uint32_t env2) {
+    uint32_t decay = (env1 >> 4) & 0xFu;
+    uint32_t sustain_type = (env2 >> 14) & 3u;
+    uint32_t release = env2 & 0x1Fu;
+
+    env->attack_rate = sas_simple_rate(env1 >> 8);
+    env->attack_type = env1 & 0x8000u ? 2 : 0;
+    env->decay_rate = decay ? (int)(0x80000000u >> decay) : 0x7FFFFFFF;
+    env->decay_type = 3;
+    env->sustain_rate = sustain_type == 3
+        ? sas_exponent_rate(env2 >> 6)
+        : sas_simple_rate(env2 >> 6);
+    env->sustain_type = (int)sustain_type;
+    if (release == 31) {
+        env->release_rate = 0;
+    } else if (!(env2 & 0x20u)) {
+        env->release_rate = release == 30 ? 0x40000000 :
+            release == 29 ? 1 : (int)(0x10000000u >> release);
+    } else {
+        env->release_rate = release ? (int)(0x80000000u >> release) : 0x7FFFFFFF;
+    }
+    env->release_type = env2 & 0x20u ? 3 : 1;
+    env->sustain_level = (int)(((env1 & 0xFu) + 1u) << 26);
+}
 
 /* Decode the next 16-byte VAG block into v->buf. Returns 0 when the stream ends. */
 static int sas_vag_block(SasVoice *v) {
@@ -2468,7 +2654,8 @@ static int sas_vag_block(SasVoice *v) {
         int nib = (i & 1) ? (byte >> 4) : (byte & 0xF);
         int samp = (int)((int16_t)((uint16_t)nib << 12)) >> shift;
         samp += (v->hist1 * vag_f0[pred] + v->hist2 * vag_f1[pred]) >> 6;
-        if (samp > 32767) samp = 32767; if (samp < -32768) samp = -32768;
+        if (samp > 32767) samp = 32767;
+        if (samp < -32768) samp = -32768;
         v->buf[i] = (int16_t)samp;
         v->hist2 = v->hist1; v->hist1 = samp;
     }
@@ -2478,32 +2665,102 @@ static int sas_vag_block(SasVoice *v) {
     return 1;
 }
 
-/* Mix one grain into out (s16 interleaved stereo in guest memory). add=0 overwrites. */
-static void sas_mix(uint32_t out, int add) {
+static int sas_noise_sample(SasVoice *v) {
+    int period = 0x1000 >> (v->noise_freq >> 2);
+    if (period < 1) period = 1;
+    if (++v->noise_count >= period) {
+        uint16_t feedback = (uint16_t)((v->noise_lfsr ^ (v->noise_lfsr >> 1)) & 1u);
+        v->noise_lfsr = (uint16_t)((v->noise_lfsr >> 1) | (feedback << 14));
+        v->noise_sample = (int16_t)(v->noise_lfsr << 1);
+        v->noise_count = 0;
+    }
+    return v->noise_sample;
+}
+
+static int sas_voice_sample(SasVoice *v, int *ended) {
+    if (v->type == SAS_VOICE_NOISE) return sas_noise_sample(v);
+    if (v->type != SAS_VOICE_VAG) return 0;
+    if (v->bufi >= v->bufn && !sas_vag_block(v)) {
+        *ended = 1;
+        return 0;
+    }
+    return v->buf[v->bufi];
+}
+
+/* Mix one grain into out (s16 interleaved stereo in guest memory). */
+static void sas_mix(uint32_t out, int add, int input_voll, int input_volr) {
     if (!out) return;
-    int32_t mixl[1024], mixr[1024];
-    int n = s_sas_grain > 1024 ? 1024 : s_sas_grain;
-    for (int i = 0; i < n; i++) { mixl[i] = 0; mixr[i] = 0; }
+    int n = s_sas_grain > SAS_GRAIN_MAX ? SAS_GRAIN_MAX : s_sas_grain;
+    for (int i = 0; i < n; i++) {
+        s_sas_mixl[i] = s_sas_mixr[i] = 0;
+        s_sas_sendl[i] = s_sas_sendr[i] = 0;
+    }
     for (int vi = 0; vi < SAS_VOICES; vi++) {
         SasVoice *v = &s_sasv[vi];
-        if (!v->on) continue;
+        if (!v->playing || v->paused) continue;
         for (int i = 0; i < n; i++) {
-            if (v->bufi >= v->bufn && !sas_vag_block(v)) { v->on = 0; break; }
-            int samp = v->buf[v->bufi];
-            mixl[i] += (samp * v->voll) >> 12;
-            mixr[i] += (samp * v->volr) >> 12;
+            if (v->envelope.state == SAS_ENV_KEYON ||
+                v->envelope.state == SAS_ENV_KEYON_STEP) {
+                sas_envelope_step(&v->envelope);
+                continue;
+            }
+
+            int ended = 0;
+            int sample = sas_voice_sample(v, &ended);
+            if (ended) {
+                v->playing = v->keyed = 0;
+                v->envelope.height = 0;
+                v->envelope.state = SAS_ENV_OFF;
+                break;
+            }
+            int envelope = (int)((sas_envelope_height(&v->envelope) + (1u << 14)) >> 15);
+            sas_envelope_step(&v->envelope);
+            sample = (int)(((int64_t)sample * envelope + (1 << 14)) >> 15);
+            s_sas_mixl[i] += sample * v->voll >> 12;
+            s_sas_mixr[i] += sample * v->volr >> 12;
+            s_sas_sendl[i] += sample * v->effl >> 12;
+            s_sas_sendr[i] += sample * v->effr >> 12;
+
             v->frac += (uint32_t)(v->pitch > 0 ? v->pitch : 0x1000);
             while (v->frac >= 0x1000) { v->frac -= 0x1000; v->bufi++; }
+            if (v->envelope.state == SAS_ENV_OFF) {
+                v->playing = v->keyed = 0;
+                break;
+            }
         }
     }
-    for (int i = 0; i < n; i++) {
-        int l = mixl[i], r = mixr[i];
-        if (add) {
-            l += (int16_t)MEM_R16(out + (uint32_t)i * 4);
-            r += (int16_t)MEM_R16(out + (uint32_t)i * 4 + 2);
+
+    if (s_sas_effect.wet) {
+        int frames = (n + 1) / 2;
+        for (int i = 0; i < frames; i++) {
+            int sample = i * 2 < n ? i * 2 : n - 1;
+            s_sas_reverb_in[i * 2] = (int16_t)(
+                s_sas_sendl[sample] < -32768 ? -32768 :
+                s_sas_sendl[sample] > 32767 ? 32767 : s_sas_sendl[sample]);
+            s_sas_reverb_in[i * 2 + 1] = (int16_t)(
+                s_sas_sendr[sample] < -32768 ? -32768 :
+                s_sas_sendr[sample] > 32767 ? 32767 : s_sas_sendr[sample]);
         }
-        if (l > 32767) l = 32767; if (l < -32768) l = -32768;
-        if (r > 32767) r = 32767; if (r < -32768) r = -32768;
+        sr_sas_reverb_process(
+            &s_sas_reverb, s_sas_reverb_out, s_sas_reverb_in, (size_t)frames,
+            s_sas_effect.voll << 3, s_sas_effect.volr << 3);
+    }
+
+    for (int i = 0; i < n; i++) {
+        int l = s_sas_effect.dry ? s_sas_mixl[i] : 0;
+        int r = s_sas_effect.dry ? s_sas_mixr[i] : 0;
+        if (s_sas_effect.wet) {
+            l += s_sas_reverb_out[i * 2];
+            r += s_sas_reverb_out[i * 2 + 1];
+        }
+        if (add) {
+            l += (int16_t)MEM_R16(out + (uint32_t)i * 4) * input_voll >> 12;
+            r += (int16_t)MEM_R16(out + (uint32_t)i * 4 + 2) * input_volr >> 12;
+        }
+        if (l > 32767) l = 32767;
+        if (l < -32768) l = -32768;
+        if (r > 32767) r = 32767;
+        if (r < -32768) r = -32768;
         MEM_W16(out + (uint32_t)i * 4,     (uint16_t)(int16_t)l);
         MEM_W16(out + (uint32_t)i * 4 + 2, (uint16_t)(int16_t)r);
     }
@@ -2511,43 +2768,189 @@ static void sas_mix(uint32_t out, int add) {
 
 static uint32_t h_SasInit(CpuState *s) {
     /* __sceSasInit(core, grain, maxVoices, outMode, sampleRate) */
-    s_sas_grain = (int)A1 > 0 && (int)A1 <= 1024 ? (int)A1 : 256;
+    s_sas_grain = (int)A1 > 0 && (int)A1 <= SAS_GRAIN_MAX ? (int)A1 : 256;
     memset(s_sasv, 0, sizeof(s_sasv));
-    for (int i = 0; i < SAS_VOICES; i++) { s_sasv[i].pitch = 0x1000; s_sasv[i].loop_start = -1; }
+    for (int i = 0; i < SAS_VOICES; i++) {
+        SasVoice *v = &s_sasv[i];
+        v->pitch = 0x1000;
+        v->voll = v->volr = v->effl = v->effr = 0x1000;
+        v->loop_start = -1;
+        v->noise_lfsr = (uint16_t)(0x4001u + (uint16_t)i * 0x101u);
+        sas_envelope_init(&v->envelope);
+    }
+    memset(&s_sas_effect, 0, sizeof(s_sas_effect));
+    s_sas_effect.type = -1;
+    s_sas_effect.dry = 1;
+    sr_sas_reverb_init(&s_sas_reverb);
     return 0;
 }
 static uint32_t h_SasSetVoice(CpuState *s) {
     /* __sceSasSetVoice(core, voice, vagAddr, size, loopmode) */
-    SasVoice *v = &s_sasv[A1 & 31u];
+    if (!sas_voice_valid(A1)) return SCE_SAS_ERROR_INVALID_VOICE;
+    SasVoice *v = &s_sasv[A1];
+    v->type = SAS_VOICE_VAG;
     v->vag = A2; v->vag_size = A3;
     v->pos = 0; v->loop_start = stack_arg(s, 0) ? 0 : -1;
     v->hist1 = v->hist2 = 0; v->bufn = v->bufi = 0; v->frac = 0;
     return 0;
 }
-static uint32_t h_SasSetPitch(CpuState *s) { s_sasv[A1 & 31u].pitch = (int)A2; return 0; }
+static uint32_t h_SasSetPitch(CpuState *s) {
+    if (!sas_voice_valid(A1)) return SCE_SAS_ERROR_INVALID_VOICE;
+    if (A2 > 0x4000u) return SCE_SAS_ERROR_INVALID_PITCH;
+    s_sasv[A1].pitch = (int)A2;
+    return 0;
+}
 static uint32_t h_SasSetVolume(CpuState *s) {
     /* __sceSasSetVolume(core, voice, l, r, effectL, effectR); volumes 0..0x1000 */
-    SasVoice *v = &s_sasv[A1 & 31u];
-    v->voll = (int)A2 & 0x1FFF; v->volr = (int)A3 & 0x1FFF;
+    if (!sas_voice_valid(A1)) return SCE_SAS_ERROR_INVALID_VOICE;
+    int64_t voll = (int32_t)A2;
+    int64_t volr = (int32_t)A3;
+    int64_t effl = (int32_t)stack_arg(s, 0);
+    int64_t effr = (int32_t)stack_arg(s, 1);
+    if (voll < -0x1000 || voll > 0x1000 ||
+        volr < -0x1000 || volr > 0x1000 ||
+        effl < -0x1000 || effl > 0x1000 ||
+        effr < -0x1000 || effr > 0x1000)
+        return SCE_SAS_ERROR_INVALID_VOLUME;
+    SasVoice *v = &s_sasv[A1];
+    v->voll = (int)voll;
+    v->volr = (int)volr;
+    v->effl = (int)effl;
+    v->effr = (int)effr;
     return 0;
 }
 static uint32_t h_SasGetEndFlag(CpuState *s) {
     (void)s;
     uint32_t m = 0;
-    for (int i = 0; i < SAS_VOICES; i++) if (!s_sasv[i].on) m |= 1u << i;
+    for (int i = 0; i < SAS_VOICES; i++) if (!s_sasv[i].playing) m |= 1u << i;
     return m;
 }
 static uint32_t h_SasSetKeyOn(CpuState *s) {
-    SasVoice *v = &s_sasv[A1 & 31u];
+    if (!sas_voice_valid(A1)) return SCE_SAS_ERROR_INVALID_VOICE;
+    SasVoice *v = &s_sasv[A1];
+    if (v->paused || v->keyed) return SCE_SAS_ERROR_VOICE_PAUSED;
     v->pos = 0; v->hist1 = v->hist2 = 0; v->bufn = v->bufi = 0; v->frac = 0;
-    if (!v->voll && !v->volr) { v->voll = 0x1000; v->volr = 0x1000; }  /* keyed before SetVolume */
-    v->on = v->vag && v->vag_size >= 16;
+    v->noise_count = 0;
+    v->playing = v->keyed = 1;
+    v->paused = 0;
+    v->envelope.state = SAS_ENV_KEYON;
     return 0;
 }
-static uint32_t h_SasSetKeyOff(CpuState *s) { s_sasv[A1 & 31u].on = 0; return 0; }
-static uint32_t h_SasGetEnvelopeHeight(CpuState *s) { return s_sasv[A1 & 31u].on ? 0x40000000u : 0; }
-static uint32_t h_SasCore(CpuState *s)        { sas_mix(A1, 0); return 0; }
-static uint32_t h_SasCoreWithMix(CpuState *s) { sas_mix(A1, 1); return 0; }
+static uint32_t h_SasSetKeyOff(CpuState *s) {
+    if (!sas_voice_valid(A1)) return SCE_SAS_ERROR_INVALID_VOICE;
+    SasVoice *v = &s_sasv[A1];
+    if (v->paused || !v->keyed) return SCE_SAS_ERROR_VOICE_PAUSED;
+    v->keyed = 0;
+    v->envelope.state = SAS_ENV_RELEASE;
+    return 0;
+}
+static uint32_t h_SasGetEnvelopeHeight(CpuState *s) {
+    if (!sas_voice_valid(A1)) return SCE_SAS_ERROR_INVALID_VOICE;
+    return sas_envelope_height(&s_sasv[A1].envelope);
+}
+static uint32_t h_SasSetADSR(CpuState *s) {
+    if (!sas_voice_valid(A1)) return SCE_SAS_ERROR_INVALID_VOICE;
+    int flag = (int)A2;
+    int attack = (int)A3;
+    int decay = (int)stack_arg(s, 0);
+    int sustain = (int)stack_arg(s, 1);
+    int release = (int)stack_arg(s, 2);
+    int invalid = (attack < 0 ? 1 : 0) | (decay < 0 ? 2 : 0) |
+        (sustain < 0 ? 4 : 0) | (release < 0 ? 8 : 0);
+    if (invalid & flag) return SCE_SAS_ERROR_INVALID_ADSR_RATE;
+    SasEnvelope *env = &s_sasv[A1].envelope;
+    if (flag & 1) env->attack_rate = attack;
+    if (flag & 2) env->decay_rate = decay;
+    if (flag & 4) env->sustain_rate = sustain;
+    if (flag & 8) env->release_rate = release;
+    return 0;
+}
+static uint32_t h_SasSetADSRMode(CpuState *s) {
+    if (!sas_voice_valid(A1)) return SCE_SAS_ERROR_INVALID_VOICE;
+    int flag = (int)A2;
+    uint32_t attack = A3 & ~0x80000000u;
+    uint32_t decay = stack_arg(s, 0) & ~0x80000000u;
+    uint32_t sustain = stack_arg(s, 1) & ~0x80000000u;
+    uint32_t release = stack_arg(s, 2) & ~0x80000000u;
+    int invalid = 0;
+    if (attack > 5 || (attack & 1)) invalid |= 1;
+    if (decay > 5 || !(decay & 1)) invalid |= 2;
+    if (sustain > 5) invalid |= 4;
+    if (release > 5 || !(release & 1)) invalid |= 8;
+    if (invalid & flag) return SCE_SAS_ERROR_INVALID_ADSR_CURVE_MODE;
+    SasEnvelope *env = &s_sasv[A1].envelope;
+    if (flag & 1) env->attack_type = (int)attack;
+    if (flag & 2) env->decay_type = (int)decay;
+    if (flag & 4) env->sustain_type = (int)sustain;
+    if (flag & 8) env->release_type = (int)release;
+    return 0;
+}
+static uint32_t h_SasSetSimpleADSR(CpuState *s) {
+    if (!sas_voice_valid(A1)) return SCE_SAS_ERROR_INVALID_VOICE;
+    if (A3 & 0x2000u) return SCE_SAS_ERROR_INVALID_ADSR_CURVE_MODE;
+    sas_envelope_set_simple(&s_sasv[A1].envelope, A2 & 0xFFFFu, A3 & 0xFFFFu);
+    return 0;
+}
+static uint32_t h_SasSetSL(CpuState *s) {
+    if (!sas_voice_valid(A1)) return SCE_SAS_ERROR_INVALID_VOICE;
+    s_sasv[A1].envelope.sustain_level = (int)A2;
+    return 0;
+}
+static uint32_t h_SasSetNoise(CpuState *s) {
+    if (!sas_voice_valid(A1)) return SCE_SAS_ERROR_INVALID_VOICE;
+    if ((int32_t)A2 < 0 || A2 >= 64) return SCE_SAS_ERROR_INVALID_NOISE_FREQ;
+    SasVoice *v = &s_sasv[A1];
+    v->type = SAS_VOICE_NOISE;
+    v->noise_freq = (int)A2;
+    return 0;
+}
+static uint32_t h_SasGetPauseFlag(CpuState *s) {
+    (void)s;
+    uint32_t paused = 0;
+    for (int i = 0; i < SAS_VOICES; i++) if (s_sasv[i].paused) paused |= 1u << i;
+    return paused;
+}
+static uint32_t h_SasSetPause(CpuState *s) {
+    uint32_t voices = A1;
+    for (int i = 0; i < SAS_VOICES; i++)
+        if (voices & (1u << i)) s_sasv[i].paused = A2 != 0;
+    return 0;
+}
+static uint32_t h_SasRevType(CpuState *s) {
+    int type = (int32_t)A1;
+    if (type < -1 || type > 8) return SCE_SAS_ERROR_REV_INVALID_TYPE;
+    if (type != s_sas_effect.type) {
+        s_sas_effect.type = type;
+        sr_sas_reverb_set_preset(&s_sas_reverb, type);
+    }
+    return 0;
+}
+static uint32_t h_SasRevParam(CpuState *s) {
+    if ((int32_t)A1 < 0 || A1 >= 128) return SCE_SAS_ERROR_REV_INVALID_DELAY;
+    if ((int32_t)A2 < 0 || A2 >= 128) return SCE_SAS_ERROR_REV_INVALID_FEEDBACK;
+    s_sas_effect.delay = (int)A1;
+    s_sas_effect.feedback = (int)A2;
+    return 0;
+}
+static uint32_t h_SasRevEVOL(CpuState *s) {
+    if (A1 > 0x1000u || A2 > 0x1000u) return SCE_SAS_ERROR_REV_INVALID_VOLUME;
+    s_sas_effect.voll = (int)A1;
+    s_sas_effect.volr = (int)A2;
+    return 0;
+}
+static uint32_t h_SasRevVON(CpuState *s) {
+    s_sas_effect.dry = A1 != 0;
+    s_sas_effect.wet = A2 != 0;
+    return 0;
+}
+static uint32_t h_SasCore(CpuState *s) {
+    sas_mix(A1, 0, 0, 0);
+    return 0;
+}
+static uint32_t h_SasCoreWithMix(CpuState *s) {
+    sas_mix(A1, 1, (int32_t)A2, (int32_t)A3);
+    return 0;
+}
 
 /* ---- semaphores and event flags, backed by the scheduler's block/wake-on-object ---- */
 
@@ -2873,12 +3276,17 @@ void sr_hle_init(void) {
     sr_hle_register(0xad84d37f, "__sceSasSetPitch", h_SasSetPitch);
     sr_hle_register(0x440ca7d8, "__sceSasSetVolume", h_SasSetVolume);
     sr_hle_register(0x74ae582a, "__sceSasGetEnvelopeHeight", h_SasGetEnvelopeHeight);
-    static const uint32_t sas_ok[] = {     /* ADSR/reverb/noise setters: accepted, unmodelled */
-        0x019b25eb, 0x267a6dd2, 0x2c8e6ab3, 0x33d4ab37,
-        0x5f9529f6, 0x787d04d5, 0x9ec3676a,
-        0xb7660a23, 0xcbcd4f79, 0xd5a229c9, 0xf983b186 };
-    for (unsigned i = 0; i < sizeof(sas_ok) / sizeof(sas_ok[0]); i++)
-        sr_hle_register(sas_ok[i], "__sceSas_ok", h_ok);
+    sr_hle_register(0x019b25eb, "__sceSasSetADSR", h_SasSetADSR);
+    sr_hle_register(0x9ec3676a, "__sceSasSetADSRmode", h_SasSetADSRMode);
+    sr_hle_register(0xcbcd4f79, "__sceSasSetSimpleADSR", h_SasSetSimpleADSR);
+    sr_hle_register(0x5f9529f6, "__sceSasSetSL", h_SasSetSL);
+    sr_hle_register(0xb7660a23, "__sceSasSetNoise", h_SasSetNoise);
+    sr_hle_register(0x2c8e6ab3, "__sceSasGetPauseFlag", h_SasGetPauseFlag);
+    sr_hle_register(0x787d04d5, "__sceSasSetPause", h_SasSetPause);
+    sr_hle_register(0x33d4ab37, "__sceSasRevType", h_SasRevType);
+    sr_hle_register(0x267a6dd2, "__sceSasRevParam", h_SasRevParam);
+    sr_hle_register(0xd5a229c9, "__sceSasRevEVOL", h_SasRevEVOL);
+    sr_hle_register(0xf983b186, "__sceSasRevVON", h_SasRevVON);
     /* time / rtc / libc clock */
     sr_hle_register(0x369ed59d, "sceKernelGetSystemTimeLow", h_GetSystemTimeLow);
     sr_hle_register(0x82bc5777, "sceKernelGetSystemTimeWide", h_GetSystemTimeWide);

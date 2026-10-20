@@ -49,6 +49,7 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/pgf.c \
               src/rt/gui.c \
               src/rt/audio.c \
+              src/rt/sas_reverb.c \
               src/rt/h264_mf.c \
               src/rt/savedata.c \
               src/rt/osk_win.c \
