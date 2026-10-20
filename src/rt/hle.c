@@ -1103,7 +1103,7 @@ static uint32_t h_AtracResetPlayPosition(CpuState *s) {
     return result;
 }
 
-/* sceUtility dialogs (savedata/msg/osk). Faithful to PPSSPP's PSPDialog status machine
+/* sceUtility dialogs (savedata/msg/netconf/game sharing/osk). Faithful to PPSSPP's PSPDialog status machine
  * (Core/Dialog/PSPDialog.cpp): status enum NONE=0, INITIALIZE=1, RUNNING=2, FINISHED=3,
  * SHUTDOWN=4. InitStart -> INITIALIZE; GetStatus returns the current status and then auto-advances
  * INITIALIZE->RUNNING and SHUTDOWN->NONE; the (real-hardware) utility thread completes the
@@ -1116,10 +1116,19 @@ static void guest_cstr(uint32_t addr, char *out, int max);
 /* sceUtilitySavedata: real persistence on a virtual memory stick (src/rt/savedata.c). */
 uint32_t sr_savedata_execute(uint32_t param);
 
-static int s_dlg_status = 0, s_dlg_tick = 0; static uint32_t s_dlg_param = 0, s_dlg_result = 0;
+enum {
+    DLG_NONE = 0,
+    DLG_SAVEDATA,
+    DLG_MESSAGE,
+    DLG_NETCONF,
+    DLG_GAMESHARING,
+};
+static int s_dlg_status = 0, s_dlg_tick = 0, s_dlg_kind = DLG_NONE;
+static uint32_t s_dlg_param = 0, s_dlg_result = 0;
 static int s_osk_current_clear(void);   /* fwd: savedata/msg dialogs take the slot from the OSK */
 static uint32_t h_SavedataInitStart(CpuState *s) {
     s_dlg_param = A0; s_dlg_status = 1; s_dlg_tick = 0;   /* INITIALIZE */
+    s_dlg_kind = DLG_SAVEDATA;
     s_osk_current_clear();
     s_dlg_result = sr_savedata_execute(A0);               /* fill result structs now (PPSSPP IO action) */
     if (getenv("SR_DLGLOG")) { static int n=0; fprintf(stderr, "** SavedataInitStart #%d **\n", ++n);
@@ -1132,11 +1141,12 @@ static uint32_t h_SavedataInitStart(CpuState *s) {
 }
 static uint32_t h_MsgDialogInitStart(CpuState *s) {
     s_dlg_param = A0; s_dlg_status = 1; s_dlg_tick = 0; s_dlg_result = 0;
+    s_dlg_kind = DLG_MESSAGE;
     s_osk_current_clear();
     return 0;
 }
-static uint32_t h_DlgGetStatus(CpuState *s) {
-    (void)s;
+static uint32_t dlg_get_status(int kind) {
+    if (s_dlg_status != 0 && s_dlg_kind != kind) return 0x80110005u;
     int ret = s_dlg_status;
     if (s_dlg_status == 1) {                              /* INITIALIZE -> RUNNING */
         s_dlg_status = 2; s_dlg_tick = 0;
@@ -1154,21 +1164,104 @@ static uint32_t h_DlgGetStatus(CpuState *s) {
     }
     return (uint32_t)ret;
 }
+static uint32_t h_SavedataGetStatus(CpuState *s) {
+    (void)s;
+    return dlg_get_status(DLG_SAVEDATA);
+}
+static uint32_t h_MsgDialogGetStatus(CpuState *s) {
+    (void)s;
+    return dlg_get_status(DLG_MESSAGE);
+}
+static uint32_t h_NetconfGetStatus(CpuState *s) {
+    (void)s;
+    return dlg_get_status(DLG_NETCONF);
+}
+static uint32_t h_GameSharingGetStatus(CpuState *s) {
+    (void)s;
+    return dlg_get_status(DLG_GAMESHARING);
+}
+static void dlg_finish(uint32_t result) {
+    s_dlg_result = result;
+    s_dlg_status = 3;
+    if (s_dlg_param) MEM_W32(s_dlg_param + 0x1c, result);
+}
 static uint32_t h_SavedataUpdate(CpuState *s) {
     (void)s;
     if (s_dlg_status == 2) {
-        s_dlg_status = 3;
-        if (s_dlg_param) MEM_W32(s_dlg_param + 0x1c, s_dlg_result);
+        dlg_finish(s_dlg_result);
         if (getenv("SR_DLGLOG")) fprintf(stderr, "SavedataUpdate: FINISHED result=0x%08x written to 0x%08x\n",
                                          s_dlg_result, s_dlg_param + 0x1c);
     }
     return 0;
 }
-static uint32_t h_DlgShutdown(CpuState *s) {
+static uint32_t h_MsgDialogUpdate(CpuState *s) {
     (void)s;
+    if (s_dlg_status != 2 || s_dlg_kind != DLG_MESSAGE) return 0;
+    uint32_t size = s_dlg_param ? MEM_R32(s_dlg_param) : 0;
+    uint32_t type = s_dlg_param ? MEM_R32(s_dlg_param + 0x34) : 1;
+    uint32_t options = size >= 580 ? MEM_R32(s_dlg_param + 0x23c) : 0;
+    char text[560];
+    if (type == 0) {
+        uint32_t error = MEM_R32(s_dlg_param + 0x38);
+        snprintf(text, sizeof(text), "An error occurred.\n\nError code: 0x%08X", error);
+    } else {
+        guest_cstr(s_dlg_param + 0x3c, text, 512);
+    }
+    int pressed = gui_message(
+        text, (options & 0x10u) != 0, (options & 0x80u) == 0,
+        (options & 0x100u) != 0);
+    if (size >= 580) MEM_W32(s_dlg_param + 0x240, (uint32_t)pressed);
+    if (s_dlg_param) MEM_W32(s_dlg_param + 0x30, 0);
+    dlg_finish(0);
+    return 0;
+}
+static uint32_t cancel_dialog_init(CpuState *s, int kind) {
+    s_dlg_param = A0;
+    s_dlg_status = 1;
+    s_dlg_tick = 0;
+    s_dlg_result = 1;   /* SCE_UTILITY_DIALOG_RESULT_CANCEL */
+    s_dlg_kind = kind;
+    s_osk_current_clear();
+    return 0;
+}
+static uint32_t h_NetconfInitStart(CpuState *s) {
+    return cancel_dialog_init(s, DLG_NETCONF);
+}
+static uint32_t h_GameSharingInitStart(CpuState *s) {
+    return cancel_dialog_init(s, DLG_GAMESHARING);
+}
+static uint32_t cancel_dialog_update(CpuState *s, int kind) {
+    (void)s;
+    if (s_dlg_status == 2 && s_dlg_kind == kind) dlg_finish(1);
+    return 0;
+}
+static uint32_t h_NetconfUpdate(CpuState *s) {
+    return cancel_dialog_update(s, DLG_NETCONF);
+}
+static uint32_t h_GameSharingUpdate(CpuState *s) {
+    return cancel_dialog_update(s, DLG_GAMESHARING);
+}
+static uint32_t dlg_shutdown(int kind) {
+    if (s_dlg_status != 0 && s_dlg_kind != kind) return 0x80110005u;
     s_dlg_status = 4;
     if (getenv("SR_DLGLOG")) fprintf(stderr, "DlgShutdownStart\n");
     return 0;
+}
+static uint32_t h_SavedataShutdown(CpuState *s) {
+    (void)s;
+    return dlg_shutdown(DLG_SAVEDATA);
+}
+static uint32_t h_MsgDialogShutdown(CpuState *s) {
+    (void)s;
+    return dlg_shutdown(DLG_MESSAGE);
+}
+static uint32_t h_NetconfShutdown(CpuState *s) {
+    (void)s;
+    return dlg_shutdown(DLG_NETCONF);
+}
+static uint32_t h_GameSharingShutdown(CpuState *s) {
+    (void)s;
+    return dlg_shutdown(DLG_GAMESHARING);
 }
 
 /* ---- sceUtilityOsk: the on-screen keyboard, backed by a native input box (osk_win.c).
@@ -3592,9 +3685,24 @@ void sr_hle_init(void) {
      * A2 bytes through A1, both garbage for this signature. */
     sr_hle_register(0xf6269b82, "sceUtilityOskInitStart", h_OskInitStart);
     sr_hle_register(0x50c4cd57, "sceUtilitySavedataInitStart", h_SavedataInitStart);
-    sr_hle_register(0x9790b33c, "sceUtilitySavedataShutdownStart", h_DlgShutdown);
-    sr_hle_register(0x8874dbe0, "sceUtilitySavedataGetStatus", h_DlgGetStatus);
+    sr_hle_register(0x9790b33c, "sceUtilitySavedataShutdownStart", h_SavedataShutdown);
+    sr_hle_register(0x8874dbe0, "sceUtilitySavedataGetStatus", h_SavedataGetStatus);
     sr_hle_register(0xd4b95ffb, "sceUtilitySavedataUpdate", h_SavedataUpdate);
+    sr_hle_register(0x2ad8e239, "sceUtilityMsgDialogInitStart", h_MsgDialogInitStart);
+    sr_hle_register(0x67af3428, "sceUtilityMsgDialogShutdownStart", h_MsgDialogShutdown);
+    sr_hle_register(0x95fc253b, "sceUtilityMsgDialogUpdate", h_MsgDialogUpdate);
+    sr_hle_register(0x9a1c91d7, "sceUtilityMsgDialogGetStatus", h_MsgDialogGetStatus);
+    sr_hle_register(0x4db1e739, "sceUtilityNetconfInitStart", h_NetconfInitStart);
+    sr_hle_register(0xf88155f6, "sceUtilityNetconfShutdownStart", h_NetconfShutdown);
+    sr_hle_register(0x91e70e35, "sceUtilityNetconfUpdate", h_NetconfUpdate);
+    sr_hle_register(0x6332aa39, "sceUtilityNetconfGetStatus", h_NetconfGetStatus);
+    sr_hle_register(0xc492f751, "sceUtilityGameSharingInitStart", h_GameSharingInitStart);
+    sr_hle_register(0xefc6f80f, "sceUtilityGameSharingShutdownStart", h_GameSharingShutdown);
+    sr_hle_register(0x7853182d, "sceUtilityGameSharingUpdate", h_GameSharingUpdate);
+    sr_hle_register(0x946963f3, "sceUtilityGameSharingGetStatus", h_GameSharingGetStatus);
+    sr_hle_register(0x0d5bc6d2, "sceUtilityLoadUsbModule", h_ok);
+    sr_hle_register(0xf64910f0, "sceUtilityUnloadUsbModule", h_ok);
+    sr_hle_register(0xf7d8d092, "sceUtilityUnloadAvModule", h_ok);
     sr_hle_register(0x64d50c56, "sceUtilityUnloadNetModule", h_ok);
     sr_net_register();    /* deterministic offline networking and stable identity */
     sr_hle_register(0x293b45b8, "sceKernelGetThreadId", h_GetThreadIdSched);

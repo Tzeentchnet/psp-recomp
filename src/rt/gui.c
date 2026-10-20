@@ -341,6 +341,23 @@ int gui_on(void) { return s_on; }
 uint32_t gui_buttons(void) { return s_buttons; }
 void gui_analog(uint8_t *lx, uint8_t *ly) { if (lx) *lx = s_lx; if (ly) *ly = s_ly; }
 int gui_pad_present(void) { return s_pad_present; }
+int gui_message(
+    const char *text, int yes_no, int allow_cancel, int default_no) {
+    int fallback = yes_no && default_no ? 2 : 1;
+    if (!s_on || getenv("SR_NO_DIALOGS")) return fallback;
+    UINT flags = MB_ICONINFORMATION | MB_SETFOREGROUND;
+    if (yes_no)
+        flags |= allow_cancel ? MB_YESNOCANCEL : MB_YESNO;
+    else
+        flags |= MB_OK;
+    if (yes_no && default_no) flags |= MB_DEFBUTTON2;
+    int result = MessageBoxA(
+        s_hwnd, text && text[0] ? text : "Killzone: Liberation",
+        "Killzone: Liberation", flags);
+    if (result == IDNO) return 2;
+    if (result == IDCANCEL) return 3;
+    return 1;
+}
 int gui_capture_next(const char *path) {
 #ifdef SR_D3D12
     if (s_on && s_d3d12) return ged3d12_capture_next(path);
