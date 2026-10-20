@@ -16,6 +16,7 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
+#include "audio.h"
 #include "atrac_decode.h"
 #include "iso.h"
 #include "pgf.h"
@@ -2218,8 +2219,7 @@ static uint32_t h_IoChangeAsyncPriority(CpuState *s) {
 /* sceAudio: a small channel table. The *Blocking output calls must block until the buffer is
  * consumed by the (virtual) audio hardware; that block is what lets the rest of the game run,
  * so a no-op return makes the audio thread monopolise the CPU. Here it yields the thread for
- * the buffer's duration AND forwards the samples to the host waveOut backend (audio.c). */
-extern void sr_audio_push(int ch, const int16_t *lr, int nframes, int volL, int volR);
+ * the buffer's duration and forwards samples to the shared XAudio2 mixer. */
 static int s_audio_ch[9], s_audio_fmt[9];   /* fmt: 0=stereo, 1=mono; [8] = Output2 SRC channel */
 static uint32_t s_audio_len[9];
 static uint32_t h_AudioChReserve(CpuState *s) {
@@ -2240,7 +2240,7 @@ static uint32_t h_AudioSetChannelDataLen(CpuState *s) {
  * an early one sleeps the difference. The old open-loop sleep of the buffer's duration ran
  * slightly slower than the device every iteration (sleep + decode time), so streams drifted
  * behind (voice lagging subtitles) and underran (crackle). */
-extern int sr_audio_queued(int ch);
+
 static uint32_t audio_output(CpuState *s, uint32_t ch, uint32_t buf, int voll, int volr) {
     uint32_t n = ch < 9 ? s_audio_len[ch] : 1024;
     if (buf && n > 0 && n <= 65536) {
@@ -2698,6 +2698,7 @@ static void frame_capture_complete(
     if (!done || fprintf(done, "%d\n", FRAME_CAPTURE_COUNT) < 0 || fclose(done) != 0)
         frame_capture_fail("cannot write completion marker", complete_path);
     fprintf(stderr, "golden-frame capture: completed %d frames\n", FRAME_CAPTURE_COUNT);
+    sr_audio_shutdown();
     sr_trace_close();
     fflush(stderr);
     _Exit(0);

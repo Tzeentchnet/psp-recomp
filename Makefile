@@ -18,11 +18,12 @@ PYTHON     ?= python
 CFLAGS     ?= -O1 -foptimize-sibling-calls -Isrc/rt -DSR_SDL3VK -DSR_D3D12 -Wall -Wextra
 CXXFLAGS   ?= -std=c++17 -O1 -Isrc/rt -DSR_D3D12 -Wall -Wextra -fno-exceptions -fno-rtti
 LDFLAGS    ?= -fuse-ld=lld
-LIBS       ?= -lSDL3 -lvulkan-1 -ld3d12 -ldxgi -lmfplat -lgdi32 -ldinput8 -ldxguid -lole32 -lwinmm
+LIBS       ?= -lSDL3 -lvulkan-1 -ld3d12 -ldxgi -lmfplat -lgdi32 -ldinput8 -ldxguid -lole32 -lwinmm -lxaudio2_9
 
 BUILD_DIR  ?= build/$(GAME_NAME)
 
 RT_GE_O    := $(BUILD_DIR)/ge.o
+RT_AUDIO_XAUDIO2_O := $(BUILD_DIR)/audio_xaudio2.o
 RT_D3D12_O := $(BUILD_DIR)/gpu_d3d12_device.o
 RT_D3D12_FRAMEBUFFER_O := $(BUILD_DIR)/gpu_d3d12_framebuffer.o
 RT_D3D12_FRAMEBUFFER_KEY_O := $(BUILD_DIR)/gpu_d3d12_framebuffer_key.o
@@ -49,7 +50,7 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/pgf.c \
               src/rt/gui.c \
               src/rt/input_config.c \
-              src/rt/audio.c \
+              src/rt/audio_mixer.c \
               src/rt/sas_reverb.c \
               src/rt/h264_mf.c \
               src/rt/savedata.c \
@@ -94,6 +95,10 @@ $(BUILD_DIR)/atrac_decode.o: src/rt/atrac_decode.cpp src/rt/atrac_decode.h \
                             third_party/at3_standalone/at3_decoders.h
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -Ithird_party/at3_standalone -c $< -o $@
+
+$(RT_AUDIO_XAUDIO2_O): src/rt/audio_xaudio2.cpp src/rt/audio.h src/rt/audio_mixer.h
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h \
                src/rt/gpu_d3d12/framebuffer.h \
@@ -200,7 +205,7 @@ check-shaders-d3d12:
 $(BUILD_DIR)/$(GAME_NAME)_recomp.o: $(BUILD_DIR)/$(GAME_NAME)_recomp.c src/rt/recomp.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_D3D12_O) \
+compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_AUDIO_XAUDIO2_O) $(RT_D3D12_O) \
          $(RT_D3D12_FRAMEBUFFER_O) $(RT_D3D12_FRAMEBUFFER_KEY_O) \
          $(RT_D3D12_VERTEX_O) $(RT_D3D12_PIPELINE_O) $(RT_D3D12_PIPELINE_KEY_O) \
          $(RT_D3D12_PRESENT_O) $(RT_D3D12_PRESENT_LAYOUT_O) \
@@ -209,6 +214,7 @@ compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_D3D12_O) \
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(GAME_NAME).exe \
 		$(BUILD_DIR)/$(GAME_NAME)_recomp.o \
 		$(RT_GE_O) \
+		$(RT_AUDIO_XAUDIO2_O) \
 		$(RT_D3D12_O) \
 		$(RT_D3D12_FRAMEBUFFER_O) \
 		$(RT_D3D12_FRAMEBUFFER_KEY_O) \

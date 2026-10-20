@@ -133,6 +133,13 @@ built-in defaults without reading or writing a file.
 ## Environment Settings
 
 Set these environment variables before running the game to control runtime features:
+- Audio uses the native Windows XAudio2 2.9 backend at 44.1 kHz stereo. Four
+  256-frame source buffers bound the device queue to 23.22 ms; PSP output
+  channels still mix through the shared saturation ring before submission.
+- `SR_AUDIO_LOG=1`: Print device-buffer lead, guest queue/resync/drop counters,
+  played time, and host-clock drift every three seconds and at shutdown.
+- `SR_NOAUDIO=1`: Disable host playback. Blocking PSP audio calls retain their
+  virtual-duration scheduler fallback, which is useful for deterministic tests.
 - `SR_GPU=vk`: Use the Vulkan GE backend (SDL3/Vulkan build).
 - `SR_GPU=sw`: Use the reference software rasterizer.
 - `SR_GPU=d3d12`: Use the SDL3/D3D12 device backend when compiled with `SR_D3D12`.
