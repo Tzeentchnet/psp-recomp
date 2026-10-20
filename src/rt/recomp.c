@@ -316,45 +316,6 @@ void sr_vwrite(CpuState *s, const uint8_t *idx, float *d, int n, uint32_t dprefi
             s->v[idx[i]] = d[i];
 }
 
-/* ---- dispatch table: guest address -> native function (open-addressing hash) ---- */
-
-#define SR_DISP_CAP 65536  /* power of two; homebrew has < a few thousand functions */
-static uint32_t s_disp_addr[SR_DISP_CAP];
-static RecompFn s_disp_fn[SR_DISP_CAP];
-static int s_disp_init = 0;
-
-static void disp_init(void) {
-    memset(s_disp_addr, 0, sizeof(s_disp_addr));
-    memset(s_disp_fn, 0, sizeof(s_disp_fn));
-    s_disp_init = 1;
-}
-
-void sr_register(uint32_t addr, RecompFn fn) {
-    if (!s_disp_init) disp_init();
-    uint32_t i = (addr >> 2) & (SR_DISP_CAP - 1);
-    for (uint32_t n = 0; n < SR_DISP_CAP; n++) {
-        if (s_disp_fn[i] == NULL || s_disp_addr[i] == addr) {
-            s_disp_addr[i] = addr;
-            s_disp_fn[i] = fn;
-            return;
-        }
-        i = (i + 1) & (SR_DISP_CAP - 1);
-    }
-    fprintf(stderr, "sr_register: dispatch table full\n");
-    abort();
-}
-
-RecompFn sr_lookup(uint32_t addr) {
-    if (!s_disp_init) return NULL;
-    uint32_t i = (addr >> 2) & (SR_DISP_CAP - 1);
-    for (uint32_t n = 0; n < SR_DISP_CAP; n++) {
-        if (s_disp_fn[i] == NULL) return NULL;
-        if (s_disp_addr[i] == addr) return s_disp_fn[i];
-        i = (i + 1) & (SR_DISP_CAP - 1);
-    }
-    return NULL;
-}
-
 void dispatch(CpuState *s, uint32_t target) {
     if (getenv("SR_DISPLOG")) {
         /* Log first invocation of boot/state-machine handlers, to see which actually run. */

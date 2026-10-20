@@ -119,10 +119,15 @@ float sr_vfpu_asin(float x);   /* vfpu_asin.c: result in units of pi/2 */
 #define SR_VFPU_STATE   2
 int sr_vfpu_interp(CpuState *s, uint32_t op);
 
-/* Dispatch: guest address -> native recompiled function (section 7). Computed jumps/calls go
- * through here; unknown targets would fall to the interpreter once it is linked in. */
+/* Dispatch: guest address -> native recompiled function (section 7). Codegen emits a sorted,
+ * immutable table so large targets do not pay for a fixed-capacity runtime hash. Computed
+ * jumps/calls go through here; unknown targets would fall to the interpreter once linked. */
 typedef void (*RecompFn)(CpuState *);
-void     sr_register(uint32_t addr, RecompFn fn);
+typedef struct SrDispatchEntry {
+    uint32_t address;
+    RecompFn function;
+} SrDispatchEntry;
+void     sr_set_dispatch_table(const SrDispatchEntry *entries, uint32_t count);
 RecompFn sr_lookup(uint32_t addr);
 void     dispatch(CpuState *s, uint32_t target);
 

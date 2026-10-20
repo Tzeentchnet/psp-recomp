@@ -36,6 +36,7 @@ RT_D3D12_SHADER_STATE_O := $(BUILD_DIR)/gpu_d3d12_shader_state.o
 RT_D3D12_TEXTURE_O := $(BUILD_DIR)/gpu_d3d12_texture.o
 RT_D3D12_TEXTURE_KEY_O := $(BUILD_DIR)/gpu_d3d12_texture_key.o
 RT_SRCS    := src/rt/recomp.c \
+              src/rt/dispatch_table.c \
               src/rt/vfpu_interp.c \
               src/rt/vfpu_asin.c \
               src/rt/hle.c \

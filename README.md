@@ -71,6 +71,8 @@ Run the code generator to translate MIPS machine instructions into native C code
 python tools/codegen.py <path_to_eboot.elf> build/mygame/mygame_recomp.c --base=0x08804000
 ```
 This produces a large C file containing translated functions mapped to their guest memory locations.
+The generated registration block is an immutable address-sorted dispatch table; computed calls use
+a bounded binary search instead of populating a fixed-capacity runtime hash.
 
 ### 4. Compile the Runtime & Game
 Build the game and compile the runtime objects:
