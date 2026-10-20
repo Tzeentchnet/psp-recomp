@@ -96,11 +96,31 @@ static int s_ge_inited = 0;
 
 /* Optional rasterizer backend (ge_shared.h). NULL = the reference software path. */
 static const GeBackend *s_backend = NULL;
-void ge_set_backend(const GeBackend *backend) { s_backend = backend; }
+int g_sr_gpu_vram_read_watch = 0;
+int g_sr_gpu_vram_write_watch = 0;
+void ge_set_backend(const GeBackend *backend) {
+    s_backend = backend;
+    if (!backend) {
+        g_sr_gpu_vram_read_watch = 0;
+        g_sr_gpu_vram_write_watch = 0;
+    }
+}
 const GeBackend *ge_backend_get(void) { return s_backend; }
 GeState *ge_state_ptr(void) { return &ge; }
 void sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes) {
     if (s_backend && s_backend->vram_dirty) s_backend->vram_dirty(addr, bytes);
+}
+void sr_gpu_vram_read(uint32_t addr, uint32_t bytes) {
+    if (s_backend && s_backend->vram_read) s_backend->vram_read(addr, bytes);
+}
+void sr_gpu_vram_prepare_write(uint32_t addr, uint32_t bytes) {
+    if (s_backend && s_backend->vram_write) s_backend->vram_write(addr, bytes);
+}
+void sr_gpu_vram_watch_reads(int enabled) {
+    g_sr_gpu_vram_read_watch = enabled != 0;
+}
+void sr_gpu_vram_watch_writes(int enabled) {
+    g_sr_gpu_vram_write_watch = enabled != 0;
 }
 
 /* Decode a GE 24-bit float mantissa word to IEEE-754 float.
@@ -2346,6 +2366,9 @@ static void ge_block_transfer(uint32_t startdata) {
     if (!srcStride || !dstStride) return;
     if (s_backend && s_backend->xfer && s_backend->xfer(startdata)) return;   /* GPU-side blit */
     if (s_backend && s_backend->flush) s_backend->flush("xfersrc");
+    sr_gpu_vram_prepare_write(
+        dstBase + (dstY * dstStride + dstX) * bpp,
+        ((h - 1) * dstStride + w) * bpp);
     for (uint32_t y = 0; y < h; y++) {
         uint32_t so = srcBase + ((srcY + y) * srcStride + srcX) * bpp;
         uint32_t dofs = dstBase + ((dstY + y) * dstStride + dstX) * bpp;

@@ -1,4 +1,5 @@
 #include "../../src/rt/gpu_d3d12/device.h"
+#include "../../src/rt/gpu_d3d12/framebuffer.h"
 #include "../../src/rt/gpu_d3d12/present.h"
 #include "../../src/rt/gpu_d3d12/vertex.h"
 
@@ -22,7 +23,15 @@ bool ged3d12_texture_capture(GeD3D12TextureBinding *out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
     out->handle = GE_D3D12_TEXTURE_HANDLE_NONE;
+    out->framebuffer.handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
     ged3d12_texture_sampler_build(&s_state, &out->sampler);
+    return true;
+}
+
+bool ged3d12_framebuffer_capture(GeD3D12FramebufferBinding *out) {
+    if (!out) return false;
+    out->color_handle = 1;
+    out->depth_handle = 2;
     return true;
 }
 
@@ -318,6 +327,133 @@ static void test_texture_keys(void) {
               (uint32_t)(int32_t)(int8_t)0xf8);
 }
 
+static void test_framebuffer_keys(void) {
+    memset(&s_state, 0, sizeof(s_state));
+    s_state.fbp = 0x00100000u;
+    s_state.fbfmt = 3;
+    s_state.zbp = 0x00188000u;
+    GeD3D12FramebufferKey source = {};
+    if (!ged3d12_framebuffer_key_build(&s_state, &source)) {
+        fail("default framebuffer key rejected");
+        return;
+    }
+    check_u32("framebuffer address", source.address, 0x04100000u);
+    check_u32("framebuffer default stride", source.stride, 512);
+    check_u32("framebuffer depth address", source.depth_address, 0x04188000u);
+    check_u32("framebuffer default depth stride", source.depth_stride, 512);
+    check_u64("framebuffer byte range",
+              ged3d12_framebuffer_key_bytes(&source),
+              UINT64_C(512) * 272u * 4u);
+    check_u32("framebuffer 565 red decode",
+              ged3d12_framebuffer_decode_pixel(0x001fu, 0),
+              0xffff0000u);
+    check_u32("framebuffer 565 blue decode",
+              ged3d12_framebuffer_decode_pixel(0xf800u, 0),
+              0xff0000ffu);
+    check_u32("framebuffer 8888 channel decode",
+              ged3d12_framebuffer_decode_pixel(0x44332211u, 3),
+              0x44112233u);
+    check_u32("framebuffer 8888 channel encode",
+              ged3d12_framebuffer_encode_pixel(0x44112233u, 3),
+              0x44332211u);
+    for (uint32_t format = 0; format < 3; format++) {
+        static const uint32_t pixels[] = {
+            0xffffu, 0x8421u, 0x1234u,
+        };
+        uint32_t raw = pixels[format];
+        check_u32("framebuffer 16-bit round trip",
+                  ged3d12_framebuffer_encode_pixel(
+                      ged3d12_framebuffer_decode_pixel(raw, format),
+                      format),
+                  raw);
+    }
+    if (!ged3d12_framebuffer_key_overlaps(
+            &source, 0x44100020u, 16u)) {
+        fail("framebuffer alias address did not overlap");
+    }
+    if (ged3d12_framebuffer_key_overlaps(
+            &source, 0x04190000u, 16u)) {
+        fail("disjoint framebuffer range overlapped");
+    }
+    s_state.fbw = 480;
+    GeD3D12FramebufferKey narrow = {};
+    if (!ged3d12_framebuffer_key_build(&s_state, &narrow))
+        fail("480-pixel framebuffer key rejected");
+    check_u32("framebuffer explicit stride", narrow.stride, 480);
+    check_u32("framebuffer inherited depth stride",
+              narrow.depth_stride, 480);
+    s_state.fbw = 0;
+    s_state.fbp = 0x001f0000u;
+    GeD3D12FramebufferKey outside = {};
+    if (ged3d12_framebuffer_key_build(&s_state, &outside))
+        fail("framebuffer outside PSP VRAM accepted");
+    s_state.fbp = 0x00100000u;
+
+    GeD3D12FramebufferAlias alias = {};
+    uint32_t alias_address = source.address + (2u * source.stride + 8u) * 4u;
+    if (!ged3d12_framebuffer_alias(
+            &source, alias_address, source.stride, 64, 32, 3, false,
+            &alias)) {
+        fail("valid framebuffer texture alias rejected");
+    }
+    check_u32("framebuffer alias x", alias.x, 8);
+    check_u32("framebuffer alias y", alias.y, 2);
+    if (ged3d12_framebuffer_alias(
+            &source, alias_address, source.stride, 64, 32, 2, false,
+            &alias)) {
+        fail("format-reinterpreted framebuffer aliased directly");
+    }
+    if (ged3d12_framebuffer_alias(
+            &source, alias_address, source.stride, 64, 32, 3, true,
+            &alias)) {
+        fail("swizzled framebuffer aliased directly");
+    }
+
+    s_state.xf_src = 0x001000u;
+    s_state.xf_srcw = 0x040000u | 512u;
+    s_state.xf_dst = 0x002000u;
+    s_state.xf_dstw = 0x040000u | 512u;
+    s_state.xf_spos = 3u | (4u << 10);
+    s_state.xf_dpos = 5u | (6u << 10);
+    s_state.xf_size = 6u | (7u << 10);
+    GeD3D12Transfer transfer = {};
+    if (!ged3d12_transfer_build(&s_state, 1, &transfer)) {
+        fail("valid framebuffer transfer rejected");
+        return;
+    }
+    check_u32("transfer source address", transfer.source_address, 0x04001000u);
+    check_u32("transfer destination address",
+              transfer.destination_address, 0x04002000u);
+    check_u32("transfer width", transfer.width, 7);
+    check_u32("transfer height", transfer.height, 8);
+    check_u32("transfer bytes per pixel", transfer.bytes_per_pixel, 4);
+
+    source.address = transfer.source_address;
+    source.stride = transfer.source_stride;
+    GeD3D12FramebufferKey destination = source;
+    destination.address = transfer.destination_address;
+    D3D12_BOX source_box = {};
+    UINT destination_x = 0;
+    UINT destination_y = 0;
+    if (!ged3d12_transfer_coordinates(
+            &transfer, &source, &destination, &source_box,
+            &destination_x, &destination_y)) {
+        fail("compatible framebuffer transfer coordinates rejected");
+    }
+    check_u32("transfer source left", source_box.left, 3);
+    check_u32("transfer source top", source_box.top, 4);
+    check_u32("transfer source right", source_box.right, 10);
+    check_u32("transfer source bottom", source_box.bottom, 12);
+    check_u32("transfer destination x", destination_x, 5);
+    check_u32("transfer destination y", destination_y, 6);
+    destination.format = 2;
+    if (ged3d12_transfer_coordinates(
+            &transfer, &source, &destination, &source_box,
+            &destination_x, &destination_y)) {
+        fail("format-reinterpreted transfer used an image copy");
+    }
+}
+
 static void test_triangle(void) {
     reset_upload();
     memset(&s_state, 0, sizeof(s_state));
@@ -485,6 +621,7 @@ int main(void) {
         test_present_viewports();
         test_pipeline_keys();
         test_texture_keys();
+        test_framebuffer_keys();
         test_triangle();
         test_sprites();
         test_lines_and_points();

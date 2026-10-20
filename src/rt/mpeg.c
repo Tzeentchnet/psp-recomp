@@ -528,7 +528,11 @@ static uint32_t video_buffer_bytes(uint32_t frameWidth, int pixelMode) {
 static void clear_video_buffer(uint32_t ptr, uint32_t frameWidth, int pixelMode) {
     if (!ptr) return;
     uint32_t bytes = video_buffer_bytes(frameWidth, pixelMode);
-    for (uint32_t i = 0; i < bytes; i++) MEM_W8(ptr + i, 0);
+    if (bytes && bytes - 1u <= UINT32_MAX - ptr &&
+        sr_inrange(ptr) && sr_inrange(ptr + bytes - 1u))
+        memset(SR_HOST(ptr), 0, bytes);
+    else
+        for (uint32_t i = 0; i < bytes; i++) MEM_W8(ptr + i, 0);
 }
 
 static void consume_stream_for_video_pts(Mpeg *ctx) {
@@ -569,6 +573,9 @@ uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth
     /* Report "a frame was produced" (1) every decode; the game keeps feeding/decoding until it has
      * read the whole file, then stops on its own. */
     int gotFrame = 0;
+    uint32_t outputBytes =
+        video_buffer_bytes(frameWidth, ctx->pixelMode);
+    if (buffer) sr_gpu_vram_prepare_write(buffer, outputBytes);
 #ifdef SR_SDL3VK
     if (ctx->h264Init && ctx->h264 >= 0 && buffer) {
         int eos = ctx->totalPackets && ctx->fedPackets >= ctx->totalPackets;
@@ -583,8 +590,7 @@ uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth
     if (gotFrame <= 0 && !ctx->h264Frames)
         clear_video_buffer(buffer, frameWidth, ctx->pixelMode);
     {
-        extern void sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes);
-        if (buffer) sr_gpu_vram_dirty(buffer, video_buffer_bytes(frameWidth, ctx->pixelMode));
+        if (buffer) sr_gpu_vram_dirty(buffer, outputBytes);
     }
     if (initAddr) MEM_W32(initAddr, 1);
     if (getenv("SR_MPEGLOG")) {

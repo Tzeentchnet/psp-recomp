@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "device.h"
+#include "framebuffer.h"
 #include "pipeline.h"
 #include "present.h"
 #include "texture.h"
@@ -101,6 +102,7 @@ static uint32_t s_buttons;
 static uint8_t s_lx = 128, s_ly = 128;
 static int s_pad_present;
 static int s_vertex_log;
+static int s_framebuffer_safe;
 static UINT64 s_vertex_frames;
 static UINT64 s_vertex_total;
 static UINT64 s_vertex_batches;
@@ -152,6 +154,7 @@ static void release_device(void) {
                     s_copy_event, "wait for copy queue");
     ged3d12_pipeline_cache_shutdown();
     ged3d12_texture_cache_shutdown();
+    ged3d12_framebuffer_cache_shutdown();
     ged3d12_present_shutdown();
     ged3d12_vertex_capture_shutdown();
 
@@ -711,6 +714,10 @@ static int device_init(void) {
         release_device();
         return 0;
     }
+    if (!ged3d12_framebuffer_cache_init()) {
+        release_device();
+        return 0;
+    }
     if (!ged3d12_texture_cache_init()) {
         release_device();
         return 0;
@@ -720,6 +727,7 @@ static int device_init(void) {
         return 0;
     }
     s_vertex_log = env_enabled("SR_D3D12_VERTEX_LOG");
+    s_framebuffer_safe = env_enabled("SR_D3D12_FRAMEBUFFER_SAFE");
     s_vertex_frames = 0;
     s_vertex_total = 0;
     s_vertex_batches = 0;
@@ -1007,9 +1015,12 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
 
     GeD3D12VertexFrame vertices = {};
     if (!ged3d12_vertex_upload_pending(&vertices)) return -2;
+    if (!ged3d12_framebuffer_prepare_pending()) return -2;
     if (!ged3d12_texture_prepare_pending()) return -2;
     for (UINT i = 0; i < vertices.batch_count; i++) {
         if (!ged3d12_pipeline_bind(&vertices.batches[i].pipeline) ||
+            !ged3d12_framebuffer_bind(
+                &vertices.batches[i].framebuffer) ||
             !ged3d12_texture_bind(&vertices.batches[i].texture)) {
             return -2;
         }
@@ -1029,33 +1040,43 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
                 (unsigned long long)vertices.hash, s_vertex_max);
     }
 
-    const UINT row_pitch = (PSP_W * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
-                           ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-    const UINT64 upload_size = (UINT64)row_pitch * PSP_H;
-    GeD3D12UploadSlice upload = {};
-    if (!ged3d12_upload_alloc(
-            upload_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, &upload)) {
-        return -2;
-    }
-    memset(upload.cpu, 0, (size_t)upload_size);
-    convert_framebuffer(static_cast<uint8_t *>(upload.cpu), row_pitch,
-                        fbaddr, format, stride);
-
     D3D12_TEXTURE_COPY_LOCATION source = {};
-    source.pResource = s_upload;
-    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    source.PlacedFootprint.Offset = upload.offset;
-    source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    source.PlacedFootprint.Footprint.Width = PSP_W;
-    source.PlacedFootprint.Footprint.Height = PSP_H;
-    source.PlacedFootprint.Footprint.Depth = 1;
-    source.PlacedFootprint.Footprint.RowPitch = row_pitch;
+    D3D12_BOX source_box = {};
+    const D3D12_BOX *source_box_ptr = nullptr;
+    bool cached_framebuffer = ged3d12_framebuffer_present_source(
+        fbaddr, (uint32_t)format, stride, &source, &source_box);
+    if (cached_framebuffer) {
+        source_box_ptr = &source_box;
+    } else {
+        const UINT row_pitch =
+            (PSP_W * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+            ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+        const UINT64 upload_size = (UINT64)row_pitch * PSP_H;
+        GeD3D12UploadSlice upload = {};
+        if (!ged3d12_upload_alloc(
+                upload_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
+                &upload)) {
+            return -2;
+        }
+        memset(upload.cpu, 0, (size_t)upload_size);
+        convert_framebuffer(static_cast<uint8_t *>(upload.cpu), row_pitch,
+                            fbaddr, format, stride);
+        source.pResource = s_upload;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint.Offset = upload.offset;
+        source.PlacedFootprint.Footprint.Format =
+            DXGI_FORMAT_B8G8R8A8_UNORM;
+        source.PlacedFootprint.Footprint.Width = PSP_W;
+        source.PlacedFootprint.Footprint.Height = PSP_H;
+        source.PlacedFootprint.Footprint.Depth = 1;
+        source.PlacedFootprint.Footprint.RowPitch = row_pitch;
+    }
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv =
         s_rtv_heap->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += (SIZE_T)frame_index * s_rtv_stride;
     if (!ged3d12_present_record(
-            &source, s_backbuffers[frame_index], rtv,
+            &source, source_box_ptr, s_backbuffers[frame_index], rtv,
             s_backbuffer_width, s_backbuffer_height)) {
         return -2;
     }
@@ -1075,6 +1096,12 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
         check_hr(present_hr, "present swapchain");
         HRESULT removed = s_device->GetDeviceRemovedReason();
         if (FAILED(removed)) check_hr(removed, "D3D12 device removed reason");
+        return -2;
+    }
+    if (s_framebuffer_safe && cached_framebuffer &&
+        !ged3d12_framebuffer_safe_readback(
+            fbaddr, (uint32_t)format, stride)) {
+        fprintf(stderr, "ged3d12: safe framebuffer readback failed\n");
         return -2;
     }
     return 1;
@@ -1099,18 +1126,28 @@ static void device_shutdown(void) {
 }
 
 static void device_flush(const char *reason) {
-    (void)reason;
+    ged3d12_framebuffer_flush(reason);
 }
 
 static void device_vram_dirty(uint32_t address, uint32_t bytes) {
     ged3d12_texture_invalidate(address, bytes);
+    ged3d12_framebuffer_invalidate(address, bytes);
+}
+
+static void device_vram_read(uint32_t address, uint32_t bytes) {
+    ged3d12_framebuffer_read(address, bytes);
+}
+
+static void device_vram_write(uint32_t address, uint32_t bytes) {
+    ged3d12_framebuffer_read(address, bytes);
 }
 
 static const GeBackend k_backend = {
     "d3d12", device_init, device_present, device_shutdown,
     ged3d12_vertex_capture_tri, ged3d12_vertex_capture_sprite,
     ged3d12_vertex_capture_line, ged3d12_vertex_capture_point,
-    device_flush, device_vram_dirty, nullptr,
+    device_flush, device_vram_dirty, device_vram_read,
+    device_vram_write, ged3d12_framebuffer_transfer,
 };
 
 extern "C" const GeBackend *ged3d12_backend(void) { return &k_backend; }

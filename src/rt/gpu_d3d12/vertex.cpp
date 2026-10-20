@@ -95,6 +95,12 @@ static bool begin_primitive(
     ged3d12_pipeline_key_build(
         ge_state_ptr(), primitive != GE_D3D12_PRIMITIVE_TRIANGLE,
         &batch->pipeline);
+    if (!ged3d12_framebuffer_capture(&batch->framebuffer)) {
+        capture_error(
+            "framebuffer capture failed", s_batch_count + 1u,
+            MAX_FRAME_BATCHES);
+        return false;
+    }
     if (!ged3d12_texture_capture(&batch->texture)) {
         capture_error(
             "texture capture failed", s_batch_count + 1u, MAX_FRAME_BATCHES);

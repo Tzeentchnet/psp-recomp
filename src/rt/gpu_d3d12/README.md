@@ -24,10 +24,15 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 - a collision-safe 512-entry texture cache with canonical metadata/CLUT keys,
   immutable encoded-content versions, up to eight decoded RGBA8 mip uploads,
   per-frame SRV/sampler reuse, bounded staging, and queue-safe LRU eviction;
+- persistent 16-entry color and depth caches with serial-protected handles,
+  format/stride reinterpretation, direct render-to-texture aliases, feedback
+  snapshots, and compatible `TRXKICK` image copies;
+- lazy CPU visibility for GPU-newer eDRAM color targets, including pre-write
+  preservation for generated stores, DMA, MPEG output, and block transfers;
 - a persistent 480×272 display texture and fullscreen-triangle presentation pass
   that preserve the exact PSP aspect ratio through window resizing;
-- software-GE framebuffer upload so `SR_GPU=d3d12` remains usable while native
-  draw submission and GPU-resident render targets are being integrated.
+- direct presentation from compatible cached 512×272 targets, with software-GE
+  framebuffer upload retained for uncached and movie frames.
 
 `vertex.cpp` deliberately consumes the existing `GeVtx` backend seam instead of
 duplicating PSP vertex decoding. `ge.c` remains authoritative for all raw attribute
@@ -62,6 +67,32 @@ waits for the graphics queue before evicting its 128 least-recently used version
 `TEXFLUSH` is treated as a synchronization hint, while actual CPU/DMA/block-transfer
 writes drive invalidation.
 
+`framebuffer_key.cpp` canonicalizes color/depth identity and exact PSP transfer
+rectangles. `framebuffer.cpp` owns fixed-size BGRA8 color resources and D16 depth
+resources, their RTV/DSV/SRV descriptors, explicit resource states, immediate
+copy/readback commands, and serial-protected LRU lifetime. Multiple views of the
+same address survive within one captured generation; an older GPU-newer view is
+materialized before a format or stride reinterpretation is uploaded.
+
+Exact unswizzled, single-level texture views can alias a cached target when their
+format, stride, offset, and bounds match. Same-target feedback samples from a
+snapshot copied before the target is rebound. Presentation copies only the
+visible 480×272 rectangle from a compatible cached target. Because native draws
+are not enabled yet, each captured target is currently refreshed from the
+authoritative software framebuffer.
+
+GPU-newer color targets activate fast-gated VRAM callbacks in `recomp.h`. CPU
+reads synchronously materialize overlapping color data; CPU writes materialize
+it before the store and invalidate overlapping framebuffer/texture views after
+the store. DMA, MPEG, and CPU block-transfer bulk writes follow the same
+pre-write contract. A full CPU-content hash catches unnotified edits to clean
+targets before GPU reuse. GPU-authoritative depth readback is deferred until the
+depth behavior in T-4.10 is implemented.
+
+Compatible `TRXKICK` operations between distinct cached targets use an exact
+D3D12 image copy and update the guest-VRAM mirror. Format, stride, pixel-size,
+aliasing, or bounds mismatches explicitly fall back to the CPU transfer path.
+
 `shaders/psp_vs.hlsl` and `shaders/psp_ps.hlsl` are the native Shader Model 6 ports of
 the Vulkan GE shaders. Their checked-in `*.inc` files contain stripped DXIL consumed by
 `device.cpp`. Regenerate or verify them with:
@@ -86,10 +117,14 @@ Set `SR_D3D12_PSO_LOG=1` to print synchronous PSO creations and a shutdown cache
 summary.
 Set `SR_D3D12_TEXTURE_LOG=1` to print texture-version misses and a shutdown summary of
 lookups, hits, uploads, invalidations, evictions, and live entries.
+Set `SR_D3D12_FRAMEBUFFER_LOG=1` to print target creation and a shutdown summary of
+captures, uploads, readbacks, aliases, invalidations, transfers, presentation hits,
+and live targets. Set `SR_D3D12_FRAMEBUFFER_SAFE=1` to force every cached target
+through a GPU readback after cached presentation; this is a diagnostic mode and
+intentionally stalls the graphics queue.
 
-Later phase-4 tasks submit the uploaded batches, populate the remaining per-draw state,
-and add GPU-resident framebuffer aliases behind the same descriptor and invalidation
-model.
+Later phase-4 tasks submit the uploaded batches and populate the remaining per-draw
+shader state behind the existing framebuffer, descriptor, and invalidation model.
 
 The root project keeps this dependency optional:
 

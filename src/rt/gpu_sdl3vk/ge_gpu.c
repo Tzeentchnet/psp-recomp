@@ -1247,6 +1247,29 @@ static void hook_vram_dirty(uint32_t addr, uint32_t bytes) {
     }
 }
 
+static void hook_vram_read(uint32_t addr, uint32_t bytes) {
+    if (!s_ready || !bytes ||
+        (addr & 0x0F000000u) != 0x04000000u) {
+        return;
+    }
+    uint32_t a0 = addr & 0x001FFFFFu;
+    for (int i = 0; i < MAX_TGT; i++) {
+        Target *t = &s_tgts[i];
+        if (!t->used || !t->gpu_valid ||
+            t->clean_gen == t->render_gen) {
+            continue;
+        }
+        uint32_t bpp_t = t->fmt == 3 ? 4 : 2;
+        uint32_t flen = t->stride * FB_H * bpp_t;
+        if (a0 < t->fba + flen && t->fba < a0 + bytes)
+            target_readback(t);
+    }
+}
+
+static void hook_vram_write(uint32_t addr, uint32_t bytes) {
+    hook_vram_read(addr, bytes);
+}
+
 /* ---- GE block transfer: GPU-side image blit ------------------------------------------------ */
 
 /* Find the target whose address range contains VRAM offset `a` (gpu_valid not required). */
@@ -1390,7 +1413,8 @@ static void gegpu_shutdown(void);
 
 static const GeBackend k_backend = {
     "vk", gegpu_init, gegpu_present, gegpu_shutdown,
-    hook_tri, hook_sprite, hook_line, hook_point, gegpu_flush, hook_vram_dirty, hook_xfer,
+    hook_tri, hook_sprite, hook_line, hook_point, gegpu_flush,
+    hook_vram_dirty, hook_vram_read, hook_vram_write, hook_xfer,
 };
 
 const GeBackend *gegpu_backend(void) { return &k_backend; }
@@ -1510,6 +1534,8 @@ static int gegpu_init(void) {
     if (!s_snap_n || !s_snap_l) return 0;
 
     s_ready = 1;
+    sr_gpu_vram_watch_reads(1);
+    sr_gpu_vram_watch_writes(1);
     fprintf(stderr, "gegpu: full GPU GE active (persistent targets, no software fallback)\n");
     return 1;
 }
@@ -1518,6 +1544,8 @@ static void gegpu_shutdown(void) {
     if (!s_ready) return;
     submit_pending();
     s_ready = 0;
+    sr_gpu_vram_watch_reads(0);
+    sr_gpu_vram_watch_writes(0);
     vkDeviceWaitIdle(s_dev);
     /* process exit follows immediately; Vulkan objects die with the device */
 }

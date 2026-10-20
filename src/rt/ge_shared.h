@@ -124,10 +124,10 @@ static inline uint32_t ge_texture_buffer_width(
  * the primitive was taken by
  * the GPU backend (the software rasterizer is skipped) — in the full GPU renderer they
  * always take it. flush(reason) is called at GE sync points ("listend", "loadclut");
- * the backend decides what each requires. vram_dirty(addr,bytes) tells the backend the
- * CPU wrote guest memory directly (movie decode, DMA) so any GPU framebuffer caching
- * that range must be invalidated. present returns 1 when shown, 0 for a user-requested
- * close, -1 when the frontend should upload guest VRAM, and -2 for a fatal backend error. */
+ * the backend decides what each requires. vram_read lazily materializes newer GPU data
+ * before a CPU load; vram_write does the same before a CPU store, and vram_dirty then
+ * invalidates the written range. present returns 1 when shown, 0 for a user-requested close,
+ * -1 when the frontend should upload guest VRAM, and -2 for a fatal backend error. */
 typedef struct GeBackend {
     const char *name;
     int  (*init)(void);
@@ -139,6 +139,8 @@ typedef struct GeBackend {
     int  (*point)(const GeVtx *a, int persp);
     void (*flush)(const char *reason);
     void (*vram_dirty)(uint32_t addr, uint32_t bytes);
+    void (*vram_read)(uint32_t addr, uint32_t bytes);
+    void (*vram_write)(uint32_t addr, uint32_t bytes);
     /* GE block transfer (state in xf_*): returns 1 when the copy was performed GPU-side
      * (image-to-image; guest VRAM intentionally left stale, like any render target). 0 =
      * not representable (RAM endpoints, format reinterpretation): caller runs the CPU copy,
@@ -151,9 +153,13 @@ typedef struct GeBackend {
 /* Implemented in ge.c. */
 void             ge_set_backend(const GeBackend *backend);
 const GeBackend *ge_backend_get(void);
-/* CPU-side writes to guest memory that may alias GPU-cached framebuffers (movie decode,
- * DMA memcpy). No-op when no GPU backend is registered. */
+/* CPU access synchronization for guest ranges that may alias GPU-cached framebuffers.
+ * All calls are no-ops when no GPU backend is registered. */
 void      sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes);
+void      sr_gpu_vram_read(uint32_t addr, uint32_t bytes);
+void      sr_gpu_vram_prepare_write(uint32_t addr, uint32_t bytes);
+void      sr_gpu_vram_watch_reads(int enabled);
+void      sr_gpu_vram_watch_writes(int enabled);
 GeState  *ge_state_ptr(void);
 uint16_t *ge_zbuf_ptr(void);        /* 272*512 entries, row stride = ge_zbuf_stride() */
 uint32_t  ge_zbuf_stride(void);

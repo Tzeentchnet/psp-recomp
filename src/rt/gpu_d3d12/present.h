@@ -16,6 +16,7 @@ bool ged3d12_present_init(void);
 void ged3d12_present_shutdown(void);
 bool ged3d12_present_record(
     const D3D12_TEXTURE_COPY_LOCATION *source,
+    const D3D12_BOX *source_box,
     ID3D12Resource *backbuffer,
     D3D12_CPU_DESCRIPTOR_HANDLE backbuffer_rtv,
     UINT output_width,

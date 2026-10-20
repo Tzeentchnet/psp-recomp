@@ -3,6 +3,7 @@
 #define GE_D3D12_TEXTURE_H
 
 #include "../ge_shared.h"
+#include "framebuffer.h"
 
 #include <d3d12.h>
 #include <stdint.h>
@@ -36,6 +37,7 @@ struct GeD3D12TextureSampler {
 
 struct GeD3D12TextureBinding {
     uint32_t handle;
+    GeD3D12FramebufferAlias framebuffer;
     GeD3D12TextureSampler sampler;
 };
 
@@ -64,7 +66,7 @@ static_assert(
     sizeof(GeD3D12TextureSampler) == 8,
     "D3D12 texture sampler key must remain canonical");
 static_assert(
-    sizeof(GeD3D12TextureBinding) == 12,
+    sizeof(GeD3D12TextureBinding) == 20,
     "D3D12 texture binding ABI changed");
 
 #endif

@@ -181,6 +181,7 @@ void ged3d12_present_shutdown(void) {
 
 bool ged3d12_present_record(
     const D3D12_TEXTURE_COPY_LOCATION *source,
+    const D3D12_BOX *source_box,
     ID3D12Resource *backbuffer,
     D3D12_CPU_DESCRIPTOR_HANDLE backbuffer_rtv,
     UINT output_width,
@@ -198,7 +199,8 @@ bool ged3d12_present_record(
     D3D12_TEXTURE_COPY_LOCATION destination = {};
     destination.pResource = s_display_texture;
     destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    command_list->CopyTextureRegion(&destination, 0, 0, 0, source, nullptr);
+    command_list->CopyTextureRegion(
+        &destination, 0, 0, 0, source, source_box);
     transition(command_list, s_display_texture,
                D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);

@@ -338,8 +338,17 @@ static uint32_t h_UmdCheckMedium(CpuState *s) { (void)s; return 1; }      /* med
 static uint32_t h_DmacMemcpy(CpuState *s) {
     /* a0=dst, a1=src, a2=size. A real DMA copy in guest memory. */
     uint32_t dst = A0, src = A1, n = A2;
-    for (uint32_t i = 0; i < n; i++) MEM_W8(dst + i, MEM_R8(src + i));
-    extern void sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes);
+    sr_gpu_vram_read(src, n);
+    sr_gpu_vram_prepare_write(dst, n);
+    if (n && n - 1u <= UINT32_MAX - src &&
+        n - 1u <= UINT32_MAX - dst &&
+        sr_inrange(src) && sr_inrange(src + n - 1u) &&
+        sr_inrange(dst) && sr_inrange(dst + n - 1u)) {
+        memmove(SR_HOST(dst), SR_HOST(src), n);
+    } else {
+        for (uint32_t i = 0; i < n; i++)
+            MEM_W8(dst + i, MEM_R8(src + i));
+    }
     sr_gpu_vram_dirty(dst, n);   /* DMA into a GPU-cached framebuffer must invalidate it */
     return 0;
 }

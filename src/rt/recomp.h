@@ -35,6 +35,11 @@ typedef struct CpuState {
  * lands inside the allocation. Keeping SR_RAM_BASE at 0x08000000 means the recompiled code's
  * MEM_* macros are unchanged (no rebuild of the big object). */
 extern uint8_t *g_mem;
+extern int g_sr_gpu_vram_read_watch;
+extern int g_sr_gpu_vram_write_watch;
+void sr_gpu_vram_read(uint32_t addr, uint32_t bytes);
+void sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes);
+void sr_gpu_vram_prepare_write(uint32_t addr, uint32_t bytes);
 #define SR_RAM_BASE 0x08000000u
 #define SR_PHYS(a)  ((a) & 0x1FFFFFFFu)
 /* Signed offset so addresses below SR_RAM_BASE (VRAM/eDRAM at 0x04000000) map below g_mem,
@@ -50,12 +55,22 @@ static inline int sr_inrange(uint32_t a) {
     return (uint32_t)(SR_PHYS(a) - 0x04000000u) < 0x08000000u;
 }
 extern void sr_oor(uint32_t a, uint32_t v, int store);   /* records out-of-range access (diag) */
-static inline uint8_t  sr_r8 (uint32_t a) { if (sr_inrange(a)) return *(uint8_t  *)SR_HOST(a); sr_oor(a,0,0); return 0u; }
-static inline uint16_t sr_r16(uint32_t a) { if (sr_inrange(a)) return *(uint16_t *)SR_HOST(a); sr_oor(a,0,0); return 0u; }
-static inline uint32_t sr_r32(uint32_t a) { if (sr_inrange(a)) return *(uint32_t *)SR_HOST(a); sr_oor(a,0,0); return 0u; }
-static inline void sr_w8 (uint32_t a, uint8_t  v) { if (sr_inrange(a)) *(uint8_t  *)SR_HOST(a) = v; else sr_oor(a,v,1); }
-static inline void sr_w16(uint32_t a, uint16_t v) { if (sr_inrange(a)) *(uint16_t *)SR_HOST(a) = v; else sr_oor(a,v,1); }
-static inline void sr_w32(uint32_t a, uint32_t v) { if (sr_inrange(a)) *(uint32_t *)SR_HOST(a) = v; else sr_oor(a,v,1); }
+static inline void sr_prepare_read(uint32_t a, uint32_t bytes) {
+    if ((uint32_t)(SR_PHYS(a) - 0x04000000u) < 0x00200000u &&
+        g_sr_gpu_vram_read_watch) {
+        sr_gpu_vram_read(a, bytes);
+    }
+}
+static inline int sr_is_watched_vram(uint32_t a) {
+    return (uint32_t)(SR_PHYS(a) - 0x04000000u) < 0x00200000u &&
+           g_sr_gpu_vram_write_watch;
+}
+static inline uint8_t  sr_r8 (uint32_t a) { if (sr_inrange(a)) { sr_prepare_read(a,1); return *(uint8_t  *)SR_HOST(a); } sr_oor(a,0,0); return 0u; }
+static inline uint16_t sr_r16(uint32_t a) { if (sr_inrange(a)) { sr_prepare_read(a,2); return *(uint16_t *)SR_HOST(a); } sr_oor(a,0,0); return 0u; }
+static inline uint32_t sr_r32(uint32_t a) { if (sr_inrange(a)) { sr_prepare_read(a,4); return *(uint32_t *)SR_HOST(a); } sr_oor(a,0,0); return 0u; }
+static inline void sr_w8 (uint32_t a, uint8_t  v) { if (sr_inrange(a)) { int w=sr_is_watched_vram(a); if(w)sr_gpu_vram_prepare_write(a,1); *(uint8_t  *)SR_HOST(a)=v; if(w)sr_gpu_vram_dirty(a,1); } else sr_oor(a,v,1); }
+static inline void sr_w16(uint32_t a, uint16_t v) { if (sr_inrange(a)) { int w=sr_is_watched_vram(a); if(w)sr_gpu_vram_prepare_write(a,2); *(uint16_t *)SR_HOST(a)=v; if(w)sr_gpu_vram_dirty(a,2); } else sr_oor(a,v,1); }
+static inline void sr_w32(uint32_t a, uint32_t v) { if (sr_inrange(a)) { int w=sr_is_watched_vram(a); if(w)sr_gpu_vram_prepare_write(a,4); *(uint32_t *)SR_HOST(a)=v; if(w)sr_gpu_vram_dirty(a,4); } else sr_oor(a,v,1); }
 
 #define MEM_R8(a)   sr_r8(a)
 #define MEM_R16(a)  sr_r16(a)

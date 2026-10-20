@@ -24,6 +24,8 @@ BUILD_DIR  ?= build/$(GAME_NAME)
 
 RT_GE_O    := $(BUILD_DIR)/ge.o
 RT_D3D12_O := $(BUILD_DIR)/gpu_d3d12_device.o
+RT_D3D12_FRAMEBUFFER_O := $(BUILD_DIR)/gpu_d3d12_framebuffer.o
+RT_D3D12_FRAMEBUFFER_KEY_O := $(BUILD_DIR)/gpu_d3d12_framebuffer_key.o
 RT_D3D12_VERTEX_O := $(BUILD_DIR)/gpu_d3d12_vertex.o
 RT_D3D12_PIPELINE_O := $(BUILD_DIR)/gpu_d3d12_pipeline.o
 RT_D3D12_PIPELINE_KEY_O := $(BUILD_DIR)/gpu_d3d12_pipeline_key.o
@@ -79,12 +81,27 @@ $(RT_GE_O): src/rt/ge.c src/rt/recomp.h
 	$(CC) -O2 -fno-math-errno -Wall -Wextra -Isrc/rt -c src/rt/ge.c -o $@
 
 $(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h \
+               src/rt/gpu_d3d12/framebuffer.h \
                src/rt/gpu_d3d12/vertex.h \
                src/rt/gpu_d3d12/texture.h \
                src/rt/gpu_d3d12/shaders/psp_vs.inc src/rt/gpu_d3d12/shaders/psp_ps.inc \
                src/rt/ge_shared.h src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/device.cpp -o $@
+
+$(RT_D3D12_FRAMEBUFFER_O): src/rt/gpu_d3d12/framebuffer.cpp \
+                           src/rt/gpu_d3d12/framebuffer.h \
+                           src/rt/gpu_d3d12/texture.h \
+                           src/rt/gpu_d3d12/device.h src/rt/ge_shared.h \
+                           src/rt/recomp.h
+	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
+	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/framebuffer.cpp -o $@
+
+$(RT_D3D12_FRAMEBUFFER_KEY_O): src/rt/gpu_d3d12/framebuffer_key.cpp \
+                               src/rt/gpu_d3d12/framebuffer.h \
+                               src/rt/ge_shared.h
+	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
+	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/framebuffer_key.cpp -o $@
 
 $(RT_D3D12_VERTEX_O): src/rt/gpu_d3d12/vertex.cpp src/rt/gpu_d3d12/vertex.h \
                       src/rt/gpu_d3d12/device.h src/rt/gpu_d3d12/pipeline.h \
@@ -116,7 +133,9 @@ $(RT_D3D12_PRESENT_LAYOUT_O): src/rt/gpu_d3d12/present_layout.cpp \
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/present_layout.cpp -o $@
 
 $(RT_D3D12_TEXTURE_O): src/rt/gpu_d3d12/texture.cpp \
-                       src/rt/gpu_d3d12/texture.h src/rt/gpu_d3d12/device.h \
+                       src/rt/gpu_d3d12/texture.h \
+                       src/rt/gpu_d3d12/framebuffer.h \
+                       src/rt/gpu_d3d12/device.h \
                        src/rt/ge_shared.h src/rt/recomp.h
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/texture.cpp -o $@
@@ -128,16 +147,19 @@ $(RT_D3D12_TEXTURE_KEY_O): src/rt/gpu_d3d12/texture_key.cpp \
 
 $(BUILD_DIR)/d3d12_vertex_test.exe: tools/tests/d3d12_vertex_test.cpp \
                                    src/rt/gpu_d3d12/vertex.cpp \
+                                   src/rt/gpu_d3d12/framebuffer_key.cpp \
                                    src/rt/gpu_d3d12/pipeline_key.cpp \
                                    src/rt/gpu_d3d12/present_layout.cpp \
                                    src/rt/gpu_d3d12/texture_key.cpp \
                                    src/rt/gpu_d3d12/vertex.h \
                                    src/rt/gpu_d3d12/pipeline.h \
                                    src/rt/gpu_d3d12/present.h \
+                                   src/rt/gpu_d3d12/framebuffer.h \
                                    src/rt/gpu_d3d12/device.h src/rt/ge_shared.h
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) tools/tests/d3d12_vertex_test.cpp \
 		src/rt/gpu_d3d12/vertex.cpp src/rt/gpu_d3d12/pipeline_key.cpp \
+		src/rt/gpu_d3d12/framebuffer_key.cpp \
 		src/rt/gpu_d3d12/present_layout.cpp \
 		src/rt/gpu_d3d12/texture_key.cpp -o $@
 
@@ -155,6 +177,7 @@ $(BUILD_DIR)/$(GAME_NAME)_recomp.o: $(BUILD_DIR)/$(GAME_NAME)_recomp.c src/rt/re
 	$(CC) $(CFLAGS) -c $< -o $@
 
 compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_D3D12_O) \
+         $(RT_D3D12_FRAMEBUFFER_O) $(RT_D3D12_FRAMEBUFFER_KEY_O) \
          $(RT_D3D12_VERTEX_O) $(RT_D3D12_PIPELINE_O) $(RT_D3D12_PIPELINE_KEY_O) \
          $(RT_D3D12_PRESENT_O) $(RT_D3D12_PRESENT_LAYOUT_O) \
          $(RT_D3D12_TEXTURE_O) $(RT_D3D12_TEXTURE_KEY_O)
@@ -162,6 +185,8 @@ compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_D3D12_O) \
 		$(BUILD_DIR)/$(GAME_NAME)_recomp.o \
 		$(RT_GE_O) \
 		$(RT_D3D12_O) \
+		$(RT_D3D12_FRAMEBUFFER_O) \
+		$(RT_D3D12_FRAMEBUFFER_KEY_O) \
 		$(RT_D3D12_VERTEX_O) \
 		$(RT_D3D12_PIPELINE_O) \
 		$(RT_D3D12_PIPELINE_KEY_O) \

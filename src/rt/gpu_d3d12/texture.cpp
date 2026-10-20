@@ -409,9 +409,14 @@ bool ged3d12_texture_capture(GeD3D12TextureBinding *out) {
     if (!out || !s_initialized) return false;
     memset(out, 0, sizeof(*out));
     out->handle = GE_D3D12_TEXTURE_HANDLE_NONE;
+    out->framebuffer.handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
     const GeState *state = ge_state_ptr();
     ged3d12_texture_sampler_build(state, &out->sampler);
     if (!state->tex_enable || state->clear || !state->tex_addr) return true;
+    if (ged3d12_framebuffer_texture_alias(
+            state, &out->framebuffer)) {
+        return true;
+    }
 
     GeD3D12TextureKey key = {};
     ged3d12_texture_key_build(state, &key);
@@ -519,47 +524,58 @@ bool ged3d12_texture_prepare_pending(void) {
 
 bool ged3d12_texture_bind(const GeD3D12TextureBinding *binding) {
     if (!binding || !s_initialized) return false;
-    if (binding->handle == GE_D3D12_TEXTURE_HANDLE_NONE) return true;
-    uint32_t slot = binding->handle & 0xffffu;
-    uint32_t serial = binding->handle >> 16;
-    if (slot >= MAX_TEXTURES) return false;
-    TextureEntry *entry = &s_textures[slot];
-    if (!entry->occupied || entry->serial != serial || !entry->resource ||
-        entry->pending) {
-        fprintf(stderr, "ged3d12: stale or unprepared texture binding\n");
-        return false;
-    }
-    if (entry->descriptor_generation != s_descriptor_generation) {
-        GeD3D12DescriptorSlice descriptors = {};
-        if (!ged3d12_srv_alloc(2, &descriptors)) return false;
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping =
-            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = entry->key.mip_count;
-        ged3d12_device()->CreateShaderResourceView(
-            entry->resource, &srv, descriptors.cpu);
+    D3D12_GPU_DESCRIPTOR_HANDLE descriptors = {};
+    if (binding->framebuffer.handle != GE_D3D12_FRAMEBUFFER_HANDLE_NONE) {
+        if (!ged3d12_framebuffer_texture_bind(
+                &binding->framebuffer, &descriptors)) {
+            return false;
+        }
+    } else if (binding->handle != GE_D3D12_TEXTURE_HANDLE_NONE) {
+        uint32_t slot = binding->handle & 0xffffu;
+        uint32_t serial = binding->handle >> 16;
+        if (slot >= MAX_TEXTURES) return false;
+        TextureEntry *entry = &s_textures[slot];
+        if (!entry->occupied || entry->serial != serial ||
+            !entry->resource || entry->pending) {
+            fprintf(stderr, "ged3d12: stale or unprepared texture binding\n");
+            return false;
+        }
+        if (entry->descriptor_generation != s_descriptor_generation) {
+            GeD3D12DescriptorSlice allocated = {};
+            if (!ged3d12_srv_alloc(2, &allocated)) return false;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = entry->key.mip_count;
+            ged3d12_device()->CreateShaderResourceView(
+                entry->resource, &srv, allocated.cpu);
 
-        D3D12_SHADER_RESOURCE_VIEW_DESC null_srv = {};
-        null_srv.Format = DXGI_FORMAT_R32_UINT;
-        null_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-        null_srv.Shader4ComponentMapping =
-            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        null_srv.Buffer.NumElements = 1;
-        D3D12_CPU_DESCRIPTOR_HANDLE null_cpu = descriptors.cpu;
-        null_cpu.ptr += ged3d12_device()->GetDescriptorHandleIncrementSize(
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        ged3d12_device()->CreateShaderResourceView(
-            nullptr, &null_srv, null_cpu);
-        entry->descriptors = descriptors.gpu;
-        entry->descriptor_generation = s_descriptor_generation;
+            D3D12_SHADER_RESOURCE_VIEW_DESC null_srv = {};
+            null_srv.Format = DXGI_FORMAT_R32_UINT;
+            null_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            null_srv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            null_srv.Buffer.NumElements = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE null_cpu = allocated.cpu;
+            null_cpu.ptr +=
+                ged3d12_device()->GetDescriptorHandleIncrementSize(
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            ged3d12_device()->CreateShaderResourceView(
+                nullptr, &null_srv, null_cpu);
+            entry->descriptors = allocated.gpu;
+            entry->descriptor_generation = s_descriptor_generation;
+        }
+        descriptors = entry->descriptors;
+    } else {
+        return true;
     }
     D3D12_GPU_DESCRIPTOR_HANDLE sampler = {};
     if (!sampler_binding(&binding->sampler, &sampler)) return false;
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
     command_list->SetGraphicsRootDescriptorTable(
-        GE_D3D12_ROOT_TEXTURES, entry->descriptors);
+        GE_D3D12_ROOT_TEXTURES, descriptors);
     command_list->SetGraphicsRootDescriptorTable(
         GE_D3D12_ROOT_SAMPLER, sampler);
     return true;

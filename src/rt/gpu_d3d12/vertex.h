@@ -3,6 +3,7 @@
 #define GE_D3D12_VERTEX_H
 
 #include "../ge_shared.h"
+#include "framebuffer.h"
 #include "pipeline.h"
 #include "texture.h"
 
@@ -32,6 +33,7 @@ struct GeD3D12VertexBatch {
     uint8_t perspective;
     uint16_t reserved;
     GeD3D12PipelineKey pipeline;
+    GeD3D12FramebufferBinding framebuffer;
     GeD3D12TextureBinding texture;
 };
 
@@ -63,6 +65,6 @@ static_assert(offsetof(GeD3D12Vertex, rw) == 12, "D3D12 GE position ABI changed"
 static_assert(offsetof(GeD3D12Vertex, u) == 16, "D3D12 GE texture ABI changed");
 static_assert(offsetof(GeD3D12Vertex, fog) == 24, "D3D12 GE fog ABI changed");
 static_assert(offsetof(GeD3D12Vertex, rgba) == 28, "D3D12 GE color ABI changed");
-static_assert(sizeof(GeD3D12VertexBatch) == 40, "D3D12 GE batch ABI changed");
+static_assert(sizeof(GeD3D12VertexBatch) == 56, "D3D12 GE batch ABI changed");
 
 #endif
