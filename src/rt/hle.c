@@ -1925,6 +1925,60 @@ static uint32_t h_AudioOutput2Release(CpuState *s) {
     return 0;
 }
 
+/* KZL uses sceAudioInput for the headset-microphone path. Host capture is deliberately not
+ * opened: complete each request with mono silence and preserve its asynchronous pacing. */
+#define AUDIO_INPUT_MAX_SAMPLES (65536u - 64u)
+static uint32_t s_audio_input_samples;
+static uint32_t s_audio_input_rate;
+static int s_audio_input_pending;
+
+static uint32_t h_AudioInputInitEx(CpuState *s) {
+    (void)s;
+    s_audio_input_samples = 0;
+    s_audio_input_rate = 0;
+    s_audio_input_pending = 0;
+    return 0;
+}
+
+static uint32_t h_AudioInput(CpuState *s) {
+    uint32_t samples = A0;
+    uint32_t rate = A1;
+    uint32_t buffer = A2;
+    uint32_t bytes;
+
+    if (samples > AUDIO_INPUT_MAX_SAMPLES ||
+        (rate != 11025 && rate != 22050 && rate != 44100))
+        return 0xFFFFFFFFu;
+    if (!samples) {
+        s_audio_input_samples = 0;
+        s_audio_input_rate = rate;
+        s_audio_input_pending = 0;
+        return 0;
+    }
+    bytes = samples * 2u;
+    if (!buffer || buffer > UINT32_MAX - (bytes - 1u) ||
+        !sr_inrange(buffer) || !sr_inrange(buffer + bytes - 1u))
+        return 0xFFFFFFFFu;
+
+    for (uint32_t i = 0; i < samples; i++)
+        MEM_W16(buffer + i * 2u, 0);
+    s_audio_input_samples = samples;
+    s_audio_input_rate = rate;
+    s_audio_input_pending = 1;
+    return samples;
+}
+
+static uint32_t h_AudioWaitInputEnd(CpuState *s) {
+    (void)s;
+    if (s_audio_input_pending && s_audio_input_rate) {
+        uint64_t usec =
+            (uint64_t)s_audio_input_samples * 1000000u / s_audio_input_rate;
+        sched_delay_current((uint32_t)(usec ? usec : 1));
+    }
+    s_audio_input_pending = 0;
+    return 0;
+}
+
 /* sceImpose language/button (PPSSPP sceImpose.cpp): English, cross = enter, matching
  * sceUtilityGetSystemParamInt. SetLanguageMode stores both. */
 static uint32_t s_impose_lang = 1, s_impose_btn = 1;
@@ -3243,6 +3297,9 @@ void sr_hle_init(void) {
     sr_hle_register(0x2d53f36e, "sceAudioOutput2OutputBlocking", h_AudioOutput2OutputBlocking);
     sr_hle_register(0x63f2889c, "sceAudioOutput2ChangeLength", h_AudioOutput2ChangeLength);
     sr_hle_register(0x43196845, "sceAudioOutput2Release", h_AudioOutput2Release);
+    sr_hle_register(0x6d4bec68, "sceAudioInput", h_AudioInput);
+    sr_hle_register(0x87b2e651, "sceAudioWaitInputEnd", h_AudioWaitInputEnd);
+    sr_hle_register(0xe926d3fb, "sceAudioInputInitEx", h_AudioInputInitEx);
     /* sceCtrl */
     sr_hle_register(0x1f4011e6, "sceCtrlSetSamplingMode", h_ok);
     sr_hle_register(0xa7144800, "sceCtrlSetIdleCancelThreshold", h_ok);
