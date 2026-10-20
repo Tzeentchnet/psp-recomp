@@ -114,8 +114,12 @@ static uint8_t s_lx = 128, s_ly = 128;
 static int s_pad_present;
 static char s_capture_path[1024];
 static int s_vertex_log;
+static int s_gpu_log;
 static int s_framebuffer_safe;
 static int s_destination_safe;
+static UINT s_state_dump_index;
+static UINT64 s_gpu_log_flushes;
+static UINT64 s_gpu_log_draws;
 static UINT64 s_vertex_frames;
 static UINT64 s_vertex_total;
 static UINT64 s_vertex_batches;
@@ -125,6 +129,25 @@ static UINT s_vertex_max;
 static int env_enabled(const char *name) {
     const char *value = getenv(name);
     return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static const char *primitive_name(uint8_t primitive) {
+    switch (primitive) {
+    case GE_D3D12_PRIMITIVE_TRIANGLE: return "triangle";
+    case GE_D3D12_PRIMITIVE_SPRITE: return "sprite";
+    case GE_D3D12_PRIMITIVE_LINE: return "line";
+    case GE_D3D12_PRIMITIVE_POINT: return "point";
+    default: return "unknown";
+    }
+}
+
+static void pix_begin_event(const char *label) {
+    s_command_list->BeginEvent(
+        1, label, (UINT)(strlen(label) + 1));
+}
+
+static void pix_end_event(void) {
+    s_command_list->EndEvent();
 }
 
 static int check_hr(HRESULT hr, const char *operation) {
@@ -796,8 +819,12 @@ static int device_init(void) {
         return 0;
     }
     s_vertex_log = env_enabled("SR_D3D12_VERTEX_LOG");
+    s_gpu_log = env_enabled("SR_GPU_LOG");
     s_framebuffer_safe = env_enabled("SR_D3D12_FRAMEBUFFER_SAFE");
     s_destination_safe = env_enabled("SR_D3D12_DESTINATION_SAFE");
+    s_state_dump_index = 0;
+    s_gpu_log_flushes = 0;
+    s_gpu_log_draws = 0;
     s_vertex_frames = 0;
     s_vertex_total = 0;
     s_vertex_batches = 0;
@@ -1031,6 +1058,18 @@ bool ged3d12_dsv_free(UINT index) {
         s_dsv_used, DSV_DESCRIPTOR_COUNT, 0, index, "DSV");
 }
 
+static void dump_ge_state_hotkey(void) {
+    char path[128];
+    snprintf(
+        path, sizeof(path), "ge_state_f%05u_p%lu_%03u.txt",
+        ge_get_frame(), (unsigned long)GetCurrentProcessId(),
+        s_state_dump_index++);
+    if (ge_debug_dump(path))
+        fprintf(stderr, "ged3d12: F10 GE state dump -> %s\n", path);
+    else
+        fprintf(stderr, "ged3d12: F10 GE state dump failed\n");
+}
+
 static void poll_input(int *quit) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -1040,6 +1079,8 @@ static void poll_input(int *quit) {
             break;
         case SDL_EVENT_KEY_DOWN:
             if (event.key.key == SDLK_ESCAPE) *quit = 1;
+            if (event.key.key == SDLK_F10 && !event.key.repeat)
+                dump_ge_state_hotkey();
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
             if (!s_pad) s_pad = SDL_OpenGamepad(event.gdevice.which);
@@ -1102,6 +1143,88 @@ static void poll_input(int *quit) {
     s_ly = ly;
 }
 
+static bool same_list(
+    const GeD3D12VertexBatch *left, const GeD3D12VertexBatch *right) {
+    return left->list_id == right->list_id &&
+           left->list_addr == right->list_addr;
+}
+
+static bool same_draw(
+    const GeD3D12VertexBatch *left, const GeD3D12VertexBatch *right) {
+    return same_list(left, right) &&
+           left->draw_serial == right->draw_serial;
+}
+
+static void log_draw_batches(
+    const GeD3D12VertexFrame *frame, UINT first) {
+    const GeD3D12VertexBatch *batch = &frame->batches[first];
+    UINT end = first + 1;
+    uint32_t vertices = batch->count;
+    while (end < frame->batch_count &&
+           same_draw(batch, &frame->batches[end])) {
+        vertices += frame->batches[end].count;
+        end++;
+    }
+    fprintf(
+        stderr,
+        "GED3D12 draw present=%llu list=%u@0x%08x draw=%u "
+        "pc=0x%08x op=0x%08x batches=%u vertices=%u primitive=%s "
+        "framebuffer=%u/%u texture=%u\n",
+        (unsigned long long)(s_vertex_frames + 1),
+        batch->list_id, batch->list_addr, batch->draw_serial,
+        batch->draw_pc, batch->draw_op, end - first, vertices,
+        primitive_name(batch->primitive),
+        batch->framebuffer.color_handle, batch->framebuffer.depth_handle,
+        batch->texture.handle);
+    s_gpu_log_draws++;
+}
+
+static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
+    const GeD3D12VertexBatch *open_list = nullptr;
+    const GeD3D12VertexBatch *open_draw = nullptr;
+    bool ok = true;
+    for (UINT i = 0; i < frame->batch_count; i++) {
+        const GeD3D12VertexBatch *batch = &frame->batches[i];
+        if (!open_list || !same_list(open_list, batch)) {
+            if (open_draw) {
+                pix_end_event();
+                open_draw = nullptr;
+            }
+            if (open_list) pix_end_event();
+            char label[96];
+            snprintf(
+                label, sizeof(label), "GE list %u @ 0x%08X",
+                batch->list_id, batch->list_addr);
+            pix_begin_event(label);
+            open_list = batch;
+        }
+        if (!open_draw || !same_draw(open_draw, batch)) {
+            if (open_draw) pix_end_event();
+            char label[128];
+            snprintf(
+                label, sizeof(label),
+                "GE draw %u pc=0x%08X op=0x%08X",
+                batch->draw_serial, batch->draw_pc, batch->draw_op);
+            pix_begin_event(label);
+            open_draw = batch;
+            if (s_gpu_log) log_draw_batches(frame, i);
+        }
+        if (!ged3d12_pipeline_bind(&batch->pipeline) ||
+            !ged3d12_framebuffer_bind(&batch->framebuffer) ||
+            (s_destination_safe &&
+             !ged3d12_framebuffer_bind_destination(
+                 &batch->framebuffer)) ||
+            !ged3d12_texture_bind(&batch->texture)) {
+            ok = false;
+            break;
+        }
+        ged3d12_shader_constants_bind(&batch->shader);
+    }
+    if (open_draw) pix_end_event();
+    if (open_list) pix_end_event();
+    return ok;
+}
+
 static void convert_framebuffer(uint8_t *destination, UINT row_pitch,
                                 uint32_t fbaddr, int format, uint32_t stride) {
     for (int y = 0; y < PSP_H; y++) {
@@ -1149,17 +1272,7 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     if (!ged3d12_vertex_upload_pending(&vertices)) return -2;
     if (!ged3d12_framebuffer_prepare_pending()) return -2;
     if (!ged3d12_texture_prepare_pending()) return -2;
-    for (UINT i = 0; i < vertices.batch_count; i++) {
-        if (!ged3d12_pipeline_bind(&vertices.batches[i].pipeline) ||
-            !ged3d12_framebuffer_bind(&vertices.batches[i].framebuffer) ||
-            (s_destination_safe &&
-             !ged3d12_framebuffer_bind_destination(
-                 &vertices.batches[i].framebuffer)) ||
-            !ged3d12_texture_bind(&vertices.batches[i].texture)) {
-            return -2;
-        }
-        ged3d12_shader_constants_bind(&vertices.batches[i].shader);
-    }
+    if (!record_vertex_batches(&vertices)) return -2;
     s_vertex_frames++;
     s_vertex_total += vertices.vertex_count;
     s_vertex_batches += vertices.batch_count;
@@ -1173,6 +1286,15 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
                 (unsigned long long)s_vertex_frames,
                 vertices.vertex_count, vertices.batch_count,
                 (unsigned long long)vertices.hash, s_vertex_max);
+    }
+    if (s_gpu_log) {
+        fprintf(
+            stderr,
+            "GED3D12 present=%llu frame=%u vertices=%u batches=%u "
+            "hash=%016llx target=0x%08x/%u fmt=%d\n",
+            (unsigned long long)s_vertex_frames, ge_get_frame(),
+            vertices.vertex_count, vertices.batch_count,
+            (unsigned long long)vertices.hash, fbaddr, stride, format);
     }
 
     D3D12_TEXTURE_COPY_LOCATION source = {};
@@ -1267,11 +1389,35 @@ static void device_shutdown(void) {
                 (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_LINE],
                 (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_POINT]);
     }
+    if (s_gpu_log) {
+        fprintf(
+            stderr,
+            "GED3D12 summary presents=%llu flushes=%llu draws=%llu "
+            "batches=%llu vertices=%llu\n",
+            (unsigned long long)s_vertex_frames,
+            (unsigned long long)s_gpu_log_flushes,
+            (unsigned long long)s_gpu_log_draws,
+            (unsigned long long)s_vertex_batches,
+            (unsigned long long)s_vertex_total);
+    }
     release_device();
     ged3d12_window_shutdown();
 }
 
 static void device_flush(const char *reason) {
+    if (s_gpu_log) {
+        uint32_t vertices = 0;
+        uint32_t batches = 0;
+        GeDebugContext context = ge_debug_context();
+        ged3d12_vertex_pending_counts(&vertices, &batches);
+        fprintf(
+            stderr,
+            "GED3D12 flush=%llu frame=%u reason=%s list=%u@0x%08x "
+            "pending_batches=%u pending_vertices=%u\n",
+            (unsigned long long)++s_gpu_log_flushes, context.frame,
+            reason ? reason : "<none>", context.list_id,
+            context.list_addr, batches, vertices);
+    }
     ged3d12_framebuffer_flush(reason);
 }
 

@@ -18,6 +18,8 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 - capture of `ge.c`'s fully decoded primitive stream into the HLSL shader's exact
   32-byte vertex ABI, including PSP flat-shading colors, 1/16-pixel snapping, sprite
   expansion, and line/point quad expansion;
+- immutable GE list/draw context on every captured batch, emitted as nested PIX events
+  when the deferred D3D12 command list is recorded;
 - a collision-safe 512-entry PSO cache keyed by a canonical 16-byte projection of
   blend, color-write, depth, cull, and attachment-format state, with synchronous
   creation on first use;
@@ -125,6 +127,9 @@ explicitly when the requested debug interface is unavailable.
 
 Set `SR_D3D12_VERTEX_LOG=1` to print compact capture counts and content hashes for the
 first three presents and every 120th present, plus a shutdown summary.
+Set `SR_GPU_LOG=1` to print every D3D12 GE flush, one line per logical GE draw, each
+present, and a shutdown summary. Draw lines include the list address, command PC/opcode,
+captured batch/vertex counts, and framebuffer/texture handles.
 Set `SR_D3D12_PSO_LOG=1` to print synchronous PSO creations and a shutdown cache
 summary.
 Set `SR_D3D12_TEXTURE_LOG=1` to print texture-version misses and a shutdown summary of
@@ -135,8 +140,12 @@ and live targets. Set `SR_D3D12_FRAMEBUFFER_SAFE=1` to force every cached target
 through a GPU readback after cached presentation; this is a diagnostic mode and
 intentionally stalls the graphics queue.
 
-Later phase-4 tasks add the destination-aware blend/logic path and submit the uploaded
-batches behind the existing framebuffer, descriptor, invalidation, and shader-state model.
+Install PIX for Windows with `winget install --id Microsoft.PIX --exact`. The command
+list always carries nested `GE list` and `GE draw` events using D3D12's PIX-compatible
+ANSI event ABI, so no PIX header or event-runtime DLL is required to build or deploy the executable. Press **F10** in
+the D3D12 window to write `ge_state_f<frame>_p<pid>_<index>.txt` in the working
+directory. The dump includes the current list/draw identity, decoded raster/texture/
+geometry/transfer state, exact matrix values, and a complete raw `GeState` byte image.
 
 The root project keeps this dependency optional:
 

@@ -101,6 +101,15 @@ typedef struct GeVtx { float x, y, z, rw; float u, v; float fog; int r, g, b, a;
 
 typedef struct GeRgb { int32_t r, g, b; } GeRgb;
 
+typedef struct GeDebugContext {
+    uint32_t frame;
+    uint32_t list_id;
+    uint32_t list_addr;
+    uint32_t draw_serial;
+    uint32_t draw_pc;
+    uint32_t draw_op;
+} GeDebugContext;
+
 static inline uint32_t ge_texture_bits_per_pixel(uint32_t format) {
     static const uint8_t bits[16] = {
         16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8, 0, 0, 0, 0, 0,
@@ -169,6 +178,9 @@ void      sr_gpu_vram_prepare_write(uint32_t addr, uint32_t bytes);
 void      sr_gpu_vram_watch_reads(int enabled);
 void      sr_gpu_vram_watch_writes(int enabled);
 GeState  *ge_state_ptr(void);
+void      ge_debug_set_list(uint32_t list_id, uint32_t list_addr);
+GeDebugContext ge_debug_context(void);
+int       ge_debug_dump(const char *path);
 uint16_t *ge_zbuf_ptr(void);        /* 272*512 entries, row stride = ge_zbuf_stride() */
 uint32_t  ge_zbuf_stride(void);
 /* Decode the current texture to RGBA8 through the exact sampler path the software

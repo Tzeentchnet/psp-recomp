@@ -123,6 +123,9 @@ Set these environment variables before running the game to control runtime featu
   an intentionally expensive resource-transition diagnostic; native draw submission remains disabled.
 - `SR_D3D12_PSO_LOG=1`: Print synchronous GE PSO creation and final cache statistics.
 - `SR_D3D12_WARP=1`: Select Microsoft WARP instead of a hardware adapter.
+- **F10** (D3D12 window): Write a complete textual GE state dump in the working directory.
+  PIX for Windows can display nested list/draw events embedded in each D3D12 command list;
+  install it with `winget install --id Microsoft.PIX --exact`.
 - `PSPRECOMP_CAPTURE_MANIFEST=<path>` and `PSPRECOMP_CAPTURE_DIR=<directory>`: Capture the
   strict 50-frame golden manifest. With the D3D12 backend, frames are read back from the
   480x272 GPU display texture after presentation conversion; other presenters use the
@@ -135,5 +138,7 @@ Set these environment variables before running the game to control runtime featu
 - `PSP_VFPU_TABLES=<directory>`: Override the `assets/vfpu` lookup-table directory. The golden
   harness sets this explicitly so runtime execution does not depend on its working directory.
 - `SR_GPU_GE` / `SR_VIDEO=gdi`: Legacy Vulkan/software and presenter overrides.
-- `SR_GPU_LOG=1`: Print GPU cache flushes and batch information to the console.
+- `SR_GPU_LOG=1`: Print GPU cache flushes and batch information to the console. D3D12
+  includes list/draw identity, command PC/opcode, per-draw batch/vertex counts, presents,
+  and a shutdown summary.
 - `SR_IOLOG=1`: Print all file system access logs.

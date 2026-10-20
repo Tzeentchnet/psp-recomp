@@ -381,6 +381,7 @@ static void process_dl_queue(void) {
         if (gelog()) fprintf(stderr, "GE: %s DL execution at %08x - stall = %08x (list %d)\n",
                              l->pc == l->startpc ? "Starting" : "Resuming", l->pc, l->stall, l->id);
         s_current = l;
+        ge_debug_set_list((uint32_t)l->id, l->startpc);
         if (!l->started) {
             if (l->context) ctx_save(l);
             ge_list_begin(l->startpc);

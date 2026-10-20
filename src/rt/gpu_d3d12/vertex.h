@@ -33,6 +33,11 @@ struct GeD3D12VertexBatch {
     uint8_t primitive;
     uint8_t perspective;
     uint16_t reserved;
+    uint32_t list_id;
+    uint32_t list_addr;
+    uint32_t draw_serial;
+    uint32_t draw_pc;
+    uint32_t draw_op;
     GeD3D12PipelineKey pipeline;
     GeD3D12FramebufferBinding framebuffer;
     GeD3D12TextureBinding texture;
@@ -61,12 +66,14 @@ int ged3d12_vertex_capture_line(
 int ged3d12_vertex_capture_point(const GeVtx *a, int perspective);
 
 bool ged3d12_vertex_upload_pending(GeD3D12VertexFrame *out);
+void ged3d12_vertex_pending_counts(
+    uint32_t *vertex_count, uint32_t *batch_count);
 
 static_assert(sizeof(GeD3D12Vertex) == 32, "D3D12 GE vertex ABI must remain 32 bytes");
 static_assert(offsetof(GeD3D12Vertex, rw) == 12, "D3D12 GE position ABI changed");
 static_assert(offsetof(GeD3D12Vertex, u) == 16, "D3D12 GE texture ABI changed");
 static_assert(offsetof(GeD3D12Vertex, fog) == 24, "D3D12 GE fog ABI changed");
 static_assert(offsetof(GeD3D12Vertex, rgba) == 28, "D3D12 GE color ABI changed");
-static_assert(sizeof(GeD3D12VertexBatch) == 216, "D3D12 GE batch ABI changed");
+static_assert(sizeof(GeD3D12VertexBatch) == 236, "D3D12 GE batch ABI changed");
 
 #endif

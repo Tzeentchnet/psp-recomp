@@ -11,12 +11,17 @@
 #define TEST_GPU_BASE UINT64_C(0x10000000)
 
 static GeState s_state;
+static GeDebugContext s_debug_context;
 static uint8_t s_upload[TEST_UPLOAD_SIZE];
 static UINT64 s_upload_cursor;
 static int s_failures;
 
 extern "C" GeState *ge_state_ptr(void) {
     return &s_state;
+}
+
+extern "C" GeDebugContext ge_debug_context(void) {
+    return s_debug_context;
 }
 
 bool ged3d12_texture_capture(GeD3D12TextureBinding *out) {
@@ -595,6 +600,11 @@ static void test_framebuffer_keys(void) {
 static void test_triangle(void) {
     reset_upload();
     memset(&s_state, 0, sizeof(s_state));
+    s_debug_context.list_id = 7;
+    s_debug_context.list_addr = 0x08123400u;
+    s_debug_context.draw_serial = 19;
+    s_debug_context.draw_pc = 0x08123440u;
+    s_debug_context.draw_op = 0x04030003u;
     s_state.shade_gouraud = 0;
     GeVtx a = vertex(1.1f, 2.2f, 3.0f, 0.25f, 4.0f, 5.0f, 0.5f,
                      1, 2, 3, 4);
@@ -622,6 +632,12 @@ static void test_triangle(void) {
     check_u32("triangle batch kind", frame.batches[0].primitive,
               GE_D3D12_PRIMITIVE_TRIANGLE);
     check_u32("triangle perspective", frame.batches[0].perspective, 1);
+    check_u32("triangle list id", frame.batches[0].list_id, 7);
+    check_u32(
+        "triangle list address", frame.batches[0].list_addr, 0x08123400u);
+    check_u32("triangle draw serial", frame.batches[0].draw_serial, 19);
+    check_u32("triangle draw pc", frame.batches[0].draw_pc, 0x08123440u);
+    check_u32("triangle draw op", frame.batches[0].draw_op, 0x04030003u);
 
     const GeD3D12Vertex *vertices = uploaded_vertices(&frame);
     check_float("triangle snapped x", vertices[0].x, 1.0625f);

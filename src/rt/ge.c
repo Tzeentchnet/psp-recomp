@@ -22,6 +22,7 @@
 #include "recomp.h"
 #include "ge_shared.h"
 
+#include <errno.h>
 #include <stdint.h>
 #include <limits.h>
 #include <string.h>
@@ -94,6 +95,10 @@ enum {
 /* GeState now lives in ge_shared.h (shared with the optional GPU backend). */
 static GeState ge;
 static int s_ge_inited = 0;
+static uint32_t s_ge_frame = 0;
+static GeDebugContext s_debug_context = {
+    0, UINT32_MAX, 0, 0, 0, 0
+};
 
 /* Optional rasterizer backend (ge_shared.h). NULL = the reference software path. */
 static const GeBackend *s_backend = NULL;
@@ -108,6 +113,22 @@ void ge_set_backend(const GeBackend *backend) {
 }
 const GeBackend *ge_backend_get(void) { return s_backend; }
 GeState *ge_state_ptr(void) { return &ge; }
+void ge_debug_set_list(uint32_t list_id, uint32_t list_addr) {
+    s_debug_context.list_id = list_id;
+    s_debug_context.list_addr = list_addr;
+    s_debug_context.draw_pc = 0;
+    s_debug_context.draw_op = 0;
+}
+GeDebugContext ge_debug_context(void) {
+    GeDebugContext context = s_debug_context;
+    context.frame = s_ge_frame;
+    return context;
+}
+static void ge_debug_begin_draw(uint32_t pc, uint32_t op) {
+    s_debug_context.draw_serial++;
+    s_debug_context.draw_pc = pc;
+    s_debug_context.draw_op = op;
+}
 void sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes) {
     if (s_backend && s_backend->vram_dirty) s_backend->vram_dirty(addr, bytes);
 }
@@ -138,6 +159,150 @@ static void ge_state_init(void) {
     ge.shade_gouraud = 1;
     ge.amb_alpha = 0xFF;   /* lit alpha multiplies by this; 0 would blank lit geometry pre-init */
     s_ge_inited = 1;
+}
+
+static void ge_debug_dump_floats(
+    FILE *file, const char *name, const float *values, size_t count) {
+    fprintf(file, "%s=", name);
+    for (size_t i = 0; i < count; i++)
+        fprintf(file, "%s%a", i ? "," : "", (double)values[i]);
+    fputc('\n', file);
+}
+
+int ge_debug_dump(const char *path) {
+    if (!path || !path[0]) {
+        fprintf(stderr, "GE: state dump requires a non-empty path\n");
+        return 0;
+    }
+    if (!s_ge_inited) ge_state_init();
+
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        fprintf(stderr, "GE: could not open state dump %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+
+    GeDebugContext context = ge_debug_context();
+    const char *backend = s_backend && s_backend->name ? s_backend->name : "sw";
+    fprintf(file, "KZL_GE_STATE_V1\n");
+    fprintf(file, "[context]\n");
+    fprintf(file, "backend=%s\n", backend);
+    fprintf(file, "frame=%u\n", context.frame);
+    fprintf(file, "list_id=%u\n", context.list_id);
+    fprintf(file, "list_handle=0x%08x\n",
+            context.list_id == UINT32_MAX
+                ? UINT32_MAX : context.list_id ^ 0x35000000u);
+    fprintf(file, "list_addr=0x%08x\n", context.list_addr);
+    fprintf(file, "draw_serial=%u\n", context.draw_serial);
+    fprintf(file, "draw_pc=0x%08x\n", context.draw_pc);
+    fprintf(file, "draw_op=0x%08x\n", context.draw_op);
+
+    fprintf(file, "[addresses]\n");
+    fprintf(file,
+            "base=0x%08x offset=0x%08x vaddr=0x%08x iaddr=0x%08x "
+            "vtype=0x%08x\n",
+            ge.base, ge.offset, ge.vaddr, ge.iaddr, ge.vtype);
+    fprintf(file,
+            "framebuffer=0x%08x stride=%u format=%u "
+            "depth=0x%08x depth_stride=%u\n",
+            ge.fbp, ge.fbw, ge.fbfmt, ge.zbp, ge.zbw);
+
+    fprintf(file, "[raster]\n");
+    fprintf(file,
+            "scissor=%d,%d,%d,%d depth_test=%d depth_func=%u "
+            "depth_write_disable=%d minz=%u maxz=%u depth_clip=%u\n",
+            ge.scis_x1, ge.scis_y1, ge.scis_x2, ge.scis_y2,
+            ge.ztest_enable, ge.ztest, ge.zwrite_disable,
+            ge.minz, ge.maxz, ge.depth_clip);
+    fprintf(file,
+            "cull_enable=%d cull=%u clear=%d clear_mode=0x%08x "
+            "shade_gouraud=%d\n",
+            ge.cull_enable, ge.cull, ge.clear, ge.clear_mode,
+            ge.shade_gouraud);
+    fprintf(file,
+            "blend_enable=%d blend_mode=0x%08x fixed_a=0x%08x "
+            "fixed_b=0x%08x logic_enable=%d logic_op=%u\n",
+            ge.blend_enable, ge.blend_mode, ge.blend_fixa, ge.blend_fixb,
+            ge.logic_op_enable, ge.logic_op);
+    fprintf(file,
+            "alpha_test=%d/0x%08x color_test=%d/0x%08x/0x%08x/0x%08x "
+            "stencil_test=%d/0x%08x/0x%08x\n",
+            ge.atest_enable, ge.atest,
+            ge.color_test_enable, ge.color_test, ge.color_ref,
+            ge.color_test_mask,
+            ge.stencil_test_enable, ge.stencil_test, ge.stencil_op);
+    fprintf(file,
+            "mask_rgb=0x%08x mask_alpha=0x%08x dither_enable=%d "
+            "fog=%d/%a/%a/0x%08x\n",
+            ge.mask_rgb, (uint32_t)ge.mask_alpha, ge.dither_enable,
+            ge.fog_enable, (double)ge.fog_end, (double)ge.fog_slope,
+            ge.fog_color);
+
+    fprintf(file, "[texture]\n");
+    fprintf(file,
+            "enable=%d addr=0x%08x stride=%u format=%u size=%dx%d "
+            "swizzle=%d max_level=%d mode=0x%08x level=0x%08x\n",
+            ge.tex_enable, ge.tex_addr, ge.tex_bufw, ge.tex_fmt,
+            ge.tex_w, ge.tex_h, ge.tex_swizzle, ge.tex_max_level,
+            ge.tex_mode, ge.tex_level);
+    fprintf(file,
+            "wrap=0x%08x filter=0x%08x function=0x%08x env=0x%08x "
+            "clut=0x%08x/0x%08x generation=%u\n",
+            ge.tex_wrap, ge.tex_filter, ge.tex_func, ge.tex_env,
+            ge.clut_addr, ge.clut_fmt, ge.clut_gen);
+    fprintf(file,
+            "map_mode=0x%08x shade_ls=0x%08x scale=%a,%a offset=%a,%a\n",
+            ge.tex_map_mode, ge.tex_shade_ls,
+            (double)ge.tex_scale_u, (double)ge.tex_scale_v,
+            (double)ge.tex_off_u, (double)ge.tex_off_v);
+    for (int level = 0; level < 8; level++) {
+        fprintf(file,
+                "level%d=0x%08x,%u,%d,%d\n",
+                level, ge.tex_addr_levels[level],
+                ge.tex_bufw_levels[level], ge.tex_width_levels[level],
+                ge.tex_height_levels[level]);
+    }
+
+    fprintf(file, "[geometry]\n");
+    fprintf(file,
+            "patch_division=0x%08x patch_primitive=%u patch_facing=%u "
+            "lighting=%d reverse_normal=%d light_mode=%d\n",
+            ge.patch_division, ge.patch_primitive, ge.patch_facing,
+            ge.lighting_enable, ge.reverse_normal, ge.light_mode);
+    ge_debug_dump_floats(file, "world", ge.world, 12);
+    ge_debug_dump_floats(file, "view", ge.view, 12);
+    ge_debug_dump_floats(file, "projection", ge.proj, 16);
+    ge_debug_dump_floats(file, "bones", ge.bone, 96);
+    ge_debug_dump_floats(file, "morph_weights", ge.morph_weight, 8);
+    ge_debug_dump_floats(file, "texgen", ge.tgen, 12);
+
+    fprintf(file, "[transfer]\n");
+    fprintf(file,
+            "source=0x%08x source_width=0x%08x destination=0x%08x "
+            "destination_width=0x%08x source_pos=0x%08x "
+            "destination_pos=0x%08x size=0x%08x\n",
+            ge.xf_src, ge.xf_srcw, ge.xf_dst, ge.xf_dstw,
+            ge.xf_spos, ge.xf_dpos, ge.xf_size);
+
+    fprintf(file, "[raw-state]\n");
+    const unsigned char *bytes = (const unsigned char *)&ge;
+    for (size_t offset = 0; offset < sizeof(ge); offset += 16) {
+        fprintf(file, "%04zx:", offset);
+        size_t end = offset + 16 < sizeof(ge) ? offset + 16 : sizeof(ge);
+        for (size_t i = offset; i < end; i++)
+            fprintf(file, " %02x", bytes[i]);
+        fputc('\n', file);
+    }
+
+    int failed = ferror(file);
+    if (fclose(file) != 0) failed = 1;
+    if (failed) {
+        fprintf(stderr, "GE: failed while writing state dump %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+    return 1;
 }
 
 /* ---- Depth buffer ----
@@ -500,7 +665,6 @@ static void clut_lookup_level(uint32_t index, int level, uint32_t tex_fmt,
 }
 
 unsigned long g_tex_samples = 0, g_tex_nonzero = 0;
-static uint32_t s_ge_frame = 0;
 
 /* ---- Per-frame statistics (SR_GESTAT=1: print every 60 frames) ----
  * Used to diagnose "black screen" states: shows whether 3D geometry is being culled,
@@ -3850,9 +4014,21 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
             case GE_TRANSFERSIZE:   ge.xf_size = data; break;
             case GE_TRANSFERSTART:  ge_block_transfer(data); break;
 
-            case GE_PRIM: s_list_prims++; draw_prim(op); break;
-            case GE_BEZIER: s_list_prims++; draw_bezier(op); break;
-            case GE_SPLINE: s_list_prims++; draw_spline(op); break;
+            case GE_PRIM:
+                s_list_prims++;
+                ge_debug_begin_draw(pc, op);
+                draw_prim(op);
+                break;
+            case GE_BEZIER:
+                s_list_prims++;
+                ge_debug_begin_draw(pc, op);
+                draw_bezier(op);
+                break;
+            case GE_SPLINE:
+                s_list_prims++;
+                ge_debug_begin_draw(pc, op);
+                draw_spline(op);
+                break;
             /* The bounding-box test result is kept by gelist.c (BJUMP); nothing to draw. */
             case GE_BOUNDINGBOX: break;
             /* SIGNAL and FINISH only take effect at the END that follows (gelist.c). */

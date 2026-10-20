@@ -92,6 +92,12 @@ static bool begin_primitive(
     batch->primitive = primitive;
     batch->perspective = perspective != 0;
     batch->reserved = 0;
+    GeDebugContext debug = ge_debug_context();
+    batch->list_id = debug.list_id;
+    batch->list_addr = debug.list_addr;
+    batch->draw_serial = debug.draw_serial;
+    batch->draw_pc = debug.draw_pc;
+    batch->draw_op = debug.draw_op;
     ged3d12_pipeline_key_build(
         ge_state_ptr(), primitive != GE_D3D12_PRIMITIVE_TRIANGLE,
         &batch->pipeline);
@@ -306,6 +312,7 @@ bool ged3d12_vertex_upload_pending(GeD3D12VertexFrame *out) {
         fprintf(stderr, "ged3d12: decoded vertex upload requires an output frame\n");
         return false;
     }
+
     memset(out, 0, sizeof(*out));
     if (s_capture_failed) {
         fprintf(stderr, "ged3d12: decoded vertex capture failed; refusing a partial upload\n");
@@ -339,4 +346,10 @@ bool ged3d12_vertex_upload_pending(GeD3D12VertexFrame *out) {
     s_batch_count = 0;
     memset(s_primitive_count, 0, sizeof(s_primitive_count));
     return true;
+}
+
+void ged3d12_vertex_pending_counts(
+    uint32_t *vertex_count, uint32_t *batch_count) {
+    if (vertex_count) *vertex_count = s_vertex_count;
+    if (batch_count) *batch_count = s_batch_count;
 }
