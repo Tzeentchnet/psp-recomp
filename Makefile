@@ -59,6 +59,13 @@ src/ref/interp.cpp \
               src/rt/sas_reverb.c \
               src/rt/h264_mf.c \
               src/rt/savedata.c \
+              src/rt/savedata_crypto.cpp \
+              third_party/ppsspp_savedata/AES.c \
+              third_party/ppsspp_savedata/SHA1.c \
+              third_party/ppsspp_savedata/bn.c \
+              third_party/ppsspp_savedata/ec.c \
+              third_party/ppsspp_savedata/kirk_engine.c \
+              third_party/ppsspp_savedata/chnnlsv.cpp \
               src/rt/osk_win.c \
               src/rt/driver.c \
               src/rt/gpu_sdl3vk/sdl3vk.c \

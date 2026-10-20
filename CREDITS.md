@@ -58,6 +58,10 @@ What this means for you:
   - **System fonts.** `font/` ships PPSSPP's free replacement `jpn0.pgf` and
     `ltn0.pgf`, needed for native text dialogs. They are not PSP firmware dumps;
     the superproject content audit pins their PPSSPP v1.20.4 SHA-256 identities.
+  - **Secure savedata.** `third_party/ppsspp_savedata/` contains a standalone
+    subset of PPSSPP's Chnnlsv implementation plus libkirk. Chnnlsv is
+    GPL-2.0-or-later; libkirk is GPL-3.0-or-later, so linked binaries must comply
+    with GPL-3.0-or-later. See that directory's README and `COPYING.GPLv3`.
 
   Note: an earlier `src/rt/gpu_vk/` bridge reused PPSSPP's `GPU_Vulkan`
   wholesale behind a C ABI (modelled on `WindowsVulkanContext.cpp`, linking

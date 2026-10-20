@@ -2,7 +2,8 @@
  *
  * Save operations write real files under memstick/PSP/SAVEDATA/<gameName><saveName>/ next to
  * the executable (override the root with SR_MEMSTICK), the same layout PPSSPP and a real PSP
- * use, so saves can be copied between this build and PPSSPP. Field offsets and result codes
+ * use. Secure operations use PPSSPP's Chnnlsv/libkirk path and SFO/file hashes, so encrypted
+ * saves round-trip with PPSSPP and real PSP saves. Field offsets and result codes
  * follow PPSSPP's SceUtilitySavedataParam (Core/Dialog/SavedataParam.h); the earlier no-op
  * implementation was also missing the abortStatus word, putting msFree/idList/fileList four
  * bytes too low.
@@ -16,6 +17,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include "recomp.h"
+#include "savedata_crypto.h"
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +46,8 @@ enum {
     SDP_msFree    = 0x5d0,
     SDP_msData    = 0x5d4,
     SDP_usedData  = 0x5d8,
+    SDP_key       = 0x5dc,
+    SDP_secureVersion = 0x5ec,
     SDP_idList    = 0x5f4,
     SDP_fileList  = 0x5f8,
     SDP_sizeInfo  = 0x5fc,
@@ -59,12 +63,14 @@ enum { SD_AUTOLOAD=0, SD_AUTOSAVE=1, SD_LOAD=2, SD_SAVE=3, SD_LISTLOAD=4, SD_LIS
        SD_ERASE=20, SD_DELETEDATA=21, SD_GETSIZE=22 };
 
 #define ERR_LOAD_NO_DATA    0x80110307u
+#define ERR_LOAD_BROKEN     0x80110306u
 #define ERR_LOAD_NOT_FOUND  0x80110309u
 #define ERR_DELETE_NO_DATA  0x80110347u
 #define ERR_RW_NO_DATA      0x80110327u
 #define ERR_RW_NOT_FOUND    0x80110329u
 #define ERR_RW_MS_FULL      0x80110323u
 #define ERR_SIZES_NO_DATA   0x801103C7u   /* SIZES on a save that doesn't exist yet (PPSSPP) */
+#define ERR_SAVE_PARAM      0x80110388u
 
 /* SceUtilitySavedataParam: bind result (offset 0x34, after mode). PPSSPP sets 1021 on every
  * successful load -- "PSP always responds this and this unlocks some games". */
@@ -104,6 +110,24 @@ static void save_dir(char *out, int cap, const char *game, const char *save) {
 
 static int sdlog(void) { static int v = -1; if (v < 0) v = getenv("SR_DLGLOG") ? 1 : 0; return v; }
 
+static int savedata_key(uint32_t param, uint8_t key[16]) {
+    int nonzero = 0;
+    for (uint32_t i = 0; i < 16; i++) {
+        key[i] = MEM_R8(param + SDP_key + i);
+        nonzero |= key[i] != 0;
+    }
+    return nonzero;
+}
+
+static int savedata_crypto_mode(uint32_t param, int has_key) {
+    uint32_t version = MEM_R32(param + SDP_secureVersion);
+    if (version == 1) return 1;
+    if (version == 2) return 3;
+    if (version == 3) return g_sdk_version > 0x0206ffffu ? 5 : 1;
+    if (has_key) return g_sdk_version > 0x0206ffffu ? 5 : 3;
+    return 1;
+}
+
 static int write_file(const char *dir, const char *name, const uint8_t *data, uint32_t n) {
     char path[MAX_PATH];
     snprintf(path, sizeof(path), "%s\\%s", dir, name);
@@ -124,16 +148,19 @@ static void write_filedata(const char *dir, const char *name, uint32_t fd) {
 /* ---- minimal PARAM.SFO writer (PSF v1.1) -------------------------------------------------- */
 typedef struct { const char *key; uint16_t fmt; uint32_t len, maxlen; const void *val; } SfoEnt;
 
-static void sfo_write(const char *dir, const char *title, const char *saveTitle,
-                      const char *detail, const char *saveDir, uint32_t parental,
-                      const char *fileName) {
+static int sfo_write(const char *dir, const char *title, const char *saveTitle,
+                     const char *detail, const char *saveDir, uint32_t parental,
+                     const char *fileName, int crypto_mode,
+                     const uint8_t file_hash[16]) {
     static uint8_t params[128], filelist[3168];   /* zeroed secure blocks */
-    /* FILE_LIST entry 0: {char name[13]; u8 hash[16]; u8 pad[3]} -- records the data file
-     * (hash left zero; we don't encrypt). */
+    /* FILE_LIST entry 0: {char name[13]; u8 hash[16]; u8 pad[3]}. */
+    memset(params, 0, sizeof(params));
     memset(filelist, 0, sizeof(filelist));
     if (fileName && fileName[0]) {
         size_t fl = strlen(fileName); if (fl > 12) fl = 12;
         memcpy(filelist, fileName, fl);
+        if (crypto_mode && file_hash)
+            memcpy(filelist + 13, file_hash, 16);
     }
     char cat[4] = "MS";
     uint32_t pl = parental;
@@ -157,8 +184,10 @@ static void sfo_write(const char *dir, const char *title, const char *saveTitle,
     uint32_t keyStart = 20 + 16u * (uint32_t)n;
     uint32_t dataStart = (keyStart + keySize + 3) & ~3u;
 
-    uint8_t *buf = (uint8_t *)calloc(1, dataStart + dataSize);
-    if (!buf) return;
+    uint32_t output_size = dataStart + dataSize;
+    uint32_t capacity = (output_size + 15u) & ~15u;
+    uint8_t *buf = (uint8_t *)calloc(1, capacity);
+    if (!buf) return 0;
     memcpy(buf, "\0PSF", 4);
     *(uint32_t *)(buf + 4) = 0x0101;
     *(uint32_t *)(buf + 8) = keyStart;
@@ -174,8 +203,15 @@ static void sfo_write(const char *dir, const char *title, const char *saveTitle,
         strcpy((char *)(buf + keyStart + keyOff[i]), e[i].key);
         memcpy(buf + dataStart + dataOff[i], e[i].val, e[i].len);
     }
-    write_file(dir, "PARAM.SFO", buf, dataStart + dataSize);
+    if (crypto_mode &&
+        sr_savedata_update_sfo_hash(
+            buf, output_size, capacity, dataStart + dataOff[5], crypto_mode) != 0) {
+        free(buf);
+        return 0;
+    }
+    int ok = write_file(dir, "PARAM.SFO", buf, output_size);
     free(buf);
+    return ok;
 }
 
 /* ---- ScePspDateTime (16 bytes) from a Windows FILETIME ------------------------------------ */
@@ -237,24 +273,126 @@ static void load_sfo_param(uint32_t param, const char *dir) {
     free(b);
 }
 
+static int load_sfo_crypto(
+    const char *dir, const char *file_name,
+    uint8_t expected_hash[16], int *has_hash) {
+    *has_hash = 0;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\PARAM.SFO", dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long length = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (length <= 20 || length > (1 << 20)) {
+        fclose(f);
+        return 0;
+    }
+    uint8_t *buffer = (uint8_t *)malloc((size_t)length);
+    if (!buffer || fread(buffer, 1, (size_t)length, f) != (size_t)length) {
+        free(buffer);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    if (memcmp(buffer, "\0PSF", 4) != 0) {
+        free(buffer);
+        return 0;
+    }
+    uint32_t key_start, data_start, count;
+    memcpy(&key_start, buffer + 8, 4);
+    memcpy(&data_start, buffer + 12, 4);
+    memcpy(&count, buffer + 16, 4);
+    int crypto_mode = 0;
+    for (uint32_t i = 0; i < count && 20 + 16 * (i + 1) <= (uint32_t)length; i++) {
+        const uint8_t *index = buffer + 20 + 16 * i;
+        uint16_t key_offset;
+        uint32_t value_length, data_offset;
+        memcpy(&key_offset, index, 2);
+        memcpy(&value_length, index + 4, 4);
+        memcpy(&data_offset, index + 12, 4);
+        if (key_start >= (uint32_t)length ||
+            key_offset >= (uint32_t)length - key_start ||
+            data_start > (uint32_t)length ||
+            data_offset > (uint32_t)length - data_start ||
+            value_length > (uint32_t)length - data_start - data_offset) {
+            continue;
+        }
+        const char *key = (const char *)buffer + key_start + key_offset;
+        size_t key_capacity = (size_t)length - key_start - key_offset;
+        if (!memchr(key, 0, key_capacity)) continue;
+        const uint8_t *value = buffer + data_start + data_offset;
+        if (!strcmp(key, "SAVEDATA_PARAMS") && value_length >= 1) {
+            switch (value[0]) {
+                case 0x01: crypto_mode = 1; break;
+                case 0x21: crypto_mode = 3; break;
+                case 0x41: crypto_mode = 5; break;
+                default: break;
+            }
+        } else if (!strcmp(key, "SAVEDATA_FILE_LIST")) {
+            uint32_t entries = value_length / 32u;
+            for (uint32_t entry = 0; entry < entries; entry++) {
+                const uint8_t *item = value + entry * 32u;
+                if (strncmp((const char *)item, file_name, 13) == 0) {
+                    memcpy(expected_hash, item + 13, 16);
+                    *has_hash = 1;
+                    break;
+                }
+            }
+        }
+    }
+    free(buffer);
+    return crypto_mode;
+}
+
 /* ---- modes -------------------------------------------------------------------------------- */
 
-static uint32_t do_save(uint32_t param, const char *game, const char *save) {
+static uint32_t do_save(
+    uint32_t param, const char *game, const char *save, int secure) {
     char dir[MAX_PATH], fileName[16], title[129], saveTitle[129], detail[1025], saveDir[64];
     save_dir(dir, sizeof(dir), game, save);
     mkdirs(dir);
     rd_cstr(param + SDP_fileName, fileName, sizeof(fileName));
     uint32_t dataBuf = MEM_R32(param + SDP_dataBuf);
     uint32_t dataSize = MEM_R32(param + SDP_dataSize);
+    int crypto_mode = 0;
+    uint8_t file_hash[16] = {0};
     if (fileName[0] && dataBuf && dataSize && dataSize < 0x04000000) {
-        if (!write_file(dir, fileName, (const uint8_t *)SR_HOST(dataBuf), dataSize))
+        const uint8_t *file_data = (const uint8_t *)SR_HOST(dataBuf);
+        uint8_t *encrypted = NULL;
+        uint32_t file_size = dataSize;
+        if (secure) {
+            uint8_t key[16];
+            int has_key = savedata_key(param, key);
+            crypto_mode = savedata_crypto_mode(param, has_key);
+            if (crypto_mode > 1 && !has_key) return ERR_SAVE_PARAM;
+            uint32_t capacity = ((dataSize + 15u) & ~15u) + 16u;
+            encrypted = (uint8_t *)calloc(1, capacity);
+            if (!encrypted) return ERR_SAVE_PARAM;
+            memcpy(encrypted, file_data, dataSize);
+            if (sr_savedata_encrypt(
+                    crypto_mode, encrypted, &file_size, capacity,
+                    file_hash, key) != 0) {
+                free(encrypted);
+                return ERR_SAVE_PARAM;
+            }
+            file_data = encrypted;
+        }
+        int wrote = write_file(dir, fileName, file_data, file_size);
+        free(encrypted);
+        if (!wrote)
             return 0x80110381u;   /* SAVE_NO_MS: couldn't write */
     }
     rd_cstr(param + SDP_sfoTitle, title, sizeof(title));
     rd_cstr(param + SDP_sfoSaveTitle, saveTitle, sizeof(saveTitle));
     rd_cstr(param + SDP_sfoDetail, detail, sizeof(detail));
     snprintf(saveDir, sizeof(saveDir), "%s%s", game, save);
-    sfo_write(dir, title, saveTitle, detail, saveDir, MEM_R8(param + SDP_sfoParental), fileName);
+    if (!sfo_write(
+            dir, title, saveTitle, detail, saveDir,
+            MEM_R8(param + SDP_sfoParental), fileName,
+            crypto_mode, file_hash)) {
+        return 0x80110381u;
+    }
     write_filedata(dir, "ICON0.PNG", param + SDP_icon0);
     write_filedata(dir, "ICON1.PMF", param + SDP_icon1);
     write_filedata(dir, "PIC1.PNG", param + SDP_pic1);
@@ -282,7 +420,8 @@ static void load_filedata(const char *dir, const char *name, uint32_t fd) {
     MEM_W32(fd + 8, (uint32_t)rd);
 }
 
-static uint32_t do_load(uint32_t param, const char *game, const char *save) {
+static uint32_t do_load(
+    uint32_t param, const char *game, const char *save, int secure) {
     char dir[MAX_PATH], fileName[16], path[MAX_PATH];
     save_dir(dir, sizeof(dir), game, save);
     rd_cstr(param + SDP_fileName, fileName, sizeof(fileName));
@@ -305,15 +444,66 @@ static uint32_t do_load(uint32_t param, const char *game, const char *save) {
         fseek(f, 0, SEEK_END);
         long n = ftell(f);
         fseek(f, 0, SEEK_SET);
-        if (n < 0) n = 0;
-        if (cap && (uint32_t)n > cap) n = (long)cap;
-        size_t rd = dataBuf ? fread(SR_HOST(dataBuf), 1, (size_t)n, f) : 0;
+        if (n < 0 || n >= 0x04000000) {
+            fclose(f);
+            return ERR_LOAD_BROKEN;
+        }
+        uint32_t host_capacity = ((uint32_t)n + 15u) & ~15u;
+        uint8_t *host_data = (uint8_t *)calloc(1, host_capacity ? host_capacity : 1);
+        size_t rd = fread(host_data, 1, (size_t)n, f);
         fclose(f);
-        MEM_W32(param + SDP_dataSize, (uint32_t)rd);
+        if (rd != (size_t)n) {
+            free(host_data);
+            return ERR_LOAD_BROKEN;
+        }
+        uint32_t loaded_size = (uint32_t)n;
+        int legacy_plaintext = 0;
+        if (secure) {
+            uint8_t expected_hash[16], key[16];
+            int has_hash;
+            int crypto_mode = load_sfo_crypto(
+                dir, fileName, expected_hash, &has_hash);
+            if (crypto_mode) {
+                int has_key = savedata_key(param, key);
+                if (crypto_mode > 1 && !has_key) {
+                    free(host_data);
+                    return ERR_LOAD_BROKEN;
+                }
+                if (sr_savedata_decrypt(
+                        crypto_mode, host_data, &loaded_size, host_capacity,
+                        key, has_hash ? expected_hash : NULL) != 0) {
+                    free(host_data);
+                    return ERR_LOAD_BROKEN;
+                }
+            } else {
+                legacy_plaintext = 1;
+            }
+        }
+        if (!dataBuf || loaded_size > cap) {
+            free(host_data);
+            return ERR_LOAD_BROKEN;
+        }
+        memcpy(SR_HOST(dataBuf), host_data, loaded_size);
+        free(host_data);
+        MEM_W32(param + SDP_dataSize, loaded_size);
         if (sdlog()) {
             const uint8_t *p = (const uint8_t *)SR_HOST(dataBuf);
             fprintf(stderr, "savedata: LOAD %s (%u bytes) -> buf=0x%08x cap=%u first=%02x%02x%02x%02x\n",
-                    path, (unsigned)rd, dataBuf, cap, p[0], p[1], p[2], p[3]);
+                    path, loaded_size, dataBuf, cap,
+                    loaded_size > 0 ? p[0] : 0, loaded_size > 1 ? p[1] : 0,
+                    loaded_size > 2 ? p[2] : 0, loaded_size > 3 ? p[3] : 0);
+        }
+        if (legacy_plaintext && getenv("SR_SAVEDATA_MIGRATE")) {
+            /* Files produced before secure savedata support were plaintext. Re-save only
+             * behind an explicit migration request, using the game's live key. */
+            load_sfo_param(param, dir);
+            load_filedata(dir, "ICON0.PNG", param + SDP_icon0);
+            load_filedata(dir, "ICON1.PMF", param + SDP_icon1);
+            load_filedata(dir, "PIC1.PNG", param + SDP_pic1);
+            load_filedata(dir, "SND0.AT3", param + SDP_snd0);
+            uint32_t result = do_save(param, game, save, 1);
+            if (result != 0) return ERR_LOAD_BROKEN;
+            if (sdlog()) fprintf(stderr, "savedata: migrated plaintext save to PSP secure format\n");
         }
     } else if (sdlog()) {
         fprintf(stderr, "savedata: LOAD %s (blank fileName: SFO/icons only)\n", dir);
@@ -583,18 +773,29 @@ uint32_t sr_savedata_execute(uint32_t param) {
     if (sdlog()) fprintf(stderr, "savedata: mode=%u game='%s' save='%s'\n", mode, game, save);
     switch (mode) {
         case SD_AUTOSAVE: case SD_SAVE: case SD_LISTSAVE:
-        case SD_MAKEDATA: case SD_MAKEDATASECURE:
-        case SD_WRITEDATA: case SD_WRITEDATASECURE: {
-            uint32_t r = do_save(param, game, save);
+        case SD_MAKEDATASECURE: case SD_WRITEDATASECURE: {
+            uint32_t r = do_save(param, game, save, 1);
             /* PPSSPP: MAKEDATA reports a full stick with the RW error code */
             if (r == 0x80110381u && (mode == SD_MAKEDATA || mode == SD_MAKEDATASECURE))
                 r = ERR_RW_MS_FULL;
             return r;
         }
+        case SD_MAKEDATA: case SD_WRITEDATA: {
+            uint32_t r = do_save(param, game, save, 0);
+            if (r == 0x80110381u && mode == SD_MAKEDATA)
+                r = ERR_RW_MS_FULL;
+            return r;
+        }
         case SD_AUTOLOAD: case SD_LOAD: case SD_LISTLOAD:
-            return do_load(param, game, save);
-        case SD_READDATA: case SD_READDATASECURE: {
-            uint32_t r = do_load(param, game, save);             /* PPSSPP error remap */
+            return do_load(param, game, save, 1);
+        case SD_READDATASECURE: {
+            uint32_t r = do_load(param, game, save, 1);
+            if (r == ERR_LOAD_NO_DATA) r = ERR_RW_NO_DATA;
+            if (r == ERR_LOAD_NOT_FOUND) r = ERR_RW_NOT_FOUND;
+            return r;
+        }
+        case SD_READDATA: {
+            uint32_t r = do_load(param, game, save, 0);             /* PPSSPP error remap */
             if (r == ERR_LOAD_NO_DATA) r = ERR_RW_NO_DATA;
             if (r == ERR_LOAD_NOT_FOUND) r = ERR_RW_NOT_FOUND;
             return r;

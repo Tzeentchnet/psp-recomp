@@ -151,6 +151,9 @@ Set these environment variables before running the game to control runtime featu
   virtual-duration scheduler fallback, which is useful for deterministic tests.
 - `SR_NO_DIALOGS=1`: Suppress native message boxes and choose their configured
   default button. Netconf and Game Sharing remain deterministic offline cancels.
+- `SR_SAVEDATA_MIGRATE=1`: After loading a legacy plaintext save produced by an
+  older runtime build, rewrite it in PSP/PPSSPP-compatible secure format using
+  the game's live key.
 - `SR_GPU=vk`: Use the Vulkan GE backend (SDL3/Vulkan build).
 - `SR_GPU=sw`: Use the reference software rasterizer.
 - `SR_GPU=d3d12`: Use the SDL3/D3D12 device backend when compiled with `SR_D3D12`.
