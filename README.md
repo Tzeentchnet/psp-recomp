@@ -111,7 +111,9 @@ Set these environment variables before running the game to control runtime featu
 - `SR_GPU=vk`: Use the Vulkan GE backend (SDL3/Vulkan build).
 - `SR_GPU=sw`: Use the reference software rasterizer.
 - `SR_GPU=d3d12`: Use the SDL3/D3D12 device backend when compiled with `SR_D3D12`.
-  The current phase uploads the software-GE framebuffer while the HLSL renderer is built out.
+  The current phase uploads the software-GE framebuffer into a fixed 480×272 display texture while the HLSL
+  renderer is built out. The resizable swapchain preserves the exact display aspect and clears letterbox or
+  pillarbox space to black.
 - `SR_GPU_GE` / `SR_VIDEO=gdi`: Legacy Vulkan/software and presenter overrides.
 - `SR_GPU_LOG=1`: Print GPU cache flushes and batch information to the console.
 - `SR_IOLOG=1`: Print all file system access logs.

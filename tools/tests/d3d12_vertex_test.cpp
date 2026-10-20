@@ -1,4 +1,5 @@
 #include "../../src/rt/gpu_d3d12/device.h"
+#include "../../src/rt/gpu_d3d12/present.h"
 #include "../../src/rt/gpu_d3d12/vertex.h"
 
 #include <math.h>
@@ -76,6 +77,51 @@ static GeVtx vertex(
     int r, int g, int b, int a) {
     GeVtx out = {x, y, z, rw, u, v, fog, r, g, b, a};
     return out;
+}
+
+static void test_present_viewports(void) {
+    GeD3D12PresentViewport layout;
+    ged3d12_present_viewport(0, 0, &layout);
+    check_float("zero viewport width", layout.viewport.Width, 0.0f);
+    check_float("zero viewport height", layout.viewport.Height, 0.0f);
+    check_u32("zero scissor right", (uint32_t)layout.scissor.right, 0);
+    check_u32("zero scissor bottom", (uint32_t)layout.scissor.bottom, 0);
+
+    ged3d12_present_viewport(960, 544, &layout);
+    check_float("2x viewport x", layout.viewport.TopLeftX, 0.0f);
+    check_float("2x viewport y", layout.viewport.TopLeftY, 0.0f);
+    check_float("2x viewport width", layout.viewport.Width, 960.0f);
+    check_float("2x viewport height", layout.viewport.Height, 544.0f);
+    check_u32("2x scissor right", (uint32_t)layout.scissor.right, 960);
+    check_u32("2x scissor bottom", (uint32_t)layout.scissor.bottom, 544);
+
+    ged3d12_present_viewport(1000, 600, &layout);
+    float letterbox_height = 1000.0f * (272.0f / 480.0f);
+    float letterbox_y = (600.0f - letterbox_height) * 0.5f;
+    check_float("letterbox x", layout.viewport.TopLeftX, 0.0f);
+    check_float("letterbox y", layout.viewport.TopLeftY, letterbox_y);
+    check_float("letterbox width", layout.viewport.Width, 1000.0f);
+    check_float("letterbox height", layout.viewport.Height, letterbox_height);
+    check_u32("letterbox scissor top", (uint32_t)layout.scissor.top, 16);
+    check_u32("letterbox scissor bottom", (uint32_t)layout.scissor.bottom, 584);
+
+    ged3d12_present_viewport(600, 1000, &layout);
+    check_float("portrait x", layout.viewport.TopLeftX, 0.0f);
+    check_float("portrait y", layout.viewport.TopLeftY, 330.0f);
+    check_float("portrait width", layout.viewport.Width, 600.0f);
+    check_float("portrait height", layout.viewport.Height, 340.0f);
+    check_u32("portrait scissor top", (uint32_t)layout.scissor.top, 330);
+    check_u32("portrait scissor bottom", (uint32_t)layout.scissor.bottom, 670);
+
+    ged3d12_present_viewport(1920, 1080, &layout);
+    float pillarbox_width = 1080.0f * (480.0f / 272.0f);
+    float pillarbox_x = (1920.0f - pillarbox_width) * 0.5f;
+    check_float("pillarbox x", layout.viewport.TopLeftX, pillarbox_x);
+    check_float("pillarbox y", layout.viewport.TopLeftY, 0.0f);
+    check_float("pillarbox width", layout.viewport.Width, pillarbox_width);
+    check_float("pillarbox height", layout.viewport.Height, 1080.0f);
+    check_u32("pillarbox scissor left", (uint32_t)layout.scissor.left, 7);
+    check_u32("pillarbox scissor right", (uint32_t)layout.scissor.right, 1913);
 }
 
 static void test_pipeline_keys(void) {
@@ -324,6 +370,7 @@ int main(void) {
     if (!ged3d12_vertex_capture_init()) {
         fail("vertex capture initialization failed");
     } else {
+        test_present_viewports();
         test_pipeline_keys();
         test_triangle();
         test_sprites();

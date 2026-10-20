@@ -18,6 +18,8 @@ SHADER_DIR = ROOT / "src" / "rt" / "gpu_d3d12" / "shaders"
 SHADERS = (
     ("psp_vs.hlsl", "vs_6_0", "psp_vs.inc"),
     ("psp_ps.hlsl", "ps_6_0", "psp_ps.inc"),
+    ("present_vs.hlsl", "vs_6_0", "present_vs.inc"),
+    ("present_ps.hlsl", "ps_6_0", "present_ps.inc"),
 )
 
 

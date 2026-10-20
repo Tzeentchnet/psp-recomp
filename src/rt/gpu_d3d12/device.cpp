@@ -19,6 +19,7 @@
 
 #include "device.h"
 #include "pipeline.h"
+#include "present.h"
 #include "vertex.h"
 extern "C" {
 #include "../recomp.h"
@@ -74,6 +75,8 @@ static UINT64 s_next_copy_fence = 1;
 
 static IDXGISwapChain3 *s_swapchain;
 static ID3D12Resource *s_backbuffers[FRAME_COUNT];
+static UINT s_backbuffer_width;
+static UINT s_backbuffer_height;
 static ID3D12DescriptorHeap *s_srv_heap;
 static ID3D12DescriptorHeap *s_sampler_heap;
 static ID3D12DescriptorHeap *s_rtv_heap;
@@ -147,6 +150,7 @@ static void release_device(void) {
     wait_queue_idle(s_copy_queue, s_copy_fence, &s_next_copy_fence,
                     s_copy_event, "wait for copy queue");
     ged3d12_pipeline_cache_shutdown();
+    ged3d12_present_shutdown();
     ged3d12_vertex_capture_shutdown();
 
     if (s_upload && s_upload_map) {
@@ -181,6 +185,8 @@ static void release_device(void) {
     s_next_graphics_fence = 1;
     s_next_copy_fence = 1;
     s_active_frame = UINT32_MAX;
+    s_backbuffer_width = 0;
+    s_backbuffer_height = 0;
     s_srv_stride = 0;
     s_sampler_stride = 0;
     s_rtv_stride = 0;
@@ -212,7 +218,9 @@ int ged3d12_window_init(const char *title) {
         return 0;
     }
     s_sdl_initialized = 1;
-    s_window = SDL_CreateWindow(title ? title : "PSP Recomp", PSP_W * 2, PSP_H * 2, 0);
+    s_window = SDL_CreateWindow(
+        title ? title : "PSP Recomp", PSP_W * 2, PSP_H * 2,
+        SDL_WINDOW_RESIZABLE);
     if (!s_window) {
         fprintf(stderr, "ged3d12: SDL_CreateWindow failed: %s\n", SDL_GetError());
         ged3d12_window_shutdown();
@@ -525,10 +533,36 @@ static int create_frame_resources(void) {
     return 1;
 }
 
+static int acquire_backbuffers(void) {
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+        s_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < FRAME_COUNT; i++) {
+        if (!check_hr(s_swapchain->GetBuffer(
+                i, IID_PPV_ARGS(&s_backbuffers[i])), "get swapchain buffer")) {
+            return 0;
+        }
+        s_device->CreateRenderTargetView(s_backbuffers[i], nullptr, rtv);
+        rtv.ptr += s_rtv_stride;
+    }
+    D3D12_RESOURCE_DESC desc = s_backbuffers[0]->GetDesc();
+    s_backbuffer_width = (UINT)desc.Width;
+    s_backbuffer_height = desc.Height;
+    return 1;
+}
+
 static int create_swapchain(IDXGIFactory4 *factory) {
+    int pixel_width = 0;
+    int pixel_height = 0;
+    if (!SDL_GetWindowSizeInPixels(
+            s_window, &pixel_width, &pixel_height) ||
+        pixel_width <= 0 || pixel_height <= 0) {
+        fprintf(stderr, "ged3d12: could not query SDL window pixel size: %s\n",
+                SDL_GetError());
+        return 0;
+    }
     DXGI_SWAP_CHAIN_DESC1 desc = {};
-    desc.Width = PSP_W;
-    desc.Height = PSP_H;
+    desc.Width = (UINT)pixel_width;
+    desc.Height = (UINT)pixel_height;
     desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.SampleDesc.Count = 1;
     desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -551,16 +585,37 @@ static int create_swapchain(IDXGIFactory4 *factory) {
         return 0;
     }
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv =
-        s_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-    for (UINT i = 0; i < FRAME_COUNT; i++) {
-        if (!check_hr(s_swapchain->GetBuffer(
-                i, IID_PPV_ARGS(&s_backbuffers[i])), "get swapchain buffer")) {
-            return 0;
-        }
-        s_device->CreateRenderTargetView(s_backbuffers[i], nullptr, rtv);
-        rtv.ptr += s_rtv_stride;
+    return acquire_backbuffers();
+}
+
+static int resize_swapchain(void) {
+    int pixel_width = 0;
+    int pixel_height = 0;
+    if (!SDL_GetWindowSizeInPixels(
+            s_window, &pixel_width, &pixel_height)) {
+        fprintf(stderr, "ged3d12: could not query SDL window pixel size: %s\n",
+                SDL_GetError());
+        return 0;
     }
+    if (pixel_width <= 0 || pixel_height <= 0 ||
+        ((UINT)pixel_width == s_backbuffer_width &&
+         (UINT)pixel_height == s_backbuffer_height)) {
+        return 1;
+    }
+    if (!wait_queue_idle(
+            s_graphics_queue, s_graphics_fence, &s_next_graphics_fence,
+            s_graphics_event, "wait for swapchain resize")) {
+        return 0;
+    }
+    for (UINT i = 0; i < FRAME_COUNT; i++) RELEASE_COM(s_backbuffers[i]);
+    if (!check_hr(s_swapchain->ResizeBuffers(
+            FRAME_COUNT, (UINT)pixel_width, (UINT)pixel_height,
+            DXGI_FORMAT_B8G8R8A8_UNORM, 0), "resize swapchain")) {
+        return 0;
+    }
+    if (!acquire_backbuffers()) return 0;
+    fprintf(stderr, "ged3d12: resized swapchain to %ux%u\n",
+            s_backbuffer_width, s_backbuffer_height);
     return 1;
 }
 
@@ -643,7 +698,8 @@ static int device_init(void) {
              create_descriptor_heaps() &&
              create_root_signature() &&
              create_frame_resources() &&
-             create_swapchain(factory);
+             create_swapchain(factory) &&
+             ged3d12_present_init();
     RELEASE_COM(factory);
     if (!ok) {
         release_device();
@@ -934,21 +990,11 @@ static void convert_framebuffer(uint8_t *destination, UINT row_pitch,
     }
 }
 
-static void transition(ID3D12GraphicsCommandList *command_list, ID3D12Resource *resource,
-                       D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = resource;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = before;
-    barrier.Transition.StateAfter = after;
-    command_list->ResourceBarrier(1, &barrier);
-}
-
 static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     int quit = 0;
     poll_input(&quit);
     if (quit) return 0;
+    if (!resize_swapchain()) return -2;
 
     UINT frame_index;
     if (!begin_frame(&frame_index)) return -2;
@@ -996,17 +1042,14 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     source.PlacedFootprint.Footprint.Depth = 1;
     source.PlacedFootprint.Footprint.RowPitch = row_pitch;
 
-    D3D12_TEXTURE_COPY_LOCATION destination = {};
-    destination.pResource = s_backbuffers[frame_index];
-    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    destination.SubresourceIndex = 0;
-
-    transition(s_command_list, s_backbuffers[frame_index],
-               D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
-    s_command_list->CopyTextureRegion(
-        &destination, 0, 0, 0, &source, nullptr);
-    transition(s_command_list, s_backbuffers[frame_index],
-               D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+        s_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += (SIZE_T)frame_index * s_rtv_stride;
+    if (!ged3d12_present_record(
+            &source, s_backbuffers[frame_index], rtv,
+            s_backbuffer_width, s_backbuffer_height)) {
+        return -2;
+    }
     if (!check_hr(s_command_list->Close(), "close graphics command list"))
         return -2;
 
