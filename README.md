@@ -89,6 +89,10 @@ The KZL branch can boot its pre-relocated `prxload.py` image without a PPSSPP tr
 ```
 `--boot` enables the scheduler, creates the PSP-compatible `module_start` thread, and supplies KZL's
 `"modulename"` argument. Keep using `--image` with a PPSSPP reference trace for differential tracing.
+The KZL root build supplies `SR_EXPECTED_ISO_SIZE` and `SR_EXPECTED_ISO_SHA1`;
+standalone boot validates `PSP_ISO` against both before allocating guest memory.
+Generic users of the fork omit those definitions and retain the toolkit's
+game-agnostic behavior.
 
 ### 5. Setup Game Assets & Run
 1. Place your dumped game UMD ISO in the directory containing `mygame.exe` (name it `game.iso`, or set the `PSP_ISO` environment variable to point to the ISO path).

@@ -17,12 +17,11 @@ Street, Fifth Floor, Boston, MA 02110-1301 USA.
 -------------------------------------------------------------------------------
 WHY GPL?
 
-This project is a derivative/combined work of PPSSPP (https://github.com/
-hrydgard/ppsspp), which is licensed GPL-2.0-or-later. It links against PPSSPP's
-libraries, includes PPSSPP source under third_party/ppsspp, adapts PPSSPP code
-(e.g. the Vulkan GPU bridge is modelled on PPSSPP's WindowsVulkanContext.cpp),
-and redistributes PPSSPP's system fonts. The GPL therefore applies to the whole
-combined work. See CREDITS.md for the full third-party attribution list.
+This project is a derivative work of PPSSPP (https://github.com/
+hrydgard/ppsspp), which is licensed GPL-2.0-or-later. It ports and adapts
+PPSSPP HLE, GE, VFPU, media, and scheduler behavior and redistributes PPSSPP's
+free replacement system fonts. The GPL therefore applies to the whole combined
+work. See CREDITS.md for the full third-party attribution list.
 
 The full text of the GNU General Public License, Version 2, follows.
 -------------------------------------------------------------------------------

@@ -11,6 +11,7 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
+#include "startup_check.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,6 +139,7 @@ int main(int argc, char **argv) {
     /* Normal runtime path: the generated image is already rebased and relocated by prxload.py.
      * The KZL bootloader passes module_start one argument block: "modulename\0". */
     if (argc >= 6 && strcmp(argv[1], "--boot") == 0) {
+        if (!sr_startup_validate()) return 2;
         long len;
         uint8_t *img = read_file(argv[2], &len);
         uint32_t base = (uint32_t)strtoul(argv[3], NULL, 16);

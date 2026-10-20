@@ -7,8 +7,9 @@ redistribute this project or anything built with it.
 
 ## License of this project
 
-Because this project links against and incorporates PPSSPP (GPL-2.0-or-later),
-the combined work is licensed **GPL-2.0-or-later**. See [LICENSE](LICENSE).
+Because this project contains ports and derivative runtime behavior from PPSSPP
+(GPL-2.0-or-later), the combined work is licensed **GPL-2.0-or-later**. See
+[LICENSE](LICENSE).
 
 If you distribute binaries built with this toolkit (for example a recompiled
 game `.exe` plus `SDL3.dll`), the GPL requires that you also make the **complete
@@ -54,10 +55,9 @@ What this means for you:
   - **Verification oracle.** The build runs `PPSSPPHeadless.exe` (PPSSPP's
     headless interpreter) as the reference the recompiled code is diffed
     against, bit-for-bit, up to the first HLE call.
-  - **System fonts.** `font/` ships PPSSPP's replacement system fonts, needed
-    for native text dialogs.
-  - **Source tree.** A full copy of PPSSPP lives under `third_party/ppsspp`
-    (including its test suite `pspautotests`).
+  - **System fonts.** `font/` ships PPSSPP's free replacement `jpn0.pgf` and
+    `ltn0.pgf`, needed for native text dialogs. They are not PSP firmware dumps;
+    the superproject content audit pins their PPSSPP v1.20.4 SHA-256 identities.
 
   Note: an earlier `src/rt/gpu_vk/` bridge reused PPSSPP's `GPU_Vulkan`
   wholesale behind a C ABI (modelled on `WindowsVulkanContext.cpp`, linking
@@ -117,8 +117,7 @@ a derivative work for licensing purposes.
 ## If you only want the recompiler, not PPSSPP
 
 The MIPS-to-C recompiler itself (`tools/`, parts of `src/rt`) and the SDL3 +
-Vulkan renderer are independent of PPSSPP. But the runtime still depends on
-PPSSPP in other ways — the ported sceMpeg HLE (`src/rt/mpeg.c`), the bundled
-fonts, and the verification oracle — and the full PPSSPP source is bundled under
-`third_party/ppsspp`. So a GPL-free build is not available today; relicensing
-would require replacing those remaining PPSSPP-derived parts.
+Vulkan renderer are independent of PPSSPP. But the runtime still contains
+PPSSPP-derived HLE/GE/VFPU code and uses PPSSPP as its verification oracle, so a
+GPL-free build is not available today; relicensing would require replacing
+those derivative parts.

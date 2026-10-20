@@ -18,7 +18,7 @@ PYTHON     ?= python
 CFLAGS     ?= -O1 -foptimize-sibling-calls -Isrc/rt -DSR_SDL3VK -DSR_D3D12 -Wall -Wextra
 CXXFLAGS   ?= -std=c++17 -O1 -Isrc/rt -DSR_D3D12 -Wall -Wextra -fno-exceptions -fno-rtti
 LDFLAGS    ?= -fuse-ld=lld
-LIBS       ?= -lSDL3 -lvulkan-1 -ld3d12 -ldxgi -lmfplat -lgdi32 -ldinput8 -ldxguid -lole32 -lwinmm -lxaudio2_9
+LIBS       ?= -lSDL3 -lvulkan-1 -ld3d12 -ldxgi -lmfplat -lgdi32 -ldinput8 -ldxguid -lole32 -lwinmm -lxaudio2_9 -lbcrypt
 
 BUILD_DIR  ?= build/$(GAME_NAME)
 
@@ -50,6 +50,7 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/pgf.c \
               src/rt/gui.c \
               src/rt/input_config.c \
+              src/rt/startup_check.c \
               src/rt/audio_mixer.c \
               src/rt/sas_reverb.c \
               src/rt/h264_mf.c \
