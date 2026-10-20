@@ -78,6 +78,88 @@ static GeVtx vertex(
     return out;
 }
 
+static void test_pipeline_keys(void) {
+    GeD3D12PipelineKey base;
+    GeD3D12PipelineKey key;
+    memset(&s_state, 0, sizeof(s_state));
+    ged3d12_pipeline_key_build(&s_state, 0, &base);
+    check_u32("default blend disabled", base.blend_enable, 0);
+    check_u32("default source blend", base.source_blend, D3D12_BLEND_ONE);
+    check_u32("default destination blend", base.destination_blend, D3D12_BLEND_ZERO);
+    check_u32("default color mask", base.color_write_mask,
+              D3D12_COLOR_WRITE_ENABLE_ALL);
+    check_u32("default depth disabled", base.depth_enable, 0);
+    check_u32("default culling", base.cull_mode, D3D12_CULL_MODE_NONE);
+    check_u32("default render-target format", base.render_target_format,
+              DXGI_FORMAT_B8G8R8A8_UNORM);
+    check_u32("default depth format", base.depth_stencil_format,
+              DXGI_FORMAT_UNKNOWN);
+
+    uint64_t base_hash = ged3d12_pipeline_key_hash(&base);
+    s_state.tex_addr = 0x04012340u;
+    s_state.tex_func = 0x10103u;
+    ged3d12_pipeline_key_build(&s_state, 0, &key);
+    check_u64("shader-only state keeps PSO hash",
+              ged3d12_pipeline_key_hash(&key), base_hash);
+    if (memcmp(&base, &key, sizeof(key)) != 0)
+        fail("shader-only state changed the PSO key");
+
+    s_state.blend_enable = 1;
+    s_state.blend_mode = 2u | (3u << 4) | (1u << 8);
+    s_state.ztest_enable = 1;
+    s_state.ztest = 6;
+    s_state.cull_enable = 1;
+    ged3d12_pipeline_key_build(&s_state, 0, &key);
+    check_u32("blend enabled", key.blend_enable, 1);
+    check_u32("source alpha blend", key.source_blend, D3D12_BLEND_SRC_ALPHA);
+    check_u32("inverse source alpha blend", key.destination_blend,
+              D3D12_BLEND_INV_SRC_ALPHA);
+    check_u32("subtract blend operation", key.blend_operation,
+              D3D12_BLEND_OP_SUBTRACT);
+    check_u32("depth enabled", key.depth_enable, 1);
+    check_u32("depth write enabled", key.depth_write, 1);
+    check_u32("depth comparison", key.depth_function,
+              D3D12_COMPARISON_FUNC_GREATER);
+    check_u32("depth format", key.depth_stencil_format,
+              DXGI_FORMAT_D16_UNORM);
+    check_u32("triangle culling", key.cull_mode, D3D12_CULL_MODE_BACK);
+    if (ged3d12_pipeline_key_hash(&key) == base_hash)
+        fail("pipeline hash ignored relevant state");
+
+    GeD3D12PipelineKey sprite;
+    ged3d12_pipeline_key_build(&s_state, 1, &sprite);
+    check_u32("sprite culling disabled", sprite.cull_mode, D3D12_CULL_MODE_NONE);
+
+    s_state.clear = 1;
+    s_state.clear_mode = 0x500;
+    ged3d12_pipeline_key_build(&s_state, 0, &key);
+    check_u32("clear disables blend", key.blend_enable, 0);
+    check_u32("clear color mask", key.color_write_mask,
+              D3D12_COLOR_WRITE_ENABLE_RED |
+              D3D12_COLOR_WRITE_ENABLE_GREEN |
+              D3D12_COLOR_WRITE_ENABLE_BLUE);
+    check_u32("clear depth enabled", key.depth_enable, 1);
+    check_u32("clear depth write", key.depth_write, 1);
+    check_u32("clear depth function", key.depth_function,
+              D3D12_COMPARISON_FUNC_ALWAYS);
+    check_u32("clear culling disabled", key.cull_mode, D3D12_CULL_MODE_NONE);
+
+    memset(&s_state, 0, sizeof(s_state));
+    s_state.blend_enable = 1;
+    s_state.blend_mode = 10u | (10u << 4);
+    s_state.blend_fixa = 0x010101u;
+    s_state.blend_fixb = 0xfefefeu;
+    ged3d12_pipeline_key_build(&s_state, 0, &key);
+    check_u32("fixed source factor", key.source_blend,
+              D3D12_BLEND_BLEND_FACTOR);
+    check_u32("bright conflicting destination factor", key.destination_blend,
+              D3D12_BLEND_ONE);
+    s_state.blend_fixb = 0x010000u;
+    ged3d12_pipeline_key_build(&s_state, 0, &key);
+    check_u32("dark conflicting destination factor", key.destination_blend,
+              D3D12_BLEND_ZERO);
+}
+
 static void test_triangle(void) {
     reset_upload();
     memset(&s_state, 0, sizeof(s_state));
@@ -242,6 +324,7 @@ int main(void) {
     if (!ged3d12_vertex_capture_init()) {
         fail("vertex capture initialization failed");
     } else {
+        test_pipeline_keys();
         test_triangle();
         test_sprites();
         test_lines_and_points();

@@ -1,8 +1,8 @@
 /* D3D12 device and presentation foundation.
  *
- * GE primitives continue through the software rasterizer until the shader/PSO stages are
- * implemented. Its finished 480x272 framebuffer is uploaded through the same per-frame ring
- * that later draw data will use, making the device layer independently testable now. */
+ * GE primitives continue through the software rasterizer until native render-target and
+ * presentation stages submit the captured batches. Its finished 480x272 framebuffer is uploaded
+ * through the same per-frame ring that later draw data will use. */
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "device.h"
+#include "pipeline.h"
 #include "vertex.h"
 extern "C" {
 #include "../recomp.h"
@@ -140,12 +141,13 @@ static int wait_queue_idle(ID3D12CommandQueue *queue, ID3D12Fence *fence,
 }
 
 static void release_device(void) {
-    ged3d12_vertex_capture_shutdown();
     if (s_swapchain) s_swapchain->SetFullscreenState(FALSE, nullptr);
     wait_queue_idle(s_graphics_queue, s_graphics_fence, &s_next_graphics_fence,
                     s_graphics_event, "wait for graphics queue");
     wait_queue_idle(s_copy_queue, s_copy_fence, &s_next_copy_fence,
                     s_copy_event, "wait for copy queue");
+    ged3d12_pipeline_cache_shutdown();
+    ged3d12_vertex_capture_shutdown();
 
     if (s_upload && s_upload_map) {
         D3D12_RANGE written = {0, 0};
@@ -651,6 +653,10 @@ static int device_init(void) {
         release_device();
         return 0;
     }
+    if (!ged3d12_pipeline_cache_init()) {
+        release_device();
+        return 0;
+    }
     s_vertex_log = env_enabled("SR_D3D12_VERTEX_LOG");
     s_vertex_frames = 0;
     s_vertex_total = 0;
@@ -949,6 +955,10 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
 
     GeD3D12VertexFrame vertices = {};
     if (!ged3d12_vertex_upload_pending(&vertices)) return -2;
+    for (UINT i = 0; i < vertices.batch_count; i++) {
+        if (!ged3d12_pipeline_bind(&vertices.batches[i].pipeline))
+            return -2;
+    }
     s_vertex_frames++;
     s_vertex_total += vertices.vertex_count;
     s_vertex_batches += vertices.batch_count;

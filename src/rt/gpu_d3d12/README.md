@@ -18,15 +18,27 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 - capture of `ge.c`'s fully decoded primitive stream into the HLSL shader's exact
   32-byte vertex ABI, including PSP flat-shading colors, 1/16-pixel snapping, sprite
   expansion, and line/point quad expansion;
-- software-GE framebuffer upload so `SR_GPU=d3d12` is usable before the HLSL renderer
-  lands.
+- a collision-safe 512-entry PSO cache keyed by a canonical 16-byte projection of
+  blend, color-write, depth, cull, and attachment-format state, with synchronous
+  creation on first use;
+- software-GE framebuffer upload so `SR_GPU=d3d12` is usable before native draw
+  submission and GPU-resident presentation land.
 
 `vertex.cpp` deliberately consumes the existing `GeVtx` backend seam instead of
 duplicating PSP vertex decoding. `ge.c` remains authoritative for all raw attribute
 formats, skinning, through mode, indices, transform/lighting, clipping, and primitive
 assembly. Captured vertices and primitive-boundary records are copied into the active
 fenced upload-ring partition during presentation. The hooks still return zero, so the
-reference software rasterizer remains authoritative until native PSOs are bound.
+reference software rasterizer remains authoritative until native batches are submitted to
+GPU render targets.
+
+`pipeline_key.cpp` maps only PSO-static GE fields; shader constants, descriptors,
+scissor, and blend constants remain per-draw state and intentionally do not multiply the
+cache. Each captured batch stores its key before later GE commands mutate the live state.
+`pipeline.cpp` uses FNV-1a to select an open-addressed slot, confirms the full key on
+hits, compiles the embedded HLSL synchronously on misses, and binds the resulting PSO to
+the live command list. Draw submission is intentionally deferred while software
+presentation remains the reference path.
 
 `shaders/psp_vs.hlsl` and `shaders/psp_ps.hlsl` are the native Shader Model 6 ports of
 the Vulkan GE shaders. Their checked-in `*.inc` files contain stripped DXIL consumed by
@@ -48,9 +60,11 @@ explicitly when the requested debug interface is unavailable.
 
 Set `SR_D3D12_VERTEX_LOG=1` to print compact capture counts and content hashes for the
 first three presents and every 120th present, plus a shutdown summary.
+Set `SR_D3D12_PSO_LOG=1` to print synchronous PSO creations and a shutdown cache
+summary.
 
-Later phase-4 tasks bind the uploaded stream through PSO and texture caches and add
-GPU-resident framebuffer presentation behind the same descriptor.
+Later phase-4 tasks submit the uploaded batches, populate per-draw state and textures,
+and add GPU-resident framebuffer presentation behind the same descriptor.
 
 The root project keeps this dependency optional:
 

@@ -92,6 +92,9 @@ static bool begin_primitive(
     batch->primitive = primitive;
     batch->perspective = perspective != 0;
     batch->reserved = 0;
+    ged3d12_pipeline_key_build(
+        ge_state_ptr(), primitive != GE_D3D12_PRIMITIVE_TRIANGLE,
+        &batch->pipeline);
     s_primitive_count[primitive]++;
     return true;
 }
