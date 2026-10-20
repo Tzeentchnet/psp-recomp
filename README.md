@@ -114,7 +114,9 @@ Set these environment variables before running the game to control runtime featu
   The software GE remains authoritative while native batches are staged. Each batch captures a 160-byte
   destination-aware fragment block; the HLSL path reads ordered BGRA8 color and R16 depth snapshots to reproduce
   PSP stencil, depth, blending, dithering, logic operations, native packing, and component masks. The resizable
-  swapchain preserves the exact 480:272 display aspect and clears letterbox or pillarbox space to black.
+  swapchain preserves the exact 480:272 display aspect and clears letterbox or pillarbox space to black. The shared
+  CPU frontend blends all morph attributes before eight-bone skinning and tessellates Bezier/B-spline commands with
+  the GE's quantized scalar evaluator before emitting ordinary backend triangles, lines, or points.
 - `SR_D3D12_FRAMEBUFFER_LOG=1`: Print persistent color/depth target allocation and cache statistics.
 - `SR_D3D12_FRAMEBUFFER_SAFE=1`: Read cached color targets back after presentation to validate GPU/CPU ownership.
 - `SR_D3D12_DESTINATION_SAFE=1`: Copy and bind color/depth destination snapshots for every staged batch. This is

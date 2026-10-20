@@ -13,8 +13,7 @@
  * programmable alpha test, alpha blending (full factor/equation set), 4x4 ordered dithering,
  * colour/alpha write masks, scissor, and a software 16-bit depth buffer.
  *
- * Not emulated: bezier/spline patches, morphing, or automatic software-rasterizer
- * mip selection.
+ * Not emulated: automatic software-rasterizer mip selection.
  *
  * Each GE command word is (cmd<<24)|data24. Command numbers follow PPSSPP GECommands.h.
  */
@@ -24,6 +23,7 @@
 #include "ge_shared.h"
 
 #include <stdint.h>
+#include <limits.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
@@ -48,6 +48,7 @@ enum {
     GE_ALPHATESTENABLE = 0x22, GE_ZTESTENABLE = 0x23, GE_STENCILTESTENABLE = 0x24,
     GE_ANTIALIASENABLE = 0x25, GE_PATCHCULLENABLE = 0x26,
     GE_COLORTESTENABLE = 0x27, GE_LOGICOPENABLE = 0x28,
+    GE_MORPHWEIGHT0 = 0x2C, GE_MORPHWEIGHT7 = 0x33,
     GE_PATCHDIVISION = 0x36, GE_PATCHPRIMITIVE = 0x37, GE_PATCHFACING = 0x38,
     GE_WORLDMATRIXNUMBER = 0x3A, GE_WORLDMATRIXDATA = 0x3B,
     GE_VIEWMATRIXNUMBER  = 0x3C, GE_VIEWMATRIXDATA  = 0x3D,
@@ -214,8 +215,11 @@ typedef struct {
     int nrm_off, nrm_fmt;    /* normal (lighting; -1 if absent) */
     int pos_off, pos_fmt;
     int w_off, w_fmt, w_n;   /* skinning weights (w_n==0 if absent) */
+    int one_size, morph_n;
     int through;
 } VFmt;
+
+static int clamp8(int v);
 
 static void decode_vtype(uint32_t vt, VFmt *v) {
     memset(v, 0, sizeof(*v));
@@ -252,7 +256,9 @@ static void decode_vtype(uint32_t vt, VFmt *v) {
     v->pos_fmt = pos;
     { int a = csz[pos ? pos : 3]; off = (off+a-1)&~(a-1); v->pos_off = off; off += a*3; if (a>maxa) maxa=a; }
 
-    v->stride = (off + maxa - 1) & ~(maxa - 1);
+    v->one_size = (off + maxa - 1) & ~(maxa - 1);
+    v->morph_n = (int)((vt >> 18) & 7u) + 1;
+    v->stride = v->one_size * v->morph_n;
 }
 
 /* Read position from a vertex. For transform-mode, all components are signed (model space).
@@ -261,7 +267,7 @@ static void decode_vtype(uint32_t vt, VFmt *v) {
  * (PPSSPP VertexDecoder Step_PosS8ToFloat/Step_PosS16ToFloat). Through-mode keeps raw screen
  * units (x/y signed, z unsigned depth). Reading transform-mode s16 unscaled made every
  * fixed-point model (briefing map, hangar geometry) 32768x too large. */
-static void read_pos(uint32_t addr, const VFmt *v, float *x, float *y, float *z) {
+static void read_pos_raw(uint32_t addr, const VFmt *v, float *x, float *y, float *z) {
     uint32_t a = addr + (uint32_t)v->pos_off;
     if (v->pos_fmt == 3) {
         uint32_t xi = MEM_R32(a), yi = MEM_R32(a+4), zi = MEM_R32(a+8);
@@ -289,11 +295,27 @@ static void read_pos(uint32_t addr, const VFmt *v, float *x, float *y, float *z)
     }
 }
 
+static void read_pos(uint32_t addr, const VFmt *v, float *x, float *y, float *z) {
+    if (v->morph_n <= 1) {
+        read_pos_raw(addr, v, x, y, z);
+        return;
+    }
+    *x = *y = *z = 0.0f;
+    for (int i = 0; i < v->morph_n; i++) {
+        float px, py, pz;
+        read_pos_raw(
+            addr + (uint32_t)(i * v->one_size), v, &px, &py, &pz);
+        *x += px * ge.morph_weight[i];
+        *y += py * ge.morph_weight[i];
+        *z += pz * ge.morph_weight[i];
+    }
+}
+
 /* Read texcoords. Through-mode: absolute texel coordinates. Transform-mode: UNSIGNED u8
  * scaled by 1/128 and UNSIGNED u16 by 1/32768 (PPSSPP Step_TcU8ToFloat/Step_TcU16ToFloat).
  * Reading these as signed flips UVs >= half range (used for texture tiling: 1.0..2.0)
  * to small negatives, which sample the wrong texels. */
-static void read_tc(uint32_t addr, const VFmt *v, float *u, float *tv) {
+static void read_tc_raw(uint32_t addr, const VFmt *v, float *u, float *tv) {
     if (v->tc_off < 0) { *u = 0; *tv = 0; return; }
     uint32_t a = addr + (uint32_t)v->tc_off;
     if (v->tc_fmt == 3) {
@@ -318,8 +340,23 @@ static void read_tc(uint32_t addr, const VFmt *v, float *u, float *tv) {
     }
 }
 
+static void read_tc(uint32_t addr, const VFmt *v, float *u, float *tv) {
+    if (v->tc_off < 0 || v->morph_n <= 1) {
+        read_tc_raw(addr, v, u, tv);
+        return;
+    }
+    *u = *tv = 0.0f;
+    for (int i = 0; i < v->morph_n; i++) {
+        float tu, ttv;
+        read_tc_raw(
+            addr + (uint32_t)(i * v->one_size), v, &tu, &ttv);
+        *u += tu * ge.morph_weight[i];
+        *tv += ttv * ge.morph_weight[i];
+    }
+}
+
 /* Read a vertex normal (model space). Defaults to +Z when absent. */
-static void read_nrm(uint32_t addr, const VFmt *v, float *x, float *y, float *z) {
+static void read_nrm_raw(uint32_t addr, const VFmt *v, float *x, float *y, float *z) {
     if (v->nrm_off < 0) { *x = 0; *y = 0; *z = 1; return; }
     uint32_t a = addr + (uint32_t)v->nrm_off;
     if (v->nrm_fmt == 3) {
@@ -334,17 +371,60 @@ static void read_nrm(uint32_t addr, const VFmt *v, float *x, float *y, float *z)
         *y = (float)(int8_t)MEM_R8(a+1) * (1.0f / 128.0f);
         *z = (float)(int8_t)MEM_R8(a+2) * (1.0f / 128.0f);
     }
-    if (ge.reverse_normal) { *x = -*x; *y = -*y; *z = -*z; }
+}
+
+static void read_nrm(uint32_t addr, const VFmt *v, float *x, float *y, float *z) {
+    if (v->nrm_off < 0 || v->morph_n <= 1) {
+        read_nrm_raw(addr, v, x, y, z);
+    } else {
+        *x = *y = *z = 0.0f;
+        for (int i = 0; i < v->morph_n; i++) {
+            float nx, ny, nz;
+            read_nrm_raw(
+                addr + (uint32_t)(i * v->one_size), v, &nx, &ny, &nz);
+            *x += nx * ge.morph_weight[i];
+            *y += ny * ge.morph_weight[i];
+            *z += nz * ge.morph_weight[i];
+        }
+    }
+    if (ge.reverse_normal) {
+        *x = -*x;
+        *y = -*y;
+        *z = -*z;
+    }
 }
 
 /* Skinning weights: unsigned fixed-point, u8/128 and u16/32768 (PPSSPP VertexDecoder
  * Step_WeightsU8/U16), float raw. */
-static void read_weights(uint32_t addr, const VFmt *v, float *w) {
+static float read_weight_raw(
+    uint32_t addr, const VFmt *v, int index) {
     uint32_t a = addr + (uint32_t)v->w_off;
+    float weight;
+    if (v->w_fmt == 3) {
+        uint32_t bits = MEM_R32(a + 4u * (uint32_t)index);
+        memcpy(&weight, &bits, 4);
+    } else if (v->w_fmt == 2) {
+        weight = (float)MEM_R16(a + 2u * (uint32_t)index) *
+            (1.0f / 32768.0f);
+    } else {
+        weight = (float)MEM_R8(a + (uint32_t)index) *
+            (1.0f / 128.0f);
+    }
+    return weight;
+}
+
+static void read_weights(uint32_t addr, const VFmt *v, float *w) {
     for (int i = 0; i < v->w_n; i++) {
-        if (v->w_fmt == 3) { uint32_t t = MEM_R32(a + 4u*(uint32_t)i); memcpy(&w[i], &t, 4); }
-        else if (v->w_fmt == 2) w[i] = (float)MEM_R16(a + 2u*(uint32_t)i) * (1.0f / 32768.0f);
-        else                    w[i] = (float)MEM_R8(a + (uint32_t)i)     * (1.0f / 128.0f);
+        if (v->morph_n <= 1) {
+            w[i] = read_weight_raw(addr, v, i);
+            continue;
+        }
+        w[i] = 0.0f;
+        for (int morph = 0; morph < v->morph_n; morph++) {
+            w[i] += read_weight_raw(
+                addr + (uint32_t)(morph * v->one_size), v, i) *
+                ge.morph_weight[morph];
+        }
     }
 }
 
@@ -360,7 +440,8 @@ static void unpack_color(uint32_t raw, int psm, int *r, int *g, int *b, int *a) 
 }
 
 /* Read a vertex colour into 8-bit RGBA (col_fmt: 4=5650,5=5551,6=4444,7=8888). */
-static void read_color(uint32_t addr, const VFmt *v, int *r, int *g, int *b, int *a) {
+static void read_color_raw(
+    uint32_t addr, const VFmt *v, int *r, int *g, int *b, int *a) {
     if (v->col_off < 0) {
         if (ge.material_set || ge.material_alpha_set) {
             *r = ge.material_set ? (ge.material & 0xFF) : 255;
@@ -375,6 +456,29 @@ static void read_color(uint32_t addr, const VFmt *v, int *r, int *g, int *b, int
     uint32_t ca = addr + (uint32_t)v->col_off;
     if (v->col_fmt == 7) unpack_color(MEM_R32(ca), 3, r, g, b, a);
     else unpack_color(MEM_R16(ca), v->col_fmt - 4, r, g, b, a);
+}
+
+static void read_color(
+    uint32_t addr, const VFmt *v, int *r, int *g, int *b, int *a) {
+    if (v->col_off < 0 || v->morph_n <= 1) {
+        read_color_raw(addr, v, r, g, b, a);
+        return;
+    }
+    float color[4] = {0, 0, 0, 0};
+    for (int i = 0; i < v->morph_n; i++) {
+        int mr, mg, mb, ma;
+        read_color_raw(
+            addr + (uint32_t)(i * v->one_size), v,
+            &mr, &mg, &mb, &ma);
+        color[0] += (float)mr * ge.morph_weight[i];
+        color[1] += (float)mg * ge.morph_weight[i];
+        color[2] += (float)mb * ge.morph_weight[i];
+        color[3] += (float)ma * ge.morph_weight[i];
+    }
+    *r = clamp8((int)color[0]);
+    *g = clamp8((int)color[1]);
+    *b = clamp8((int)color[2]);
+    *a = clamp8((int)color[3]);
 }
 
 /* Look up a CLUT entry (palette index -> RGBA). */
@@ -1746,42 +1850,50 @@ typedef struct {
     float sx, sy, sz;
 } CVtx;
 
-/* read_nrm + skinning blend: normals rotate through the bone matrices' 3x3 parts with the
- * same weights as positions (PPSSPP TransformUnit / software skinning). */
-static void read_nrm_skinned(uint32_t addr, const VFmt *vf, const float *w, int skinned,
-                             float *x, float *y, float *z) {
-    read_nrm(addr, vf, x, y, z);
-    if (!skinned) return;
-    float px = 0, py = 0, pz = 0;
+typedef struct {
+    float x, y, z;
+    float nx, ny, nz;
+    float u, v;
+    int r, g, b, a;
+} ModelVtx;
+
+static void decode_model_vtx(uint32_t addr, const VFmt *vf, ModelVtx *out) {
+    read_pos(addr, vf, &out->x, &out->y, &out->z);
+    read_nrm(addr, vf, &out->nx, &out->ny, &out->nz);
+    read_tc(addr, vf, &out->u, &out->v);
+    read_color(addr, vf, &out->r, &out->g, &out->b, &out->a);
+    if (vf->through || !vf->w_n) return;
+
+    float weights[8];
+    read_weights(addr, vf, weights);
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
     for (int i = 0; i < vf->w_n; i++) {
-        if (w[i] == 0.0f) continue;
+        if (weights[i] == 0.0f) continue;
         float tx, ty, tz;
-        mat33_mul(ge.bone + 12*i, *x, *y, *z, &tx, &ty, &tz);
-        px += tx*w[i]; py += ty*w[i]; pz += tz*w[i];
+        mat43_mul(
+            ge.bone + 12 * i, out->x, out->y, out->z,
+            &tx, &ty, &tz);
+        px += tx * weights[i];
+        py += ty * weights[i];
+        pz += tz * weights[i];
+        mat33_mul(
+            ge.bone + 12 * i, out->nx, out->ny, out->nz,
+            &tx, &ty, &tz);
+        nx += tx * weights[i];
+        ny += ty * weights[i];
+        nz += tz * weights[i];
     }
-    *x = px; *y = py; *z = pz;
+    out->x = px;
+    out->y = py;
+    out->z = pz;
+    out->nx = nx;
+    out->ny = ny;
+    out->nz = nz;
 }
 
-static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
-    float mx, my, mz;
-    read_pos(addr, vf, &mx, &my, &mz);
-
-    /* Skinning: blend the model-space position through up to 8 bone matrices; the world
-     * matrix then applies to the blended result (PSP T&L order). The hangar aircraft uses
-     * one rigid bone per part with single-weight vertices. */
-    float skw[8];
-    int skinned = (!vf->through && vf->w_n) ? 1 : 0;
-    if (skinned) {
-        read_weights(addr, vf, skw);
-        float px = 0, py = 0, pz = 0;
-        for (int i = 0; i < vf->w_n; i++) {
-            if (skw[i] == 0.0f) continue;
-            float tx, ty, tz;
-            mat43_mul(ge.bone + 12*i, mx, my, mz, &tx, &ty, &tz);
-            px += tx*skw[i]; py += ty*skw[i]; pz += tz*skw[i];
-        }
-        mx = px; my = py; mz = pz;
-    }
+static void transform_model_vtx_clip(const ModelVtx *in, CVtx *o) {
+    float mx = in->x, my = in->y, mz = in->z;
 
     /* World transform (model → world) */
     float wx, wy, wz;
@@ -1830,9 +1942,11 @@ static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
         float sx, sy, sz2;
         switch ((ge.tex_map_mode >> 8) & 3) {
         case 0:  sx = mx; sy = my; sz2 = mz; break;
-        case 1:  read_tc(addr, vf, &sx, &sy); sz2 = 0.0f; break;
+        case 1:  sx = in->u; sy = in->v; sz2 = 0.0f; break;
         default: {
-            read_nrm_skinned(addr, vf, skw, skinned, &sx, &sy, &sz2);
+            sx = in->nx;
+            sy = in->ny;
+            sz2 = in->nz;
             if (((ge.tex_map_mode >> 8) & 3) == 2) {
                 float nl = sqrtf(sx*sx + sy*sy + sz2*sz2);
                 if (nl > 0.0f) { sx /= nl; sy /= nl; sz2 /= nl; }
@@ -1847,9 +1961,10 @@ static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
         fv = (tt / tq) * (float)ge.tex_h;
     } else if (tmm == 2) {
         /* env map: s/t = (1 + dot(normalize(lightpos[lsN]), worldnormal)) / 2 */
-        float nx2, ny2, nz2, wnx2, wny2, wnz2;
-        read_nrm_skinned(addr, vf, skw, skinned, &nx2, &ny2, &nz2);
-        mat33_mul(ge.world, nx2, ny2, nz2, &wnx2, &wny2, &wnz2);
+        float wnx2, wny2, wnz2;
+        mat33_mul(
+            ge.world, in->nx, in->ny, in->nz,
+            &wnx2, &wny2, &wnz2);
         float nl2 = sqrtf(wnx2*wnx2 + wny2*wny2 + wnz2*wnz2);
         if (nl2 > 0.0f) { wnx2 /= nl2; wny2 /= nl2; wnz2 /= nl2; }
         float st2[2];
@@ -1863,22 +1978,26 @@ static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
         u  = st2[0] * (float)ge.tex_w;
         fv = st2[1] * (float)ge.tex_h;
     } else {
-        read_tc(addr, vf, &u, &fv);
+        u = in->u;
+        fv = in->v;
         u  = (u  * ge.tex_scale_u + ge.tex_off_u) * (float)ge.tex_w;
         fv = (fv * ge.tex_scale_v + ge.tex_off_v) * (float)ge.tex_h;
     }
     o->u = u;
     o->v = fv;
 
-    read_color(addr, vf, &o->r, &o->g, &o->b, &o->a);
+    o->r = in->r;
+    o->g = in->g;
+    o->b = in->b;
+    o->a = in->a;
 
     static int nolight = -1;
     if (nolight < 0) nolight = getenv("SR_NOLIGHT") ? 1 : 0;
     if (ge.lighting_enable && !nolight) {
-        float nx, ny, nz;
-        read_nrm_skinned(addr, vf, skw, skinned, &nx, &ny, &nz);
         float wnx, wny, wnz;
-        mat33_mul(ge.world, nx, ny, nz, &wnx, &wny, &wnz);
+        mat33_mul(
+            ge.world, in->nx, in->ny, in->nz,
+            &wnx, &wny, &wnz);
         float nl = sqrtf(wnx*wnx + wny*wny + wnz*wnz);
         if (nl > 0.0f) { wnx/=nl; wny/=nl; wnz/=nl; }
         light_vertex(wx, wy, wz, wnx, wny, wnz, o->r, o->g, o->b, o->a, &o->r, &o->g, &o->b, &o->a);
@@ -1904,6 +2023,12 @@ static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
             if (sx > SB || sy >= SB || sx < 0.0f || sy < 0.0f || sz < 0.0f || sz >= 65536.0f) o->oor = 1;
         }
     }
+}
+
+static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
+    ModelVtx model;
+    decode_model_vtx(addr, vf, &model);
+    transform_model_vtx_clip(&model, o);
 }
 
 /* Smallest clip-space w kept by the near clipper. */
@@ -2140,6 +2265,776 @@ static void near_dump(const char *what, uint32_t a0, const VFmt *vf, const CVtx 
             ge.proj[0], ge.proj[1], ge.proj[2], ge.proj[3], ge.proj[4], ge.proj[5],
             ge.proj[6], ge.proj[7], ge.proj[8], ge.proj[9], ge.proj[10], ge.proj[11],
             ge.proj[12], ge.proj[13], ge.proj[14], ge.proj[15]);
+}
+
+static void draw_patch_cvtx_triangle(CVtx a, CVtx b, CVtx c) {
+    CVtx cv[3] = {a, b, c};
+    if (ge.cull_enable && !ge.clear && (ge.cull & 1u) == 0u) {
+        CVtx swap = cv[0];
+        cv[0] = cv[1];
+        cv[1] = swap;
+    }
+    if (cv[0].oor || cv[1].oor || cv[2].oor) {
+        s_stat.nearclip++;
+        return;
+    }
+    if (cv[0].cw < 0.0f && cv[1].cw < 0.0f && cv[2].cw < 0.0f) {
+        s_stat.nearclip++;
+        return;
+    }
+    int positive_z = cv[0].ozp + cv[1].ozp + cv[2].ozp;
+    int negative_z = cv[0].ozn + cv[1].ozn + cv[2].ozn;
+    if ((!ge.depth_clip && positive_z + negative_z > 0) ||
+        positive_z >= 3 || negative_z >= 3) {
+        s_stat.nearclip++;
+        return;
+    }
+
+    float near_distance[3] = {
+        clip_d_nearz(&cv[0]),
+        clip_d_nearz(&cv[1]),
+        clip_d_nearz(&cv[2]),
+    };
+    if (near_distance[0] >= 0.0f &&
+        near_distance[1] >= 0.0f &&
+        near_distance[2] >= 0.0f) {
+        if (cv[0].cw <= NEAR_W ||
+            cv[1].cw <= NEAR_W ||
+            cv[2].cw <= NEAR_W) {
+            s_stat.nearclip++;
+            return;
+        }
+        Vtx projected[3];
+        project_cvtx(&cv[0], &projected[0]);
+        project_cvtx(&cv[1], &projected[1]);
+        project_cvtx(&cv[2], &projected[2]);
+        raster_tri(&projected[0], &projected[1], &projected[2], 1);
+        return;
+    }
+    if (near_distance[0] < 0.0f &&
+        near_distance[1] < 0.0f &&
+        near_distance[2] < 0.0f) {
+        s_stat.nearclip++;
+        return;
+    }
+
+    CVtx clipped[4];
+    int count = clip_poly_near(cv, 3, clipped);
+    s_stat.nearclip++;
+    if (count < 3) return;
+    Vtx projected[4];
+    int invalid[4] = {0, 0, 0, 0};
+    for (int i = 0; i < count && i < 4; i++) {
+        invalid[i] =
+            clipped[i].cw <= NEAR_W ||
+            clip_vtx_out_of_range(&clipped[i]);
+        if (!invalid[i]) project_cvtx(&clipped[i], &projected[i]);
+    }
+    for (int i = 2; i < count && i < 4; i++) {
+        if (!invalid[0] && !invalid[i - 1] && !invalid[i]) {
+            raster_tri(
+                &projected[0], &projected[i - 1], &projected[i], 1);
+        }
+    }
+}
+
+static void draw_patch_cvtx_line(CVtx a, CVtx b) {
+    if (a.oor || b.oor ||
+        (a.cw < 0.0f && b.cw < 0.0f) ||
+        (!ge.depth_clip && (a.ozp || a.ozn || b.ozp || b.ozn)) ||
+        (a.ozp && b.ozp) || (a.ozn && b.ozn)) {
+        s_stat.nearclip++;
+        return;
+    }
+    float da = clip_d_nearz(&a);
+    float db = clip_d_nearz(&b);
+    if (da < 0.0f && db < 0.0f) {
+        s_stat.nearclip++;
+        return;
+    }
+    if (da < 0.0f) {
+        CVtx clipped;
+        clip_lerp_cvtx(&a, &b, da / (da - db), &clipped);
+        a = clipped;
+    } else if (db < 0.0f) {
+        CVtx clipped;
+        clip_lerp_cvtx(&b, &a, db / (db - da), &clipped);
+        b = clipped;
+    }
+    if (a.cw <= NEAR_W || b.cw <= NEAR_W ||
+        clip_vtx_out_of_range(&a) || clip_vtx_out_of_range(&b)) {
+        s_stat.nearclip++;
+        return;
+    }
+    Vtx projected_a, projected_b;
+    project_cvtx(&a, &projected_a);
+    project_cvtx(&b, &projected_b);
+    draw_line_vtx(&projected_a, &projected_b, 1);
+}
+
+static void model_to_through_vtx(const ModelVtx *model, Vtx *out) {
+    out->x = model->x;
+    out->y = model->y;
+    out->z = model->z;
+    out->rw = 1.0f;
+    out->u = model->u;
+    out->v = model->v;
+    out->fog = 1.0f;
+    out->r = model->r;
+    out->g = model->g;
+    out->b = model->b;
+    out->a = model->a;
+}
+
+static void draw_patch_triangle(
+    const ModelVtx *a, const ModelVtx *b, const ModelVtx *c,
+    const VFmt *vf) {
+    if (vf->through) {
+        Vtx va, vb, vc;
+        model_to_through_vtx(a, &va);
+        model_to_through_vtx(b, &vb);
+        model_to_through_vtx(c, &vc);
+        if (ge.cull_enable && !ge.clear && (ge.cull & 1u) == 0u) {
+            Vtx swap = va;
+            va = vb;
+            vb = swap;
+        }
+        raster_tri(&va, &vb, &vc, 0);
+        return;
+    }
+    CVtx ca, cb, cc;
+    transform_model_vtx_clip(a, &ca);
+    transform_model_vtx_clip(b, &cb);
+    transform_model_vtx_clip(c, &cc);
+    draw_patch_cvtx_triangle(ca, cb, cc);
+}
+
+static void draw_patch_line(
+    const ModelVtx *a, const ModelVtx *b, const VFmt *vf) {
+    if (vf->through) {
+        Vtx va, vb;
+        model_to_through_vtx(a, &va);
+        model_to_through_vtx(b, &vb);
+        draw_line_vtx(&va, &vb, 0);
+        return;
+    }
+    CVtx ca, cb;
+    transform_model_vtx_clip(a, &ca);
+    transform_model_vtx_clip(b, &cb);
+    draw_patch_cvtx_line(ca, cb);
+}
+
+static void draw_patch_point(const ModelVtx *point, const VFmt *vf) {
+    if (vf->through) {
+        Vtx projected;
+        model_to_through_vtx(point, &projected);
+        draw_point_vtx(&projected, 0);
+        return;
+    }
+    CVtx clip;
+    transform_model_vtx_clip(point, &clip);
+    if (clip.cw <= NEAR_W || clip.oor ||
+        (!ge.depth_clip && (clip.ozp || clip.ozn))) {
+        s_stat.nearclip++;
+        return;
+    }
+    Vtx projected;
+    project_cvtx(&clip, &projected);
+    draw_point_vtx(&projected, 1);
+}
+
+#define GE_MAX_PATCH_VERTICES 65536u
+
+typedef struct {
+    int segment;
+    int k;
+    int alpha[6];
+} PatchAxisParam;
+
+typedef struct {
+    float position[3];
+    float before[3];
+    float after[3];
+    float texcoord[2];
+    int color[4];
+} PatchColumn;
+
+typedef struct {
+    int32_t mantissa;
+    int lsb_exponent;
+} PatchRowTerm;
+
+static int patch_param_256(int index, int tessellation) {
+    return 2 * index <= tessellation
+        ? (256 * index) / tessellation
+        : 256 - (256 * (tessellation - index)) / tessellation;
+}
+
+static float patch_ge_lerp(float a, float b, int k) {
+    if (k == 0) return a;
+    if (k == 256) return b;
+    uint32_t bits_a, bits_b;
+    memcpy(&bits_a, &a, sizeof(bits_a));
+    memcpy(&bits_b, &b, sizeof(bits_b));
+    int exponent_a = (int)((bits_a >> 23) & 0xffu);
+    int exponent_b = (int)((bits_b >> 23) & 0xffu);
+    int exponent =
+        exponent_a > exponent_b ? exponent_a : exponent_b;
+    if (exponent == 0) return 0.0f;
+    int fixed_a = 0;
+    int fixed_b = 0;
+    if (exponent_a != 0 && exponent - exponent_a < 16) {
+        fixed_a = (int)(
+            ((bits_a & 0x7fffffu) | 0x800000u) >>
+            (exponent - exponent_a + 8));
+        if ((bits_a & 0x80000000u) != 0) fixed_a = -fixed_a;
+    }
+    if (exponent_b != 0 && exponent - exponent_b < 16) {
+        fixed_b = (int)(
+            ((bits_b & 0x7fffffu) | 0x800000u) >>
+            (exponent - exponent_b + 8));
+        if ((bits_b & 0x80000000u) != 0) fixed_b = -fixed_b;
+    }
+    int result = fixed_a + (((fixed_b - fixed_a) * k) >> 8);
+    if (exponent <= 15)
+        return ldexpf((float)result, exponent - 127 - 15);
+    uint32_t scale_bits = (uint32_t)(exponent - 15) << 23;
+    float scale;
+    memcpy(&scale, &scale_bits, sizeof(scale));
+    return (float)result * scale;
+}
+
+static float patch_bezier_eval(
+    const float values[4], int k, float *before, float *after) {
+    float a = patch_ge_lerp(values[0], values[1], k);
+    float b = patch_ge_lerp(values[1], values[2], k);
+    float c = patch_ge_lerp(values[2], values[3], k);
+    float left = patch_ge_lerp(a, b, k);
+    float right = patch_ge_lerp(b, c, k);
+    if (before) *before = left;
+    if (after) *after = right;
+    return patch_ge_lerp(left, right, k);
+}
+
+static int patch_color_lerp(int a, int b, int k) {
+    return a + (((b - a) * k) >> 8);
+}
+
+static int patch_bezier_color(const int values[4], int k) {
+    int a = patch_color_lerp(values[0], values[1], k);
+    int b = patch_color_lerp(values[1], values[2], k);
+    int c = patch_color_lerp(values[2], values[3], k);
+    return patch_color_lerp(
+        patch_color_lerp(a, b, k),
+        patch_color_lerp(b, c, k), k);
+}
+
+static int patch_spline_knot(int index, int patch_count, int type) {
+    if (index < 3 && (type & 1) != 0) return 0;
+    if (index > patch_count + 3 && (type & 2) != 0)
+        return patch_count;
+    return index - 3;
+}
+
+static void patch_spline_param(
+    int index, int tessellation, int patch_count, int type,
+    PatchAxisParam *out) {
+    out->segment = index / tessellation;
+    out->k = patch_param_256(index % tessellation, tessellation);
+    if (out->segment == patch_count) {
+        out->segment = patch_count - 1;
+        out->k = 256;
+    }
+    int level_index[6] = {
+        out->segment + 1, out->segment + 2,
+        out->segment + 3, out->segment + 2,
+        out->segment + 3, out->segment + 3,
+    };
+    static const int level[6] = {1, 1, 1, 2, 2, 3};
+    for (int i = 0; i < 6; i++) {
+        int knot_left =
+            patch_spline_knot(level_index[i], patch_count, type);
+        int knot_right = patch_spline_knot(
+            level_index[i] + 4 - level[i], patch_count, type);
+        int span = knot_right - knot_left;
+        int distance_left =
+            256 * (out->segment - knot_left) + out->k;
+        int distance_right = 256 * span - distance_left;
+        out->alpha[i] = span == 0 ? 0
+            : (distance_left <= distance_right
+                ? distance_left / span
+                : 256 - distance_right / span);
+    }
+}
+
+static float patch_spline_eval(
+    const float values[4], const int alpha[6],
+    float *before, float *after) {
+    float left0 = patch_ge_lerp(values[0], values[1], alpha[0]);
+    float left1 = patch_ge_lerp(values[1], values[2], alpha[1]);
+    float left2 = patch_ge_lerp(values[2], values[3], alpha[2]);
+    float middle0 = patch_ge_lerp(left0, left1, alpha[3]);
+    float middle1 = patch_ge_lerp(left1, left2, alpha[4]);
+    if (before) *before = middle0;
+    if (after) *after = middle1;
+    return patch_ge_lerp(middle0, middle1, alpha[5]);
+}
+
+static int patch_spline_color(
+    const int values[4], const int alpha[6]) {
+    int left0 =
+        patch_color_lerp(values[0], values[1], alpha[0]);
+    int left1 =
+        patch_color_lerp(values[1], values[2], alpha[1]);
+    int left2 =
+        patch_color_lerp(values[2], values[3], alpha[2]);
+    return patch_color_lerp(
+        patch_color_lerp(left0, left1, alpha[3]),
+        patch_color_lerp(left1, left2, alpha[4]), alpha[5]);
+}
+
+static float patch_axis_eval(
+    const float values[4], const PatchAxisParam *param,
+    int spline, float *before, float *after) {
+    return spline
+        ? patch_spline_eval(
+            values, param->alpha, before, after)
+        : patch_bezier_eval(values, param->k, before, after);
+}
+
+static int patch_axis_color(
+    const int values[4], const PatchAxisParam *param, int spline) {
+    return spline
+        ? patch_spline_color(values, param->alpha)
+        : patch_bezier_color(values, param->k);
+}
+
+static float patch_truncate_float24(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits &= 0xffffff00u;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static float patch_ge_add(float a, float b) {
+    uint32_t bits_a, bits_b;
+    memcpy(&bits_a, &a, sizeof(bits_a));
+    memcpy(&bits_b, &b, sizeof(bits_b));
+    int exponent_a = (int)((bits_a >> 23) & 0xffu);
+    int exponent_b = (int)((bits_b >> 23) & 0xffu);
+    if (exponent_a == 0 || exponent_b == 0) {
+        if (exponent_a == 0 && exponent_b == 0) return 0.0f;
+        return exponent_a == 0
+            ? patch_truncate_float24(b)
+            : patch_truncate_float24(a);
+    }
+    int max_exponent =
+        exponent_a > exponent_b ? exponent_a : exponent_b;
+    int clear_a = 8 + max_exponent - exponent_a;
+    int clear_b = 8 + max_exponent - exponent_b;
+    bits_a = clear_a >= 24
+        ? bits_a & 0x80000000u
+        : bits_a & ~((1u << clear_a) - 1u);
+    bits_b = clear_b >= 24
+        ? bits_b & 0x80000000u
+        : bits_b & ~((1u << clear_b) - 1u);
+    memcpy(&a, &bits_a, sizeof(a));
+    memcpy(&b, &bits_b, sizeof(b));
+    return a + b;
+}
+
+static PatchRowTerm patch_ge_product(float a, float b) {
+    uint32_t bits_a, bits_b;
+    memcpy(&bits_a, &a, sizeof(bits_a));
+    memcpy(&bits_b, &b, sizeof(bits_b));
+    int exponent_a = (int)((bits_a >> 23) & 0xffu);
+    int exponent_b = (int)((bits_b >> 23) & 0xffu);
+    PatchRowTerm term;
+    if (exponent_a == 0 || exponent_b == 0) {
+        term.mantissa = 0;
+        term.lsb_exponent = INT_MIN;
+        return term;
+    }
+    uint64_t mantissa_a =
+        (uint64_t)((bits_a & 0x7fffffu) | 0x800000u);
+    uint64_t mantissa_b =
+        (uint64_t)((bits_b & 0x7fffffu) | 0x800000u);
+    int32_t product =
+        (int32_t)((mantissa_a * mantissa_b) >> 31);
+    term.mantissa =
+        ((bits_a ^ bits_b) & 0x80000000u) != 0
+        ? -product : product;
+    term.lsb_exponent =
+        (exponent_a - 127) + (exponent_b - 127) - 15;
+    return term;
+}
+
+static float patch_ge_row_sum(const PatchRowTerm terms[2]) {
+    int lsb_exponent = terms[0].lsb_exponent >
+        terms[1].lsb_exponent
+        ? terms[0].lsb_exponent : terms[1].lsb_exponent;
+    int32_t sum = 0;
+    for (int i = 0; i < 2; i++) {
+        int32_t mantissa = terms[i].mantissa;
+        if (mantissa == 0) continue;
+        int shift = lsb_exponent - terms[i].lsb_exponent;
+        if (shift < 32) {
+            sum += mantissa < 0
+                ? -(-mantissa >> shift)
+                : mantissa >> shift;
+        }
+    }
+    if (sum == 0) return 0.0f;
+    return patch_truncate_float24(
+        ldexpf((float)sum, lsb_exponent));
+}
+
+static int build_spline_axis_params(
+    int point_count, int tessellation, int edge_type,
+    PatchAxisParam **out_params, int *out_count) {
+    int patch_count = point_count - 3;
+    int count = patch_count * tessellation + 1;
+    PatchAxisParam *params = (PatchAxisParam *)malloc(
+        (size_t)count * sizeof(*params));
+    if (!params) return 0;
+    for (int index = 0; index < count; index++)
+        patch_spline_param(
+            index, tessellation, patch_count, edge_type,
+            &params[index]);
+    *out_params = params;
+    *out_count = count;
+    return 1;
+}
+
+static void evaluate_patch_vertex(
+    const ModelVtx *control, int point_stride,
+    const PatchAxisParam *u_param,
+    const PatchAxisParam *v_param, int spline,
+    float generated_u, float generated_v,
+    int has_texcoord, int needs_normal,
+    ModelVtx *out) {
+    PatchColumn columns[4];
+    float tangent_u[3] = {0.0f, 0.0f, 0.0f};
+    float tangent_v[3] = {0.0f, 0.0f, 0.0f};
+    for (int column = 0; column < 4; column++) {
+        for (int component = 0; component < 3; component++) {
+            float values[4];
+            for (int row = 0; row < 4; row++) {
+                const ModelVtx *point = &control[
+                    (v_param->segment + row) * point_stride +
+                    u_param->segment + column];
+                values[row] = (&point->x)[component];
+            }
+            columns[column].position[component] = patch_axis_eval(
+                values, v_param, spline,
+                &columns[column].before[component],
+                &columns[column].after[component]);
+        }
+        if (has_texcoord) {
+            for (int component = 0; component < 2; component++) {
+                float values[4];
+                for (int row = 0; row < 4; row++) {
+                    const ModelVtx *point = &control[
+                        (v_param->segment + row) * point_stride +
+                        u_param->segment + column];
+                    values[row] = (&point->u)[component];
+                }
+                columns[column].texcoord[component] =
+                    patch_axis_eval(
+                        values, v_param, spline, NULL, NULL);
+            }
+        }
+        for (int component = 0; component < 4; component++) {
+            int values[4];
+            for (int row = 0; row < 4; row++) {
+                const ModelVtx *point = &control[
+                    (v_param->segment + row) * point_stride +
+                    u_param->segment + column];
+                values[row] =
+                    ((&point->r)[component] << 7) | 0x7f;
+            }
+            columns[column].color[component] =
+                patch_axis_color(values, v_param, spline);
+        }
+    }
+
+    for (int component = 0; component < 3; component++) {
+        float values[4], before_values[4], after_values[4];
+        for (int column = 0; column < 4; column++) {
+            values[column] = columns[column].position[component];
+            before_values[column] = columns[column].before[component];
+            after_values[column] = columns[column].after[component];
+        }
+        float before, after;
+        (&out->x)[component] = patch_axis_eval(
+            values, u_param, spline, &before, &after);
+        tangent_u[component] = patch_ge_add(after, -before);
+        tangent_v[component] = patch_ge_add(
+            patch_axis_eval(
+                after_values, u_param, spline, NULL, NULL),
+            -patch_axis_eval(
+                before_values, u_param, spline, NULL, NULL));
+    }
+    if (has_texcoord) {
+        for (int component = 0; component < 2; component++) {
+            float values[4];
+            for (int column = 0; column < 4; column++)
+                values[column] =
+                    columns[column].texcoord[component];
+            (&out->u)[component] = patch_axis_eval(
+                values, u_param, spline, NULL, NULL);
+        }
+    } else {
+        out->u = generated_u;
+        out->v = generated_v;
+    }
+    for (int component = 0; component < 4; component++) {
+        int values[4];
+        for (int column = 0; column < 4; column++)
+            values[column] = columns[column].color[component];
+        (&out->r)[component] = clamp8(
+            patch_axis_color(values, u_param, spline) >> 7);
+    }
+
+    if (needs_normal) {
+        for (int component = 0; component < 3; component++) {
+            int first = (component + 1) % 3;
+            int second = (component + 2) % 3;
+            PatchRowTerm terms[2] = {
+                patch_ge_product(
+                    tangent_u[first], tangent_v[second]),
+                patch_ge_product(
+                    -tangent_u[second], tangent_v[first]),
+            };
+            (&out->nx)[component] = patch_ge_row_sum(terms);
+        }
+    } else {
+        out->nx = 0.0f;
+        out->ny = 0.0f;
+        out->nz = 1.0f;
+    }
+    if ((ge.patch_facing ^ (uint32_t)(ge.reverse_normal != 0)) != 0) {
+        out->nx = -out->nx;
+        out->ny = -out->ny;
+        out->nz = -out->nz;
+    }
+}
+
+static void draw_patch_grid(
+    const ModelVtx *vertices, int width, int height,
+    const VFmt *vf) {
+    for (int v = 0; v + 1 < height; v++) {
+        for (int u = 0; u + 1 < width; u++) {
+            const ModelVtx *top_left = &vertices[v * width + u];
+            const ModelVtx *top_right = top_left + 1;
+            const ModelVtx *bottom_left =
+                &vertices[(v + 1) * width + u];
+            const ModelVtx *bottom_right = bottom_left + 1;
+            if ((ge.patch_primitive & 3u) == 0u) {
+                draw_patch_triangle(
+                    top_left, bottom_left, top_right, vf);
+                draw_patch_triangle(
+                    top_right, bottom_left, bottom_right, vf);
+            } else if ((ge.patch_primitive & 3u) == 1u) {
+                draw_patch_line(top_left, bottom_left, vf);
+                draw_patch_line(bottom_left, top_right, vf);
+                draw_patch_line(top_right, bottom_right, vf);
+            } else {
+                draw_patch_point(top_left, vf);
+                draw_patch_point(bottom_left, vf);
+                draw_patch_point(bottom_left, vf);
+                draw_patch_point(top_right, vf);
+                draw_patch_point(top_right, vf);
+                draw_patch_point(bottom_right, vf);
+            }
+        }
+    }
+}
+
+static void limit_patch_tessellation(
+    int *tess_u, int *tess_v, uint64_t patch_u, uint64_t patch_v,
+    int separate_patches) {
+    for (;;) {
+        uint64_t width = separate_patches
+            ? (uint64_t)(*tess_u + 1)
+            : patch_u * (uint64_t)*tess_u + 1u;
+        uint64_t height = separate_patches
+            ? (uint64_t)(*tess_v + 1)
+            : patch_v * (uint64_t)*tess_v + 1u;
+        uint64_t vertices = width * height;
+        if (separate_patches) vertices *= patch_u * patch_v;
+        if (vertices <= GE_MAX_PATCH_VERTICES ||
+            (*tess_u <= 1 && *tess_v <= 1)) {
+            return;
+        }
+        if (*tess_u >= *tess_v && *tess_u > 1)
+            (*tess_u)--;
+        else if (*tess_v > 1)
+            (*tess_v)--;
+    }
+}
+
+static ModelVtx *decode_patch_controls(
+    uint32_t vbase, uint32_t ibase, int index_format,
+    const VFmt *vf, int count) {
+    ModelVtx *control = (ModelVtx *)malloc(
+        (size_t)count * sizeof(*control));
+    if (!control) return NULL;
+    for (int i = 0; i < count; i++) {
+        uint32_t address = prim_vtx_addr(
+            vbase, ibase, index_format, i, vf->stride);
+        decode_model_vtx(address, vf, &control[i]);
+    }
+    return control;
+}
+
+static void advance_patch_vertices(
+    int count, int index_format, const VFmt *vf) {
+    if (index_format)
+        ge.iaddr += (uint32_t)(count << (index_format - 1));
+    else
+        ge.vaddr += (uint32_t)(count * vf->stride);
+}
+
+static void draw_bezier(uint32_t op) {
+    int points_u = (int)(op & 0xffu);
+    int points_v = (int)((op >> 8) & 0xffu);
+    int count = points_u * points_v;
+    VFmt vf;
+    decode_vtype(ge.vtype, &vf);
+    int index_format = (int)((ge.vtype >> 11) & 3u);
+    uint32_t vbase = ge.vaddr;
+    uint32_t ibase = ge.iaddr;
+    advance_patch_vertices(count, index_format, &vf);
+    int patch_u = (points_u - 1) / 3;
+    int patch_v = (points_v - 1) / 3;
+    if (points_u < 4 || points_v < 4 ||
+        patch_u < 1 || patch_v < 1) {
+        return;
+    }
+    ModelVtx *control = decode_patch_controls(
+        vbase, ibase, index_format, &vf, count);
+    if (!control) {
+        fprintf(stderr, "GE: Bezier control-point allocation failed\n");
+        return;
+    }
+
+    int tess_u = (int)(ge.patch_division & 0x7fu);
+    int tess_v = (int)((ge.patch_division >> 8) & 0x7fu);
+    if (tess_u < 1) tess_u = 1;
+    if (tess_v < 1) tess_v = 1;
+    limit_patch_tessellation(
+        &tess_u, &tess_v, (uint64_t)patch_u, (uint64_t)patch_v, 1);
+    int width = tess_u + 1;
+    int height = tess_v + 1;
+    int needs_normal =
+        vf.nrm_off >= 0 || ge.lighting_enable ||
+        (ge.tex_map_mode & 3u) == 2u;
+    ModelVtx *vertices = (ModelVtx *)malloc(
+        (size_t)width * (size_t)height * sizeof(*vertices));
+    if (!vertices) {
+        fprintf(stderr, "GE: Bezier tessellation allocation failed\n");
+        free(control);
+        return;
+    }
+    for (int pu = 0; pu < patch_u; pu++) {
+        for (int pv = 0; pv < patch_v; pv++) {
+            const ModelVtx *patch =
+                &control[(pv * 3) * points_u + pu * 3];
+            for (int v = 0; v <= tess_v; v++) {
+                PatchAxisParam param_v = {0};
+                param_v.k = patch_param_256(v, tess_v);
+                for (int u = 0; u <= tess_u; u++) {
+                    PatchAxisParam param_u = {0};
+                    param_u.k = patch_param_256(u, tess_u);
+                    evaluate_patch_vertex(
+                        patch, points_u, &param_u, &param_v, 0,
+                        (float)pu + (float)param_u.k / 256.0f,
+                        (float)pv + (float)param_v.k / 256.0f,
+                        vf.tc_off >= 0, needs_normal,
+                        &vertices[v * width + u]);
+                }
+            }
+            draw_patch_grid(vertices, width, height, &vf);
+        }
+    }
+    free(vertices);
+    free(control);
+}
+
+static void draw_spline(uint32_t op) {
+    int points_u = (int)(op & 0xffu);
+    int points_v = (int)((op >> 8) & 0xffu);
+    int count = points_u * points_v;
+    VFmt vf;
+    decode_vtype(ge.vtype, &vf);
+    int index_format = (int)((ge.vtype >> 11) & 3u);
+    uint32_t vbase = ge.vaddr;
+    uint32_t ibase = ge.iaddr;
+    advance_patch_vertices(count, index_format, &vf);
+    int patch_u = points_u - 3;
+    int patch_v = points_v - 3;
+    if (patch_u < 1 || patch_v < 1) return;
+    ModelVtx *control = decode_patch_controls(
+        vbase, ibase, index_format, &vf, count);
+    if (!control) {
+        fprintf(stderr, "GE: spline control-point allocation failed\n");
+        return;
+    }
+
+    int tess_u = (int)(ge.patch_division & 0x7fu);
+    int tess_v = (int)((ge.patch_division >> 8) & 0x7fu);
+    if (tess_u < 1) tess_u = 1;
+    if (tess_v < 1) tess_v = 1;
+    limit_patch_tessellation(
+        &tess_u, &tess_v, (uint64_t)patch_u, (uint64_t)patch_v, 0);
+    PatchAxisParam *params_u = NULL;
+    PatchAxisParam *params_v = NULL;
+    int width = 0, height = 0;
+    int type_u = (int)((op >> 16) & 3u);
+    int type_v = (int)((op >> 18) & 3u);
+    if (!build_spline_axis_params(
+            points_u, tess_u, type_u, &params_u, &width) ||
+        !build_spline_axis_params(
+            points_v, tess_v, type_v, &params_v, &height)) {
+        fprintf(stderr, "GE: spline parameter allocation failed\n");
+        free(params_u);
+        free(params_v);
+        free(control);
+        return;
+    }
+    ModelVtx *vertices = (ModelVtx *)malloc(
+        (size_t)width * (size_t)height * sizeof(*vertices));
+    if (!vertices) {
+        fprintf(stderr, "GE: spline tessellation allocation failed\n");
+        free(params_u);
+        free(params_v);
+        free(control);
+        return;
+    }
+    int needs_normal =
+        vf.nrm_off >= 0 || ge.lighting_enable ||
+        (ge.tex_map_mode & 3u) == 2u;
+    for (int v = 0; v < height; v++) {
+        for (int u = 0; u < width; u++) {
+            const PatchAxisParam *param_u = &params_u[u];
+            const PatchAxisParam *param_v = &params_v[v];
+            evaluate_patch_vertex(
+                control, points_u, param_u, param_v, 1,
+                (float)param_u->segment +
+                    (float)param_u->k / 256.0f,
+                (float)param_v->segment +
+                    (float)param_v->k / 256.0f,
+                vf.tc_off >= 0, needs_normal,
+                &vertices[v * width + u]);
+        }
+    }
+    draw_patch_grid(vertices, width, height, &vf);
+    free(vertices);
+    free(params_u);
+    free(params_v);
+    free(control);
 }
 
 static void draw_prim(uint32_t op) {
@@ -2577,6 +3472,10 @@ static const char *ge_cmd_name(uint32_t cmd) {
         case 0x05: return "BEZIER";           case 0x06: return "SPLINE";
         case 0x07: return "BOUNDINGBOX";
         case 0x2A: return "BONEMATRIXNUMBER"; case 0x2B: return "BONEMATRIXDATA";
+        case 0x2C: return "MORPHWEIGHT0";      case 0x2D: return "MORPHWEIGHT1";
+        case 0x2E: return "MORPHWEIGHT2";      case 0x2F: return "MORPHWEIGHT3";
+        case 0x30: return "MORPHWEIGHT4";      case 0x31: return "MORPHWEIGHT5";
+        case 0x32: return "MORPHWEIGHT6";      case 0x33: return "MORPHWEIGHT7";
         case 0x40: return "TGENMATRIXNUMBER"; case 0x41: return "TGENMATRIXDATA";
         case 0xB2: return "TRANSFERSRC";      case 0xB3: return "TRANSFERSRCW";
         case 0xB4: return "TRANSFERDST";      case 0xB5: return "TRANSFERDSTW";
@@ -2739,7 +3638,16 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
             case GE_MASKALPHA: ge.mask_alpha = (int)(data & 0xFF); break;
             case GE_ANTIALIASENABLE: case GE_PATCHCULLENABLE: break;
             case GE_LOGICOPENABLE: ge.logic_op_enable = data & 1; break;
-            case GE_PATCHDIVISION: case GE_PATCHPRIMITIVE: case GE_PATCHFACING: break;
+            case GE_MORPHWEIGHT0: case GE_MORPHWEIGHT0 + 1:
+            case GE_MORPHWEIGHT0 + 2: case GE_MORPHWEIGHT0 + 3:
+            case GE_MORPHWEIGHT0 + 4: case GE_MORPHWEIGHT0 + 5:
+            case GE_MORPHWEIGHT0 + 6: case GE_MORPHWEIGHT7:
+                ge.morph_weight[cmd - GE_MORPHWEIGHT0] =
+                    decode_float24(data);
+                break;
+            case GE_PATCHDIVISION: ge.patch_division = data; break;
+            case GE_PATCHPRIMITIVE: ge.patch_primitive = data & 3u; break;
+            case GE_PATCHFACING: ge.patch_facing = data & 1u; break;
 
             /* ---- Matrix capture ----
              * *MATRIXNUMBER sets the write cursor; *MATRIXDATA writes one float24 and advances.
@@ -2943,6 +3851,8 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
             case GE_TRANSFERSTART:  ge_block_transfer(data); break;
 
             case GE_PRIM: s_list_prims++; draw_prim(op); break;
+            case GE_BEZIER: s_list_prims++; draw_bezier(op); break;
+            case GE_SPLINE: s_list_prims++; draw_spline(op); break;
             /* The bounding-box test result is kept by gelist.c (BJUMP); nothing to draw. */
             case GE_BOUNDINGBOX: break;
             /* SIGNAL and FINISH only take effect at the END that follows (gelist.c). */

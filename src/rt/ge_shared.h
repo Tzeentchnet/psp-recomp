@@ -34,6 +34,8 @@ typedef struct {
     int world_num, view_num, proj_num;
     float bone[96];                          /* 8 bone matrices, 4x3 each (skinning) */
     int bone_num;
+    float morph_weight[8];
+    uint32_t patch_division, patch_primitive, patch_facing;
     /* Viewport: raw 24-bit float mantissa words from VIEWPORTXSCALE..VIEWPORTZCENTER. */
     uint32_t viewport_raw[6];   /* [0]=XS [1]=YS [2]=ZS [3]=XC [4]=YC [5]=ZC */
     uint32_t offsetx, offsety;  /* sub-pixel offset (pixels = (raw&0xFFFF)/16.0) */

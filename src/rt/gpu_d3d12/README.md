@@ -36,15 +36,17 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 
 `vertex.cpp` deliberately consumes the existing `GeVtx` backend seam instead of
 duplicating PSP vertex decoding. `ge.c` remains authoritative for all raw attribute
-formats, skinning, through mode, indices, transform/lighting, clipping, and primitive
-assembly. Captured vertices and primitive-boundary records are copied into the active
-fenced upload-ring partition during presentation. The hooks still return zero, so the
-reference software rasterizer remains authoritative until native batches are submitted to
-GPU render targets.
+formats, morph-before-skin decoding, through mode, indices, GE-exact CPU Bezier/B-spline
+tessellation, transform/lighting, clipping, and primitive assembly. Generated patch
+triangles, lines, and points cross the same `GeBackend` seam as ordinary primitives.
+Captured vertices and primitive-boundary records are copied into the active fenced
+upload-ring partition during presentation. The hooks still return zero, so the reference
+software rasterizer remains authoritative until native batches are submitted to GPU
+render targets.
 
 `pipeline_key.cpp` maps only PSO-static GE fields; shader constants, descriptors,
 scissor, and blend constants remain per-draw state and intentionally do not multiply the
-cache. Each captured batch stores its key and canonical 112-byte shader block before later
+cache. Each captured batch stores its key and canonical 160-byte shader block before later
 GE commands mutate the live state.
 `pipeline.cpp` uses FNV-1a to select an open-addressed slot, confirms the full key on
 hits, compiles the embedded HLSL synchronously on misses, and binds the resulting PSO to
@@ -97,17 +99,13 @@ aliasing, or bounds mismatches explicitly fall back to the CPU transfer path.
 
 `shaders/psp_vs.hlsl` and `shaders/psp_ps.hlsl` are the native Shader Model 6 ports of
 the Vulkan GE shaders. Their checked-in `*.inc` files contain stripped DXIL consumed by
-`device.cpp`. `shader_state.cpp` snapshots texture functions, alpha/color tests, color
-doubling, fog, D16 `minz`/`maxz`, framebuffer-alias offsets, stencil state, and the signed
-4×4 dither matrix into the 28-DWORD root block. The pixel shader performs color test after
-fog and ordered dithering, while ordinary PSOs preserve destination alpha as PSP stencil.
-
-The fixed-function path can emit destination-independent, always-pass stencil depth-pass
-zero/replace operations when all stored stencil bits are writable. Other comparisons,
-stencil fail/depth-fail operations, invert/increment/decrement, partial 8888 masks, and
-exact post-blend dithering require destination color/depth access. They intentionally share
-the programmable destination path needed for the remaining blend and logic operations;
-native draws are not enabled before that path is complete.
+`device.cpp`. `shader_state.cpp` snapshots texture functions, alpha/color tests, fog,
+D16 `minz`/`maxz`, framebuffer aliases, stencil/depth state, exact blend and fixed-color
+state, logic operations, native masks/formats, clear state, scissor, and the signed 4×4
+dither matrix into the 40-DWORD root block. The pixel shader reads ordered destination
+color/depth snapshots at `t2`/`t3` and performs PSP fragment ordering, native packing,
+component masks, and `SV_Depth` preservation manually. Native draw replay remains disabled
+until software raster suppression and GPU target ownership switch atomically.
 
 Regenerate or verify the shaders with:
 
