@@ -1,14 +1,14 @@
 /* H.264 video decode for sceMpeg (PSMF movies) via Windows Media Foundation.
  *
  * The game feeds 2048-byte MPEG-PS packets into the mpeg ring buffer; mpeg.c hands those
- * bytes here. We demux the program stream (video PES packets, stream id 0xE0-0xEF) into an
- * H.264 annex-B elementary stream and run it through the OS H.264 decoder MFT
+ * bytes here. We demux the program stream into H.264 and ATRAC3+ elementary streams, then run
+ * video through the OS H.264 decoder MFT
  * (msmpeg2vdec.dll) in low-latency mode, converting each NV12 frame into the guest video
  * buffer in the PSP pixel format the game asked for.
  *
- * Pull model: sr_h264_feed() only demuxes (cheap); sr_h264_frame() pushes ES chunks into the
- * MFT until it yields one frame (or runs out of data). This keeps the MFT's input queue from
- * overflowing and bounds the work done per sceMpegAvcDecode call.
+ * Pull model: sr_h264_feed() only demuxes (cheap); sr_h264_frame() pushes video ES chunks into
+ * the MFT until it yields one frame, while sr_h264_audio_frame() returns complete ATRAC3+
+ * frames. This keeps the decoder queues bounded to work requested by sceMpegAvcDecode/AtracDecode.
  *
  * No external dependencies: mfplat.dll / msmpeg2vdec.dll ship with Windows.
  */
@@ -60,6 +60,8 @@ typedef struct {
     /* demuxed H.264 ES byte fifo + chunk table (one chunk per video PES payload) */
     uint8_t *es; uint32_t esLen, esCap;
     EsChunk *ck; uint32_t nCk, capCk, curCk;
+    uint8_t *audio; uint32_t audioLen, audioCap, audioPos;
+    EsChunk *audioCk; uint32_t nAudioCk, capAudioCk;
     LONGLONG fakeTime;             /* synthetic input timestamp when the PES had no PTS */
 } Dec;
 
@@ -94,6 +96,24 @@ static void es_append(Dec *d, const uint8_t *p, uint32_t n, int64_t pts) {
     d->ck[d->nCk].pts = pts;
     d->nCk++;
     d->esLen += n;
+}
+
+static void audio_append(Dec *d, const uint8_t *p, uint32_t n, int64_t pts) {
+    if (!buf_reserve(&d->audio, &d->audioCap, d->audioLen + n)) return;
+    if (d->nAudioCk == d->capAudioCk) {
+        uint32_t capacity = d->capAudioCk ? d->capAudioCk * 2u : 256u;
+        EsChunk *chunks =
+            (EsChunk *)realloc(d->audioCk, capacity * sizeof(EsChunk));
+        if (!chunks) return;
+        d->audioCk = chunks;
+        d->capAudioCk = capacity;
+    }
+    memcpy(d->audio + d->audioLen, p, n);
+    d->audioCk[d->nAudioCk].off = d->audioLen;
+    d->audioCk[d->nAudioCk].len = n;
+    d->audioCk[d->nAudioCk].pts = pts;
+    d->nAudioCk++;
+    d->audioLen += n;
 }
 
 /* Drop consumed bytes so the fifos stay small (the ring is ~1.2MB; the game feeds as we drain). */
@@ -139,7 +159,8 @@ static int ps_parse_one(Dec *d) {
     uint32_t len = ((uint32_t)p[4] << 8) | p[5];
     uint32_t tot = 6 + len;
     if (n < tot) return 0;
-    if (code >= 0xE0 && code <= 0xEF && len >= 3 && (p[6] & 0xC0) == 0x80) {
+    if (((code >= 0xE0 && code <= 0xEF) || code == 0xBD) &&
+        len >= 3 && (p[6] & 0xC0) == 0x80) {
         uint32_t hdr = 9 + p[8];
         int64_t pts = -1;
         if ((p[7] & 0x80) && p[8] >= 5 && len >= 8) {
@@ -149,7 +170,17 @@ static int ps_parse_one(Dec *d) {
                   ((int64_t) p[12]          << 7)  |
                   ((int64_t)(p[13] >> 1));
         }
-        if (tot > hdr) es_append(d, p + hdr, tot - hdr, pts);
+        if (tot > hdr && code >= 0xE0 && code <= 0xEF) {
+            es_append(d, p + hdr, tot - hdr, pts);
+        } else if (tot > hdr + 4 && code == 0xBD) {
+            uint8_t channel = p[hdr];
+            uint32_t audio_header =
+                channel >= 0xB0 && channel <= 0xBF ? 5u : 4u;
+            if (tot > hdr + audio_header)
+                audio_append(
+                    d, p + hdr + audio_header,
+                    tot - hdr - audio_header, pts);
+        }
     }
     d->psPos += tot;
     return 1;
@@ -364,6 +395,7 @@ void sr_h264_destroy(int id) {
     Dec *d = &s_dec[id];
     if (d->xf) IMFTransform_Release(d->xf);
     free(d->ps); free(d->es); free(d->ck);
+    free(d->audio); free(d->audioCk);
     memset(d, 0, sizeof(*d));
 }
 
@@ -380,6 +412,54 @@ void sr_h264_feed(int id, const uint8_t *data, uint32_t len) {
         d->psLen -= d->psPos;
         d->psPos = 0;
     }
+}
+
+static int audio_frame_size(Dec *d) {
+    while (d->audioPos + 2 <= d->audioLen &&
+           !(d->audio[d->audioPos] == 0x0F &&
+             d->audio[d->audioPos + 1] == 0xD0))
+        d->audioPos++;
+    if (d->audioLen - d->audioPos < 4) return 0;
+    uint8_t code1 = d->audio[d->audioPos + 2];
+    uint8_t code2 = d->audio[d->audioPos + 3];
+    uint32_t frame_size =
+        (((uint32_t)code1 & 3u) << 8) | ((uint32_t)code2 << 3);
+    frame_size += 0x10u;
+    if (frame_size < 8 || d->audioLen - d->audioPos < frame_size) return 0;
+    return (int)frame_size;
+}
+
+int sr_h264_audio_available(int id) {
+    if (id < 0 || id >= MAX_DEC || !s_dec[id].used) return 0;
+    return audio_frame_size(&s_dec[id]) > 0;
+}
+
+/* Return one demuxed PSP ATRAC3+ frame, without its 8-byte 0F D0 frame header. */
+int sr_h264_audio_frame(
+    int id, uint8_t *dst, int capacity, int *channels, int64_t *pts) {
+    if (id < 0 || id >= MAX_DEC || !s_dec[id].used || !dst || capacity <= 0)
+        return -1;
+    Dec *d = &s_dec[id];
+    int frame_size_int = audio_frame_size(d);
+    if (frame_size_int <= 0) return frame_size_int;
+    uint32_t frame_size = (uint32_t)frame_size_int;
+    uint8_t code1 = d->audio[d->audioPos + 2];
+    uint32_t payload = frame_size - 8u;
+    if (payload > (uint32_t)capacity) return -1;
+
+    memcpy(dst, d->audio + d->audioPos + 8u, payload);
+    if (pts) {
+        *pts = -1;
+        for (uint32_t i = 0; i < d->nAudioCk; i++) {
+            if (d->audioCk[i].off > d->audioPos) break;
+            if (d->audioPos < d->audioCk[i].off + d->audioCk[i].len &&
+                d->audioCk[i].pts >= 0)
+                *pts = d->audioCk[i].pts;
+        }
+    }
+    d->audioPos += frame_size;
+    if (channels) *channels = code1 == 0x24 ? 1 : 2;
+    return (int)payload;
 }
 
 /* Decode the next frame into dst (host pointer to the guest video buffer). eos != 0 once the

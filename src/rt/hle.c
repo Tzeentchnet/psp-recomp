@@ -3597,7 +3597,7 @@ void sr_hle_init(void) {
     sr_hle_register(0xceb870b1, "sceMpegFreeAvcEsBuf", h_MpegFreeAvcEsBuf);
     sr_hle_register(0x167afd9e, "sceMpegInitAu", h_MpegInitAu);
     sr_hle_register(0xf8dcb679, "sceMpegQueryAtracEsSize", h_MpegQueryAtracEsSize);
-    /* sceAtrac3plus (control flow only; silence output). */
+    /* sceAtrac3plus (RIFF parsing, real decode, looping and streamed refills). */
     sr_hle_register(0x7a20e7af, "sceAtracSetDataAndGetID", h_AtracSetDataAndGetID);
     sr_hle_register(0x61eb33f5, "sceAtracReleaseAtracID", h_AtracReleaseAtracID);
     sr_hle_register(0x6a8c3cd5, "sceAtracDecodeData", h_AtracDecodeData);

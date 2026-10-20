@@ -2,23 +2,25 @@
  *
  * This is a faithful port of PPSSPP's sceMpeg control flow: PSMF header analysis, ring-buffer
  * packet accounting, MPEG handle/context creation, stream registration, and the access-unit
- * getters with timestamp progression and end-of-stream detection. The one part that cannot be
- * ported without ffmpeg is the actual AVC/ATRAC sample decode (the PPSSPP MediaEngine); here the
- * media-engine timestamp is modelled directly (video advances by videoTimestampStep per decoded
- * frame and ends at the stream's last timestamp), so a game's movie-playback loop runs and
- * *completes* identically — the decoded video frame is left blank.
+ * getters with timestamp progression and end-of-stream detection. Windows GPU builds demux the
+ * program stream into Media Foundation H.264 video and standalone ATRAC3+ audio; timestamp-only
+ * operation remains the fallback for renderer-less tools.
  *
  * Because the project links the recompiled game (GPLv2+ via this port), this binds to GPLv2+.
  */
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
-#ifdef SR_SDL3VK
-/* Media Foundation H.264 decode (h264_mf.c): real movie frames for the SDL3 build. */
+#include "atrac_decode.h"
+#if defined(SR_SDL3VK) || defined(SR_D3D12)
+/* Media Foundation H.264 decode (h264_mf.c): real movie frames for Windows GPU builds. */
 int  sr_h264_create(void);
 void sr_h264_destroy(int id);
 void sr_h264_feed(int id, const uint8_t *data, uint32_t len);
 int  sr_h264_frame(int id, int eos, uint8_t *dst, int frameWidth, int pixelMode);
+int  sr_h264_audio_available(int id);
+int  sr_h264_audio_frame(
+    int id, uint8_t *dst, int capacity, int *channels, int64_t *pts);
 #endif
 #include <stdint.h>
 #include <string.h>
@@ -41,6 +43,9 @@ int  sr_h264_frame(int id, int eos, uint8_t *dst, int frameWidth, int pixelMode)
 
 #define MPEG_AVC_ES_SIZE   2048
 #define MPEG_ATRAC_ES_SIZE 2112
+#define MPEG_ATRAC_ES_OUTPUT_SIZE 8192
+#define MPEG_ATRAC_SAMPLES_PER_FRAME 2048
+#define MPEG_ATRAC_CODEC_PLUS 0x1000
 
 #define MPEG_MEMSIZE_0105 0x10000u
 
@@ -78,8 +83,11 @@ typedef struct {
     uint32_t fedPackets;         /* cumulative packets the game has put into the ring */
     uint32_t consumedPackets;    /* packets consumed by timestamp-proportional demux */
     uint32_t headerAddr;         /* guest address of the PSMF header passed to QueryStreamOffset */
-    int h264;                    /* SDL3 build: Media Foundation H.264 decoder id (-1 = none) */
+    int h264;                    /* Windows GPU build: PSMF demux/H.264 decoder id (-1 = none) */
     int h264Init, h264Frames;
+    SrAtracDecoder *pmfAtrac;
+    int pmfAtracChannels, pmfAtracBlock, pmfAudioFrames;
+    int64_t maxAvDrift;
     int defaultFrameWidth, pixelMode;
     int esBuffers[2];           /* MPEG_DATA_ES_BUFFERS: allocated-flag per ES buffer */
     /* stream map: small fixed table sid -> (type,num,needsReset) */
@@ -187,12 +195,16 @@ static void au_write_pts(uint32_t auAddr, int off, int64_t v) {
 
 uint32_t mpeg_init(void) { s_mpegInit = 1; return 0; }
 uint32_t mpeg_finish(void) {
-#ifdef SR_SDL3VK
-    for (int i = 0; i < 8; i++) if (s_mpeg[i].used && s_mpeg[i].h264 >= 0) {
-        sr_h264_destroy(s_mpeg[i].h264);
-        s_mpeg[i].h264 = -1;
-    }
+    for (int i = 0; i < 8; i++) if (s_mpeg[i].used) {
+#if defined(SR_SDL3VK) || defined(SR_D3D12)
+        if (s_mpeg[i].h264 >= 0) {
+            sr_h264_destroy(s_mpeg[i].h264);
+            s_mpeg[i].h264 = -1;
+        }
 #endif
+        sr_atrac_decoder_destroy(s_mpeg[i].pmfAtrac);
+        s_mpeg[i].pmfAtrac = NULL;
+    }
     s_mpegInit = 0;
     return 0;
 }
@@ -257,7 +269,9 @@ uint32_t mpeg_create(uint32_t mpegAddr, uint32_t dataPtr, uint32_t size, uint32_
 
 /* sceMpegAvcDecodeMode(mpeg, mode*): mode[1] is the output pixel format (GE 5650..8888). */
 uint32_t mpeg_avc_decode_mode(uint32_t mpegAddr, uint32_t modeAddr) {
-    if (!sr_inrange(modeAddr)) return (uint32_t)-1;
+    if (!modeAddr || modeAddr > UINT32_MAX - 7u ||
+        !sr_inrange(modeAddr) || !sr_inrange(modeAddr + 7u))
+        return (uint32_t)-1;
     Mpeg *ctx = mpeg_find(mpegAddr);
     if (!ctx) return (uint32_t)-1;
     int pixelMode = (int)MEM_R32(modeAddr + 4);
@@ -269,9 +283,18 @@ uint32_t mpeg_avc_decode_mode(uint32_t mpegAddr, uint32_t modeAddr) {
 uint32_t mpeg_delete(uint32_t mpegAddr) {
     Mpeg *ctx = mpeg_find(mpegAddr);
     if (!ctx) return (uint32_t)-1;
-#ifdef SR_SDL3VK
+#if defined(SR_SDL3VK) || defined(SR_D3D12)
     if (ctx->h264 >= 0) { sr_h264_destroy(ctx->h264); ctx->h264 = -1; }
 #endif
+    if (getenv("SR_MPEGLOG"))
+        fprintf(stderr,
+                "MpegDelete videoFrames=%d audioFrames=%d videoPts=%lld "
+                "audioPts=%lld maxDrift=%lld\n",
+                ctx->h264Frames, ctx->pmfAudioFrames,
+                (long long)ctx->videoPts, (long long)ctx->audioPts,
+                (long long)ctx->maxAvDrift);
+    sr_atrac_decoder_destroy(ctx->pmfAtrac);
+    ctx->pmfAtrac = NULL;
     ctx->used = 0;
     return 0;
 }
@@ -426,7 +449,7 @@ uint32_t mpeg_ringbuffer_put(CpuState *s, uint32_t ring, uint32_t numPackets, ui
             }
         }
 
-#ifdef SR_SDL3VK
+#if defined(SR_SDL3VK) || defined(SR_D3D12)
         if (ctx && got) {
             if (!ctx->h264Init) { ctx->h264Init = 1; ctx->h264 = sr_h264_create(); }
             if (ctx->h264 >= 0)
@@ -508,7 +531,18 @@ uint32_t mpeg_get_atrac_au(uint32_t mpegAddr, uint32_t sid, uint32_t auAddr, uin
     if (!ctx) return (uint32_t)-1;
     uint32_t ring = ctx->ringAddr;
     if (!ring) return (uint32_t)-1;
-    if (rb_get(ring, RB_packetsAvail) == 0) return SCE_MPEG_ERROR_NO_DATA;
+    int audio_available = 0;
+#if defined(SR_SDL3VK) || defined(SR_D3D12)
+    if (ctx->h264Init && ctx->h264 >= 0)
+        audio_available = sr_h264_audio_available(ctx->h264);
+#endif
+    if (rb_get(ring, RB_packetsAvail) == 0 && !audio_available)
+        return SCE_MPEG_ERROR_NO_DATA;
+    if (ctx->pmfAudioFrames &&
+        ctx->audioPts > ctx->videoPts + audioTimestampStep)
+        return SCE_MPEG_ERROR_NO_DATA;
+    if (ctx->h264Init && ctx->h264 >= 0 && !audio_available)
+        return SCE_MPEG_ERROR_NO_DATA;
     int needsReset = 0, num = 0;
     au_stream(mpegAddr, sid, &needsReset, &num);
     int64_t pts = ctx->audioPts + ctx->firstTimestamp;
@@ -549,15 +583,22 @@ static void consume_stream_for_video_pts(Mpeg *ctx) {
         rb_set(ctx->ringAddr, RB_packetsAvail, avail - take);
         ctx->consumedPackets += take;
     }
-    if (elapsed == duration &&
-        (ctx->videoTailBuffered ||
-         (ctx->fedPackets >= ctx->totalPackets && ctx->consumedPackets >= ctx->totalPackets))) {
+    int audio_pending = 0;
+#if defined(SR_SDL3VK) || defined(SR_D3D12)
+    if (ctx->h264Init && ctx->h264 >= 0)
+        audio_pending = sr_h264_audio_available(ctx->h264);
+#endif
+    int packets_complete =
+        ctx->fedPackets >= ctx->totalPackets &&
+        ctx->consumedPackets >= ctx->totalPackets;
+    if (elapsed == duration && !audio_pending &&
+        (ctx->videoTailBuffered || packets_complete)) {
         ctx->videoEnd = 1;
     }
 }
 
 /* AvcDecode(mpeg, auAddr, frameWidth, bufferAddr, initAddr): decode one AVC frame into
- * *bufferAddr. The SDL3 build decodes through Media Foundation (h264_mf.c); otherwise the
+ * *bufferAddr. Windows GPU builds decode through Media Foundation (h264_mf.c); otherwise the
  * timestamp-only model runs and leaves the frame blank. */
 uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth, uint32_t bufferAddr, uint32_t initAddr) {
     (void)auAddr;
@@ -568,7 +609,10 @@ uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth
         frameWidth = ctx->defaultFrameWidth ? (uint32_t)ctx->defaultFrameWidth : 512u;
     uint32_t buffer = bufferAddr ? MEM_R32(bufferAddr) : 0;
 
+    int64_t duration = ctx->lastTimestamp - ctx->firstTimestamp;
     ctx->videoPts += videoTimestampStep;
+    if (duration > 0 && ctx->videoPts > duration)
+        ctx->videoPts = duration;
     consume_stream_for_video_pts(ctx);
     /* Report "a frame was produced" (1) every decode; the game keeps feeding/decoding until it has
      * read the whole file, then stops on its own. */
@@ -576,7 +620,7 @@ uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth
     uint32_t outputBytes =
         video_buffer_bytes(frameWidth, ctx->pixelMode);
     if (buffer) sr_gpu_vram_prepare_write(buffer, outputBytes);
-#ifdef SR_SDL3VK
+#if defined(SR_SDL3VK) || defined(SR_D3D12)
     if (ctx->h264Init && ctx->h264 >= 0 && buffer) {
         int eos = ctx->totalPackets && ctx->fedPackets >= ctx->totalPackets;
         gotFrame = sr_h264_frame(ctx->h264, eos, (uint8_t *)SR_HOST(buffer),
@@ -603,10 +647,81 @@ uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth
     return 0;
 }
 uint32_t mpeg_atrac_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t bufferAddr, uint32_t init) {
-    (void)auAddr; (void)bufferAddr; (void)init;
+    (void)init;
     Mpeg *ctx = mpeg_find(mpegAddr);
     if (!ctx) return (uint32_t)-1;
-    ctx->audioPts += audioTimestampStep;
+    if (!bufferAddr ||
+        bufferAddr > UINT32_MAX - (MPEG_ATRAC_ES_OUTPUT_SIZE - 1u) ||
+        !sr_inrange(bufferAddr) ||
+        !sr_inrange(bufferAddr + MPEG_ATRAC_ES_OUTPUT_SIZE - 1u))
+        return (uint32_t)-1;
+
+    memset(SR_HOST(bufferAddr), 0, MPEG_ATRAC_ES_OUTPUT_SIZE);
+    int encoded_bytes = 0;
+    int channels = 2;
+    int64_t encoded_pts = -1;
+    static uint8_t encoded[0x2000];
+    static int16_t pcm[MPEG_ATRAC_SAMPLES_PER_FRAME * 2];
+#if defined(SR_SDL3VK) || defined(SR_D3D12)
+    if (ctx->h264Init && ctx->h264 >= 0)
+        encoded_bytes =
+            sr_h264_audio_frame(
+                ctx->h264, encoded, sizeof(encoded), &channels, &encoded_pts);
+#endif
+    int samples = 0;
+    if (encoded_bytes > 0) {
+        if (!ctx->pmfAtrac || ctx->pmfAtracChannels != channels ||
+            ctx->pmfAtracBlock != encoded_bytes) {
+            sr_atrac_decoder_destroy(ctx->pmfAtrac);
+            ctx->pmfAtrac =
+                sr_atrac_decoder_create(
+                    MPEG_ATRAC_CODEC_PLUS, channels, encoded_bytes);
+            ctx->pmfAtracChannels = channels;
+            ctx->pmfAtracBlock = encoded_bytes;
+        }
+        int consumed = ctx->pmfAtrac
+            ? sr_atrac_decoder_decode(
+                  ctx->pmfAtrac, encoded, encoded_bytes, pcm, 2,
+                  MPEG_ATRAC_SAMPLES_PER_FRAME, &samples)
+            : -1;
+        if (consumed < 0) {
+            fprintf(stderr,
+                    "sceMpegAtracDecode: ATRAC3+ decode failed (%d bytes, code %d)\n",
+                    encoded_bytes, consumed);
+            samples = 0;
+        } else {
+            uint32_t bytes = (uint32_t)samples * 4u;
+            if (bytes > MPEG_ATRAC_ES_OUTPUT_SIZE)
+                bytes = MPEG_ATRAC_ES_OUTPUT_SIZE;
+            memcpy(SR_HOST(bufferAddr), pcm, bytes);
+            ctx->pmfAudioFrames++;
+        }
+    }
+
+    if (encoded_bytes > 0) {
+        if (encoded_pts >= ctx->firstTimestamp)
+            ctx->audioPts =
+                encoded_pts - ctx->firstTimestamp + audioTimestampStep;
+        else
+            ctx->audioPts += audioTimestampStep;
+    }
+    int64_t drift = ctx->videoPts - ctx->audioPts;
+    int64_t abs_drift = drift < 0 ? -drift : drift;
+    if (ctx->h264Frames && ctx->pmfAudioFrames && abs_drift > ctx->maxAvDrift)
+        ctx->maxAvDrift = abs_drift;
+    if (auAddr)
+        au_write_pts(auAddr, 0, ctx->audioPts + ctx->firstTimestamp);
+    if (getenv("SR_MPEGLOG")) {
+        static int n = 0;
+        if (n++ < 32 || (n & 0xFF) == 0)
+            fprintf(stderr,
+                    "MpegAtracDecode #%d bytes=%d samples=%d pesPts=%lld pts=%lld "
+                    "videoPts=%lld drift=%lld frames=%d\n",
+                    n, encoded_bytes, samples, (long long)encoded_pts,
+                    (long long)ctx->audioPts,
+                    (long long)ctx->videoPts, (long long)drift,
+                    ctx->pmfAudioFrames);
+    }
     return 0;
 }
 uint32_t mpeg_avc_decode_stop(uint32_t mpegAddr, uint32_t frameWidth, uint32_t bufferAddr, uint32_t statusAddr) {
