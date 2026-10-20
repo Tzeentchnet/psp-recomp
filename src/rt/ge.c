@@ -13,8 +13,8 @@
  * programmable alpha test, alpha blending (full factor/equation set), 4x4 ordered dithering,
  * colour/alpha write masks, scissor, and a software 16-bit depth buffer.
  *
- * Not emulated: logic ops, bezier/spline patches, morphing, or automatic
- * software-rasterizer mip selection.
+ * Not emulated: bezier/spline patches, morphing, or automatic software-rasterizer
+ * mip selection.
  *
  * Each GE command word is (cmd<<24)|data24. Command numbers follow PPSSPP GECommands.h.
  */
@@ -992,35 +992,109 @@ static void write_stencil_px(int x, int y, uint8_t stencil) {
     else MEM_W16(address, (uint16_t)color);
 }
 
-static int factor_component(int f, int chan, int sr, int sg, int sb, int sa, int dr, int dg, int db, int da, int srcSide) {
-    int sv = chan==0?sr:(chan==1?sg:sb), dv = chan==0?dr:(chan==1?dg:db);
-    int fixedA = chan==0?(ge.blend_fixa&0xFF):(chan==1?((ge.blend_fixa>>8)&0xFF):((ge.blend_fixa>>16)&0xFF));
-    int fixedB = chan==0?(ge.blend_fixb&0xFF):(chan==1?((ge.blend_fixb>>8)&0xFF):((ge.blend_fixb>>16)&0xFF));
-    switch (f & 0xF) {
-        case 0: return srcSide?dv:sv;    case 1: return 255-(srcSide?dv:sv);
-        case 2: return sa;               case 3: return 255-sa;
-        case 4: return da;               case 5: return 255-da;
-        case 6: return clamp8(sa*2);     case 7: return clamp8(255-sa*2);
-        case 8: return clamp8(da*2);     case 9: return clamp8(255-da*2);
-        case 10: default: return srcSide?fixedA:fixedB;
+static int color_component(uint32_t color, int channel) {
+    return (int)((color >> (channel * 8)) & 0xffu);
+}
+
+static int blend_factor(
+    uint32_t factor, int channel, uint32_t source, uint32_t destination,
+    uint32_t fixed, int source_side) {
+    int source_alpha = color_component(source, 3);
+    int destination_alpha = color_component(destination, 3);
+    int other = color_component(source_side ? destination : source, channel);
+    switch (factor & 0xfu) {
+        case 0: return other;
+        case 1: return 255 - other;
+        case 2: return source_alpha;
+        case 3: return 255 - source_alpha;
+        case 4: return destination_alpha;
+        case 5: return 255 - destination_alpha;
+        case 6: return source_alpha * 2;
+        case 7: return 255 - source_alpha * 2;
+        case 8: return destination_alpha * 2;
+        case 9: return 255 - destination_alpha * 2;
+        default: return color_component(fixed, channel);
     }
 }
 
-static int blend_chan(int s, int d, int sf, int df, int eq) {
-    int sv=s*sf/255, dv=d*df/255;
-    switch (eq&7) {
-        case 1: return clamp8(sv-dv); case 2: return clamp8(dv-sv);
-        case 3: return sv<dv?sv:dv;   case 4: return sv>dv?sv:dv;
-        case 5: return abs(sv-dv);
-        case 0: default: return clamp8(sv+dv);
+static int blend_term(int color, int factor) {
+    int magnitude =
+        ((color * 2 + 1) * (abs(factor) * 2 + 1)) >> 10;
+    return factor < 0 ? -magnitude : magnitude;
+}
+
+GeRgb ge_blend_rgb(
+    uint32_t mode, uint32_t fixed_a, uint32_t fixed_b,
+    uint32_t source, uint32_t destination) {
+    GeRgb result = {0};
+    int *components[3] = {&result.r, &result.g, &result.b};
+    uint32_t equation = (mode >> 8) & 7u;
+    for (int channel = 0; channel < 3; channel++) {
+        int source_color = color_component(source, channel);
+        int destination_color = color_component(destination, channel);
+        int value;
+        if (equation == 3u) {
+            value = source_color < destination_color
+                ? source_color : destination_color;
+        } else if (equation == 4u) {
+            value = source_color > destination_color
+                ? source_color : destination_color;
+        } else if (equation == 5u) {
+            value = abs(source_color - destination_color);
+        } else if (equation <= 2u) {
+            int source_factor = blend_factor(
+                mode, channel, source, destination, fixed_a, 1);
+            int destination_factor = blend_factor(
+                mode >> 4, channel, source, destination, fixed_b, 0);
+            int source_term = blend_term(source_color, source_factor);
+            int destination_term =
+                blend_term(destination_color, destination_factor);
+            value = equation == 1u ? source_term - destination_term :
+                    equation == 2u ? destination_term - source_term :
+                    source_term + destination_term;
+        } else {
+            value = source_color;
+        }
+        *components[channel] = value;
     }
+    return result;
+}
+
+uint32_t ge_logic_apply(
+    uint32_t operation, uint32_t source, uint32_t destination) {
+    uint32_t alpha = source & 0xff000000u;
+    uint32_t source_rgb = source & 0x00ffffffu;
+    uint32_t destination_rgb = destination & 0x00ffffffu;
+    uint32_t result;
+    switch (operation & 0xfu) {
+        case 0: result = 0; break;
+        case 1: result = source_rgb & destination_rgb; break;
+        case 2: result = source_rgb & ~destination_rgb; break;
+        case 3: result = source_rgb; break;
+        case 4: result = ~source_rgb & destination_rgb; break;
+        case 5: result = destination_rgb; break;
+        case 6: result = source_rgb ^ destination_rgb; break;
+        case 7: result = source_rgb | destination_rgb; break;
+        case 8: result = ~(source_rgb | destination_rgb); break;
+        case 9: result = ~(source_rgb ^ destination_rgb); break;
+        case 10: result = ~destination_rgb; break;
+        case 11: result = source_rgb | ~destination_rgb; break;
+        case 12: result = ~source_rgb; break;
+        case 13: result = ~source_rgb | destination_rgb; break;
+        case 14: result = ~(source_rgb & destination_rgb); break;
+        default: result = 0x00ffffffu; break;
+    }
+    return alpha | (result & 0x00ffffffu);
 }
 
 static void put_px_rgba_raw(
     int x, int y, int r, int g, int b, int source_alpha,
     int stencil) {
     int a = source_alpha;
+    int dr, dg, db, da;
     if (!pixel_in_bounds(x, y)) return;
+    read_fb_px(x, y, &dr, &dg, &db, &da);
+    if ((ge.fbfmt & 3u) == 0u) da = 0;
     if (s_stat_on > 0 && s_in3d && !ge.clear && s_pxpass < 6) {
         s_pxpass++;
         fprintf(stderr, "PXPASS f=%u xy=(%d,%d) rgba=(%d,%d,%d,%d) fbp=0x%08x blend=%d/%06x\n",
@@ -1040,38 +1114,67 @@ static void put_px_rgba_raw(
         if (!write_color && !write_alpha) return;
         if (ge.dither_enable) {
             int d = ge.dith[y & 3][x & 3];
-            r = clamp8(r + d);
-            g = clamp8(g + d);
-            b = clamp8(b + d);
+            r += d;
+            g += d;
+            b += d;
         }
         if (!write_color || !write_alpha) {
-            int dr,dg,db,da; read_fb_px(x,y,&dr,&dg,&db,&da);
             if (!write_color) { r=dr; g=dg; b=db; }
             if (!write_alpha) a=da;
         }
     } else {
         if (ge.blend_enable) {
-            int dr,dg,db,da; read_fb_px(x,y,&dr,&dg,&db,&da);
-            int eq=(int)((ge.blend_mode>>8)&7);
-            int rfa=factor_component((int)(ge.blend_mode&0xF),   0,r,g,b,a,dr,dg,db,da,1);
-            int gfa=factor_component((int)(ge.blend_mode&0xF),   1,r,g,b,a,dr,dg,db,da,1);
-            int bfa=factor_component((int)(ge.blend_mode&0xF),   2,r,g,b,a,dr,dg,db,da,1);
-            int rfb=factor_component((int)((ge.blend_mode>>4)&0xF),0,r,g,b,a,dr,dg,db,da,0);
-            int gfb=factor_component((int)((ge.blend_mode>>4)&0xF),1,r,g,b,a,dr,dg,db,da,0);
-            int bfb=factor_component((int)((ge.blend_mode>>4)&0xF),2,r,g,b,a,dr,dg,db,da,0);
-            r=blend_chan(r,dr,rfa,rfb,eq); g=blend_chan(g,dg,gfa,gfb,eq); b=blend_chan(b,db,bfa,bfb,eq);
+            uint32_t source =
+                (uint32_t)clamp8(r) |
+                ((uint32_t)clamp8(g) << 8) |
+                ((uint32_t)clamp8(b) << 16) |
+                ((uint32_t)clamp8(a) << 24);
+            uint32_t destination =
+                (uint32_t)dr | ((uint32_t)dg << 8) |
+                ((uint32_t)db << 16) | ((uint32_t)da << 24);
+            GeRgb blended = ge_blend_rgb(
+                ge.blend_mode, ge.blend_fixa, ge.blend_fixb,
+                source, destination);
+            r = blended.r;
+            g = blended.g;
+            b = blended.b;
         }
         a = stencil;
         if (ge.dither_enable) {
             int d = ge.dith[y & 3][x & 3];
-            r = clamp8(r + d); g = clamp8(g + d); b = clamp8(b + d);
+            r += d;
+            g += d;
+            b += d;
+        }
+        r = clamp8(r);
+        g = clamp8(g);
+        b = clamp8(b);
+        if (ge.logic_op_enable) {
+            uint32_t source =
+                (uint32_t)r | ((uint32_t)g << 8) |
+                ((uint32_t)b << 16) | ((uint32_t)a << 24);
+            uint32_t destination =
+                (uint32_t)dr | ((uint32_t)dg << 8) |
+                ((uint32_t)db << 16) | ((uint32_t)da << 24);
+            uint32_t logical =
+                ge_logic_apply(ge.logic_op, source, destination);
+            r = (int)(logical & 0xffu);
+            g = (int)((logical >> 8) & 0xffu);
+            b = (int)((logical >> 16) & 0xffu);
         }
         if (ge.mask_rgb || ge.mask_alpha) {
-            int dr,dg,db,da; read_fb_px(x,y,&dr,&dg,&db,&da);
             int mr=(int)(ge.mask_rgb&0xFF), mg=(int)((ge.mask_rgb>>8)&0xFF), mb=(int)((ge.mask_rgb>>16)&0xFF);
             r=(r&~mr)|(dr&mr); g=(g&~mg)|(dg&mg); b=(b&~mb)|(db&mb);
             a=(a&~ge.mask_alpha)|(da&ge.mask_alpha);
         }
+    }
+    r = clamp8(r);
+    g = clamp8(g);
+    b = clamp8(b);
+    if (ge.clear && (ge.mask_rgb || ge.mask_alpha)) {
+        int mr=(int)(ge.mask_rgb&0xFF), mg=(int)((ge.mask_rgb>>8)&0xFF), mb=(int)((ge.mask_rgb>>16)&0xFF);
+        r=(r&~mr)|(dr&mr); g=(g&~mg)|(dg&mg); b=(b&~mb)|(db&mb);
+        a=(a&~ge.mask_alpha)|(da&ge.mask_alpha);
     }
     uint32_t c = pack_fb(r,g,b,a);
     uint32_t stride = ge.fbw ? ge.fbw : 512;
@@ -1100,9 +1203,7 @@ static void put_px_rgba(int x, int y, int r, int g, int b, int a) {
     }
     uint8_t stencil = read_stencil_px(x, y);
     if (ge.stencil_test_enable) {
-        uint8_t reference =
-            (uint8_t)(ge.stencil_test >> 8) &
-            (uint8_t)(ge.stencil_test >> 16);
+        uint8_t reference = (uint8_t)(ge.stencil_test >> 8);
         if (!ge_stencil_test_pass(ge.stencil_test, stencil)) {
             stencil = ge_stencil_apply(
                 ge.stencil_op, ge.fbfmt, stencil, reference);
@@ -1119,9 +1220,7 @@ static void put_px_rgba(int x, int y, int r, int g, int b, int a) {
 static void put_px_rgba_z(int x, int y, uint16_t pz, int r, int g, int b, int a) {
     if (!pixel_in_bounds(x, y)) return;
     uint8_t stencil = read_stencil_px(x, y);
-    uint8_t reference =
-        (uint8_t)(ge.stencil_test >> 8) &
-        (uint8_t)(ge.stencil_test >> 16);
+    uint8_t reference = (uint8_t)(ge.stencil_test >> 8);
     if (ge.stencil_test_enable &&
         !ge_stencil_test_pass(ge.stencil_test, stencil)) {
         stencil = ge_stencil_apply(
@@ -2639,7 +2738,7 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
             case GE_MASKRGB:   ge.mask_rgb   = data; break;
             case GE_MASKALPHA: ge.mask_alpha = (int)(data & 0xFF); break;
             case GE_ANTIALIASENABLE: case GE_PATCHCULLENABLE: break;
-            case GE_LOGICOPENABLE: break;
+            case GE_LOGICOPENABLE: ge.logic_op_enable = data & 1; break;
             case GE_PATCHDIVISION: case GE_PATCHPRIMITIVE: case GE_PATCHFACING: break;
 
             /* ---- Matrix capture ----
@@ -2830,6 +2929,7 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
             case GE_BLENDMODE:  ge.blend_mode=data; break;
             case GE_BLENDFIXEDA: ge.blend_fixa=data; break;
             case GE_BLENDFIXEDB: ge.blend_fixb=data; break;
+            case GE_LOGICOP: ge.logic_op=data; break;
             case GE_CLEARMODE:  ge.clear_mode=data; ge.clear=data&1; break;
 
             /* ---- Block transfer ---- */

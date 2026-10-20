@@ -8,7 +8,7 @@
 #include <d3d12.h>
 #include <stdint.h>
 
-#define GE_D3D12_SHADER_CONSTANT_DWORDS 28u
+#define GE_D3D12_SHADER_CONSTANT_DWORDS 40u
 
 enum GeD3D12ShaderFlag : uint32_t {
     GE_D3D12_SHADER_TEXTURE = 1u,
@@ -33,6 +33,9 @@ struct GeD3D12ShaderConstants {
     uint32_t color_test[4];
     uint32_t stencil_test[4];
     uint32_t dither[4];
+    uint32_t blend[4];
+    uint32_t fragment[4];
+    int32_t scissor[4];
 };
 
 void ged3d12_shader_constants_build(

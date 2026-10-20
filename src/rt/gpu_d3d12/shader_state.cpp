@@ -8,6 +8,16 @@ static float color_channel(uint32_t color, uint32_t shift) {
     return (float)((color >> shift) & 0xffu) * (1.0f / 255.0f);
 }
 
+static uint32_t clamp_scissor_start(int value, uint32_t limit) {
+    if (value <= 0) return 0;
+    return (uint32_t)value < limit ? (uint32_t)value : limit;
+}
+
+static uint32_t clamp_scissor_end(int value, uint32_t limit) {
+    if (value < 0) return 0;
+    return (uint32_t)value < limit ? (uint32_t)value + 1u : limit;
+}
+
 void ged3d12_shader_constants_build(
     const GeState *state, int perspective, int sprite_semantics,
     const GeD3D12TextureBinding *texture,
@@ -34,13 +44,6 @@ void ged3d12_shader_constants_build(
             !((state->tex_filter >> 8) & 1u)) {
             flags |= GE_D3D12_SHADER_NEAREST;
         }
-    }
-    if (!clear && state->blend_enable) {
-        uint32_t source_factor = state->blend_mode & 0xfu;
-        if (source_factor == 6u)
-            flags |= GE_D3D12_SHADER_DOUBLE_SOURCE_ALPHA;
-        else if (source_factor == 7u)
-            flags |= GE_D3D12_SHADER_DOUBLE_INVERSE_SOURCE_ALPHA;
     }
     if (!clear && state->color_test_enable)
         flags |= GE_D3D12_SHADER_COLOR_TEST;
@@ -91,11 +94,50 @@ void ged3d12_shader_constants_build(
                 (column * 4u);
         out->dither[row] = packed;
     }
+    out->blend[0] =
+        !clear && state->blend_enable &&
+        ((state->blend_mode >> 8) & 7u) <= 5u;
+    out->blend[1] = state->blend_mode;
+    out->blend[2] = state->blend_fixa & 0xffffffu;
+    out->blend[3] = state->blend_fixb & 0xffffffu;
+    out->fragment[0] =
+        (state->mask_rgb & 0xffffffu) |
+        (((uint32_t)state->mask_alpha & 0xffu) << 24);
+    out->fragment[1] =
+        (!clear && state->logic_op_enable ? 1u : 0u) |
+        ((state->logic_op & 0xfu) << 8);
+    out->fragment[2] = state->clear_mode;
+    out->fragment[3] =
+        (state->ztest_enable ? 1u : 0u) |
+        ((state->ztest & 7u) << 8) |
+        ((!state->zwrite_disable ? 1u : 0u) << 16);
+    uint32_t scissor_left = clamp_scissor_start(
+        state->scis_x1, GE_D3D12_FRAMEBUFFER_WIDTH);
+    uint32_t scissor_top = clamp_scissor_start(
+        state->scis_y1, GE_D3D12_FRAMEBUFFER_HEIGHT);
+    uint32_t scissor_right = clamp_scissor_end(
+        state->scis_x2, GE_D3D12_FRAMEBUFFER_WIDTH);
+    uint32_t scissor_bottom = clamp_scissor_end(
+        state->scis_y2, GE_D3D12_FRAMEBUFFER_HEIGHT);
+    out->scissor[0] = (int32_t)scissor_left;
+    out->scissor[1] = (int32_t)scissor_top;
+    out->scissor[2] =
+        (int32_t)(scissor_right < scissor_left
+            ? scissor_left : scissor_right);
+    out->scissor[3] =
+        (int32_t)(scissor_bottom < scissor_top
+            ? scissor_top : scissor_bottom);
 }
 
 void ged3d12_shader_constants_bind(
     const GeD3D12ShaderConstants *constants) {
-    ged3d12_command_list()->SetGraphicsRoot32BitConstants(
+    ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
+    command_list->SetGraphicsRoot32BitConstants(
         GE_D3D12_ROOT_GE_STATE,
         sizeof(*constants) / sizeof(uint32_t), constants, 0);
+    D3D12_RECT scissor = {
+        constants->scissor[0], constants->scissor[1],
+        constants->scissor[2], constants->scissor[3],
+    };
+    command_list->RSSetScissorRects(1, &scissor);
 }

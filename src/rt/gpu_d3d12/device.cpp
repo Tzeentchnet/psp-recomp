@@ -104,6 +104,7 @@ static uint8_t s_lx = 128, s_ly = 128;
 static int s_pad_present;
 static int s_vertex_log;
 static int s_framebuffer_safe;
+static int s_destination_safe;
 static UINT64 s_vertex_frames;
 static UINT64 s_vertex_total;
 static UINT64 s_vertex_batches;
@@ -399,7 +400,7 @@ static int create_descriptor_heaps(void) {
 }
 
 static int create_root_signature(void) {
-    D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+    D3D12_DESCRIPTOR_RANGE ranges[3] = {};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 2; /* t0 texture, t1 CLUT */
     ranges[0].BaseShaderRegister = 0;
@@ -412,8 +413,14 @@ static int create_root_signature(void) {
     ranges[1].RegisterSpace = 0;
     ranges[1].OffsetInDescriptorsFromTableStart =
         D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[2].NumDescriptors = 2; /* t2 destination color, t3 depth */
+    ranges[2].BaseShaderRegister = 2;
+    ranges[2].RegisterSpace = 0;
+    ranges[2].OffsetInDescriptorsFromTableStart =
+        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER parameters[3] = {};
+    D3D12_ROOT_PARAMETER parameters[4] = {};
     parameters[GE_D3D12_ROOT_GE_STATE].ParameterType =
         D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[GE_D3D12_ROOT_GE_STATE].Constants.ShaderRegister = 0;
@@ -433,6 +440,14 @@ static int create_root_signature(void) {
     parameters[GE_D3D12_ROOT_SAMPLER].DescriptorTable.NumDescriptorRanges = 1;
     parameters[GE_D3D12_ROOT_SAMPLER].DescriptorTable.pDescriptorRanges = &ranges[1];
     parameters[GE_D3D12_ROOT_SAMPLER].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[GE_D3D12_ROOT_DESTINATION].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[GE_D3D12_ROOT_DESTINATION]
+        .DescriptorTable.NumDescriptorRanges = 1;
+    parameters[GE_D3D12_ROOT_DESTINATION]
+        .DescriptorTable.pDescriptorRanges = &ranges[2];
+    parameters[GE_D3D12_ROOT_DESTINATION].ShaderVisibility =
         D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_STATIC_SAMPLER_DESC static_samplers[2] = {};
@@ -639,8 +654,10 @@ static const char *feature_level_name(D3D_FEATURE_LEVEL level) {
 
 static int bind_default_root_state(void) {
     GeD3D12DescriptorSlice srvs = {};
+    GeD3D12DescriptorSlice destination = {};
     GeD3D12DescriptorSlice sampler = {};
     if (!ged3d12_srv_alloc(2, &srvs) ||
+        !ged3d12_srv_alloc(2, &destination) ||
         !ged3d12_sampler_alloc(1, &sampler)) {
         return 0;
     }
@@ -661,6 +678,25 @@ static int bind_default_root_state(void) {
     clut_cpu.ptr += s_srv_stride;
     s_device->CreateShaderResourceView(nullptr, &clut, clut_cpu);
 
+    D3D12_SHADER_RESOURCE_VIEW_DESC destination_color = {};
+    destination_color.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    destination_color.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    destination_color.Shader4ComponentMapping =
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    destination_color.Texture2D.MipLevels = 1;
+    s_device->CreateShaderResourceView(
+        nullptr, &destination_color, destination.cpu);
+    D3D12_SHADER_RESOURCE_VIEW_DESC destination_depth = {};
+    destination_depth.Format = DXGI_FORMAT_R16_UNORM;
+    destination_depth.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    destination_depth.Shader4ComponentMapping =
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    destination_depth.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE destination_depth_cpu = destination.cpu;
+    destination_depth_cpu.ptr += s_srv_stride;
+    s_device->CreateShaderResourceView(
+        nullptr, &destination_depth, destination_depth_cpu);
+
     D3D12_SAMPLER_DESC sampler_desc = {};
     sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
     sampler_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -679,6 +715,8 @@ static int bind_default_root_state(void) {
         GE_D3D12_ROOT_TEXTURES, srvs.gpu);
     s_command_list->SetGraphicsRootDescriptorTable(
         GE_D3D12_ROOT_SAMPLER, sampler.gpu);
+    s_command_list->SetGraphicsRootDescriptorTable(
+        GE_D3D12_ROOT_DESTINATION, destination.gpu);
     return 1;
 }
 
@@ -731,6 +769,7 @@ static int device_init(void) {
     }
     s_vertex_log = env_enabled("SR_D3D12_VERTEX_LOG");
     s_framebuffer_safe = env_enabled("SR_D3D12_FRAMEBUFFER_SAFE");
+    s_destination_safe = env_enabled("SR_D3D12_DESTINATION_SAFE");
     s_vertex_frames = 0;
     s_vertex_total = 0;
     s_vertex_batches = 0;
@@ -758,7 +797,7 @@ static int device_init(void) {
     fprintf(stderr,
             "ged3d12: using %s (feature level %s, %u buffers, "
             "descriptors=%u srv/%u sampler/%u rtv/%u dsv, "
-            "root=b0[28]+t0-t1+s0+s1/s2, upload=%llu MiB, gamepad=%s)\n",
+            "root=b0[40]+t0-t3+s0+s1/s2, upload=%llu MiB, gamepad=%s)\n",
             adapter_name[0] ? adapter_name : "<unnamed adapter>",
             feature_level_name(levels.MaxSupportedFeatureLevel),
             FRAME_COUNT, SRV_DESCRIPTOR_COUNT, SAMPLER_DESCRIPTOR_COUNT,
@@ -1022,8 +1061,10 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     if (!ged3d12_texture_prepare_pending()) return -2;
     for (UINT i = 0; i < vertices.batch_count; i++) {
         if (!ged3d12_pipeline_bind(&vertices.batches[i].pipeline) ||
-            !ged3d12_framebuffer_bind(
-                &vertices.batches[i].framebuffer) ||
+            !ged3d12_framebuffer_bind(&vertices.batches[i].framebuffer) ||
+            (s_destination_safe &&
+             !ged3d12_framebuffer_bind_destination(
+                 &vertices.batches[i].framebuffer)) ||
             !ged3d12_texture_bind(&vertices.batches[i].texture)) {
             return -2;
         }

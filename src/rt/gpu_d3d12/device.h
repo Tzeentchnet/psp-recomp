@@ -45,6 +45,7 @@ enum GeD3D12RootParameter : UINT {
     GE_D3D12_ROOT_GE_STATE = 0,
     GE_D3D12_ROOT_TEXTURES = 1,
     GE_D3D12_ROOT_SAMPLER = 2,
+    GE_D3D12_ROOT_DESTINATION = 3,
 };
 
 enum GeD3D12SamplerRegister : UINT {

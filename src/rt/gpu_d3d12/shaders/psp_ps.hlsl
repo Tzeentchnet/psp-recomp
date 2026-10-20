@@ -1,9 +1,9 @@
-/* PSP GE pixel-stage uber-shader. Mirrors ge.c shade() + zrange_ok():
- * texture functions, alpha test, fog, depth-range discard, clear mode, and the
- * doubled-source-alpha factors that cannot be expressed directly by D3D12 blending.
- * Blending, color masks, depth/stencil, and raster state remain PSO state. */
+/* PSP GE destination-aware pixel shader. Fragment tests, depth/stencil, blending,
+ * dithering, logic operations, and write masks follow the software GE ordering. */
 
 Texture2D<float4> psp_texture : register(t0);
+Texture2D<float4> destination_color : register(t2);
+Texture2D<float> destination_depth : register(t3);
 SamplerState psp_sampler : register(s0);
 
 cbuffer PSPConstants : register(b0) {
@@ -14,6 +14,9 @@ cbuffer PSPConstants : register(b0) {
     int4 color_test_state; /* x=func, y=reference RGB, z=mask RGB */
     int4 stencil_state;    /* x=test, y=ops, z=write mask, w=fb format */
     int4 dither_rows;      /* four packed signed-nibble rows */
+    int4 blend_state;      /* x=enabled, y=mode, z=FIXA, w=FIXB */
+    int4 fragment_state;   /* x=write mask, y=logic, z=clear, w=depth */
+    int4 scissor_state;    /* applied as dynamic raster state by the CPU */
 };
 
 struct PSInput {
@@ -24,17 +27,198 @@ struct PSInput {
     noperspective float4 color   : COLOR0;
 };
 
-float4 main(PSInput input) : SV_Target0 {
-    int flags = cfg.x >> 8;
+struct PSOutput {
+    float4 color : SV_Target0;
+    float depth : SV_Depth;
+};
 
-    /* Transform-mode depth range is a PSP kill test, not a clamp. */
-    if ((flags & 16) != 0) {
-        int z16 = (int)(input.position.z * 65535.0 + 0.5);
-        if (z16 < cfg.z || z16 > cfg.w) discard;
+bool compare_value(int function, int value, int reference) {
+    if (function == 0) return false;
+    if (function == 1) return true;
+    if (function == 2) return value == reference;
+    if (function == 3) return value != reference;
+    if (function == 4) return value < reference;
+    if (function == 5) return value <= reference;
+    if (function == 6) return value > reference;
+    return value >= reference;
+}
+
+int stencil_operation(int operation, int format, int old_value, int reference) {
+    if (operation == 1) return 0;
+    if (operation == 2) return reference;
+    if (operation == 3) return old_value ^ 255;
+    if (operation == 4) {
+        if (format == 0) return 0;
+        if (format == 1) return 255;
+        if (format == 2)
+            return old_value < 240 ? old_value + 16 : old_value;
+        return min(old_value + 1, 255);
+    }
+    if (operation == 5) {
+        if (format == 0 || format == 1) return 0;
+        if (format == 2)
+            return old_value >= 16 ? old_value - 16 : old_value;
+        return max(old_value - 1, 0);
+    }
+    return old_value;
+}
+
+uint pack_native(int4 color, int format) {
+    color = clamp(color, int4(0, 0, 0, 0), int4(255, 255, 255, 255));
+    if (format == 0) {
+        return (uint)(color.r >> 3) |
+               ((uint)(color.g >> 2) << 5) |
+               ((uint)(color.b >> 3) << 11);
+    }
+    if (format == 1) {
+        return (uint)(color.r >> 3) |
+               ((uint)(color.g >> 3) << 5) |
+               ((uint)(color.b >> 3) << 10) |
+               ((uint)(color.a >> 7) << 15);
+    }
+    if (format == 2) {
+        return (uint)(color.r >> 4) |
+               ((uint)(color.g >> 4) << 4) |
+               ((uint)(color.b >> 4) << 8) |
+               ((uint)(color.a >> 4) << 12);
+    }
+    return (uint)color.r | ((uint)color.g << 8) |
+           ((uint)color.b << 16) | ((uint)color.a << 24);
+}
+
+int4 unpack_native(uint pixel, int format) {
+    if (format == 0) {
+        int red = (int)(pixel & 31);
+        int green = (int)((pixel >> 5) & 63);
+        int blue = (int)((pixel >> 11) & 31);
+        return int4(
+            (red << 3) | (red >> 2),
+            (green << 2) | (green >> 4),
+            (blue << 3) | (blue >> 2), 255);
+    }
+    if (format == 1) {
+        int red = (int)(pixel & 31);
+        int green = (int)((pixel >> 5) & 31);
+        int blue = (int)((pixel >> 10) & 31);
+        return int4(
+            (red << 3) | (red >> 2),
+            (green << 3) | (green >> 2),
+            (blue << 3) | (blue >> 2),
+            (pixel & 32768) != 0 ? 255 : 0);
+    }
+    if (format == 2) {
+        int4 value = int4(
+            (int)(pixel & 15), (int)((pixel >> 4) & 15),
+            (int)((pixel >> 8) & 15), (int)((pixel >> 12) & 15));
+        return (value << 4) | value;
+    }
+    return int4(
+        (int)(pixel & 255), (int)((pixel >> 8) & 255),
+        (int)((pixel >> 16) & 255), (int)((pixel >> 24) & 255));
+}
+
+int factor_value(
+    int factor, int channel, int4 source, int4 destination,
+    int fixed_color, bool source_side) {
+    int other = source_side ? destination[channel] : source[channel];
+    if (factor == 0) return other;
+    if (factor == 1) return 255 - other;
+    if (factor == 2) return source.a;
+    if (factor == 3) return 255 - source.a;
+    if (factor == 4) return destination.a;
+    if (factor == 5) return 255 - destination.a;
+    if (factor == 6) return source.a * 2;
+    if (factor == 7) return 255 - source.a * 2;
+    if (factor == 8) return destination.a * 2;
+    if (factor == 9) return 255 - destination.a * 2;
+    return (fixed_color >> (channel * 8)) & 255;
+}
+
+int blend_term(int color, int factor) {
+    int magnitude =
+        ((color * 2 + 1) * (abs(factor) * 2 + 1)) >> 10;
+    return factor < 0 ? -magnitude : magnitude;
+}
+
+int3 blend_rgb(int4 source, int4 destination) {
+    int mode = blend_state.y;
+    int equation = (mode >> 8) & 7;
+    if (equation == 3) return min(source.rgb, destination.rgb);
+    if (equation == 4) return max(source.rgb, destination.rgb);
+    if (equation == 5) return abs(source.rgb - destination.rgb);
+    if (equation > 2) return source.rgb;
+
+    int3 result;
+    [unroll]
+    for (int channel = 0; channel < 3; channel++) {
+        int source_factor = factor_value(
+            mode & 15, channel, source, destination,
+            blend_state.z, true);
+        int destination_factor = factor_value(
+            (mode >> 4) & 15, channel, source, destination,
+            blend_state.w, false);
+        int source_term = blend_term(source[channel], source_factor);
+        int destination_term =
+            blend_term(destination[channel], destination_factor);
+        result[channel] =
+            equation == 1 ? source_term - destination_term :
+            equation == 2 ? destination_term - source_term :
+            source_term + destination_term;
+    }
+    return result;
+}
+
+uint logic_rgb(int operation, uint source, uint destination) {
+    source &= 0x00ffffff;
+    destination &= 0x00ffffff;
+    if (operation == 0) return 0;
+    if (operation == 1) return source & destination;
+    if (operation == 2) return source & ~destination;
+    if (operation == 3) return source;
+    if (operation == 4) return ~source & destination;
+    if (operation == 5) return destination;
+    if (operation == 6) return source ^ destination;
+    if (operation == 7) return source | destination;
+    if (operation == 8) return ~(source | destination);
+    if (operation == 9) return ~(source ^ destination);
+    if (operation == 10) return ~destination;
+    if (operation == 11) return source | ~destination;
+    if (operation == 12) return ~source;
+    if (operation == 13) return ~source | destination;
+    if (operation == 14) return ~(source & destination);
+    return 0x00ffffff;
+}
+
+int dither_value(int2 pixel) {
+    int row = dither_rows[pixel.y & 3];
+    int value = (row >> ((pixel.x & 3) * 4)) & 15;
+    return value >= 8 ? value - 16 : value;
+}
+
+int4 apply_write_mask(
+    int4 color, int4 old_color, uint write_mask, int format) {
+    uint native_mask = pack_native(int4(
+        (int)(write_mask & 255), (int)((write_mask >> 8) & 255),
+        (int)((write_mask >> 16) & 255), (int)((write_mask >> 24) & 255)),
+        format);
+    uint old_native = pack_native(old_color, format);
+    uint new_native = pack_native(color, format);
+    return unpack_native(
+        (new_native & ~native_mask) | (old_native & native_mask),
+        format);
+}
+
+PSOutput main(PSInput input) {
+    int flags = cfg.x >> 8;
+    int source_depth = (int)(input.position.z * 65535.0 + 0.5);
+
+    if ((flags & 16) != 0 &&
+        (source_depth < cfg.z || source_depth > cfg.w)) {
+        discard;
     }
 
     float4 vertex = input.color * 255.0;
-    float4 color = vertex;
+    float4 shaded = vertex;
 
     if ((flags & 32) == 0) {
         if ((flags & 1) != 0) {
@@ -52,13 +236,10 @@ float4 main(PSInput input) : SV_Target0 {
             float alpha;
 
             if (texture_function == 1) {
-                if (texture_rgba) {
-                    rgb = lerp(
-                        vertex.rgb, texture_color.rgb,
-                        texture_color.a * (1.0 / 255.0)) * color_scale;
-                } else {
-                    rgb = texture_color.rgb * color_scale;
-                }
+                rgb = texture_rgba
+                    ? lerp(vertex.rgb, texture_color.rgb,
+                           texture_color.a * (1.0 / 255.0)) * color_scale
+                    : texture_color.rgb * color_scale;
                 alpha = vertex.a;
             } else if (texture_function == 2) {
                 rgb = lerp(
@@ -82,85 +263,133 @@ float4 main(PSInput input) : SV_Target0 {
                     ? vertex.a * texture_color.a * (1.0 / 255.0)
                     : vertex.a;
             }
-            color = float4(
+            shaded = float4(
                 min(rgb, float3(255.0, 255.0, 255.0)),
                 min(alpha, 255.0));
         }
 
         int alpha_test = cfg.y;
-        int alpha_function = alpha_test & 7;
-        if (alpha_function != 1) {
-            int alpha_mask = (alpha_test >> 16) & 0xff;
-            int alpha_reference = ((alpha_test >> 8) & 0xff) & alpha_mask;
-            int alpha_value = ((int)(color.a + 0.5)) & alpha_mask;
-            bool pass;
-            if (alpha_function == 0) {
-                pass = false;
-            } else if (alpha_function == 2) {
-                pass = alpha_value == alpha_reference;
-            } else if (alpha_function == 3) {
-                pass = alpha_value != alpha_reference;
-            } else if (alpha_function == 4) {
-                pass = alpha_value < alpha_reference;
-            } else if (alpha_function == 5) {
-                pass = alpha_value <= alpha_reference;
-            } else if (alpha_function == 6) {
-                pass = alpha_value > alpha_reference;
-            } else {
-                pass = alpha_value >= alpha_reference;
-            }
-            if (!pass) discard;
+        int alpha_mask = (alpha_test >> 16) & 255;
+        int alpha_reference = ((alpha_test >> 8) & 255) & alpha_mask;
+        int alpha_value = ((int)(shaded.a + 0.5)) & alpha_mask;
+        if (!compare_value(
+                alpha_test & 7, alpha_value, alpha_reference)) {
+            discard;
         }
 
         if ((flags & 8) != 0) {
-            float fog = saturate(input.fog);
-            color.rgb = lerp(fogcol.rgb * 255.0, color.rgb, fog);
+            shaded.rgb = lerp(
+                fogcol.rgb * 255.0, shaded.rgb, saturate(input.fog));
         }
 
         if ((flags & 512) != 0) {
-            int3 rgb = (int3)(color.rgb + 0.5);
+            int3 rgb = (int3)(shaded.rgb + 0.5);
             int packed = rgb.r | (rgb.g << 8) | (rgb.b << 16);
             int masked = packed & color_test_state.z;
-            int reference =
-                color_test_state.y & color_test_state.z;
-            bool pass =
-                color_test_state.x == 1 ||
-                (color_test_state.x == 2 && masked == reference) ||
-                (color_test_state.x == 3 && masked != reference);
-            if (!pass) discard;
-        }
-
-        if ((flags & 128) != 0) {
-            color.rgb *= saturate(color.a * (2.0 / 255.0));
-        }
-        if ((flags & 256) != 0) {
-            color.rgb *= saturate(1.0 - color.a * (2.0 / 255.0));
-        }
-    }
-
-    if ((flags & 1024) != 0) {
-        int row = dither_rows[(int)input.position.y & 3];
-        int value =
-            (row >> (((int)input.position.x & 3) * 4)) & 15;
-        if (value >= 8) value -= 16;
-        color.rgb = clamp(
-            color.rgb + (float)value,
-            float3(0.0, 0.0, 0.0),
-            float3(255.0, 255.0, 255.0));
-    }
-
-    if ((flags & 2048) != 0) {
-        int stencil_pass = (stencil_state.y >> 16) & 7;
-        if ((stencil_state.x & 7) == 1) {
-            if (stencil_pass == 1) {
-                color.a = 0.0;
-            } else if (stencil_pass == 2) {
-                color.a = (float)(
-                    ((stencil_state.x >> 8) & 255) &
-                    ((stencil_state.x >> 16) & 255));
+            int reference = color_test_state.y & color_test_state.z;
+            if (!compare_value(
+                    color_test_state.x, masked, reference)) {
+                discard;
             }
         }
     }
 
-    return color * (1.0 / 255.0);
+    int4 source = clamp(
+        (int4)(shaded + 0.5),
+        int4(0, 0, 0, 0), int4(255, 255, 255, 255));
+    int2 pixel = (int2)input.position.xy;
+    int format = stencil_state.w & 3;
+    int4 old_storage = (int4)(
+        destination_color.Load(int3(pixel, 0)) * 255.0 + 0.5);
+    int4 destination = old_storage;
+    if (format == 0) destination.a = 0;
+    int old_depth = (int)(
+        destination_depth.Load(int3(pixel, 0)) * 65535.0 + 0.5);
+
+    int4 result = source;
+    int output_depth = old_depth;
+    uint write_mask = (uint)fragment_state.x;
+
+    if ((flags & 32) != 0) {
+        if ((flags & 1024) != 0)
+            result.rgb += dither_value(pixel);
+        result = clamp(
+            result, int4(0, 0, 0, 0), int4(255, 255, 255, 255));
+        if ((fragment_state.z & 0x100) == 0)
+            result.rgb = old_storage.rgb;
+        if ((fragment_state.z & 0x200) == 0)
+            result.a = old_storage.a;
+        if ((fragment_state.z & 0x400) != 0)
+            output_depth = source_depth;
+    } else {
+        int stencil = format == 0 ? 0 : destination.a;
+        int stencil_function = stencil_state.x & 7;
+        int stencil_reference = (stencil_state.x >> 8) & 255;
+        int stencil_mask = (stencil_state.x >> 16) & 255;
+        bool stencil_pass = (flags & 2048) == 0 ||
+            compare_value(
+                stencil_function,
+                stencil_reference & stencil_mask,
+                stencil & stencil_mask);
+        bool color_pass = stencil_pass;
+        if (!stencil_pass) {
+            stencil = stencil_operation(
+                stencil_state.y & 7, format, stencil, stencil_reference);
+        } else {
+            int depth_state = fragment_state.w;
+            bool depth_enabled = (depth_state & 1) != 0;
+            bool depth_pass = !depth_enabled ||
+                compare_value(
+                    (depth_state >> 8) & 7,
+                    source_depth, old_depth);
+            if (!depth_pass) {
+                stencil = stencil_operation(
+                    (stencil_state.y >> 8) & 7,
+                    format, stencil, stencil_reference);
+                color_pass = false;
+            } else {
+                stencil = stencil_operation(
+                    (stencil_state.y >> 16) & 7,
+                    format, stencil, stencil_reference);
+                if (depth_enabled && (depth_state & 0x10000) != 0)
+                    output_depth = source_depth;
+            }
+        }
+
+        if (color_pass) {
+            result.rgb = blend_state.x != 0
+                ? blend_rgb(source, destination) : source.rgb;
+            result.a = stencil;
+            if ((flags & 1024) != 0)
+                result.rgb += dither_value(pixel);
+            result = clamp(
+                result, int4(0, 0, 0, 0),
+                int4(255, 255, 255, 255));
+            if ((fragment_state.y & 1) != 0) {
+                uint logical = logic_rgb(
+                    (fragment_state.y >> 8) & 15,
+                    (uint)result.r | ((uint)result.g << 8) |
+                        ((uint)result.b << 16),
+                    (uint)destination.r |
+                        ((uint)destination.g << 8) |
+                        ((uint)destination.b << 16));
+                result.rgb = int3(
+                    (int)(logical & 255),
+                    (int)((logical >> 8) & 255),
+                    (int)((logical >> 16) & 255));
+            }
+        } else {
+            result = old_storage;
+            result.a = stencil;
+        }
+
+        if ((flags & 2048) == 0)
+            write_mask |= 0xff000000;
+    }
+
+    result = apply_write_mask(result, old_storage, write_mask, format);
+    PSOutput output;
+    output.color = (float4)result * (1.0 / 255.0);
+    output.depth = (float)output_depth * (1.0 / 65535.0);
+    return output;
 }

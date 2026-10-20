@@ -161,7 +161,11 @@ static void test_shader_constants(void) {
     state.atest_enable = 1;
     state.atest = 6u | (0x7fu << 8) | (0xf0u << 16);
     state.blend_enable = 1;
-    state.blend_mode = 6;
+    state.blend_mode = 6u | (9u << 4) | (2u << 8);
+    state.blend_fixa = 0x00112233u;
+    state.blend_fixb = 0x00445566u;
+    state.logic_op_enable = 1;
+    state.logic_op = 6;
     state.color_test_enable = 1;
     state.color_test = 2;
     state.color_ref = 0x00a1b2c3u;
@@ -169,8 +173,15 @@ static void test_shader_constants(void) {
     state.stencil_test_enable = 1;
     state.stencil_test = 5u | (0x66u << 8) | (0xf0u << 16);
     state.stencil_op = 1u | (2u << 8) | (3u << 16);
+    state.mask_rgb = 0x00a1b2c3u;
     state.mask_alpha = 0x0f;
     state.fbfmt = 2;
+    state.ztest_enable = 1;
+    state.ztest = 6;
+    state.scis_x1 = 3;
+    state.scis_y1 = 5;
+    state.scis_x2 = 200;
+    state.scis_y2 = 150;
     state.dither_enable = 1;
     state.dith[0][0] = -4;
     state.dith[0][1] = -1;
@@ -197,7 +208,6 @@ static void test_shader_constants(void) {
         GE_D3D12_SHADER_FOG |
         GE_D3D12_SHADER_DEPTH_RANGE |
         GE_D3D12_SHADER_NEAREST |
-        GE_D3D12_SHADER_DOUBLE_SOURCE_ALPHA |
         GE_D3D12_SHADER_COLOR_TEST |
         GE_D3D12_SHADER_DITHER |
         GE_D3D12_SHADER_STENCIL);
@@ -231,6 +241,32 @@ static void test_shader_constants(void) {
     check_u32("shader stencil write mask", constants.stencil_test[2], 0x0f);
     check_u32("shader stencil format", constants.stencil_test[3], 2);
     check_u32("shader dither row", constants.dither[0], 0x000070fcu);
+    check_u32("shader blend enable", constants.blend[0], 1);
+    check_u32("shader blend mode", constants.blend[1], state.blend_mode);
+    check_u32("shader fixed source", constants.blend[2], 0x00112233u);
+    check_u32("shader fixed destination", constants.blend[3], 0x00445566u);
+    check_u32("shader write mask", constants.fragment[0], 0x0fa1b2c3u);
+    check_u32("shader logic state", constants.fragment[1], 0x00000601u);
+    check_u32("shader depth state", constants.fragment[3], 0x00010601u);
+    check_u32("shader scissor left", (uint32_t)constants.scissor[0], 3);
+    check_u32("shader scissor top", (uint32_t)constants.scissor[1], 5);
+    check_u32("shader scissor right", (uint32_t)constants.scissor[2], 201);
+    check_u32("shader scissor bottom", (uint32_t)constants.scissor[3], 151);
+
+    state.scis_x1 = 600;
+    state.scis_y1 = 300;
+    state.scis_x2 = 2;
+    state.scis_y2 = 4;
+    ged3d12_shader_constants_build(
+        &state, 1, 0, &texture, &constants);
+    check_u32(
+        "empty scissor left", (uint32_t)constants.scissor[0], 512);
+    check_u32(
+        "empty scissor top", (uint32_t)constants.scissor[1], 272);
+    check_u32(
+        "empty scissor right", (uint32_t)constants.scissor[2], 512);
+    check_u32(
+        "empty scissor bottom", (uint32_t)constants.scissor[3], 272);
 
     state.clear = 1;
     state.clear_mode = 0x700;
@@ -247,6 +283,9 @@ static void test_shader_constants(void) {
         "clear color test disabled", constants.color_test[0], 1);
     check_u32(
         "clear stencil test disabled", constants.stencil_test[0], 1);
+    check_u32("clear blend disabled", constants.blend[0], 0);
+    check_u32("clear logic disabled", constants.fragment[1], 0x00000600u);
+    check_u32("clear mode state", constants.fragment[2], 0x700);
 }
 
 static void test_pipeline_keys(void) {
@@ -259,15 +298,17 @@ static void test_pipeline_keys(void) {
     check_u32("default destination blend", base.destination_blend, D3D12_BLEND_ZERO);
     check_u32(
         "default color mask", base.color_write_mask,
-        D3D12_COLOR_WRITE_ENABLE_RED |
-        D3D12_COLOR_WRITE_ENABLE_GREEN |
-        D3D12_COLOR_WRITE_ENABLE_BLUE);
-    check_u32("default depth disabled", base.depth_enable, 0);
+        D3D12_COLOR_WRITE_ENABLE_ALL);
+    check_u32("manual depth enabled", base.depth_enable, 1);
+    check_u32("manual depth write", base.depth_write, 1);
+    check_u32(
+        "manual depth comparison", base.depth_function,
+        D3D12_COMPARISON_FUNC_ALWAYS);
     check_u32("default culling", base.cull_mode, D3D12_CULL_MODE_NONE);
     check_u32("default render-target format", base.render_target_format,
               DXGI_FORMAT_B8G8R8A8_UNORM);
     check_u32("default depth format", base.depth_stencil_format,
-              DXGI_FORMAT_UNKNOWN);
+              DXGI_FORMAT_D16_UNORM);
 
     uint64_t base_hash = ged3d12_pipeline_key_hash(&base);
     s_state.tex_addr = 0x04012340u;
@@ -282,20 +323,22 @@ static void test_pipeline_keys(void) {
     s_state.blend_mode = 2u | (3u << 4) | (1u << 8);
     s_state.ztest_enable = 1;
     s_state.ztest = 6;
+    s_state.stencil_test_enable = 1;
+    s_state.stencil_test = 2u | (0x55u << 8) | (0xf0u << 16);
+    s_state.stencil_op = 1u | (3u << 8) | (5u << 16);
+    s_state.logic_op_enable = 1;
+    s_state.logic_op = 6;
+    s_state.mask_rgb = 0x123456u;
+    s_state.mask_alpha = 0x78;
+    ged3d12_pipeline_key_build(&s_state, 0, &key);
+    check_u64(
+        "destination fragment state keeps PSO hash",
+        ged3d12_pipeline_key_hash(&key), base_hash);
+    if (memcmp(&base, &key, sizeof(key)) != 0)
+        fail("destination fragment state changed the PSO key");
+
     s_state.cull_enable = 1;
     ged3d12_pipeline_key_build(&s_state, 0, &key);
-    check_u32("blend enabled", key.blend_enable, 1);
-    check_u32("source alpha blend", key.source_blend, D3D12_BLEND_SRC_ALPHA);
-    check_u32("inverse source alpha blend", key.destination_blend,
-              D3D12_BLEND_INV_SRC_ALPHA);
-    check_u32("subtract blend operation", key.blend_operation,
-              D3D12_BLEND_OP_SUBTRACT);
-    check_u32("depth enabled", key.depth_enable, 1);
-    check_u32("depth write enabled", key.depth_write, 1);
-    check_u32("depth comparison", key.depth_function,
-              D3D12_COMPARISON_FUNC_GREATER);
-    check_u32("depth format", key.depth_stencil_format,
-              DXGI_FORMAT_D16_UNORM);
     check_u32("triangle culling", key.cull_mode, D3D12_CULL_MODE_BACK);
     if (ged3d12_pipeline_key_hash(&key) == base_hash)
         fail("pipeline hash ignored relevant state");
@@ -308,69 +351,14 @@ static void test_pipeline_keys(void) {
     s_state.clear_mode = 0x500;
     ged3d12_pipeline_key_build(&s_state, 0, &key);
     check_u32("clear disables blend", key.blend_enable, 0);
-    check_u32("clear color mask", key.color_write_mask,
-              D3D12_COLOR_WRITE_ENABLE_RED |
-              D3D12_COLOR_WRITE_ENABLE_GREEN |
-              D3D12_COLOR_WRITE_ENABLE_BLUE);
+    check_u32(
+        "clear writes fetched result", key.color_write_mask,
+        D3D12_COLOR_WRITE_ENABLE_ALL);
     check_u32("clear depth enabled", key.depth_enable, 1);
     check_u32("clear depth write", key.depth_write, 1);
     check_u32("clear depth function", key.depth_function,
               D3D12_COMPARISON_FUNC_ALWAYS);
     check_u32("clear culling disabled", key.cull_mode, D3D12_CULL_MODE_NONE);
-
-    memset(&s_state, 0, sizeof(s_state));
-    s_state.stencil_test_enable = 1;
-    s_state.stencil_test = 1;
-    s_state.stencil_op = 2u << 16;
-    s_state.fbfmt = 3;
-    ged3d12_pipeline_key_build(&s_state, 0, &key);
-    check_u32(
-        "stencil replace enables alpha write", key.color_write_mask,
-        D3D12_COLOR_WRITE_ENABLE_ALL);
-    s_state.stencil_op = 0;
-    ged3d12_pipeline_key_build(&s_state, 0, &key);
-    check_u32(
-        "stencil keep preserves alpha", key.color_write_mask,
-        D3D12_COLOR_WRITE_ENABLE_RED |
-        D3D12_COLOR_WRITE_ENABLE_GREEN |
-        D3D12_COLOR_WRITE_ENABLE_BLUE);
-    s_state.stencil_test = 2;
-    s_state.stencil_op = 2u << 16;
-    ged3d12_pipeline_key_build(&s_state, 0, &key);
-    check_u32(
-        "stencil compare preserves alpha", key.color_write_mask,
-        D3D12_COLOR_WRITE_ENABLE_RED |
-        D3D12_COLOR_WRITE_ENABLE_GREEN |
-        D3D12_COLOR_WRITE_ENABLE_BLUE);
-    s_state.stencil_test = 1;
-    s_state.mask_alpha = 0x0f;
-    s_state.fbfmt = 3;
-    ged3d12_pipeline_key_build(&s_state, 0, &key);
-    check_u32(
-        "partial 8888 stencil mask preserves alpha", key.color_write_mask,
-        D3D12_COLOR_WRITE_ENABLE_RED |
-        D3D12_COLOR_WRITE_ENABLE_GREEN |
-        D3D12_COLOR_WRITE_ENABLE_BLUE);
-    s_state.fbfmt = 2;
-    ged3d12_pipeline_key_build(&s_state, 0, &key);
-    check_u32(
-        "irrelevant 4444 stencil mask writes alpha", key.color_write_mask,
-        D3D12_COLOR_WRITE_ENABLE_ALL);
-
-    memset(&s_state, 0, sizeof(s_state));
-    s_state.blend_enable = 1;
-    s_state.blend_mode = 10u | (10u << 4);
-    s_state.blend_fixa = 0x010101u;
-    s_state.blend_fixb = 0xfefefeu;
-    ged3d12_pipeline_key_build(&s_state, 0, &key);
-    check_u32("fixed source factor", key.source_blend,
-              D3D12_BLEND_BLEND_FACTOR);
-    check_u32("bright conflicting destination factor", key.destination_blend,
-              D3D12_BLEND_ONE);
-    s_state.blend_fixb = 0x010000u;
-    ged3d12_pipeline_key_build(&s_state, 0, &key);
-    check_u32("dark conflicting destination factor", key.destination_blend,
-              D3D12_BLEND_ZERO);
 }
 
 static void test_texture_keys(void) {

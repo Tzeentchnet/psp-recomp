@@ -75,6 +75,8 @@ void ged3d12_framebuffer_cache_shutdown(void);
 bool ged3d12_framebuffer_capture(GeD3D12FramebufferBinding *out);
 bool ged3d12_framebuffer_prepare_pending(void);
 bool ged3d12_framebuffer_bind(const GeD3D12FramebufferBinding *binding);
+bool ged3d12_framebuffer_bind_destination(
+    const GeD3D12FramebufferBinding *binding);
 bool ged3d12_framebuffer_mark_rendered(
     const GeD3D12FramebufferBinding *binding);
 bool ged3d12_framebuffer_texture_alias(

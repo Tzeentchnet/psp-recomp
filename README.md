@@ -111,9 +111,16 @@ Set these environment variables before running the game to control runtime featu
 - `SR_GPU=vk`: Use the Vulkan GE backend (SDL3/Vulkan build).
 - `SR_GPU=sw`: Use the reference software rasterizer.
 - `SR_GPU=d3d12`: Use the SDL3/D3D12 device backend when compiled with `SR_D3D12`.
-  The current phase uploads the software-GE framebuffer into a fixed 480×272 display texture while the HLSL
-  renderer is built out. The resizable swapchain preserves the exact display aspect and clears letterbox or
-  pillarbox space to black.
+  The software GE remains authoritative while native batches are staged. Each batch captures a 160-byte
+  destination-aware fragment block; the HLSL path reads ordered BGRA8 color and R16 depth snapshots to reproduce
+  PSP stencil, depth, blending, dithering, logic operations, native packing, and component masks. The resizable
+  swapchain preserves the exact 480:272 display aspect and clears letterbox or pillarbox space to black.
+- `SR_D3D12_FRAMEBUFFER_LOG=1`: Print persistent color/depth target allocation and cache statistics.
+- `SR_D3D12_FRAMEBUFFER_SAFE=1`: Read cached color targets back after presentation to validate GPU/CPU ownership.
+- `SR_D3D12_DESTINATION_SAFE=1`: Copy and bind color/depth destination snapshots for every staged batch. This is
+  an intentionally expensive resource-transition diagnostic; native draw submission remains disabled.
+- `SR_D3D12_PSO_LOG=1`: Print synchronous GE PSO creation and final cache statistics.
+- `SR_D3D12_WARP=1`: Select Microsoft WARP instead of a hardware adapter.
 - `SR_GPU_GE` / `SR_VIDEO=gdi`: Legacy Vulkan/software and presenter overrides.
 - `SR_GPU_LOG=1`: Print GPU cache flushes and batch information to the console.
 - `SR_IOLOG=1`: Print all file system access logs.

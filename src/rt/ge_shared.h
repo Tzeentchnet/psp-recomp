@@ -43,6 +43,7 @@ typedef struct {
     uint32_t clear_mode;
     int blend_enable;
     uint32_t blend_mode, blend_fixa, blend_fixb;
+    int logic_op_enable; uint32_t logic_op;
     uint32_t tex_addr, tex_bufw, tex_fmt;   /* level-0 texture base / stride(texels) / PSM */
     uint32_t tex_addr_levels[8], tex_bufw_levels[8];
     int tex_width_levels[8], tex_height_levels[8];
@@ -95,6 +96,8 @@ typedef struct {
  * colour, and per-vertex fog factor (1 = no fog). In transform mode u/v are stored
  * pre-multiplied by rw (texel coords over w). */
 typedef struct GeVtx { float x, y, z, rw; float u, v; float fog; int r, g, b, a; } GeVtx;
+
+typedef struct GeRgb { int32_t r, g, b; } GeRgb;
 
 static inline uint32_t ge_texture_bits_per_pixel(uint32_t format) {
     static const uint8_t bits[16] = {
@@ -179,6 +182,11 @@ int       ge_stencil_test_pass(uint32_t test, uint8_t stencil);
 uint8_t   ge_stencil_apply(
               uint32_t operation, uint32_t format, uint8_t stencil,
               uint8_t reference);
+GeRgb     ge_blend_rgb(
+              uint32_t mode, uint32_t fixed_a, uint32_t fixed_b,
+              uint32_t source, uint32_t destination);
+uint32_t  ge_logic_apply(
+              uint32_t operation, uint32_t source, uint32_t destination);
 
 #ifdef __cplusplus
 }

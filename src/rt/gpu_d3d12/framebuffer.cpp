@@ -55,6 +55,10 @@ static ID3D12Resource *s_snapshot;
 static D3D12_RESOURCE_STATES s_snapshot_state;
 static D3D12_GPU_DESCRIPTOR_HANDLE s_snapshot_descriptors;
 static uint64_t s_snapshot_descriptor_generation;
+static ID3D12Resource *s_depth_snapshot;
+static D3D12_RESOURCE_STATES s_depth_snapshot_state;
+static D3D12_GPU_DESCRIPTOR_HANDLE s_destination_descriptors;
+static uint64_t s_destination_descriptor_generation;
 
 static ID3D12Resource *s_readback;
 static ID3D12CommandAllocator *s_immediate_allocator;
@@ -77,6 +81,7 @@ static uint64_t s_aliases;
 static uint64_t s_invalidations;
 static uint64_t s_transfers;
 static uint64_t s_present_hits;
+static uint64_t s_destination_snapshots;
 static bool s_initialized;
 static bool s_log;
 
@@ -211,7 +216,7 @@ static bool create_depth_resource(DepthTarget *depth) {
     desc.Height = GE_D3D12_FRAMEBUFFER_HEIGHT;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_D16_UNORM;
+    desc.Format = DXGI_FORMAT_R16_TYPELESS;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -636,6 +641,16 @@ static bool create_auxiliary_resources(void) {
     }
     s_snapshot_state = D3D12_RESOURCE_STATE_COPY_DEST;
 
+    texture.Format = DXGI_FORMAT_R16_TYPELESS;
+    if (!check_hr(ged3d12_device()->CreateCommittedResource(
+            &default_heap, D3D12_HEAP_FLAG_NONE, &texture,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&s_depth_snapshot)),
+            "create framebuffer depth snapshot")) {
+        return false;
+    }
+    s_depth_snapshot_state = D3D12_RESOURCE_STATE_COPY_DEST;
+
     D3D12_HEAP_PROPERTIES readback_heap = {};
     readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
     readback_heap.CreationNodeMask = 1;
@@ -706,6 +721,7 @@ bool ged3d12_framebuffer_cache_init(void) {
     s_target_count = s_depth_count = 0;
     s_captures = s_uploads = s_readbacks = s_aliases = 0;
     s_invalidations = s_transfers = s_present_hits = 0;
+    s_destination_snapshots = 0;
     const char *log = getenv("SR_D3D12_FRAMEBUFFER_LOG");
     s_log = log && log[0] && strcmp(log, "0") != 0;
     s_initialized = true;
@@ -726,7 +742,8 @@ void ged3d12_framebuffer_cache_shutdown(void) {
         fprintf(stderr,
                 "ged3d12: framebuffer cache captures=%llu uploads=%llu "
                 "readbacks=%llu aliases=%llu invalidations=%llu transfers=%llu "
-                "present_hits=%llu colors=%u depths=%u\n",
+                "present_hits=%llu destination_snapshots=%llu "
+                "colors=%u depths=%u\n",
                 (unsigned long long)s_captures,
                 (unsigned long long)s_uploads,
                 (unsigned long long)s_readbacks,
@@ -734,6 +751,7 @@ void ged3d12_framebuffer_cache_shutdown(void) {
                 (unsigned long long)s_invalidations,
                 (unsigned long long)s_transfers,
                 (unsigned long long)s_present_hits,
+                (unsigned long long)s_destination_snapshots,
                 s_target_count, s_depth_count);
     }
     for (uint32_t i = 0; i < MAX_TARGETS; i++)
@@ -746,10 +764,14 @@ void ged3d12_framebuffer_cache_shutdown(void) {
     RELEASE_COM(s_immediate_list);
     RELEASE_COM(s_immediate_allocator);
     RELEASE_COM(s_readback);
+    RELEASE_COM(s_depth_snapshot);
     RELEASE_COM(s_snapshot);
     s_snapshot_state = D3D12_RESOURCE_STATE_COMMON;
+    s_depth_snapshot_state = D3D12_RESOURCE_STATE_COMMON;
     s_snapshot_descriptors.ptr = 0;
     s_snapshot_descriptor_generation = 0;
+    s_destination_descriptors.ptr = 0;
+    s_destination_descriptor_generation = 0;
     s_initialized = false;
     s_log = false;
     sr_gpu_vram_watch_reads(0);
@@ -848,6 +870,68 @@ bool ged3d12_framebuffer_bind(const GeD3D12FramebufferBinding *binding) {
     target->lru = s_lru++;
     depth->lru = s_lru++;
     s_active_target = target;
+    return true;
+}
+
+bool ged3d12_framebuffer_bind_destination(
+    const GeD3D12FramebufferBinding *binding) {
+    if (!binding || !s_initialized) return false;
+    ColorTarget *target = color_from_handle(binding->color_handle);
+    DepthTarget *depth = depth_from_handle(binding->depth_handle);
+    if (!target || !depth || target->pending_upload || depth->pending_upload) {
+        fprintf(stderr, "ged3d12: stale destination snapshot binding\n");
+        return false;
+    }
+    ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
+    transition(command_list, target->resource, &target->state,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(command_list, depth->resource, &depth->state,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(command_list, s_snapshot, &s_snapshot_state,
+               D3D12_RESOURCE_STATE_COPY_DEST);
+    transition(command_list, s_depth_snapshot, &s_depth_snapshot_state,
+               D3D12_RESOURCE_STATE_COPY_DEST);
+    command_list->CopyResource(s_snapshot, target->resource);
+    command_list->CopyResource(s_depth_snapshot, depth->resource);
+    if (s_log && !s_destination_snapshots)
+        fprintf(stderr, "ged3d12: destination snapshots active\n");
+    s_destination_snapshots++;
+    transition(command_list, s_snapshot, &s_snapshot_state,
+               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    transition(command_list, s_depth_snapshot, &s_depth_snapshot_state,
+               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    transition(command_list, target->resource, &target->state,
+               D3D12_RESOURCE_STATE_RENDER_TARGET);
+    transition(command_list, depth->resource, &depth->state,
+               D3D12_RESOURCE_STATE_DEPTH_WRITE);
+
+    if (s_destination_descriptor_generation != s_descriptor_generation) {
+        GeD3D12DescriptorSlice descriptors = {};
+        if (!ged3d12_srv_alloc(2, &descriptors)) return false;
+        D3D12_SHADER_RESOURCE_VIEW_DESC color_view = {};
+        color_view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        color_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        color_view.Shader4ComponentMapping =
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        color_view.Texture2D.MipLevels = 1;
+        ged3d12_device()->CreateShaderResourceView(
+            s_snapshot, &color_view, descriptors.cpu);
+        D3D12_SHADER_RESOURCE_VIEW_DESC depth_view = {};
+        depth_view.Format = DXGI_FORMAT_R16_UNORM;
+        depth_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        depth_view.Shader4ComponentMapping =
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        depth_view.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE depth_cpu = descriptors.cpu;
+        depth_cpu.ptr += ged3d12_device()->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        ged3d12_device()->CreateShaderResourceView(
+            s_depth_snapshot, &depth_view, depth_cpu);
+        s_destination_descriptors = descriptors.gpu;
+        s_destination_descriptor_generation = s_descriptor_generation;
+    }
+    command_list->SetGraphicsRootDescriptorTable(
+        GE_D3D12_ROOT_DESTINATION, s_destination_descriptors);
     return true;
 }
 
