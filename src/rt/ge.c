@@ -9,12 +9,12 @@
  * depth test, perspective-correct UV interpolation with TEXSCALE/TEXOFFSET, and flat/gouraud
  * shading. Points, lines, triangles (list/strip/fan) and sprites are rasterised.
  *
- * Per-fragment: texturing (5650/5551/4444/8888/CLUT4/CLUT8, swizzled or linear, bilinear),
+ * Per-fragment: texturing (all direct, CLUT, and DXT formats; swizzled or linear; bilinear),
  * programmable alpha test, alpha blending (full factor/equation set), 4x4 ordered dithering,
  * colour/alpha write masks, scissor, and a software 16-bit depth buffer.
  *
  * Not emulated: stencil ops (PSP stencil lives in destination alpha), logic ops, colour test,
- * bezier/spline patches, skinning/morphing, mipmaps (level 0 only), DXT/CLUT16/CLUT32 textures.
+ * bezier/spline patches, morphing, or automatic software-rasterizer mip selection.
  *
  * Each GE command word is (cmd<<24)|data24. Command numbers follow PPSSPP GECommands.h.
  */
@@ -353,12 +353,18 @@ static void read_color(uint32_t addr, const VFmt *v, int *r, int *g, int *b, int
 }
 
 /* Look up a CLUT entry (palette index -> RGBA). */
-static void clut_lookup(uint32_t index, int *r, int *g, int *b, int *a) {
+static void clut_lookup_level(uint32_t index, int level, uint32_t tex_fmt,
+                              int *r, int *g, int *b, int *a) {
     uint32_t shift = (ge.clut_fmt >> 2) & 0x1F;
     uint32_t mask  = (ge.clut_fmt >> 8) & 0xFF;
     uint32_t start = ((ge.clut_fmt >> 16) & 0x1F) << 4;
     uint32_t start_mask = (ge.clut_fmt & 3) == 3 ? 0xFFu : 0x1FFu;
     index = ((index >> shift) & mask) | (start & start_mask);
+    if ((ge.tex_mode & 0x100u) != 0) {
+        if (tex_fmt == 4) index += (uint32_t)level * 16u;
+        else if (tex_fmt == 5 && (ge.clut_fmt & 3) != 3)
+            index += (uint32_t)(level & 1) * 256u;
+    }
     int epsm = ge.clut_fmt & 3;
     if (epsm == 3) { uint32_t raw; memcpy(&raw, &ge.clutram[(index * 4) & 2047], 4); unpack_color(raw, 3, r, g, b, a); }
     else           { uint16_t raw; memcpy(&raw, &ge.clutram[(index * 2) & 2047], 2); unpack_color(raw, epsm, r, g, b, a); }
@@ -504,8 +510,9 @@ void ge_set_frame(uint32_t frame) {
     }
 }
 
-static uint32_t texel_offset(uint32_t row_pitch_pixels, uint32_t u, uint32_t v, uint32_t texel_bits) {
-    if (!ge.tex_swizzle)
+static uint32_t texel_offset(uint32_t row_pitch_pixels, uint32_t u, uint32_t v,
+                             uint32_t texel_bits, int swizzled) {
+    if (!swizzled)
         return v * ((row_pitch_pixels * texel_bits) >> 3) + ((u * texel_bits) >> 3);
 
     /* PPSSPP Software/Sampler.cpp GetPixelDataOffset() */
@@ -529,30 +536,204 @@ static int tex_coord(int v, int size, int clamp_mode) {
     return v & (size - 1) & 511;
 }
 
-static void sample_tex(int tu, int tv, int *r, int *g, int *b, int *a) {
-    g_tex_samples++;
-    if (ge.tex_w > 0) {
-        tu = tex_coord(tu, ge.tex_w, ge.tex_wrap & 1);
-        tv = tex_coord(tv, ge.tex_h, (ge.tex_wrap >> 8) & 1);
+typedef struct {
+    uint8_t lines[4];
+    uint16_t color1, color2;
+} GeDxt1Block;
+
+typedef struct {
+    GeDxt1Block color;
+    uint16_t alpha_lines[4];
+} GeDxt3Block;
+
+typedef struct {
+    GeDxt1Block color;
+    uint32_t alpha_data2;
+    uint16_t alpha_data1;
+    uint8_t alpha1, alpha2;
+} GeDxt5Block;
+
+static void texture_level_info(int level, uint32_t *address, uint32_t *stride,
+                               int *width, int *height) {
+    if (level <= 0) {
+        *address = ge.tex_addr;
+        *stride = ge_texture_buffer_width(ge.tex_fmt, ge.tex_bufw);
+        *width = ge.tex_w;
+        *height = ge.tex_h;
+        return;
     }
-    uint32_t stride = ge.tex_bufw ? ge.tex_bufw : (uint32_t)ge.tex_w;
+    *address = ge.tex_addr_levels[level];
+    *width = ge.tex_width_levels[level];
+    *height = ge.tex_height_levels[level];
+    *stride = ge_texture_buffer_width(
+        ge.tex_fmt, ge.tex_bufw_levels[level]);
+}
+
+uint64_t ge_texture_level_byte_size(const GeState *state, int level) {
+    if (!state || level < 0 || level >= 8) return 0;
+    uint32_t format = state->tex_fmt & 15u;
+    uint32_t bits = ge_texture_bits_per_pixel(format);
+    uint32_t stride;
+    int width;
+    int height;
+    if (level == 0) {
+        width = state->tex_w;
+        height = state->tex_h;
+        stride = ge_texture_buffer_width(state->tex_fmt, state->tex_bufw);
+    } else {
+        width = state->tex_width_levels[level];
+        height = state->tex_height_levels[level];
+        stride = ge_texture_buffer_width(
+            state->tex_fmt, state->tex_bufw_levels[level]);
+    }
+    if (!bits || width <= 0 || height <= 0 || !stride) return 0;
+    if (format >= 8 && format <= 10) {
+        uint64_t blocks_x = ((uint64_t)stride + 3u) / 4u;
+        uint64_t blocks_y = ((uint64_t)(uint32_t)height + 3u) / 4u;
+        return blocks_x * blocks_y * (format == 8 ? 8u : 16u);
+    }
+    uint64_t rows = state->tex_swizzle
+        ? ((uint64_t)(uint32_t)height + 7u) & ~UINT64_C(7)
+        : (uint64_t)(uint32_t)height;
+    return ((uint64_t)stride * rows * bits + 7u) >> 3;
+}
+
+static uint32_t dxt_color(const GeDxt1Block *block, int x, int y, int alpha) {
+    uint16_t c1 = block->color1;
+    uint16_t c2 = block->color2;
+    int b1 = (c1 << 3) & 0xF8, b2 = (c2 << 3) & 0xF8;
+    int g1 = (c1 >> 3) & 0xFC, g2 = (c2 >> 3) & 0xFC;
+    int r1 = (c1 >> 8) & 0xF8, r2 = (c2 >> 8) & 0xF8;
+    int index = (block->lines[y] >> (x * 2)) & 3;
+    int r, g, b, a = alpha;
+    if (index == 0) {
+        r = r1; g = g1; b = b1;
+    } else if (index == 1) {
+        r = r2; g = g2; b = b2;
+    } else if (c1 > c2) {
+        if (index == 2) {
+            r = (r1 + r1 + r2) / 3;
+            g = (g1 + g1 + g2) / 3;
+            b = (b1 + b1 + b2) / 3;
+        } else {
+            r = (r2 + r2 + r1) / 3;
+            g = (g2 + g2 + g1) / 3;
+            b = (b2 + b2 + b1) / 3;
+        }
+    } else if (index == 3) {
+        r = g = b = a = 0;
+    } else {
+        r = (r1 + r2) / 2;
+        g = (g1 + g2) / 2;
+        b = (b1 + b2) / 2;
+    }
+    return (uint32_t)r | ((uint32_t)g << 8) |
+           ((uint32_t)b << 16) | ((uint32_t)a << 24);
+}
+
+static uint8_t dxt_alpha_lerp(uint8_t a1, uint8_t a2, int n, int denominator) {
+    int v1 = (a1 * ((denominator - n) << 8)) / denominator;
+    int v2 = (a2 * (n << 8)) / denominator;
+    return (uint8_t)((v1 + v2 + 31) >> 8);
+}
+
+static uint32_t dxt_sample(uint32_t address, uint32_t stride, uint32_t format,
+                           uint32_t u, uint32_t v) {
+    uint32_t blocks_per_row = (stride + 3u) >> 2;
+    if (!blocks_per_row) blocks_per_row = 1;
+    uint32_t block_index = (v >> 2) * blocks_per_row + (u >> 2);
+    uint32_t block_size = format == 8 ? 8u : 16u;
+    uint8_t bytes[16] = {0};
+    for (uint32_t i = 0; i < block_size; i++)
+        bytes[i] = MEM_R8(address + block_index * block_size + i);
+    if (format == 8) {
+        GeDxt1Block block;
+        memcpy(&block, bytes, sizeof(block));
+        return dxt_color(&block, (int)(u & 3), (int)(v & 3), 255);
+    }
+    if (format == 9) {
+        GeDxt3Block block;
+        memcpy(&block, bytes, sizeof(block));
+        uint32_t color = dxt_color(
+            &block.color, (int)(u & 3), (int)(v & 3), 0);
+        uint32_t alpha =
+            (block.alpha_lines[v & 3] >> ((u & 3) * 4)) & 15u;
+        return color | (alpha << 28);
+    }
+    GeDxt5Block block;
+    memcpy(&block, bytes, sizeof(block));
+    uint32_t color = dxt_color(
+        &block.color, (int)(u & 3), (int)(v & 3), 0);
+    uint64_t alpha_data =
+        ((uint64_t)block.alpha_data1 << 32) | block.alpha_data2;
+    uint32_t alpha_index =
+        (uint32_t)((alpha_data >> ((v & 3) * 12 + (u & 3) * 3)) & 7u);
+    uint8_t alpha;
+    if (alpha_index == 0) alpha = block.alpha1;
+    else if (alpha_index == 1) alpha = block.alpha2;
+    else if (block.alpha1 > block.alpha2)
+        alpha = dxt_alpha_lerp(
+            block.alpha1, block.alpha2, (int)alpha_index - 1, 7);
+    else if (alpha_index == 6) alpha = 0;
+    else if (alpha_index == 7) alpha = 255;
+    else
+        alpha = dxt_alpha_lerp(
+            block.alpha1, block.alpha2, (int)alpha_index - 1, 5);
+    return color | ((uint32_t)alpha << 24);
+}
+
+static void sample_tex_level(int level, int tu, int tv,
+                             int *r, int *g, int *b, int *a) {
+    g_tex_samples++;
+    uint32_t address, stride;
+    int width, height;
+    texture_level_info(level, &address, &stride, &width, &height);
+    if (width > 0) {
+        tu = tex_coord(tu, width, ge.tex_wrap & 1);
+        tv = tex_coord(tv, height, (ge.tex_wrap >> 8) & 1);
+    }
     uint32_t u = (uint32_t)tu, v = (uint32_t)tv;
     switch (ge.tex_fmt) {
         case 0: case 1: case 2:
-            unpack_color(MEM_R16(ge.tex_addr + texel_offset(stride, u, v, 16)), ge.tex_fmt, r, g, b, a); break;
+            unpack_color(MEM_R16(address + texel_offset(
+                stride, u, v, 16, ge.tex_swizzle)), ge.tex_fmt, r, g, b, a); break;
         case 3:
-            unpack_color(MEM_R32(ge.tex_addr + texel_offset(stride, u, v, 32)), 3, r, g, b, a); break;
+            unpack_color(MEM_R32(address + texel_offset(
+                stride, u, v, 32, ge.tex_swizzle)), 3, r, g, b, a); break;
         case 4: {
-            uint32_t off = texel_offset(stride, u, v, 4);
-            uint8_t byte = MEM_R8(ge.tex_addr + off);
+            uint32_t off = texel_offset(stride, u, v, 4, ge.tex_swizzle);
+            uint8_t byte = MEM_R8(address + off);
             int ni = (u & 1) ? (byte >> 4) : (byte & 0xF);
-            clut_lookup((uint32_t)ni, r, g, b, a); break;
+            clut_lookup_level((uint32_t)ni, level, ge.tex_fmt, r, g, b, a); break;
         }
-        case 5: clut_lookup(MEM_R8(ge.tex_addr + texel_offset(stride, u, v, 8)), r, g, b, a); break;
+        case 5:
+            clut_lookup_level(MEM_R8(address + texel_offset(
+                stride, u, v, 8, ge.tex_swizzle)), level, ge.tex_fmt,
+                r, g, b, a); break;
+        case 6:
+            clut_lookup_level(MEM_R16(address + texel_offset(
+                stride, u, v, 16, ge.tex_swizzle)), level, ge.tex_fmt,
+                r, g, b, a); break;
+        case 7:
+            clut_lookup_level(MEM_R32(address + texel_offset(
+                stride, u, v, 32, ge.tex_swizzle)), level, ge.tex_fmt,
+                r, g, b, a); break;
+        case 8: case 9: case 10: {
+            uint32_t color = dxt_sample(address, stride, ge.tex_fmt, u, v);
+            *r = color & 0xff;
+            *g = (color >> 8) & 0xff;
+            *b = (color >> 16) & 0xff;
+            *a = color >> 24;
+            break;
+        }
         default: *r=*g=*b=*a=255; break;
     }
     if (*r | *g | *b) g_tex_nonzero++;
     if (s_stat_on > 0 && *a == 0) s_stat.texa0++;
+}
+
+static void sample_tex(int tu, int tv, int *r, int *g, int *b, int *a) {
+    sample_tex_level(0, tu, tv, r, g, b, a);
 }
 
 static void sample_tex_f(float fu, float fv_coord, int *r, int *g, int *b, int *a) {
@@ -619,17 +800,23 @@ static void texdump_maybe(void) {
  * Linear (non-swizzled) direct-color formats take a row-wise fast path with the same
  * unpack_color expansion — render-to-texture sources are re-decoded every frame and the
  * per-texel sample_tex call (wrap + swizzle offset math) dominates otherwise. */
-void ge_decode_tex_rgba(uint32_t *out) {
+void ge_decode_tex_rgba_level(uint32_t *out, int level) {
+    if (!out || level < 0 || level >= 8) return;
+    uint32_t address, stride;
+    int width, height;
+    texture_level_info(level, &address, &stride, &width, &height);
+    if (!address || width <= 0 || height <= 0) return;
     if (!ge.tex_swizzle && ge.tex_fmt <= 3) {
-        uint32_t stride = ge.tex_bufw ? ge.tex_bufw : (uint32_t)ge.tex_w;
-        for (int v = 0; v < ge.tex_h; v++) {
-            uint32_t *dst = out + (uint32_t)v * (uint32_t)ge.tex_w;
+        for (int v = 0; v < height; v++) {
+            uint32_t *dst = out + (uint32_t)v * (uint32_t)width;
             if (ge.tex_fmt == 3) {
-                const uint32_t *src = (const uint32_t *)SR_HOST(ge.tex_addr + (uint32_t)v * stride * 4);
-                memcpy(dst, src, (size_t)ge.tex_w * 4);
+                const uint32_t *src =
+                    (const uint32_t *)SR_HOST(address + (uint32_t)v * stride * 4);
+                memcpy(dst, src, (size_t)width * 4);
             } else {
-                const uint16_t *src = (const uint16_t *)SR_HOST(ge.tex_addr + (uint32_t)v * stride * 2);
-                for (int u = 0; u < ge.tex_w; u++) {
+                const uint16_t *src =
+                    (const uint16_t *)SR_HOST(address + (uint32_t)v * stride * 2);
+                for (int u = 0; u < width; u++) {
                     int r, g, b, a;
                     unpack_color(src[u], (int)ge.tex_fmt, &r, &g, &b, &a);
                     dst[u] = (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | ((uint32_t)a << 24);
@@ -638,13 +825,18 @@ void ge_decode_tex_rgba(uint32_t *out) {
         }
         return;
     }
-    for (int v = 0; v < ge.tex_h; v++)
-        for (int u = 0; u < ge.tex_w; u++) {
+    for (int v = 0; v < height; v++)
+        for (int u = 0; u < width; u++) {
             int r, g, b, a;
-            sample_tex(u, v, &r, &g, &b, &a);
-            out[v * ge.tex_w + u] = (uint32_t)(r & 0xFF) | ((uint32_t)(g & 0xFF) << 8) |
-                                    ((uint32_t)(b & 0xFF) << 16) | ((uint32_t)(a & 0xFF) << 24);
+            sample_tex_level(level, u, v, &r, &g, &b, &a);
+            out[v * width + u] =
+                (uint32_t)(r & 0xFF) | ((uint32_t)(g & 0xFF) << 8) |
+                ((uint32_t)(b & 0xFF) << 16) | ((uint32_t)(a & 0xFF) << 24);
         }
+}
+
+void ge_decode_tex_rgba(uint32_t *out) {
+    ge_decode_tex_rgba_level(out, 0);
 }
 
 static uint16_t pack565(int r, int g, int b)           { return (uint16_t)(((r>>3)&0x1F)|(((g>>2)&0x3F)<<5)|(((b>>3)&0x1F)<<11)); }
@@ -877,7 +1069,9 @@ static int shade(float u, float fv, int fog, int vr, int vg, int vb, int va, int
                     uint32_t stride2 = ge.tex_bufw ? ge.tex_bufw : (uint32_t)ge.tex_w;
                     uint32_t tu = (uint32_t)tex_coord((int)u, ge.tex_w, ge.tex_wrap & 1);
                     uint32_t tv = (uint32_t)tex_coord((int)fv, ge.tex_h, (ge.tex_wrap >> 8) & 1);
-                    rawidx = MEM_R8(ge.tex_addr + texel_offset(stride2, tu, tv, ge.tex_fmt == 4 ? 4 : 8));
+                    rawidx = MEM_R8(ge.tex_addr + texel_offset(
+                        stride2, tu, tv, ge.tex_fmt == 4 ? 4 : 8,
+                        ge.tex_swizzle));
                     if (ge.tex_fmt == 4) rawidx = (tu & 1) ? (rawidx >> 4) : (rawidx & 0xF);
                     uint32_t shift2 = (ge.clut_fmt >> 2) & 0x1F, mask2 = (ge.clut_fmt >> 8) & 0xFF;
                     uint32_t cidx = ((rawidx >> shift2) & mask2);
@@ -2357,18 +2551,48 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
 
             /* ---- Texturing ---- */
             case GE_TEXTUREMAPENABLE: ge.tex_enable=data&1; break;
-            case GE_TEXADDR0:     ge.tex_addr=(ge.tex_addr&0xFF000000)|(data&0x00FFFFFF); break;
-            case GE_TEXBUFWIDTH0: ge.tex_bufw=data&0xFFFF; ge.tex_addr=(ge.tex_addr&0x00FFFFFF)|((data&0xFF0000)<<8); break;
-            case GE_TEXSIZE0:  ge.tex_w=1<<(data&0xF); ge.tex_h=1<<((data>>8)&0xF); break;
-            /* Mip levels 1-7 (addr/bufwidth/size): only level 0 is sampled. */
-            case GE_TEXADDR0+1: case GE_TEXADDR0+2: case GE_TEXADDR0+3: case GE_TEXADDR0+4:
-            case GE_TEXADDR0+5: case GE_TEXADDR0+6: case GE_TEXADDR0+7:
-            case GE_TEXBUFWIDTH0+1: case GE_TEXBUFWIDTH0+2: case GE_TEXBUFWIDTH0+3:
-            case GE_TEXBUFWIDTH0+4: case GE_TEXBUFWIDTH0+5: case GE_TEXBUFWIDTH0+6:
-            case GE_TEXBUFWIDTH0+7:
-            case GE_TEXSIZE0+1: case GE_TEXSIZE0+2: case GE_TEXSIZE0+3: case GE_TEXSIZE0+4:
-            case GE_TEXSIZE0+5: case GE_TEXSIZE0+6: case GE_TEXSIZE0+7: break;
-            case GE_TEXMODE:   ge.tex_swizzle=data&1; break;
+            case GE_TEXADDR0: case GE_TEXADDR0+1: case GE_TEXADDR0+2:
+            case GE_TEXADDR0+3: case GE_TEXADDR0+4: case GE_TEXADDR0+5:
+            case GE_TEXADDR0+6: case GE_TEXADDR0+7: {
+                int level = (int)(cmd - GE_TEXADDR0);
+                ge.tex_addr_levels[level] =
+                    (ge.tex_addr_levels[level] & 0xFF000000u) |
+                    (data & 0x00FFFFFFu);
+                if (level == 0) ge.tex_addr = ge.tex_addr_levels[0];
+                break;
+            }
+            case GE_TEXBUFWIDTH0: case GE_TEXBUFWIDTH0+1:
+            case GE_TEXBUFWIDTH0+2: case GE_TEXBUFWIDTH0+3:
+            case GE_TEXBUFWIDTH0+4: case GE_TEXBUFWIDTH0+5:
+            case GE_TEXBUFWIDTH0+6: case GE_TEXBUFWIDTH0+7: {
+                int level = (int)(cmd - GE_TEXBUFWIDTH0);
+                ge.tex_bufw_levels[level] = data & 0xFFFFu;
+                ge.tex_addr_levels[level] =
+                    (ge.tex_addr_levels[level] & 0x00FFFFFFu) |
+                    ((data & 0xFF0000u) << 8);
+                if (level == 0) {
+                    ge.tex_bufw = ge.tex_bufw_levels[0];
+                    ge.tex_addr = ge.tex_addr_levels[0];
+                }
+                break;
+            }
+            case GE_TEXSIZE0: case GE_TEXSIZE0+1: case GE_TEXSIZE0+2:
+            case GE_TEXSIZE0+3: case GE_TEXSIZE0+4: case GE_TEXSIZE0+5:
+            case GE_TEXSIZE0+6: case GE_TEXSIZE0+7: {
+                int level = (int)(cmd - GE_TEXSIZE0);
+                ge.tex_width_levels[level] = 1 << (data & 0xF);
+                ge.tex_height_levels[level] = 1 << ((data >> 8) & 0xF);
+                if (level == 0) {
+                    ge.tex_w = ge.tex_width_levels[0];
+                    ge.tex_h = ge.tex_height_levels[0];
+                }
+                break;
+            }
+            case GE_TEXMODE:
+                ge.tex_mode = data;
+                ge.tex_swizzle = data & 1;
+                ge.tex_max_level = (int)((data >> 16) & 7);
+                break;
             case GE_TEXFORMAT: ge.tex_fmt=data&0xF; break;
             case GE_TEXFILTER: ge.tex_filter=data; break;
             case GE_TEXWRAP:   ge.tex_wrap=data; break;
@@ -2385,8 +2609,12 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
                 if (ge.tgen_num < 12) ge.tgen[ge.tgen_num] = decode_float24(data);
                 ge.tgen_num++;
                 break;
-            case GE_TEXLEVEL: case GE_TEXLODSLOPE: break;     /* mipmaps not sampled */
-            case GE_TEXFLUSH: case GE_TEXSYNC: break;         /* no texture cache to flush */
+            case GE_TEXLEVEL: ge.tex_level=data; break;
+            case GE_TEXLODSLOPE: break;
+            case GE_TEXFLUSH:
+                if (s_backend && s_backend->flush) s_backend->flush("texflush");
+                break;
+            case GE_TEXSYNC: break;
             case GE_LOADCLUT: {
                 /* Copy (data&0x3F) 32-byte blocks from clut_addr into internal CLUT RAM, like
                  * the hardware (PPSSPP TextureCacheCommon::LoadClut). */

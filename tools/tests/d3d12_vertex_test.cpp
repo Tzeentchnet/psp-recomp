@@ -18,6 +18,14 @@ extern "C" GeState *ge_state_ptr(void) {
     return &s_state;
 }
 
+bool ged3d12_texture_capture(GeD3D12TextureBinding *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    out->handle = GE_D3D12_TEXTURE_HANDLE_NONE;
+    ged3d12_texture_sampler_build(&s_state, &out->sampler);
+    return true;
+}
+
 bool ged3d12_upload_alloc(
     UINT64 size, UINT64 alignment, GeD3D12UploadSlice *out) {
     UINT64 offset = (s_upload_cursor + alignment - 1) & ~(alignment - 1);
@@ -206,6 +214,110 @@ static void test_pipeline_keys(void) {
               D3D12_BLEND_ZERO);
 }
 
+static void test_texture_keys(void) {
+    GeD3D12TextureKey base;
+    GeD3D12TextureKey changed;
+    GeD3D12TextureSampler sampler;
+    memset(&s_state, 0, sizeof(s_state));
+    s_state.tex_enable = 1;
+    s_state.tex_addr = 0x04010000u;
+    s_state.tex_bufw = 8;
+    s_state.tex_w = 8;
+    s_state.tex_h = 8;
+    s_state.tex_fmt = 4;
+    s_state.tex_filter = 4;
+    s_state.tex_max_level = 2;
+    s_state.tex_mode = 0x100;
+    s_state.clut_fmt = 3u | (0xffu << 8);
+    s_state.clutram[4] = 0x55;
+    s_state.tex_addr_levels[1] = 0x04010100u;
+    s_state.tex_bufw_levels[1] = 4;
+    s_state.tex_width_levels[1] = 4;
+    s_state.tex_height_levels[1] = 4;
+    s_state.tex_addr_levels[2] = 0x04010200u;
+    s_state.tex_bufw_levels[2] = 2;
+    s_state.tex_width_levels[2] = 2;
+    s_state.tex_height_levels[2] = 2;
+    ged3d12_texture_key_build(&s_state, &base);
+    check_u32("texture key format", base.format, 4);
+    check_u32("texture key mip count", base.mip_count, 3);
+    check_u32("texture key base address", base.address[0], 0x04010000u);
+    check_u32("texture key mip address", base.address[2], 0x04010200u);
+    check_u32("texture key mip width", base.width[1], 4);
+    check_u32("texture key aligned stride", base.stride[0], 32);
+    check_u32("texture key separate CLUT", base.clut_shared, 0);
+    if (!base.clut_hash) fail("texture key omitted CLUT identity");
+    check_u64("texture CLUT4 byte size",
+              ged3d12_texture_key_level_bytes(&base, 0), 128);
+    if (!ged3d12_texture_key_overlaps(&base, 0x04010010u, 4))
+        fail("texture key missed base-level invalidation");
+    if (!ged3d12_texture_key_overlaps(&base, 0x04010200u, 1))
+        fail("texture key missed mip-level invalidation");
+    if (ged3d12_texture_key_overlaps(&base, 0x04011000u, 4))
+        fail("texture key reported disjoint invalidation");
+
+    changed = base;
+    s_state.tex_wrap = 0x101;
+    s_state.tex_filter = 5;
+    ged3d12_texture_key_build(&s_state, &changed);
+    if (memcmp(&base, &changed, sizeof(base)) != 0)
+        fail("sampler-only state changed texture resource key");
+
+    uint64_t base_hash = ged3d12_texture_key_hash(&base);
+    s_state.clutram[4] ^= 1;
+    ged3d12_texture_key_build(&s_state, &changed);
+    if (ged3d12_texture_key_hash(&changed) == base_hash)
+        fail("texture resource hash ignored CLUT contents");
+
+    s_state.tex_fmt = 8;
+    s_state.tex_filter = 0;
+    s_state.tex_swizzle = 0;
+    s_state.tex_bufw = 8;
+    s_state.tex_w = 8;
+    s_state.tex_h = 8;
+    ged3d12_texture_key_build(&s_state, &changed);
+    check_u64("texture DXT1 key byte size",
+              ged3d12_texture_key_level_bytes(&changed, 0), 32);
+
+    s_state.tex_w = 1;
+    s_state.tex_h = 1;
+    s_state.tex_max_level = 7;
+    s_state.tex_filter = 4;
+    for (int level = 1; level < GE_D3D12_TEXTURE_LEVELS; level++) {
+        s_state.tex_addr_levels[level] =
+            0x04010000u + (uint32_t)level * 0x100u;
+        s_state.tex_bufw_levels[level] = 4;
+        s_state.tex_width_levels[level] = 1;
+        s_state.tex_height_levels[level] = 1;
+    }
+    ged3d12_texture_key_build(&s_state, &changed);
+    check_u32("texture legal mip chain cap", changed.mip_count, 1);
+
+    s_state.tex_fmt = 5;
+    s_state.tex_swizzle = 1;
+    s_state.tex_bufw = 16;
+    s_state.tex_w = 16;
+    s_state.tex_h = 1;
+    ged3d12_texture_key_build(&s_state, &changed);
+    check_u64("texture swizzled key byte size",
+              ged3d12_texture_key_level_bytes(&changed, 0), 128);
+
+    s_state.tex_filter = 0x107;
+    s_state.tex_wrap = 0x101;
+    s_state.tex_level = 0xf80000u;
+    s_state.tex_max_level = 2;
+    ged3d12_texture_sampler_build(&s_state, &sampler);
+    check_u32("texture sampler min linear", sampler.min_linear, 1);
+    check_u32("texture sampler mag linear", sampler.mag_linear, 1);
+    check_u32("texture sampler mip linear", sampler.mip_linear, 1);
+    check_u32("texture sampler mip enabled", sampler.mip_enabled, 1);
+    check_u32("texture sampler clamp u", sampler.clamp_u, 1);
+    check_u32("texture sampler clamp v", sampler.clamp_v, 1);
+    check_u32("texture sampler signed bias",
+              (uint32_t)(int32_t)sampler.lod_bias_16,
+              (uint32_t)(int32_t)(int8_t)0xf8);
+}
+
 static void test_triangle(void) {
     reset_upload();
     memset(&s_state, 0, sizeof(s_state));
@@ -372,6 +484,7 @@ int main(void) {
     } else {
         test_present_viewports();
         test_pipeline_keys();
+        test_texture_keys();
         test_triangle();
         test_sprites();
         test_lines_and_points();

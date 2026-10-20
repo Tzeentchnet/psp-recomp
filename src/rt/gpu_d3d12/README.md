@@ -21,8 +21,13 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 - a collision-safe 512-entry PSO cache keyed by a canonical 16-byte projection of
   blend, color-write, depth, cull, and attachment-format state, with synchronous
   creation on first use;
-- software-GE framebuffer upload so `SR_GPU=d3d12` is usable before native draw
-  submission and GPU-resident presentation land.
+- a collision-safe 512-entry texture cache with canonical metadata/CLUT keys,
+  immutable encoded-content versions, up to eight decoded RGBA8 mip uploads,
+  per-frame SRV/sampler reuse, bounded staging, and queue-safe LRU eviction;
+- a persistent 480×272 display texture and fullscreen-triangle presentation pass
+  that preserve the exact PSP aspect ratio through window resizing;
+- software-GE framebuffer upload so `SR_GPU=d3d12` remains usable while native
+  draw submission and GPU-resident render targets are being integrated.
 
 `vertex.cpp` deliberately consumes the existing `GeVtx` backend seam instead of
 duplicating PSP vertex decoding. `ge.c` remains authoritative for all raw attribute
@@ -39,6 +44,23 @@ cache. Each captured batch stores its key before later GE commands mutate the li
 hits, compiles the embedded HLSL synchronously on misses, and binds the resulting PSO to
 the live command list. Draw submission is intentionally deferred while software
 presentation remains the reference path.
+
+`texture_key.cpp` separates resource identity from sampling state. The 96-byte texture
+key retains the legal PSP mip chain, aligned buffer widths, format/swizzle state, and
+complete CLUT identity; the 8-byte sampler key retains min/mag/mip filters, U/V wrap,
+and signed LOD bias. `texture.cpp` combines that metadata with quick and full hashes of
+the encoded source ranges. It creates immutable D3D12 resource versions so batches
+captured before and after a RAM write keep the correct contents. CPU, DMA, and block
+transfer dirty ranges invalidate every overlapping mip. Each large texture is fully
+verified once per presented frame even without an explicit notification.
+
+The cache decodes through the shared `ge.c` implementation, which supports 5650, 5551,
+4444, 8888, CLUT4/8/16/32, and PSP-layout DXT1/3/5, including swizzling and shared or
+per-level palettes. Unique SRVs and sampler descriptors are reused within a fenced frame.
+The cache is bounded to 512 entries and 64 MiB of pending decoded data; a full cache
+waits for the graphics queue before evicting its 128 least-recently used versions.
+`TEXFLUSH` is treated as a synchronization hint, while actual CPU/DMA/block-transfer
+writes drive invalidation.
 
 `shaders/psp_vs.hlsl` and `shaders/psp_ps.hlsl` are the native Shader Model 6 ports of
 the Vulkan GE shaders. Their checked-in `*.inc` files contain stripped DXIL consumed by
@@ -62,9 +84,12 @@ Set `SR_D3D12_VERTEX_LOG=1` to print compact capture counts and content hashes f
 first three presents and every 120th present, plus a shutdown summary.
 Set `SR_D3D12_PSO_LOG=1` to print synchronous PSO creations and a shutdown cache
 summary.
+Set `SR_D3D12_TEXTURE_LOG=1` to print texture-version misses and a shutdown summary of
+lookups, hits, uploads, invalidations, evictions, and live entries.
 
-Later phase-4 tasks submit the uploaded batches, populate per-draw state and textures,
-and add GPU-resident framebuffer presentation behind the same descriptor.
+Later phase-4 tasks submit the uploaded batches, populate the remaining per-draw state,
+and add GPU-resident framebuffer aliases behind the same descriptor and invalidation
+model.
 
 The root project keeps this dependency optional:
 

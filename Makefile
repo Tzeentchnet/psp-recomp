@@ -29,6 +29,8 @@ RT_D3D12_PIPELINE_O := $(BUILD_DIR)/gpu_d3d12_pipeline.o
 RT_D3D12_PIPELINE_KEY_O := $(BUILD_DIR)/gpu_d3d12_pipeline_key.o
 RT_D3D12_PRESENT_O := $(BUILD_DIR)/gpu_d3d12_present.o
 RT_D3D12_PRESENT_LAYOUT_O := $(BUILD_DIR)/gpu_d3d12_present_layout.o
+RT_D3D12_TEXTURE_O := $(BUILD_DIR)/gpu_d3d12_texture.o
+RT_D3D12_TEXTURE_KEY_O := $(BUILD_DIR)/gpu_d3d12_texture_key.o
 RT_SRCS    := src/rt/recomp.c \
               src/rt/vfpu_interp.c \
               src/rt/vfpu_asin.c \
@@ -78,6 +80,7 @@ $(RT_GE_O): src/rt/ge.c src/rt/recomp.h
 
 $(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h \
                src/rt/gpu_d3d12/vertex.h \
+               src/rt/gpu_d3d12/texture.h \
                src/rt/gpu_d3d12/shaders/psp_vs.inc src/rt/gpu_d3d12/shaders/psp_ps.inc \
                src/rt/ge_shared.h src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
@@ -85,6 +88,7 @@ $(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h \
 
 $(RT_D3D12_VERTEX_O): src/rt/gpu_d3d12/vertex.cpp src/rt/gpu_d3d12/vertex.h \
                       src/rt/gpu_d3d12/device.h src/rt/gpu_d3d12/pipeline.h \
+                      src/rt/gpu_d3d12/texture.h \
                       src/rt/ge_shared.h
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/vertex.cpp -o $@
@@ -111,10 +115,22 @@ $(RT_D3D12_PRESENT_LAYOUT_O): src/rt/gpu_d3d12/present_layout.cpp \
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/present_layout.cpp -o $@
 
+$(RT_D3D12_TEXTURE_O): src/rt/gpu_d3d12/texture.cpp \
+                       src/rt/gpu_d3d12/texture.h src/rt/gpu_d3d12/device.h \
+                       src/rt/ge_shared.h src/rt/recomp.h
+	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
+	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/texture.cpp -o $@
+
+$(RT_D3D12_TEXTURE_KEY_O): src/rt/gpu_d3d12/texture_key.cpp \
+                           src/rt/gpu_d3d12/texture.h src/rt/ge_shared.h
+	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
+	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/texture_key.cpp -o $@
+
 $(BUILD_DIR)/d3d12_vertex_test.exe: tools/tests/d3d12_vertex_test.cpp \
                                    src/rt/gpu_d3d12/vertex.cpp \
                                    src/rt/gpu_d3d12/pipeline_key.cpp \
                                    src/rt/gpu_d3d12/present_layout.cpp \
+                                   src/rt/gpu_d3d12/texture_key.cpp \
                                    src/rt/gpu_d3d12/vertex.h \
                                    src/rt/gpu_d3d12/pipeline.h \
                                    src/rt/gpu_d3d12/present.h \
@@ -122,7 +138,8 @@ $(BUILD_DIR)/d3d12_vertex_test.exe: tools/tests/d3d12_vertex_test.cpp \
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) tools/tests/d3d12_vertex_test.cpp \
 		src/rt/gpu_d3d12/vertex.cpp src/rt/gpu_d3d12/pipeline_key.cpp \
-		src/rt/gpu_d3d12/present_layout.cpp -o $@
+		src/rt/gpu_d3d12/present_layout.cpp \
+		src/rt/gpu_d3d12/texture_key.cpp -o $@
 
 test-d3d12-vertex: $(BUILD_DIR)/d3d12_vertex_test.exe
 	$<
@@ -139,7 +156,8 @@ $(BUILD_DIR)/$(GAME_NAME)_recomp.o: $(BUILD_DIR)/$(GAME_NAME)_recomp.c src/rt/re
 
 compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_D3D12_O) \
          $(RT_D3D12_VERTEX_O) $(RT_D3D12_PIPELINE_O) $(RT_D3D12_PIPELINE_KEY_O) \
-         $(RT_D3D12_PRESENT_O) $(RT_D3D12_PRESENT_LAYOUT_O)
+         $(RT_D3D12_PRESENT_O) $(RT_D3D12_PRESENT_LAYOUT_O) \
+         $(RT_D3D12_TEXTURE_O) $(RT_D3D12_TEXTURE_KEY_O)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(GAME_NAME).exe \
 		$(BUILD_DIR)/$(GAME_NAME)_recomp.o \
 		$(RT_GE_O) \
@@ -149,6 +167,8 @@ compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_D3D12_O) \
 		$(RT_D3D12_PIPELINE_KEY_O) \
 		$(RT_D3D12_PRESENT_O) \
 		$(RT_D3D12_PRESENT_LAYOUT_O) \
+		$(RT_D3D12_TEXTURE_O) \
+		$(RT_D3D12_TEXTURE_KEY_O) \
 		$(RT_SRCS) \
 		$(LIBS)
 	@cp SDL3.dll $(BUILD_DIR)/ 2>/dev/null || cp ../SDL3.dll $(BUILD_DIR)/ 2>/dev/null || true

@@ -44,6 +44,10 @@ typedef struct {
     int blend_enable;
     uint32_t blend_mode, blend_fixa, blend_fixb;
     uint32_t tex_addr, tex_bufw, tex_fmt;   /* level-0 texture base / stride(texels) / PSM */
+    uint32_t tex_addr_levels[8], tex_bufw_levels[8];
+    int tex_width_levels[8], tex_height_levels[8];
+    uint32_t tex_mode, tex_level;
+    int tex_max_level;
     uint32_t tex_wrap, tex_func, tex_env, tex_filter;
     int tex_w, tex_h;                        /* texture dimensions (from TEXSIZE log2) */
     uint32_t clut_addr, clut_fmt;            /* palette base and format word */
@@ -89,6 +93,32 @@ typedef struct {
  * pre-multiplied by rw (texel coords over w). */
 typedef struct GeVtx { float x, y, z, rw; float u, v; float fog; int r, g, b, a; } GeVtx;
 
+static inline uint32_t ge_texture_bits_per_pixel(uint32_t format) {
+    static const uint8_t bits[16] = {
+        16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8, 0, 0, 0, 0, 0,
+    };
+    return bits[format & 15u];
+}
+
+static inline uint32_t ge_texture_buffer_width(
+    uint32_t format, uint32_t raw_width) {
+    uint32_t mask;
+    switch (format & 15u) {
+        case 0: case 1: case 2: case 6: mask = 0x7f8u; break;
+        case 3: case 7: mask = 0x7fcu; break;
+        case 4: mask = 0x7e0u; break;
+        case 5: mask = 0x7f0u; break;
+        case 8: case 9: case 10: mask = 0x7ffu; break;
+        default: return 0;
+    }
+    uint32_t width = raw_width & mask;
+    if (!width) {
+        uint32_t bits = ge_texture_bits_per_pixel(format);
+        if (bits) width = 128u / bits;
+    }
+    return width;
+}
+
 /* Rasterizer backend. init/present/shutdown provide the lifecycle seam needed to select
  * Vulkan, D3D12, or the software fallback at runtime. The primitive hooks return 1 when
  * the primitive was taken by
@@ -127,10 +157,12 @@ void      sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes);
 GeState  *ge_state_ptr(void);
 uint16_t *ge_zbuf_ptr(void);        /* 272*512 entries, row stride = ge_zbuf_stride() */
 uint32_t  ge_zbuf_stride(void);
-/* Decode the CURRENT texture (ge.tex_addr, tex_w x tex_h) to RGBA8 through the exact
- * sampler path the software rasterizer uses (swizzle + CLUT + format). out must hold
- * tex_w*tex_h words; layout is row-major, r|g<<8|b<<16|a<<24. */
+/* Decode the current texture to RGBA8 through the exact sampler path the software
+ * rasterizer uses (swizzle + CLUT + direct/DXT format). Layout is row-major,
+ * r|g<<8|b<<16|a<<24. Level zero uses the legacy tex_addr/tex_w fields above. */
 void      ge_decode_tex_rgba(uint32_t *out);
+void      ge_decode_tex_rgba_level(uint32_t *out, int level);
+uint64_t  ge_texture_level_byte_size(const GeState *state, int level);
 
 #ifdef __cplusplus
 }

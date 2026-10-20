@@ -9,7 +9,7 @@
 
 #define INITIAL_VERTEX_CAPACITY 4096u
 #define INITIAL_BATCH_CAPACITY 2048u
-/* Leaves enough of each 8 MiB frame partition for the 557 KiB presentation upload. */
+/* Leaves over 24 MiB in each frame partition for textures and presentation. */
 #define MAX_FRAME_VERTICES 240000u
 #define MAX_FRAME_BATCHES (MAX_FRAME_VERTICES / 3u)
 
@@ -86,7 +86,7 @@ static bool begin_primitive(
         return false;
     }
     *first = s_vertex_count;
-    GeD3D12VertexBatch *batch = &s_batches[s_batch_count++];
+    GeD3D12VertexBatch *batch = &s_batches[s_batch_count];
     batch->first = *first;
     batch->count = vertex_count;
     batch->primitive = primitive;
@@ -95,6 +95,12 @@ static bool begin_primitive(
     ged3d12_pipeline_key_build(
         ge_state_ptr(), primitive != GE_D3D12_PRIMITIVE_TRIANGLE,
         &batch->pipeline);
+    if (!ged3d12_texture_capture(&batch->texture)) {
+        capture_error(
+            "texture capture failed", s_batch_count + 1u, MAX_FRAME_BATCHES);
+        return false;
+    }
+    s_batch_count++;
     s_primitive_count[primitive]++;
     return true;
 }

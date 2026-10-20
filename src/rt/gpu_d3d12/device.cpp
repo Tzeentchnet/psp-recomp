@@ -20,6 +20,7 @@
 #include "device.h"
 #include "pipeline.h"
 #include "present.h"
+#include "texture.h"
 #include "vertex.h"
 extern "C" {
 #include "../recomp.h"
@@ -32,7 +33,7 @@ extern "C" {
 #define SAMPLER_DESCRIPTOR_COUNT 768u
 #define RTV_DESCRIPTOR_COUNT 256u
 #define DSV_DESCRIPTOR_COUNT 64u
-#define UPLOAD_BYTES_PER_FRAME (8ull * 1024ull * 1024ull)
+#define UPLOAD_BYTES_PER_FRAME (32ull * 1024ull * 1024ull)
 #define UPLOAD_BYTES (FRAME_COUNT * UPLOAD_BYTES_PER_FRAME)
 
 #define RELEASE_COM(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
@@ -150,6 +151,7 @@ static void release_device(void) {
     wait_queue_idle(s_copy_queue, s_copy_fence, &s_next_copy_fence,
                     s_copy_event, "wait for copy queue");
     ged3d12_pipeline_cache_shutdown();
+    ged3d12_texture_cache_shutdown();
     ged3d12_present_shutdown();
     ged3d12_vertex_capture_shutdown();
 
@@ -709,6 +711,10 @@ static int device_init(void) {
         release_device();
         return 0;
     }
+    if (!ged3d12_texture_cache_init()) {
+        release_device();
+        return 0;
+    }
     if (!ged3d12_pipeline_cache_init()) {
         release_device();
         return 0;
@@ -1001,9 +1007,12 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
 
     GeD3D12VertexFrame vertices = {};
     if (!ged3d12_vertex_upload_pending(&vertices)) return -2;
+    if (!ged3d12_texture_prepare_pending()) return -2;
     for (UINT i = 0; i < vertices.batch_count; i++) {
-        if (!ged3d12_pipeline_bind(&vertices.batches[i].pipeline))
+        if (!ged3d12_pipeline_bind(&vertices.batches[i].pipeline) ||
+            !ged3d12_texture_bind(&vertices.batches[i].texture)) {
             return -2;
+        }
     }
     s_vertex_frames++;
     s_vertex_total += vertices.vertex_count;
@@ -1089,11 +1098,19 @@ static void device_shutdown(void) {
     ged3d12_window_shutdown();
 }
 
+static void device_flush(const char *reason) {
+    (void)reason;
+}
+
+static void device_vram_dirty(uint32_t address, uint32_t bytes) {
+    ged3d12_texture_invalidate(address, bytes);
+}
+
 static const GeBackend k_backend = {
     "d3d12", device_init, device_present, device_shutdown,
     ged3d12_vertex_capture_tri, ged3d12_vertex_capture_sprite,
     ged3d12_vertex_capture_line, ged3d12_vertex_capture_point,
-    nullptr, nullptr, nullptr,
+    device_flush, device_vram_dirty, nullptr,
 };
 
 extern "C" const GeBackend *ged3d12_backend(void) { return &k_backend; }
@@ -1113,6 +1130,7 @@ ID3D12DescriptorHeap *ged3d12_sampler_heap(void) { return s_sampler_heap; }
 ID3D12DescriptorHeap *ged3d12_rtv_heap(void) { return s_rtv_heap; }
 ID3D12DescriptorHeap *ged3d12_dsv_heap(void) { return s_dsv_heap; }
 ID3D12RootSignature *ged3d12_root_signature(void) { return s_root_signature; }
+ID3D12Resource *ged3d12_upload_resource(void) { return s_upload; }
 D3D12_SHADER_BYTECODE ged3d12_vertex_shader(void) {
     D3D12_SHADER_BYTECODE shader = {k_psp_vs_dxil, sizeof(k_psp_vs_dxil)};
     return shader;
@@ -1120,4 +1138,9 @@ D3D12_SHADER_BYTECODE ged3d12_vertex_shader(void) {
 D3D12_SHADER_BYTECODE ged3d12_pixel_shader(void) {
     D3D12_SHADER_BYTECODE shader = {k_psp_ps_dxil, sizeof(k_psp_ps_dxil)};
     return shader;
+}
+bool ged3d12_graphics_wait_idle(void) {
+    return wait_queue_idle(
+        s_graphics_queue, s_graphics_fence, &s_next_graphics_fence,
+        s_graphics_event, "wait for D3D12 texture cache eviction") != 0;
 }
