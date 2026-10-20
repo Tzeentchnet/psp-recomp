@@ -207,6 +207,7 @@ uint32_t gui_buttons(void);
 void     gui_analog(uint8_t *lx, uint8_t *ly);   /* live left-stick (0..255, 128=centre) */
 int      gui_pad_present(void);                  /* 1 when a game controller is connected */
 void     gui_present(uint32_t fbaddr, int fmt, uint32_t stride);
+int gui_capture_next(const char *path);
 
 typedef uint32_t (*HleFn)(CpuState *s);
 void     sr_hle_register(uint32_t nid, const char *name, HleFn fn);

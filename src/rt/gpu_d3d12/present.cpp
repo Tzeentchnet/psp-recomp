@@ -7,6 +7,10 @@
 
 #define PSP_WIDTH 480u
 #define PSP_HEIGHT 272u
+#define CAPTURE_ROW_PITCH \
+    ((PSP_WIDTH * 4u + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) & \
+     ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u))
+#define CAPTURE_BYTES ((UINT64)CAPTURE_ROW_PITCH * PSP_HEIGHT)
 #define RELEASE_COM(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
 
 static const uint8_t k_present_vs_dxil[] =
@@ -17,6 +21,7 @@ static const uint8_t k_present_ps_dxil[] =
 ;
 
 static ID3D12Resource *s_display_texture;
+static ID3D12Resource *s_capture_readback;
 static ID3D12RootSignature *s_present_root_signature;
 static ID3D12PipelineState *s_present_pipeline;
 static D3D12_RESOURCE_STATES s_display_state;
@@ -65,6 +70,26 @@ static bool create_display_texture(void) {
     }
     s_display_state = D3D12_RESOURCE_STATE_COPY_DEST;
     return true;
+}
+
+static bool create_capture_readback(void) {
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = CAPTURE_BYTES;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    return check_hr(ged3d12_device()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        IID_PPV_ARGS(&s_capture_readback)), "create present capture readback");
 }
 
 static bool create_present_root_signature(void) {
@@ -159,11 +184,13 @@ static bool create_present_pipeline(void) {
 }
 
 bool ged3d12_present_init(void) {
-    if (s_display_texture || s_present_root_signature || s_present_pipeline) {
+    if (s_display_texture || s_capture_readback ||
+        s_present_root_signature || s_present_pipeline) {
         fprintf(stderr, "ged3d12: present renderer already initialized\n");
         return false;
     }
     if (!create_display_texture() ||
+        !create_capture_readback() ||
         !create_present_root_signature() ||
         !create_present_pipeline()) {
         ged3d12_present_shutdown();
@@ -175,6 +202,7 @@ bool ged3d12_present_init(void) {
 void ged3d12_present_shutdown(void) {
     RELEASE_COM(s_present_pipeline);
     RELEASE_COM(s_present_root_signature);
+    RELEASE_COM(s_capture_readback);
     RELEASE_COM(s_display_texture);
     s_display_state = D3D12_RESOURCE_STATE_COMMON;
 }
@@ -237,5 +265,73 @@ bool ged3d12_present_record(
     transition(command_list, backbuffer,
                D3D12_RESOURCE_STATE_RENDER_TARGET,
                D3D12_RESOURCE_STATE_PRESENT);
+    return true;
+}
+
+bool ged3d12_present_capture_record(void) {
+    if (!s_display_texture || !s_capture_readback) {
+        fprintf(stderr, "ged3d12: present capture is not initialized\n");
+        return false;
+    }
+    ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
+    transition(command_list, s_display_texture, s_display_state,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = s_display_texture;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = s_capture_readback;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint.Footprint.Format =
+        DXGI_FORMAT_B8G8R8A8_UNORM;
+    destination.PlacedFootprint.Footprint.Width = PSP_WIDTH;
+    destination.PlacedFootprint.Footprint.Height = PSP_HEIGHT;
+    destination.PlacedFootprint.Footprint.Depth = 1;
+    destination.PlacedFootprint.Footprint.RowPitch = CAPTURE_ROW_PITCH;
+    command_list->CopyTextureRegion(
+        &destination, 0, 0, 0, &source, nullptr);
+
+    transition(command_list, s_display_texture,
+               D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    s_display_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    return true;
+}
+
+bool ged3d12_present_capture_write(const char *path) {
+    if (!path || !path[0] || !s_capture_readback) return false;
+    D3D12_RANGE read_range = {0, (SIZE_T)CAPTURE_BYTES};
+    uint8_t *data = nullptr;
+    if (!check_hr(s_capture_readback->Map(
+            0, &read_range, reinterpret_cast<void **>(&data)),
+            "map present capture readback")) {
+        return false;
+    }
+
+    FILE *file = fopen(path, "wb");
+    bool failed = !file ||
+        fprintf(file, "P6\n%u %u\n255\n", PSP_WIDTH, PSP_HEIGHT) < 0;
+    for (UINT y = 0; y < PSP_HEIGHT && !failed; y++) {
+        const uint8_t *row = data + (UINT64)y * CAPTURE_ROW_PITCH;
+        for (UINT x = 0; x < PSP_WIDTH; x++) {
+            const uint8_t rgb[3] = {
+                row[x * 4 + 2],
+                row[x * 4 + 1],
+                row[x * 4],
+            };
+            if (fwrite(rgb, 1, sizeof(rgb), file) != sizeof(rgb)) {
+                failed = true;
+                break;
+            }
+        }
+    }
+    if (file && fclose(file) != 0) failed = true;
+    D3D12_RANGE written_range = {0, 0};
+    s_capture_readback->Unmap(0, &written_range);
+    if (failed) {
+        fprintf(stderr, "ged3d12: cannot write present capture %s\n", path);
+        return false;
+    }
     return true;
 }

@@ -513,7 +513,7 @@ void sr_yield(CpuState *s) {
      * can never advance because nobody ever blocks. Deliver an overdue vblank from the yield
      * path too; deliver_vblank saves/restores the live register file and runs the handler with
      * s_cur = -1, so it is interrupt-safe here. */
-    if (s_pace_on > 0 && s_vtime_us >= s_vbl_next_us)
+    if (!s_pace_on || s_vtime_us >= s_vbl_next_us)
         deliver_vblank();
     TCB *t = &s_tcb[s_cur];
     /* Only switch if someone else could run; otherwise keep going (avoids pointless churn). */
@@ -915,7 +915,10 @@ void sched_run(uint32_t entry, uint32_t arglen, uint32_t argp, int create_start_
             for (int i = 0; i < s_ntcb; i++)
                 if ((s_tcb[i].state == TH_WAIT_DELAY || s_tcb[i].state == TH_WAIT_OBJ) &&
                     s_tcb[i].wake < soonest) soonest = s_tcb[i].wake;
-            if (soonest == (uint64_t)-1) break;   /* truly nothing runnable (all infinite waits) */
+            if (soonest == (uint64_t)-1) {
+                if (getenv("SCHED_DUMP")) sched_dump_threads();
+                break;   /* truly nothing runnable (all infinite waits) */
+            }
             if (!s_pace_on) {                     /* turbo: jump the clock over the wait */
                 if (soonest > s_vtime_us) s_vtime_us = soonest;
                 idx = pick_next();

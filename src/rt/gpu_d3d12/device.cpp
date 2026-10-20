@@ -37,6 +37,7 @@ extern "C" {
 #define DSV_DESCRIPTOR_COUNT 64u
 #define UPLOAD_BYTES_PER_FRAME (32ull * 1024ull * 1024ull)
 #define UPLOAD_BYTES (FRAME_COUNT * UPLOAD_BYTES_PER_FRAME)
+#define UPLOAD_OVERFLOW_SLAB_COUNT 16u
 
 #define RELEASE_COM(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
 
@@ -46,6 +47,13 @@ static const uint8_t k_psp_vs_dxil[] =
 static const uint8_t k_psp_ps_dxil[] =
 #include "shaders/psp_ps.inc"
 ;
+
+struct UploadSlab {
+    ID3D12Resource *resource;
+    uint8_t *map;
+    UINT64 cursor;
+    UINT64 size;
+};
 
 struct FrameContext {
     ID3D12CommandAllocator *allocator;
@@ -59,6 +67,8 @@ struct FrameContext {
     UINT sampler_begin;
     UINT sampler_cursor;
     UINT sampler_end;
+    UploadSlab upload_overflow[UPLOAD_OVERFLOW_SLAB_COUNT];
+    UINT upload_overflow_count;
 };
 
 static SDL_Window *s_window;
@@ -102,6 +112,7 @@ static uint8_t *s_upload_map;
 static uint32_t s_buttons;
 static uint8_t s_lx = 128, s_ly = 128;
 static int s_pad_present;
+static char s_capture_path[1024];
 static int s_vertex_log;
 static int s_framebuffer_safe;
 static int s_destination_safe;
@@ -148,6 +159,21 @@ static int wait_queue_idle(ID3D12CommandQueue *queue, ID3D12Fence *fence,
     return wait_for_fence(fence, value, event_handle, operation);
 }
 
+static void release_upload_overflow(FrameContext *frame) {
+    for (UINT i = 0; i < frame->upload_overflow_count; i++) {
+        UploadSlab *slab = &frame->upload_overflow[i];
+        if (slab->resource && slab->map) {
+            D3D12_RANGE written = {0, 0};
+            slab->resource->Unmap(0, &written);
+        }
+        slab->map = nullptr;
+        RELEASE_COM(slab->resource);
+        slab->cursor = 0;
+        slab->size = 0;
+    }
+    frame->upload_overflow_count = 0;
+}
+
 static void release_device(void) {
     if (s_swapchain) s_swapchain->SetFullscreenState(FALSE, nullptr);
     wait_queue_idle(s_graphics_queue, s_graphics_fence, &s_next_graphics_fence,
@@ -168,6 +194,7 @@ static void release_device(void) {
     RELEASE_COM(s_upload);
 
     for (UINT i = 0; i < FRAME_COUNT; i++) {
+        release_upload_overflow(&s_frames[i]);
         RELEASE_COM(s_backbuffers[i]);
         RELEASE_COM(s_frames[i].allocator);
         memset(&s_frames[i], 0, sizeof(s_frames[i]));
@@ -192,6 +219,7 @@ static void release_device(void) {
     s_next_graphics_fence = 1;
     s_next_copy_fence = 1;
     s_active_frame = UINT32_MAX;
+    s_capture_path[0] = '\0';
     s_backbuffer_width = 0;
     s_backbuffer_height = 0;
     s_srv_stride = 0;
@@ -814,6 +842,7 @@ static int begin_frame(UINT *frame_index) {
                         "wait for frame fence")) {
         return 0;
     }
+    release_upload_overflow(frame);
     frame->upload_cursor = frame->upload_begin;
     frame->srv_cursor = frame->srv_begin;
     frame->sampler_cursor = frame->sampler_begin;
@@ -842,14 +871,75 @@ bool ged3d12_upload_alloc(UINT64 size, UINT64 alignment, GeD3D12UploadSlice *out
     }
     FrameContext *frame = &s_frames[s_active_frame];
     UINT64 offset = align_up(frame->upload_cursor, alignment);
-    if (offset > frame->upload_end || size > frame->upload_end - offset) {
-        fprintf(stderr, "ged3d12: frame upload ring exhausted (%llu bytes requested)\n",
-                (unsigned long long)size);
-        return false;
+    if (offset <= frame->upload_end && size <= frame->upload_end - offset) {
+        frame->upload_cursor = offset + size;
+        out->resource = s_upload;
+        out->cpu = s_upload_map + offset;
+        out->gpu = s_upload->GetGPUVirtualAddress() + offset;
+        out->offset = offset;
+        out->size = size;
+        return true;
     }
-    frame->upload_cursor = offset + size;
-    out->cpu = s_upload_map + offset;
-    out->gpu = s_upload->GetGPUVirtualAddress() + offset;
+
+    UploadSlab *slab = nullptr;
+    if (frame->upload_overflow_count) {
+        UploadSlab *candidate =
+            &frame->upload_overflow[frame->upload_overflow_count - 1];
+        offset = align_up(candidate->cursor, alignment);
+        if (offset <= candidate->size && size <= candidate->size - offset)
+            slab = candidate;
+    }
+    if (!slab) {
+        if (frame->upload_overflow_count >= UPLOAD_OVERFLOW_SLAB_COUNT ||
+            size > UINT64_MAX - (alignment - 1)) {
+            fprintf(stderr,
+                    "ged3d12: frame upload overflow exhausted "
+                    "(%llu bytes requested)\n",
+                    (unsigned long long)size);
+            return false;
+        }
+        UINT64 slab_size = align_up(size, alignment);
+        if (slab_size < UPLOAD_BYTES_PER_FRAME)
+            slab_size = UPLOAD_BYTES_PER_FRAME;
+
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
+        D3D12_RESOURCE_DESC resource = {};
+        resource.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        resource.Width = slab_size;
+        resource.Height = 1;
+        resource.DepthOrArraySize = 1;
+        resource.MipLevels = 1;
+        resource.SampleDesc.Count = 1;
+        resource.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        UploadSlab created = {};
+        if (!check_hr(s_device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &resource,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&created.resource)),
+                "create frame upload overflow")) {
+            return false;
+        }
+        D3D12_RANGE read_range = {0, 0};
+        if (!check_hr(created.resource->Map(
+                0, &read_range, reinterpret_cast<void **>(&created.map)),
+                "map frame upload overflow")) {
+            RELEASE_COM(created.resource);
+            return false;
+        }
+        created.size = slab_size;
+        slab = &frame->upload_overflow[frame->upload_overflow_count++];
+        *slab = created;
+        offset = 0;
+    }
+
+    slab->cursor = offset + size;
+    out->resource = slab->resource;
+    out->cpu = slab->map + offset;
+    out->gpu = slab->resource->GetGPUVirtualAddress() + offset;
     out->offset = offset;
     out->size = size;
     return true;
@@ -1106,7 +1196,7 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
         memset(upload.cpu, 0, (size_t)upload_size);
         convert_framebuffer(static_cast<uint8_t *>(upload.cpu), row_pitch,
                             fbaddr, format, stride);
-        source.pResource = s_upload;
+        source.pResource = upload.resource;
         source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         source.PlacedFootprint.Offset = upload.offset;
         source.PlacedFootprint.Footprint.Format =
@@ -1125,6 +1215,8 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
             s_backbuffer_width, s_backbuffer_height)) {
         return -2;
     }
+    const bool capture_requested = s_capture_path[0] != '\0';
+    if (capture_requested && !ged3d12_present_capture_record()) return -2;
     if (!check_hr(s_command_list->Close(), "close graphics command list"))
         return -2;
 
@@ -1142,6 +1234,15 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
         HRESULT removed = s_device->GetDeviceRemovedReason();
         if (FAILED(removed)) check_hr(removed, "D3D12 device removed reason");
         return -2;
+    }
+    if (capture_requested) {
+        if (!wait_for_fence(s_graphics_fence, fence_value, s_graphics_event,
+                            "wait for present capture") ||
+            !ged3d12_present_capture_write(s_capture_path)) {
+            return -2;
+        }
+        fprintf(stderr, "ged3d12: captured presented frame -> %s\n", s_capture_path);
+        s_capture_path[0] = '\0';
     }
     if (s_framebuffer_safe && cached_framebuffer &&
         !ged3d12_framebuffer_safe_readback(
@@ -1202,6 +1303,16 @@ extern "C" void ged3d12_analog(uint8_t *lx, uint8_t *ly) {
     if (ly) *ly = s_ly;
 }
 extern "C" int ged3d12_pad_present(void) { return s_pad_present; }
+extern "C" int ged3d12_capture_next(const char *path) {
+    if (!path || !path[0] || s_capture_path[0]) return 0;
+    size_t length = strlen(path);
+    if (length >= sizeof(s_capture_path)) {
+        fprintf(stderr, "ged3d12: capture path is too long\n");
+        return 0;
+    }
+    memcpy(s_capture_path, path, length + 1);
+    return 1;
+}
 
 ID3D12Device *ged3d12_device(void) { return s_device; }
 ID3D12GraphicsCommandList *ged3d12_command_list(void) { return s_command_list; }
@@ -1212,7 +1323,6 @@ ID3D12DescriptorHeap *ged3d12_sampler_heap(void) { return s_sampler_heap; }
 ID3D12DescriptorHeap *ged3d12_rtv_heap(void) { return s_rtv_heap; }
 ID3D12DescriptorHeap *ged3d12_dsv_heap(void) { return s_dsv_heap; }
 ID3D12RootSignature *ged3d12_root_signature(void) { return s_root_signature; }
-ID3D12Resource *ged3d12_upload_resource(void) { return s_upload; }
 D3D12_SHADER_BYTECODE ged3d12_vertex_shader(void) {
     D3D12_SHADER_BYTECODE shader = {k_psp_vs_dxil, sizeof(k_psp_vs_dxil)};
     return shader;

@@ -21,5 +21,7 @@ bool ged3d12_present_record(
     D3D12_CPU_DESCRIPTOR_HANDLE backbuffer_rtv,
     UINT output_width,
     UINT output_height);
+bool ged3d12_present_capture_record(void);
+bool ged3d12_present_capture_write(const char *path);
 
 #endif

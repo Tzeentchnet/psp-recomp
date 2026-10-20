@@ -335,7 +335,7 @@ static bool upload_color(ColorTarget *target) {
     destination_location.pResource = target->resource;
     destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_TEXTURE_COPY_LOCATION source_location = {};
-    source_location.pResource = ged3d12_upload_resource();
+    source_location.pResource = upload.resource;
     source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     source_location.PlacedFootprint.Offset = upload.offset;
     source_location.PlacedFootprint.Footprint.Format =
@@ -374,7 +374,7 @@ static bool upload_depth(DepthTarget *depth) {
     destination.pResource = depth->resource;
     destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_TEXTURE_COPY_LOCATION source = {};
-    source.pResource = ged3d12_upload_resource();
+    source.pResource = upload.resource;
     source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     source.PlacedFootprint.Offset = upload.offset;
     source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_D16_UNORM;

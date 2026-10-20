@@ -153,7 +153,20 @@ static uint32_t h_GetSystemParamInt(CpuState *s) {
     if (getenv("SR_LANGLOG")) fprintf(stderr, "GetSystemParamInt id=%u -> %u\n", id, v);
     return 0;
 }
-/* sceUtilityGetSystemParamString(id, char *out, int len): nickname etc. Write a short ASCII name. */
+static uint32_t h_GetSystemParamString(CpuState *s) {
+    static const char nickname[] = "shadow";
+    uint32_t id = A0, out = A1, size = A2;
+    if (id != 1) return 0x80110103u;   /* INVALID_SYSTEM_PARAM_ID */
+    if (size <= strlen(nickname)) return 0x80110102u;   /* STRING_TOO_LONG */
+    if (!out || !sr_inrange(out) || size - 1 > UINT32_MAX - out ||
+        !sr_inrange(out + size - 1)) {
+        return UINT32_MAX;
+    }
+    for (uint32_t i = 0; i < size; i++) MEM_W8(out + i, 0);
+    for (uint32_t i = 0; i < sizeof(nickname) - 1; i++)
+        MEM_W8(out + i, (uint8_t)nickname[i]);
+    return 0;
+}
 /* sceCtrlGetIdleCancelThreshold(int *idlereset, int *idleback): both thresholds "disabled". */
 static uint32_t h_CtrlGetIdleCancelThreshold(CpuState *s) {
     if (A0) MEM_W32(A0, 0xFFFFFFFFu);   /* -1 = idle cancel disabled (PPSSPP default) */
@@ -677,6 +690,19 @@ static uint32_t h_AtracGetLoopStatus(CpuState *s) {
     return 0;
 }
 static uint32_t h_AtracSetLoopNum(CpuState *s) { Atrac *a = atrac_of(A0); if (a) a->loopNum = (int)A1; return 0; }
+static uint32_t h_AtracGetBufferInfoForResetting(CpuState *s) {
+    Atrac *a = atrac_of(A0);
+    if (!a) return 0x80630002u;
+    if ((uint32_t)A1 > (uint32_t)a->endSample) return 0x80630015u;
+    if (!A2 || A2 > UINT32_MAX - 31u || !sr_inrange(A2) || !sr_inrange(A2 + 31u))
+        return 0x800200d3u;
+
+    /* SetDataAndGetID models an all-data-loaded buffer, so neither reset buffer needs refilling. */
+    for (uint32_t off = 0; off < 32u; off += 4u) MEM_W32(A2 + off, 0);
+    MEM_W32(A2 + 0, a->buf);
+    MEM_W32(A2 + 16, a->buf);
+    return 0;
+}
 static uint32_t h_AtracResetPlayPosition(CpuState *s) { Atrac *a = atrac_of(A0); if (a) a->posSample = (int)A1; return 0; }
 
 /* sceUtility dialogs (savedata/msg/osk). Faithful to PPSSPP's PSPDialog status machine
@@ -1957,6 +1983,7 @@ static void sr_dump_calls(void) {
 typedef struct { uint32_t btn; uint8_t lx, ly; } CtrlSample;
 static CtrlSample s_ctrl_ring[CTRL_RING] = { [0 ... CTRL_RING-1] = { 0, 128, 128 } };
 static int s_ctrl_w = 1, s_ctrl_r = 0;   /* start with one sample available */
+static uint32_t s_present_count = 0;
 #define CTRL_WAIT_OBJ 0xC471D000u
 
 /* sceCtrl: sticks centred. To drive past the skippable intro movie and confirmation prompts
@@ -1967,11 +1994,12 @@ static uint32_t h_CtrlButtons(void) {
      * window environment no key is ever pressed, so without the pulse the intro movie never gets
      * its START and loops forever. SR_NOINPUT disables the pulse for a neutral pad. */
     uint32_t keys = gui_on() ? gui_buttons() : 0;
-    /* SR_PADSCRIPT=<file>: lines of "frame hexmask width" -- press mask at frame for width
-     * frames. Lets an unattended run navigate menus deterministically; replaces the default
-     * START pulse entirely when present. */
+    /* SR_PADSCRIPT=<file>: v3 uses PPSSPP vblanks and runtime presentations so turbo-mode
+     * scheduler timing cannot make runtime inputs expire before a screen appears. Legacy
+     * three-column scripts and v2 continue to use runtime vblanks. */
     {
         static int scr_n = -1;
+        static int scr_present_timing;
         static struct { uint32_t f, mask; uint32_t w; } scr[256];
         if (scr_n < 0) {
             scr_n = 0;
@@ -1979,16 +2007,50 @@ static uint32_t h_CtrlButtons(void) {
             if (sp) {
                 FILE *fp = fopen(sp, "r");
                 if (fp) {
-                    while (scr_n < 256 &&
-                           fscanf(fp, "%u %x %u", &scr[scr_n].f, &scr[scr_n].mask, &scr[scr_n].w) == 3)
-                        scr_n++;
+                    char line[160];
+                    while (scr_n < 256 && fgets(line, sizeof(line), fp)) {
+                        uint32_t pf, rf, mask, pw, rw;
+                        char extra;
+                        char *p = line;
+                        while (*p == ' ' || *p == '\t') p++;
+                        if (!*p || *p == '\r' || *p == '\n') continue;
+                        if (*p == '#') {
+                            if (strncmp(
+                                    p, "# psp-recomp pad script v3",
+                                    sizeof("# psp-recomp pad script v3") - 1) == 0)
+                                scr_present_timing = 1;
+                            continue;
+                        }
+                        if (sscanf(p, "%u %u %x %u %u %c",
+                                   &pf, &rf, &mask, &pw, &rw, &extra) == 5) {
+                            scr[scr_n].f = rf;
+                            scr[scr_n].mask = mask;
+                            scr[scr_n].w = rw;
+                            scr_n++;
+                        } else if (sscanf(p, "%u %x %u %c", &rf, &mask, &rw, &extra) == 3) {
+                            scr[scr_n].f = rf;
+                            scr[scr_n].mask = mask;
+                            scr[scr_n].w = rw;
+                            scr_n++;
+                        } else {
+                            fprintf(stderr, "SR_PADSCRIPT: malformed line: %s", line);
+                            fclose(fp);
+                            _Exit(2);
+                        }
+                    }
                     fclose(fp);
+                } else {
+                    fprintf(stderr, "SR_PADSCRIPT: cannot open %s\n", sp);
+                    _Exit(2);
                 }
             }
         }
         if (scr_n > 0) {
+            uint32_t frame =
+                scr_present_timing ? s_present_count : s_vcount_fwd;
             for (int i = 0; i < scr_n; i++)
-                if (s_vcount_fwd >= scr[i].f && s_vcount_fwd < scr[i].f + scr[i].w) keys |= scr[i].mask;
+                if (frame >= scr[i].f && frame < scr[i].f + scr[i].w)
+                    keys |= scr[i].mask;
             return keys;
         }
     }
@@ -2070,12 +2132,161 @@ static uint32_t h_CtrlReadBuffer(CpuState *s) { return ctrl_fill(A0, A1, 0); }
 static uint32_t h_CtrlPeekBuffer(CpuState *s) { return ctrl_fill_n(A0, A1, 0, 1); }
 
 /* sceDisplay: remember the framebuffer; vblank waits block until the next delivered vblank. */
-static void dump_fb_fmt(const char *path, uint32_t fbaddr, int fmt, uint32_t stride);
+static int dump_fb_fmt(const char *path, uint32_t fbaddr, int fmt, uint32_t stride);
 static uint32_t s_framebuf = 0, s_vcount = 0;
 static uint32_t s_last_flip_vcount = 0;   /* hang watchdog (see sr_vblank_tick) */
+
+#define FRAME_CAPTURE_COUNT 50
+typedef struct {
+    uint32_t present;
+    char name[64];
+} FrameCaptureRequest;
+
+static FrameCaptureRequest s_frame_capture[FRAME_CAPTURE_COUNT];
+static int s_frame_capture_initialized;
+static int s_frame_capture_next;
+static char s_frame_capture_dir[768];
+
+static void frame_capture_fail(const char *message, const char *detail) {
+    fprintf(stderr, "golden-frame capture: %s%s%s\n",
+            message, detail ? ": " : "", detail ? detail : "");
+    fflush(stderr);
+    _Exit(2);
+}
+
+static void frame_capture_init(void) {
+    const char *manifest = getenv("PSPRECOMP_CAPTURE_MANIFEST");
+    const char *output_dir;
+    FILE *f;
+    char line[256];
+    int count = 0, line_number = 0, seen_header = 0;
+    uint32_t previous_ppsspp_present = 0;
+
+    if (s_frame_capture_initialized) return;
+    s_frame_capture_initialized = 1;
+    if (!manifest || !manifest[0]) return;
+    output_dir = getenv("PSPRECOMP_CAPTURE_DIR");
+    if (!output_dir || !output_dir[0])
+        frame_capture_fail("PSPRECOMP_CAPTURE_DIR is required", NULL);
+    if (strlen(output_dir) >= sizeof(s_frame_capture_dir))
+        frame_capture_fail("capture directory path is too long", output_dir);
+    strcpy(s_frame_capture_dir, output_dir);
+
+    f = fopen(manifest, "rb");
+    if (!f) frame_capture_fail("cannot open manifest", manifest);
+    while (fgets(line, sizeof(line), f)) {
+        uint32_t ppsspp_present, present;
+        char name[64], scene[32], extra;
+        char *p = line;
+        int fields;
+        line_number++;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (!*p) continue;
+        if (*p == '#') {
+            if (strcmp(p, "# psp-recomp golden frames v2\n") == 0 ||
+                strcmp(p, "# psp-recomp golden frames v2\r\n") == 0)
+                seen_header = 1;
+            continue;
+        }
+        fields = sscanf(p, "%u %u %63s %31s %c",
+                        &ppsspp_present, &present, name, scene, &extra);
+        if (fields != 4) {
+            char detail[64];
+            snprintf(detail, sizeof(detail), "malformed line %d", line_number);
+            fclose(f);
+            frame_capture_fail("invalid manifest", detail);
+        }
+        if (count >= FRAME_CAPTURE_COUNT || !ppsspp_present || !present ||
+            (count && ppsspp_present <= previous_ppsspp_present) ||
+            (count && present <= s_frame_capture[count - 1].present) ||
+            strchr(name, '/') || strchr(name, '\\') ||
+            strlen(name) < 5 || strcmp(name + strlen(name) - 4, ".ppm") != 0) {
+            char detail[64];
+            snprintf(detail, sizeof(detail), "invalid request on line %d", line_number);
+            fclose(f);
+            frame_capture_fail("invalid manifest", detail);
+        }
+        for (int i = 0; i < count; i++) {
+            if (strcmp(name, s_frame_capture[i].name) == 0) {
+                char detail[64];
+                snprintf(detail, sizeof(detail), "duplicate name on line %d", line_number);
+                fclose(f);
+                frame_capture_fail("invalid manifest", detail);
+            }
+        }
+        s_frame_capture[count].present = present;
+        strcpy(s_frame_capture[count].name, name);
+        previous_ppsspp_present = ppsspp_present;
+        count++;
+    }
+    if (ferror(f)) {
+        fclose(f);
+        frame_capture_fail("cannot read manifest", manifest);
+    }
+    fclose(f);
+    if (!seen_header || count != FRAME_CAPTURE_COUNT)
+        frame_capture_fail("manifest must contain its v2 header and exactly 50 frames", manifest);
+    fprintf(stderr, "golden-frame capture: loaded %d requests from %s\n", count, manifest);
+}
+
+static int frame_capture_path(char *path, size_t path_size) {
+    FrameCaptureRequest *request;
+    int n;
+
+    frame_capture_init();
+    if (!s_frame_capture_dir[0] || s_frame_capture_next >= FRAME_CAPTURE_COUNT) return 0;
+    request = &s_frame_capture[s_frame_capture_next];
+    if (s_present_count < request->present) return 0;
+    if (s_present_count != request->present)
+        frame_capture_fail("runtime skipped a requested presented frame", request->name);
+    n = snprintf(path, path_size, "%s\\%s", s_frame_capture_dir, request->name);
+    if (n < 0 || (size_t)n >= path_size)
+        frame_capture_fail("capture output path is too long", request->name);
+    return 1;
+}
+
+static void frame_capture_complete(
+    uint32_t fbaddr, int fmt, uint32_t stride,
+    const char *path, int captured_by_d3d12) {
+    char complete_path[1024];
+    int n;
+    FILE *done;
+
+    if (!captured_by_d3d12 && dump_fb_fmt(path, fbaddr, fmt, stride) != 0)
+        frame_capture_fail("cannot write frame", path);
+    fprintf(stderr, "golden-frame capture: present %u vblank %u%s -> %s\n",
+            s_present_count, s_vcount,
+            captured_by_d3d12 ? " d3d12" : "", path);
+    s_frame_capture_next++;
+    if (s_frame_capture_next != FRAME_CAPTURE_COUNT) return;
+
+    n = snprintf(complete_path, sizeof(complete_path),
+                 "%s\\capture.complete", s_frame_capture_dir);
+    if (n < 0 || (size_t)n >= sizeof(complete_path))
+        frame_capture_fail("completion path is too long", s_frame_capture_dir);
+    done = fopen(complete_path, "wb");
+    if (!done || fprintf(done, "%d\n", FRAME_CAPTURE_COUNT) < 0 || fclose(done) != 0)
+        frame_capture_fail("cannot write completion marker", complete_path);
+    fprintf(stderr, "golden-frame capture: completed %d frames\n", FRAME_CAPTURE_COUNT);
+    sr_trace_close();
+    fflush(stderr);
+    _Exit(0);
+}
+
 static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
+    char capture_path[1024];
+    int capture_requested = 0;
+    int captured_by_d3d12 = 0;
+
     s_framebuf = A0;
     s_last_flip_vcount = s_vcount;
+    if (s_framebuf) {
+        s_present_count++;
+        capture_requested = frame_capture_path(
+            capture_path, sizeof(capture_path));
+        if (capture_requested && gui_on())
+            captured_by_d3d12 = gui_capture_next(capture_path);
+    }
     /* SR_GEWATCH: interleave presents with GELIST lines to expose draw-vs-present ordering. */
     {
         static int gw = -1, gwa = 0;
@@ -2087,6 +2298,10 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
     /* Interactive window: show this finished frame and sample the keyboard (A1=bufferwidth,
      * A2=pixelformat 0=5650/1=5551/2=4444/3=8888). */
     if (gui_on() && s_framebuf) gui_present(s_framebuf, (int)A2, A1);
+    if (capture_requested)
+        frame_capture_complete(
+            s_framebuf, (int)A2, A1 ? A1 : 512,
+            capture_path, captured_by_d3d12);
     /* SR_FBSNAP=<N>: dump the presented framebuffer every N frames into a rotating set of
      * PPMs so an unattended run can be observed after the fact (8 most recent kept). */
     {
@@ -2130,11 +2345,14 @@ static uint32_t h_DisplayGetFrameBuf(CpuState *s) {
 }
 
 /* Dump a PSP framebuffer to a binary PPM. fmt: 0=5650, 1=5551, 2=4444, 3=8888. */
-static void dump_fb_fmt(const char *path, uint32_t fbaddr, int fmt, uint32_t stride) {
+static int dump_fb_fmt(const char *path, uint32_t fbaddr, int fmt, uint32_t stride) {
     FILE *f = fopen(path, "wb");
-    if (!f) return;
+    if (!f) return -1;
     if (!stride) stride = 512;
-    fprintf(f, "P6\n480 272\n255\n");
+    if (fprintf(f, "P6\n480 272\n255\n") < 0) {
+        fclose(f);
+        return -1;
+    }
     for (int y = 0; y < 272; y++)
         for (int x = 0; x < 480; x++) {
             unsigned char rgb[3];
@@ -2157,10 +2375,14 @@ static void dump_fb_fmt(const char *path, uint32_t fbaddr, int fmt, uint32_t str
                     rgb[2] = (unsigned char)(((p >> 11) & 0x1F) * 255 / 31);
                 }
             }
-            fwrite(rgb, 1, 3, f);
+            if (fwrite(rgb, 1, 3, f) != 3) {
+                fclose(f);
+                return -1;
+            }
         }
-    fclose(f);
+    if (fclose(f) != 0) return -1;
     fprintf(stderr, "dumped framebuffer 0x%08x fmt=%d stride=%u -> %s\n", fbaddr, fmt, stride, path);
+    return 0;
 }
 static void dump_fb(const char *path, uint32_t fbaddr) { dump_fb_fmt(path, fbaddr, 3, 512); }
 
@@ -2491,6 +2713,7 @@ void sr_hle_init(void) {
     /* Boot setup batch (return success / reference value). */
     sr_hle_register(0x4ac57943, "sceKernelRegisterExitCallback", h_ok);
     sr_hle_register(0xa5da2406, "sceUtilityGetSystemParamInt", h_GetSystemParamInt);
+    sr_hle_register(0x34b78343, "sceUtilityGetSystemParamString", h_GetSystemParamString);
     sr_hle_register(0x36aa6e91, "sceImposeSetLanguageMode", h_ImposeSetLanguageMode);
     sr_hle_register(0x24fd7bcf, "sceImposeGetLanguageMode", h_ImposeGetLanguageMode);
     /* sceUtility dialogs (OSK / savedata / netconf): no dialog active -> status 0, calls ok. */
@@ -2553,6 +2776,7 @@ void sr_hle_init(void) {
     sr_hle_register(0xa2bba8be, "sceAtracGetSoundSample", h_AtracGetSoundSample);
     sr_hle_register(0xfaa4f89b, "sceAtracGetLoopStatus", h_AtracGetLoopStatus);
     sr_hle_register(0x868120b5, "sceAtracSetLoopNum", h_AtracSetLoopNum);
+    sr_hle_register(0x2dd3e298, "sceAtracGetBufferInfoForResetting", h_AtracGetBufferInfoForResetting);
     sr_hle_register(0x644e5607, "sceAtracResetPlayPosition", h_AtracResetPlayPosition);
     sr_hle_register(0x707b7629, "sceMpegFlushAllStream", h_ok);
     /* sceLibFont (firmware fonts absent; valid handles + empty glyphs). */

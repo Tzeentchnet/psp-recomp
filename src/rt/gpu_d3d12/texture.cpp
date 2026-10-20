@@ -276,7 +276,7 @@ static bool upload_entry(TextureEntry *entry) {
         source_location.PlacedFootprint.Footprint.Height = height;
         source_location.PlacedFootprint.Footprint.Depth = 1;
         source_location.PlacedFootprint.Footprint.RowPitch = row_pitch;
-        source_location.pResource = ged3d12_upload_resource();
+        source_location.pResource = upload.resource;
 
         D3D12_TEXTURE_COPY_LOCATION destination_location = {};
         destination_location.pResource = entry->resource;

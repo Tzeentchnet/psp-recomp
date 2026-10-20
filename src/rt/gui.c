@@ -324,6 +324,14 @@ int gui_on(void) { return s_on; }
 uint32_t gui_buttons(void) { return s_buttons; }
 void gui_analog(uint8_t *lx, uint8_t *ly) { if (lx) *lx = s_lx; if (ly) *ly = s_ly; }
 int gui_pad_present(void) { return s_pad_present; }
+int gui_capture_next(const char *path) {
+#ifdef SR_D3D12
+    if (s_on && s_d3d12) return ged3d12_capture_next(path);
+#else
+    (void)path;
+#endif
+    return 0;
+}
 
 /* Present a framebuffer at guest address fbaddr. fmt: 0=5650, 1=5551, 2=4444, 3=8888.
  * stride is in pixels (PSP buffer width, typically 512). */

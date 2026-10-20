@@ -123,6 +123,17 @@ Set these environment variables before running the game to control runtime featu
   an intentionally expensive resource-transition diagnostic; native draw submission remains disabled.
 - `SR_D3D12_PSO_LOG=1`: Print synchronous GE PSO creation and final cache statistics.
 - `SR_D3D12_WARP=1`: Select Microsoft WARP instead of a hardware adapter.
+- `PSPRECOMP_CAPTURE_MANIFEST=<path>` and `PSPRECOMP_CAPTURE_DIR=<directory>`: Capture the
+  strict 50-frame golden manifest. With the D3D12 backend, frames are read back from the
+  480x272 GPU display texture after presentation conversion; other presenters use the
+  authoritative guest framebuffer. A successful sequence writes `capture.complete`.
+- `SR_PADSCRIPT=<path>`: Inject deterministic controller pulses. Golden pad-script v3 entries
+  contain a PPSSPP vblank index, a runtime presentation index, a shared PSP button mask, and
+  backend-specific widths; the runtime consumes presentation-timed values so turbo scheduler
+  variance cannot consume inputs before a menu appears. Legacy three-column and v2 scripts retain
+  runtime-vblank timing.
+- `PSP_VFPU_TABLES=<directory>`: Override the `assets/vfpu` lookup-table directory. The golden
+  harness sets this explicitly so runtime execution does not depend on its working directory.
 - `SR_GPU_GE` / `SR_VIDEO=gdi`: Legacy Vulkan/software and presenter overrides.
 - `SR_GPU_LOG=1`: Print GPU cache flushes and batch information to the console.
 - `SR_IOLOG=1`: Print all file system access logs.

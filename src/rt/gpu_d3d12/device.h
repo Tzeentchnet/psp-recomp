@@ -17,6 +17,7 @@ const GeBackend *ged3d12_backend(void);
 uint32_t ged3d12_buttons(void);
 void     ged3d12_analog(uint8_t *lx, uint8_t *ly);
 int      ged3d12_pad_present(void);
+int ged3d12_capture_next(const char *path);
 
 #ifdef __cplusplus
 }
@@ -24,6 +25,7 @@ int      ged3d12_pad_present(void);
 #include <d3d12.h>
 
 struct GeD3D12UploadSlice {
+    ID3D12Resource *resource;
     void *cpu;
     D3D12_GPU_VIRTUAL_ADDRESS gpu;
     UINT64 offset;
@@ -63,7 +65,6 @@ ID3D12DescriptorHeap *ged3d12_sampler_heap(void);
 ID3D12DescriptorHeap *ged3d12_rtv_heap(void);
 ID3D12DescriptorHeap *ged3d12_dsv_heap(void);
 ID3D12RootSignature *ged3d12_root_signature(void);
-ID3D12Resource *ged3d12_upload_resource(void);
 D3D12_SHADER_BYTECODE ged3d12_vertex_shader(void);
 D3D12_SHADER_BYTECODE ged3d12_pixel_shader(void);
 bool ged3d12_graphics_wait_idle(void);
