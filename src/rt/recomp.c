@@ -31,6 +31,7 @@ void sr_oor(uint32_t a, uint32_t v, int store) {
 #define SR_RAM_SIZE  0x04000000u  /* 64 MB user RAM at 0x08000000 */
 
 void sr_mem_init(void) {
+    sr_configure_fpu();
     if (!g_mem) {
         /* One arena covering VRAM (0x04000000..) and user RAM (0x08000000..). g_mem points at
          * the user-RAM base so SR_RAM_BASE stays 0x08000000; the VRAM span sits below it. */

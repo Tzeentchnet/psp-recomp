@@ -44,6 +44,38 @@ def emit_dispatch_table(addresses):
     ]
 
 
+def load_hot_functions(path):
+    addresses = set()
+    with open(path, "r", encoding="ascii") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            fields = line.split()
+            if not fields or not fields[0].startswith("0x"):
+                continue
+            try:
+                addresses.add(int(fields[0], 16))
+            except ValueError as exc:
+                raise ValueError(
+                    f"{path}:{line_number}: invalid hot function address {fields[0]!r}"
+                ) from exc
+    return addresses
+
+
+def chunk_functions(functions, byte_limit):
+    parts = []
+    current = []
+    size = 0
+    for function in functions:
+        current.append(function)
+        size += sum(len(line) + 1 for line in function)
+        if size >= byte_limit:
+            parts.append(current)
+            current = []
+            size = 0
+    if current:
+        parts.append(current)
+    return parts
+
+
 def rs(w): return (w >> 21) & 0x1F
 def rt(w): return (w >> 16) & 0x1F
 def rd(w): return (w >> 11) & 0x1F
@@ -826,9 +858,13 @@ def main(argv):
     args = [a for a in argv[1:] if not a.startswith("--")]
     opts = [a for a in argv[1:] if a.startswith("--")]
     if len(args) < 2:
-        sys.stderr.write("usage: codegen.py <elf> <out.c> [--base=HEX] [--jumptables=TOML] [--overrides=TOML]\n")
+        sys.stderr.write(
+            "usage: codegen.py <elf> <out.c> [--base=HEX] [--jumptables=TOML] "
+            "[--overrides=TOML] [--hot-functions=TXT]\n"
+        )
         return 2
     base = None
+    hot_path = None
     for o in opts:
         if o.startswith("--base="):
             base = int(o.split("=", 1)[1], 16)
@@ -838,6 +874,8 @@ def main(argv):
             gotos, jal_next = cx.load_overrides(o.split("=", 1)[1])
             JUMPTABLES.update(gotos)
             JAL_NEXT.update(jal_next)
+        elif o.startswith("--hot-functions="):
+            hot_path = o.split("=", 1)[1]
     elf = Elf(args[0], base=base)
     ranges = exec_ranges(elf)
     known, _ = analyze(elf)
@@ -932,21 +970,43 @@ def main(argv):
             f.write("\n".join([banner, f"#ifndef {guard}", f"#define {guard}"] + includes + [""] + helpers
                               + protos + ["void sr_register_all(void);", "#endif", ""]))
         tu_head = [banner, f'#include "{stem}.h"', ""]
-        parts, cur, size = [], [], 0
-        for fn in funcs:
-            cur.append(fn)
-            size += sum(len(ln) + 1 for ln in fn)
-            if size >= chunk:
-                parts.append(cur)
-                cur, size = [], 0
-        if cur:
-            parts.append(cur)
-        for i, part in enumerate(parts):
-            with open(os.path.join(out_dir, f"{stem}_{i:03d}.c"), "w", encoding="ascii", newline="\n") as f:
-                f.write("\n".join(tu_head + [ln for fn in part for ln in fn]) + "\n")
+        if hot_path:
+            hot_addresses = load_hot_functions(hot_path)
+            if not (hot_addresses & known):
+                raise ValueError(
+                    f"{hot_path}: no listed hot function belongs to the generated image"
+                )
+            if known:
+                hot_addresses.add(min(known))
+            paired = list(zip(sorted(known), funcs))
+            hot_funcs = [function for address, function in paired if address in hot_addresses]
+            cold_funcs = [function for address, function in paired if address not in hot_addresses]
+            groups = [
+                ("hot", chunk_functions(hot_funcs, chunk)),
+                ("cold", chunk_functions(cold_funcs, chunk)),
+            ]
+        else:
+            hot_funcs = []
+            groups = [("", chunk_functions(funcs, chunk))]
+        part_count = 0
+        for kind, parts in groups:
+            for i, part in enumerate(parts):
+                suffix = f"_{kind}_{i:03d}" if kind else f"_{i:03d}"
+                with open(
+                    os.path.join(out_dir, f"{stem}{suffix}.c"),
+                    "w", encoding="ascii", newline="\n",
+                ) as f:
+                    f.write("\n".join(tu_head + [ln for fn in part for ln in fn]) + "\n")
+                part_count += 1
         with open(os.path.join(out_dir, f"{stem}_register.c"), "w", encoding="ascii", newline="\n") as f:
             f.write("\n".join([banner, f'#include "{stem}.h"', ""] + register))
-        print(f"wrote {out_dir}/{stem}.h + {len(parts)} TUs + {stem}_register.c: "
+        split_summary = f"{part_count} TUs"
+        if hot_path:
+            split_summary = (
+                f"{len(groups[0][1])} hot + {len(groups[1][1])} cold TUs "
+                f"({len(hot_funcs)} hot functions)"
+            )
+        print(f"wrote {out_dir}/{stem}.h + {split_summary} + {stem}_register.c: "
               f"{len(emitted)}/{len(known)} functions ({len(stubbed)} trapping stubs)")
     if stubbed:
         sp = os.path.join(os.path.dirname(args[1]) or ".", "stubs.txt")

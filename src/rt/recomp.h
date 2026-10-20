@@ -80,6 +80,7 @@ static inline void sr_w32(uint32_t a, uint32_t v) { if (sr_inrange(a)) { int w=s
 #define MEM_W32(a,v) sr_w32((a), (uint32_t)(v))
 
 void  sr_mem_init(void);
+void  sr_configure_fpu(void);
 void  sr_load_segment(uint32_t vaddr, const void *data, uint32_t len);
 uint32_t sr_loaded_start(void); /* lowest guest address the loader wrote (module start) */
 uint32_t sr_loaded_end(void);   /* highest guest address the loader wrote (module end incl. BSS) */
