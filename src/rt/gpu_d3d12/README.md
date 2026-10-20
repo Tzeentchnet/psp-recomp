@@ -11,18 +11,19 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 - a D3D12 device, direct and copy queues, timeline fences, and a three-buffer
   flip-discard swapchain;
 - shader-visible CBV/SRV/UAV descriptor rings plus RTV and DSV heaps;
-- a 28-DWORD `b0` GE-state root block, `t0` texture/`t1` CLUT table, dynamic
-  `s0` sampler table, and static clamp-nearest `s1`/clamp-linear `s2` samplers;
+- a 40-DWORD `b0` GE-state root block, `t0` texture plus `t2`/`t3` destination
+  tables, dynamic `s0` sampler table, static clamp-nearest `s1`/clamp-linear `s2` samplers,
+  and a vertex-visible space-1 `t0` raw-buffer root SRV;
 - a shader-visible dynamic sampler ring partitioned by fenced frame;
 - a persistently mapped, three-frame upload ring;
 - capture of `ge.c`'s fully decoded primitive stream into the HLSL shader's exact
-  32-byte vertex ABI, including PSP flat-shading colors, 1/16-pixel snapping, sprite
-  expansion, and line/point quad expansion;
+  32-byte raw-load ABI, including PSP flat-shading colors, 1/16-pixel snapping, sprite
+  expansion, line/point quad expansion, and one state record per logical GE draw;
 - immutable GE list/draw context on every captured batch, emitted as nested PIX events
   when the deferred D3D12 command list is recorded;
-- a collision-safe 512-entry PSO cache keyed by a canonical 16-byte projection of
-  blend, color-write, depth, cull, and attachment-format state, with synchronous
-  creation on first use;
+- a collision-safe 512-entry asynchronous PSO cache keyed by a canonical 16-byte
+  projection of blend, color-write, depth, cull, and attachment-format state, backed by
+  `ID3D12PipelineLibrary` and an exact no-cull ubershader fallback;
 - a collision-safe 512-entry texture cache with canonical metadata/CLUT keys,
   immutable encoded-content versions, up to eight decoded RGBA8 mip uploads,
   per-frame SRV/sampler reuse, bounded staging, and queue-safe LRU eviction;
@@ -41,19 +42,25 @@ duplicating PSP vertex decoding. `ge.c` remains authoritative for all raw attrib
 formats, morph-before-skin decoding, through mode, indices, GE-exact CPU Bezier/B-spline
 tessellation, transform/lighting, clipping, and primitive assembly. Generated patch
 triangles, lines, and points cross the same `GeBackend` seam as ordinary primitives.
-Captured vertices and primitive-boundary records are copied into the active fenced
-upload-ring partition during presentation. The hooks still return zero, so the reference
-software rasterizer remains authoritative until native batches are submitted to GPU
-render targets.
+Captured vertices are copied into the active fenced upload-ring partition during
+presentation. `psp_vs.hlsl` indexes the upload GPU address with `SV_VertexID` and performs
+two aligned raw loads, so PSOs need no fixed input layout or per-frame IA vertex-buffer bind.
+Accepted primitives with the same immutable list/draw identity, kind and perspective mode
+append to one batch. The hooks still return zero, so the reference software rasterizer
+remains authoritative until native batches are submitted to GPU render targets.
 
 `pipeline_key.cpp` maps only PSO-static GE fields; shader constants, descriptors,
 scissor, and blend constants remain per-draw state and intentionally do not multiply the
-cache. Each captured batch stores its key and canonical 160-byte shader block before later
-GE commands mutate the live state.
-`pipeline.cpp` uses FNV-1a to select an open-addressed slot, confirms the full key on
-hits, compiles the embedded HLSL synchronously on misses, and binds the resulting PSO to
-the live command list. Draw submission is intentionally deferred while software
-presentation remains the reference path.
+cache. Each logical draw stores its key and canonical 160-byte shader block before later
+GE commands mutate the live state. Command recording compares that block exactly with the
+previous binding and skips an identical 40-DWORD root write while still restoring scissor.
+`pipeline.cpp` creates one no-cull ubershader PSO during device initialization and never
+compiles on the command-recording thread. The pixel shader uses `SV_IsFrontFace` for exact
+fallback culling, while a worker prewarms the hardware-cull variant and promotes later
+misses after a full-key check. A versioned, shader-hashed, key-sized, adapter-LUID-scoped
+`ID3D12PipelineLibrary` is capped at 64 MiB and published through a flushed temporary file
+plus atomic replace. Draw submission is intentionally deferred while software presentation
+remains the reference path.
 
 `texture_key.cpp` separates resource identity from sampling state. The 96-byte texture
 key retains the legal PSP mip chain, aligned buffer widths, format/swizzle state, and
@@ -130,8 +137,10 @@ first three presents and every 120th present, plus a shutdown summary.
 Set `SR_GPU_LOG=1` to print every D3D12 GE flush, one line per logical GE draw, each
 present, and a shutdown summary. Draw lines include the list address, command PC/opcode,
 captured batch/vertex counts, and framebuffer/texture handles.
-Set `SR_D3D12_PSO_LOG=1` to print synchronous PSO creations and a shutdown cache
-summary.
+Set `SR_D3D12_PSO_LOG=1` to print ubershader setup, asynchronous PSO sources, disk-cache
+writes, and a shutdown cache summary. `SR_D3D12_PSO_CACHE=<path>` overrides the default
+`%LOCALAPPDATA%\KZLRecomp\cache\d3d12-pipelines.bin`; set it to `0` to disable only disk
+persistence.
 Set `SR_D3D12_TEXTURE_LOG=1` to print texture-version misses and a shutdown summary of
 lookups, hits, uploads, invalidations, evictions, and live entries.
 Set `SR_D3D12_FRAMEBUFFER_LOG=1` to print target creation and a shutdown summary of

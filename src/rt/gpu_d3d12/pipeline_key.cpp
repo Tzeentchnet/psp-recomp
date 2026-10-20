@@ -32,3 +32,22 @@ uint64_t ged3d12_pipeline_key_hash(const GeD3D12PipelineKey *key) {
     }
     return hash;
 }
+
+void ged3d12_pipeline_uber_key(GeD3D12PipelineKey *out) {
+    GeState state = {};
+    ged3d12_pipeline_key_build(&state, 0, out);
+}
+
+bool ged3d12_pipeline_uber_compatible(
+    const GeD3D12PipelineKey *key) {
+    if (!key ||
+        (key->cull_mode != D3D12_CULL_MODE_NONE &&
+         key->cull_mode != D3D12_CULL_MODE_BACK)) {
+        return false;
+    }
+    GeD3D12PipelineKey candidate = *key;
+    candidate.cull_mode = D3D12_CULL_MODE_NONE;
+    GeD3D12PipelineKey uber;
+    ged3d12_pipeline_uber_key(&uber);
+    return memcmp(&candidate, &uber, sizeof(uber)) == 0;
+}

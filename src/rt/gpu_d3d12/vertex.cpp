@@ -80,19 +80,33 @@ static bool reserve_batch(void) {
 static bool begin_primitive(
     GeD3D12Primitive primitive, int perspective, uint32_t vertex_count,
     uint32_t *first) {
-    if (s_capture_failed ||
-        !reserve_vertices(vertex_count) ||
-        !reserve_batch()) {
+    if (s_capture_failed || !reserve_vertices(vertex_count)) {
         return false;
     }
     *first = s_vertex_count;
+    GeDebugContext debug = ge_debug_context();
+    if (s_batch_count) {
+        GeD3D12VertexBatch *last = &s_batches[s_batch_count - 1u];
+        if (last->first + last->count == s_vertex_count &&
+            last->primitive == primitive &&
+            last->perspective == (uint8_t)(perspective != 0) &&
+            last->list_id == debug.list_id &&
+            last->list_addr == debug.list_addr &&
+            last->draw_serial == debug.draw_serial &&
+            last->draw_pc == debug.draw_pc &&
+            last->draw_op == debug.draw_op) {
+            last->count += vertex_count;
+            s_primitive_count[primitive]++;
+            return true;
+        }
+    }
+    if (!reserve_batch()) return false;
     GeD3D12VertexBatch *batch = &s_batches[s_batch_count];
     batch->first = *first;
     batch->count = vertex_count;
     batch->primitive = primitive;
     batch->perspective = perspective != 0;
     batch->reserved = 0;
-    GeDebugContext debug = ge_debug_context();
     batch->list_id = debug.list_id;
     batch->list_addr = debug.list_addr;
     batch->draw_serial = debug.draw_serial;
@@ -115,6 +129,7 @@ static bool begin_primitive(
     ged3d12_shader_constants_build(
         ge_state_ptr(), perspective,
         primitive == GE_D3D12_PRIMITIVE_SPRITE,
+        primitive == GE_D3D12_PRIMITIVE_TRIANGLE,
         &batch->texture, &batch->shader);
     s_batch_count++;
     s_primitive_count[primitive]++;

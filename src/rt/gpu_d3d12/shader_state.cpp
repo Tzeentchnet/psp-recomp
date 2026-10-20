@@ -20,6 +20,7 @@ static uint32_t clamp_scissor_end(int value, uint32_t limit) {
 
 void ged3d12_shader_constants_build(
     const GeState *state, int perspective, int sprite_semantics,
+    int triangle_semantics,
     const GeD3D12TextureBinding *texture,
     GeD3D12ShaderConstants *out) {
     memset(out, 0, sizeof(*out));
@@ -51,6 +52,8 @@ void ged3d12_shader_constants_build(
         flags |= GE_D3D12_SHADER_DITHER;
     if (!clear && state->stencil_test_enable)
         flags |= GE_D3D12_SHADER_STENCIL;
+    if (!clear && triangle_semantics && state->cull_enable)
+        flags |= GE_D3D12_SHADER_CULL_BACK;
 
     out->config[0] =
         (int32_t)((state->tex_func & 7u) | (flags << 8));
@@ -129,15 +132,33 @@ void ged3d12_shader_constants_build(
             ? scissor_top : scissor_bottom);
 }
 
-void ged3d12_shader_constants_bind(
+bool ged3d12_shader_constants_cache_update(
+    GeD3D12ShaderConstantCache *cache,
+    const GeD3D12ShaderConstants *constants) {
+    if (!cache || !constants) return false;
+    if (cache->valid &&
+        memcmp(&cache->value, constants, sizeof(*constants)) == 0) {
+        return false;
+    }
+    cache->value = *constants;
+    cache->valid = 1;
+    return true;
+}
+
+bool ged3d12_shader_constants_bind(
+    GeD3D12ShaderConstantCache *cache,
     const GeD3D12ShaderConstants *constants) {
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
-    command_list->SetGraphicsRoot32BitConstants(
-        GE_D3D12_ROOT_GE_STATE,
-        sizeof(*constants) / sizeof(uint32_t), constants, 0);
+    bool updated = ged3d12_shader_constants_cache_update(cache, constants);
+    if (updated) {
+        command_list->SetGraphicsRoot32BitConstants(
+            GE_D3D12_ROOT_GE_STATE,
+            sizeof(*constants) / sizeof(uint32_t), constants, 0);
+    }
     D3D12_RECT scissor = {
         constants->scissor[0], constants->scissor[1],
         constants->scissor[2], constants->scissor[3],
     };
     command_list->RSSetScissorRects(1, &scissor);
+    return updated;
 }

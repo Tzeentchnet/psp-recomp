@@ -1,17 +1,10 @@
 /* PSP GE vertex stage.
  *
- * Vertices are already transformed by ge.c's CPU T&L. The input layout is the same
- * 32-byte GpuVert used by the Vulkan backend:
- *   POSITION0 float4, TEXCOORD0 float2, TEXCOORD1 float, COLOR0 unorm8x4.
- * All varyings are noperspective because the software rasterizer interpolates u*rw,
- * v*rw, and rw affinely in screen space, then divides in the pixel shader. */
+ * ge.c remains authoritative for PSP vertex formats, T&L, clipping, and primitive
+ * assembly. The shader raw-loads its canonical 32-byte output stream instead of
+ * requiring an input-layout decode and vertex-buffer bind for every frame. */
 
-struct VSInput {
-    float4 position : POSITION0;
-    float2 uv       : TEXCOORD0;
-    float  fog      : TEXCOORD1;
-    float4 color    : COLOR0;
-};
+ByteAddressBuffer ge_vertices : register(t0, space1);
 
 struct VSOutput {
     float4 position              : SV_Position;
@@ -21,18 +14,31 @@ struct VSOutput {
     noperspective float4 color   : COLOR0;
 };
 
-VSOutput main(VSInput input) {
+VSOutput main(uint vertex_id : SV_VertexID) {
+    uint byte_offset = vertex_id << 5;
+    uint4 position_bits = ge_vertices.Load4(byte_offset);
+    uint4 attributes = ge_vertices.Load4(byte_offset + 16);
+    float4 input_position = asfloat(position_bits);
+    float2 input_uv = asfloat(attributes.xy);
+    float input_fog = asfloat(attributes.z);
+    uint packed_color = attributes.w;
+    float4 input_color = float4(
+        packed_color & 255,
+        (packed_color >> 8) & 255,
+        (packed_color >> 16) & 255,
+        packed_color >> 24) * (1.0 / 255.0);
+
     VSOutput output;
     /* D3D maps NDC +Y to the top of the viewport, opposite Vulkan's positive-height
      * viewport transform. Both paths therefore land on the same PSP screen pixels. */
     output.position = float4(
-        input.position.x * (1.0 / 256.0) - 1.0,
-        1.0 - input.position.y * (1.0 / 136.0),
-        input.position.z * (1.0 / 65535.0),
+        input_position.x * (1.0 / 256.0) - 1.0,
+        1.0 - input_position.y * (1.0 / 136.0),
+        input_position.z * (1.0 / 65535.0),
         1.0);
-    output.uv = input.uv;
-    output.rw = input.position.w;
-    output.fog = input.fog;
-    output.color = input.color;
+    output.uv = input_uv;
+    output.rw = input_position.w;
+    output.fog = input_fog;
+    output.color = input_color;
     return output;
 }

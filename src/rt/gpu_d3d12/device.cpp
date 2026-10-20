@@ -123,6 +123,8 @@ static UINT64 s_gpu_log_draws;
 static UINT64 s_vertex_frames;
 static UINT64 s_vertex_total;
 static UINT64 s_vertex_batches;
+static UINT64 s_constant_updates;
+static UINT64 s_constant_reuses;
 static UINT64 s_vertex_primitives[GE_D3D12_PRIMITIVE_COUNT];
 static UINT s_vertex_max;
 
@@ -471,7 +473,7 @@ static int create_root_signature(void) {
     ranges[2].OffsetInDescriptorsFromTableStart =
         D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER parameters[4] = {};
+    D3D12_ROOT_PARAMETER parameters[5] = {};
     parameters[GE_D3D12_ROOT_GE_STATE].ParameterType =
         D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[GE_D3D12_ROOT_GE_STATE].Constants.ShaderRegister = 0;
@@ -500,6 +502,12 @@ static int create_root_signature(void) {
         .DescriptorTable.pDescriptorRanges = &ranges[2];
     parameters[GE_D3D12_ROOT_DESTINATION].ShaderVisibility =
         D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[GE_D3D12_ROOT_VERTICES].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[GE_D3D12_ROOT_VERTICES].Descriptor.ShaderRegister = 0;
+    parameters[GE_D3D12_ROOT_VERTICES].Descriptor.RegisterSpace = 1;
+    parameters[GE_D3D12_ROOT_VERTICES].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_VERTEX;
 
     D3D12_STATIC_SAMPLER_DESC static_samplers[2] = {};
     for (UINT i = 0; i < 2; i++) {
@@ -828,6 +836,8 @@ static int device_init(void) {
     s_vertex_frames = 0;
     s_vertex_total = 0;
     s_vertex_batches = 0;
+    s_constant_updates = 0;
+    s_constant_reuses = 0;
     s_vertex_max = 0;
     memset(s_vertex_primitives, 0, sizeof(s_vertex_primitives));
 
@@ -852,7 +862,8 @@ static int device_init(void) {
     fprintf(stderr,
             "ged3d12: using %s (feature level %s, %u buffers, "
             "descriptors=%u srv/%u sampler/%u rtv/%u dsv, "
-            "root=b0[40]+t0-t3+s0+s1/s2, upload=%llu MiB, gamepad=%s)\n",
+            "root=b0[40]+t0-t3+s0+s1/s2+space1:t0, upload=%llu MiB, "
+            "gamepad=%s)\n",
             adapter_name[0] ? adapter_name : "<unnamed adapter>",
             feature_level_name(levels.MaxSupportedFeatureLevel),
             FRAME_COUNT, SRV_DESCRIPTOR_COUNT, SAMPLER_DESCRIPTOR_COUNT,
@@ -1182,7 +1193,14 @@ static void log_draw_batches(
 static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
     const GeD3D12VertexBatch *open_list = nullptr;
     const GeD3D12VertexBatch *open_draw = nullptr;
+    GeD3D12ShaderConstantCache constant_cache = {};
     bool ok = true;
+    if (frame->vertex_count) {
+        s_command_list->SetGraphicsRootShaderResourceView(
+            GE_D3D12_ROOT_VERTICES, frame->buffer.BufferLocation);
+        s_command_list->IASetPrimitiveTopology(
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    }
     for (UINT i = 0; i < frame->batch_count; i++) {
         const GeD3D12VertexBatch *batch = &frame->batches[i];
         if (!open_list || !same_list(open_list, batch)) {
@@ -1218,7 +1236,12 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
             ok = false;
             break;
         }
-        ged3d12_shader_constants_bind(&batch->shader);
+        if (ged3d12_shader_constants_bind(
+                &constant_cache, &batch->shader)) {
+            s_constant_updates++;
+        } else {
+            s_constant_reuses++;
+        }
     }
     if (open_draw) pix_end_event();
     if (open_list) pix_end_event();
@@ -1282,10 +1305,12 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     if (s_vertex_log && (s_vertex_frames <= 3 || s_vertex_frames % 120 == 0)) {
         fprintf(stderr,
                 "ged3d12: vertex present=%llu vertices=%u batches=%u hash=%016llx "
-                "max=%u\n",
+                "max=%u constants=%llu/%llu\n",
                 (unsigned long long)s_vertex_frames,
                 vertices.vertex_count, vertices.batch_count,
-                (unsigned long long)vertices.hash, s_vertex_max);
+                (unsigned long long)vertices.hash, s_vertex_max,
+                (unsigned long long)s_constant_updates,
+                (unsigned long long)s_constant_reuses);
     }
     if (s_gpu_log) {
         fprintf(
@@ -1379,11 +1404,14 @@ static void device_shutdown(void) {
     if (s_vertex_log) {
         fprintf(stderr,
                 "ged3d12: vertex capture presents=%llu vertices=%llu batches=%llu "
-                "max=%u tri=%llu sprite=%llu line=%llu point=%llu\n",
+                "max=%u constants=%llu/%llu tri=%llu sprite=%llu "
+                "line=%llu point=%llu\n",
                 (unsigned long long)s_vertex_frames,
                 (unsigned long long)s_vertex_total,
                 (unsigned long long)s_vertex_batches,
                 s_vertex_max,
+                (unsigned long long)s_constant_updates,
+                (unsigned long long)s_constant_reuses,
                 (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_TRIANGLE],
                 (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_SPRITE],
                 (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_LINE],
@@ -1393,12 +1421,14 @@ static void device_shutdown(void) {
         fprintf(
             stderr,
             "GED3D12 summary presents=%llu flushes=%llu draws=%llu "
-            "batches=%llu vertices=%llu\n",
+            "batches=%llu vertices=%llu constants=%llu/%llu\n",
             (unsigned long long)s_vertex_frames,
             (unsigned long long)s_gpu_log_flushes,
             (unsigned long long)s_gpu_log_draws,
             (unsigned long long)s_vertex_batches,
-            (unsigned long long)s_vertex_total);
+            (unsigned long long)s_vertex_total,
+            (unsigned long long)s_constant_updates,
+            (unsigned long long)s_constant_reuses);
     }
     release_device();
     ged3d12_window_shutdown();

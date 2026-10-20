@@ -208,10 +208,13 @@ int4 apply_write_mask(
         format);
 }
 
-PSOutput main(PSInput input) {
+PSOutput main(PSInput input, bool front_facing : SV_IsFrontFace) {
     int flags = cfg.x >> 8;
     int source_depth = (int)(input.position.z * 65535.0 + 0.5);
 
+    if ((flags & 4096) != 0 && !front_facing) {
+        discard;
+    }
     if ((flags & 16) != 0 &&
         (source_depth < cfg.z || source_depth > cfg.w)) {
         discard;

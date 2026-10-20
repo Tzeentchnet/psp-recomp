@@ -14,6 +14,8 @@ static GeState s_state;
 static GeDebugContext s_debug_context;
 static uint8_t s_upload[TEST_UPLOAD_SIZE];
 static UINT64 s_upload_cursor;
+static uint32_t s_texture_captures;
+static uint32_t s_framebuffer_captures;
 static int s_failures;
 
 extern "C" GeState *ge_state_ptr(void) {
@@ -26,6 +28,7 @@ extern "C" GeDebugContext ge_debug_context(void) {
 
 bool ged3d12_texture_capture(GeD3D12TextureBinding *out) {
     if (!out) return false;
+    s_texture_captures++;
     memset(out, 0, sizeof(*out));
     out->handle = GE_D3D12_TEXTURE_HANDLE_NONE;
     out->framebuffer.handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
@@ -35,6 +38,7 @@ bool ged3d12_texture_capture(GeD3D12TextureBinding *out) {
 
 bool ged3d12_framebuffer_capture(GeD3D12FramebufferBinding *out) {
     if (!out) return false;
+    s_framebuffer_captures++;
     out->color_handle = 1;
     out->depth_handle = 2;
     return true;
@@ -200,7 +204,18 @@ static void test_shader_constants(void) {
     texture.framebuffer.y = 11;
     GeD3D12ShaderConstants constants = {};
     ged3d12_shader_constants_build(
-        &state, 1, 0, &texture, &constants);
+        &state, 1, 0, 1, &texture, &constants);
+    GeD3D12ShaderConstantCache cache = {};
+    if (!ged3d12_shader_constants_cache_update(&cache, &constants))
+        fail("constant cache rejected initial state");
+    if (ged3d12_shader_constants_cache_update(&cache, &constants))
+        fail("constant cache missed identical state");
+    GeD3D12ShaderConstants changed_constants = constants;
+    changed_constants.config[3]++;
+    if (!ged3d12_shader_constants_cache_update(
+            &cache, &changed_constants)) {
+        fail("constant cache missed changed state");
+    }
     uint32_t flags = (uint32_t)constants.config[0] >> 8;
     check_u32(
         "shader texture function",
@@ -263,7 +278,7 @@ static void test_shader_constants(void) {
     state.scis_x2 = 2;
     state.scis_y2 = 4;
     ged3d12_shader_constants_build(
-        &state, 1, 0, &texture, &constants);
+        &state, 1, 0, 1, &texture, &constants);
     check_u32(
         "empty scissor left", (uint32_t)constants.scissor[0], 512);
     check_u32(
@@ -276,7 +291,7 @@ static void test_shader_constants(void) {
     state.clear = 1;
     state.clear_mode = 0x700;
     ged3d12_shader_constants_build(
-        &state, 1, 1, &texture, &constants);
+        &state, 1, 1, 0, &texture, &constants);
     flags = (uint32_t)constants.config[0] >> 8;
     check_u32(
         "clear shader flags", flags,
@@ -316,6 +331,12 @@ static void test_pipeline_keys(void) {
               DXGI_FORMAT_D16_UNORM);
 
     uint64_t base_hash = ged3d12_pipeline_key_hash(&base);
+    GeD3D12PipelineKey uber;
+    ged3d12_pipeline_uber_key(&uber);
+    if (memcmp(&base, &uber, sizeof(base)) != 0)
+        fail("default pipeline key differs from ubershader key");
+    if (!ged3d12_pipeline_uber_compatible(&base))
+        fail("default pipeline key is not ubershader-compatible");
     s_state.tex_addr = 0x04012340u;
     s_state.tex_func = 0x10103u;
     ged3d12_pipeline_key_build(&s_state, 0, &key);
@@ -347,10 +368,34 @@ static void test_pipeline_keys(void) {
     check_u32("triangle culling", key.cull_mode, D3D12_CULL_MODE_BACK);
     if (ged3d12_pipeline_key_hash(&key) == base_hash)
         fail("pipeline hash ignored relevant state");
+    if (!ged3d12_pipeline_uber_compatible(&key))
+        fail("cull pipeline key is not ubershader-compatible");
+
+    GeState cull_state = {};
+    cull_state.cull_enable = 1;
+    GeD3D12TextureBinding no_texture = {};
+    GeD3D12ShaderConstants cull_constants = {};
+    ged3d12_shader_constants_build(
+        &cull_state, 1, 0, 1, &no_texture, &cull_constants);
+    check_u32(
+        "ubershader triangle culling",
+        (uint32_t)cull_constants.config[0] >> 8,
+        GE_D3D12_SHADER_DEPTH_RANGE | GE_D3D12_SHADER_CULL_BACK);
+    ged3d12_shader_constants_build(
+        &cull_state, 1, 0, 0, &no_texture, &cull_constants);
+    check_u32(
+        "ubershader non-triangle culling",
+        (uint32_t)cull_constants.config[0] >> 8,
+        GE_D3D12_SHADER_DEPTH_RANGE);
 
     GeD3D12PipelineKey sprite;
     ged3d12_pipeline_key_build(&s_state, 1, &sprite);
     check_u32("sprite culling disabled", sprite.cull_mode, D3D12_CULL_MODE_NONE);
+
+    GeD3D12PipelineKey incompatible = base;
+    incompatible.render_target_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (ged3d12_pipeline_uber_compatible(&incompatible))
+        fail("incompatible render-target key accepted by ubershader");
 
     s_state.clear = 1;
     s_state.clear_mode = 0x500;
@@ -748,6 +793,44 @@ static void test_lines_and_points(void) {
     check_float("point max y", vertices[10].y, 9.0f);
 }
 
+static void test_draw_batching(void) {
+    reset_upload();
+    memset(&s_state, 0, sizeof(s_state));
+    s_state.shade_gouraud = 1;
+    s_debug_context.list_id = 11;
+    s_debug_context.list_addr = 0x08110000u;
+    s_debug_context.draw_serial = 40;
+    s_debug_context.draw_pc = 0x08110100u;
+    s_debug_context.draw_op = 0x04030006u;
+    GeVtx a = vertex(1.0f, 2.0f, 3.0f, 1.0f, 4.0f, 5.0f, 1.0f,
+                     1, 2, 3, 4);
+    GeVtx b = a;
+    GeVtx c = a;
+    uint32_t texture_captures = s_texture_captures;
+    uint32_t framebuffer_captures = s_framebuffer_captures;
+    ged3d12_vertex_capture_tri(&a, &b, &c, 1);
+    ged3d12_vertex_capture_tri(&a, &b, &c, 1);
+    s_debug_context.draw_serial++;
+    s_debug_context.draw_pc += 4;
+    ged3d12_vertex_capture_tri(&a, &b, &c, 1);
+
+    GeD3D12VertexFrame frame;
+    if (!ged3d12_vertex_upload_pending(&frame)) {
+        fail("draw batching upload failed");
+        return;
+    }
+    check_u32("batched draw vertex count", frame.vertex_count, 9);
+    check_u32("batched draw batch count", frame.batch_count, 2);
+    check_u32("batched first draw vertices", frame.batches[0].count, 6);
+    check_u32("batched second draw first", frame.batches[1].first, 6);
+    check_u32("batched primitive count",
+              frame.primitive_count[GE_D3D12_PRIMITIVE_TRIANGLE], 3);
+    check_u32("batched texture captures",
+              s_texture_captures - texture_captures, 2);
+    check_u32("batched framebuffer captures",
+              s_framebuffer_captures - framebuffer_captures, 2);
+}
+
 static void test_storage_growth(void) {
     reset_upload();
     s_state.shade_gouraud = 1;
@@ -755,8 +838,10 @@ static void test_storage_growth(void) {
                      1, 2, 3, 4);
     GeVtx b = a;
     GeVtx c = a;
-    for (uint32_t i = 0; i < 3000; i++)
+    for (uint32_t i = 0; i < 3000; i++) {
+        s_debug_context.draw_serial = i;
         ged3d12_vertex_capture_tri(&a, &b, &c, 1);
+    }
 
     GeD3D12VertexFrame frame;
     if (!ged3d12_vertex_upload_pending(&frame)) {
@@ -780,6 +865,7 @@ int main(void) {
         test_triangle();
         test_sprites();
         test_lines_and_points();
+        test_draw_batching();
         test_storage_growth();
         ged3d12_vertex_capture_shutdown();
     }

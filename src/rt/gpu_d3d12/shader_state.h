@@ -23,6 +23,7 @@ enum GeD3D12ShaderFlag : uint32_t {
     GE_D3D12_SHADER_COLOR_TEST = 512u,
     GE_D3D12_SHADER_DITHER = 1024u,
     GE_D3D12_SHADER_STENCIL = 2048u,
+    GE_D3D12_SHADER_CULL_BACK = 4096u,
 };
 
 struct GeD3D12ShaderConstants {
@@ -38,16 +39,30 @@ struct GeD3D12ShaderConstants {
     int32_t scissor[4];
 };
 
+struct GeD3D12ShaderConstantCache {
+    GeD3D12ShaderConstants value;
+    uint32_t valid;
+};
+
 void ged3d12_shader_constants_build(
     const GeState *state, int perspective, int sprite_semantics,
+    int triangle_semantics,
     const GeD3D12TextureBinding *texture,
     GeD3D12ShaderConstants *out);
-void ged3d12_shader_constants_bind(
+bool ged3d12_shader_constants_cache_update(
+    GeD3D12ShaderConstantCache *cache,
+    const GeD3D12ShaderConstants *constants);
+bool ged3d12_shader_constants_bind(
+    GeD3D12ShaderConstantCache *cache,
     const GeD3D12ShaderConstants *constants);
 
 static_assert(
     sizeof(GeD3D12ShaderConstants) ==
         GE_D3D12_SHADER_CONSTANT_DWORDS * sizeof(uint32_t),
     "D3D12 shader constants ABI changed");
+static_assert(
+    sizeof(GeD3D12ShaderConstantCache) ==
+        sizeof(GeD3D12ShaderConstants) + sizeof(uint32_t),
+    "D3D12 shader constant cache ABI changed");
 
 #endif

@@ -116,12 +116,17 @@ Set these environment variables before running the game to control runtime featu
   PSP stencil, depth, blending, dithering, logic operations, native packing, and component masks. The resizable
   swapchain preserves the exact 480:272 display aspect and clears letterbox or pillarbox space to black. The shared
   CPU frontend blends all morph attributes before eight-bone skinning and tessellates Bezier/B-spline commands with
-  the GE's quantized scalar evaluator before emitting ordinary backend triangles, lines, or points.
+  the GE's quantized scalar evaluator before emitting ordinary backend triangles, lines, or points. The vertex
+  shader raw-loads that canonical 32-byte stream through a root SRV; primitives from one logical GE command share
+  one captured state record, and unchanged fragment blocks reuse their previous root constants.
 - `SR_D3D12_FRAMEBUFFER_LOG=1`: Print persistent color/depth target allocation and cache statistics.
 - `SR_D3D12_FRAMEBUFFER_SAFE=1`: Read cached color targets back after presentation to validate GPU/CPU ownership.
 - `SR_D3D12_DESTINATION_SAFE=1`: Copy and bind color/depth destination snapshots for every staged batch. This is
   an intentionally expensive resource-transition diagnostic; native draw submission remains disabled.
-- `SR_D3D12_PSO_LOG=1`: Print synchronous GE PSO creation and final cache statistics.
+- `SR_D3D12_PSO_LOG=1`: Print ubershader, asynchronous GE PSO, pipeline-library, and final cache statistics.
+- `SR_D3D12_PSO_CACHE=<path>`: Override the default
+  `%LOCALAPPDATA%\KZLRecomp\cache\d3d12-pipelines.bin` pipeline-library path. Set it to `0` to disable disk
+  persistence; the exact ubershader fallback and asynchronous in-memory cache remain active.
 - `SR_D3D12_WARP=1`: Select Microsoft WARP instead of a hardware adapter.
 - **F10** (D3D12 window): Write a complete textual GE state dump in the working directory.
   PIX for Windows can display nested list/draw events embedded in each D3D12 command list;

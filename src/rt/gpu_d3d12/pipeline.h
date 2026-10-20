@@ -1,4 +1,4 @@
-/* D3D12 GE pipeline-state key and synchronous PSO cache. */
+/* D3D12 GE pipeline-state key and asynchronous PSO cache. */
 #ifndef GE_D3D12_PIPELINE_H
 #define GE_D3D12_PIPELINE_H
 
@@ -28,13 +28,21 @@ struct GeD3D12PipelineStats {
     uint64_t lookups;
     uint64_t hits;
     uint64_t misses;
+    uint64_t fallback_binds;
     uint32_t entries;
+    uint32_t pending;
+    uint32_t compiled;
+    uint32_t library_hits;
+    uint32_t cache_writes;
     uint32_t failures;
 };
 
 void ged3d12_pipeline_key_build(
     const GeState *state, int sprite_semantics, GeD3D12PipelineKey *out);
 uint64_t ged3d12_pipeline_key_hash(const GeD3D12PipelineKey *key);
+void ged3d12_pipeline_uber_key(GeD3D12PipelineKey *out);
+bool ged3d12_pipeline_uber_compatible(
+    const GeD3D12PipelineKey *key);
 
 bool ged3d12_pipeline_cache_init(void);
 void ged3d12_pipeline_cache_shutdown(void);
