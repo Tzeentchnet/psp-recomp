@@ -17,8 +17,6 @@ sr_vfpu_asin from src/rt/vfpu_asin.c) in 13 functions, vnop/vflush (opcode 0x3F)
 """
 import struct
 
-R = lambda i: "0u" if i == 0 else f"s->r[{i}]"  # noqa: E731
-
 
 def rs(w): return (w >> 21) & 0x1F
 def rt(w): return (w >> 16) & 0x1F
@@ -27,8 +25,14 @@ def sa(w): return (w >> 6) & 0x1F
 def s16(w): return (w & 0xFFFF) - 0x10000 if w & 0x8000 else w & 0xFFFF
 
 
-def wr(i, expr):
-    return "(void)0;" if i == 0 else f"s->r[{i}] = {expr};"
+def gpr(i, local_gprs=False):
+    if i == 0:
+        return "0u"
+    return f"SR_GPR(s, {i})" if local_gprs else f"s->r[{i}]"
+
+
+def wr(i, expr, local_gprs=False):
+    return "(void)0;" if i == 0 else f"{gpr(i, local_gprs)} = {expr};"
 
 
 def vec_size(w):
@@ -111,14 +115,15 @@ def _block(body):
 
 # ---- SPECIAL3 BSHFL and cache -------------------------------------------------------------
 
-def alu_effect(addr, w):
+def alu_effect(addr, w, local_gprs=False):
+    r = lambda i: gpr(i, local_gprs)
     op = w >> 26
     if op == 0x1F and w & 0x3F == 0x20:
         sub = sa(w)
         if sub == 0x03:  # wsbw: byte-swap the word
-            return wr(rd(w), f"__builtin_bswap32({R(rt(w))})"), None, 0
+            return wr(rd(w), f"__builtin_bswap32({r(rt(w))})", local_gprs), None, 0
         if sub == 0x14:  # bitrev: reverse all 32 bits
-            return wr(rd(w), f"sr_bitrev32({R(rt(w))})"), None, 0
+            return wr(rd(w), f"sr_bitrev32({r(rt(w))})", local_gprs), None, 0
         return None
     if op == 0x2F:  # cache: no data cache to maintain on the host
         return "(void)0; /* cache */", None, 0
@@ -202,11 +207,11 @@ def _vx2i(sub, vd, vs, n):
     return _block(head + calc + tail)
 
 
-def effect(addr, w):
+def effect(addr, w, local_gprs=False):
     """Try the KZL extensions; None means 'not ours, use the base decoder'."""
     op = w >> 26
     if op in (0x1F, 0x2F):
-        return alu_effect(addr, w)
+        return alu_effect(addr, w, local_gprs)
     if op in (0x34, 0x3C):
         return vfpu_effect(addr, w)
     if op == 0x3F:  # vflush / vnop / vsync: no-ops; only 0xFFFFxxxx keeps the prefixes (PPSSPP Int_Vflush)
@@ -239,7 +244,7 @@ def load_jumptables(path):
         return {t["jr"]: t for t in tomllib.load(f).get("jumptable", [])}
 
 
-def emit_switch_jr(pc, w, delay_line, table, known):
+def emit_switch_jr(pc, w, delay_line, table, known, local_gprs=False):
     """C lines for `jr rX` at pc that goes through a recovered jump table.
 
     The target is read before the delay slot runs (the slot may overwrite rX). Case targets
@@ -247,16 +252,25 @@ def emit_switch_jr(pc, w, delay_line, table, known):
     reaches the default goes through dispatch() as before, so a wrong table fails loudly.
     """
     reg = rs(w)
-    lines = [f"    sr_begin(s, 0x{pc:08x}u, 0x{w:08x}u); sr_end(s, 0u, 0);",
-             f"    {{ uint32_t _t = {R(reg)};",
+    if local_gprs:
+        trace = (
+            f"    SR_TRACE_BEGIN(s, 0x{pc:08x}u, 0x{w:08x}u); "
+            "SR_TRACE_END(s, 0u, 0);"
+        )
+    else:
+        trace = f"    sr_begin(s, 0x{pc:08x}u, 0x{w:08x}u); sr_end(s, 0u, 0);"
+    lines = [trace,
+             f"    {{ uint32_t _t = {gpr(reg, local_gprs)};",
              f"   {delay_line}",
              "      switch (_t) {"]
     for t in sorted(set(table["targets"])):
         if t in known:
-            lines.append(f"        case 0x{t:08x}u: f_{t:08x}(s); return;")
+            sync = "SR_GPR_FLUSH(s); " if local_gprs else ""
+            lines.append(f"        case 0x{t:08x}u: {sync}f_{t:08x}(s); return;")
         else:
             lines.append(f"        case 0x{t:08x}u: goto L_{t:08x};")
-    lines.append("        default: dispatch(s, _t); return;")
+    sync = "SR_GPR_FLUSH(s); " if local_gprs else ""
+    lines.append(f"        default: {sync}dispatch(s, _t); return;")
     lines.append("      } }")
     return lines
 
@@ -276,7 +290,17 @@ def load_overrides(path):
     return gotos, {j["at"] for j in cfg.get("jal_next", [])}
 
 
-def emit_jal_next(pc, w, delay_line):
+def emit_jal_next(pc, w, delay_line, local_gprs=False):
     """`jal .+8` (get-PC idiom): link only, then fall through into the delay slot's successor."""
-    return [f"    sr_begin(s, 0x{pc:08x}u, 0x{w:08x}u); s->r[31] = 0x{(pc + 8) & 0xFFFFFFFF:08x}u; sr_end(s, 0u, 0);",
-            delay_line]
+    if local_gprs:
+        return [
+            f"    SR_TRACE_BEGIN(s, 0x{pc:08x}u, 0x{w:08x}u); "
+            f"SR_GPR(s, 31) = 0x{(pc + 8) & 0xFFFFFFFF:08x}u; "
+            "SR_TRACE_END(s, 0u, 0);",
+            delay_line,
+        ]
+    return [
+        f"    sr_begin(s, 0x{pc:08x}u, 0x{w:08x}u); "
+        f"s->r[31] = 0x{(pc + 8) & 0xFFFFFFFF:08x}u; sr_end(s, 0u, 0);",
+        delay_line,
+    ]

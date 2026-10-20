@@ -5,9 +5,11 @@
 # per ARCHITECTURE.md section 6. Each instruction becomes one C statement, with branch
 # delay-slot reordering, intra-function branches as labels + goto, direct calls for known
 # targets, jr $ra as return, and computed transfers through dispatch(). Every emitted
-# instruction is wrapped in sr_begin/sr_end trace hooks (in PPSSPP's branch-then-delay
-# order) so the generated code can be diffed against the reference trace.
+# instruction can report through sr_begin/sr_end trace hooks (in PPSSPP's branch-then-delay
+# order) so the generated code can be diffed against the reference trace. Release builds
+# compile those hooks out unless SR_ENABLE_INSTRUCTION_TRACE is explicitly enabled.
 
+import re
 import struct
 import sys
 
@@ -20,7 +22,7 @@ import codegen_ext as cx
 JUMPTABLES = {}
 JAL_NEXT = set()
 
-R = lambda i: "0u" if i == 0 else f"s->r[{i}]"           # read GPR (r0 is constant 0)
+R = lambda i: "0u" if i == 0 else f"SR_GPR(s, {i})"       # cached in release, direct in trace
 F = lambda i: f"s->f[{i}]"
 FI = lambda i: f"s->fi[{i}]"
 
@@ -88,7 +90,42 @@ def s16(w): return (w & 0xFFFF) - 0x10000 if w & 0x8000 else w & 0xFFFF
 
 def wr(i, expr):
     # Assignment to GPR i; writes to r0 are dropped (ARCHITECTURE section 4).
-    return "(void)0;" if i == 0 else f"s->r[{i}] = {expr};"
+    return "(void)0;" if i == 0 else f"SR_GPR(s, {i}) = {expr};"
+
+
+def gpr_cache_preamble():
+    return f"""\
+#define SR_GPR_YIELD(s, flush, reload) do {{ \\
+    if (sr_sched_on && --sr_timeslice <= 0) {{ \\
+        flush; sr_yield(s); reload; \\
+    }} \\
+}} while (0)
+
+#ifndef SR_ENABLE_INSTRUCTION_TRACE
+# ifdef NDEBUG
+#  define SR_ENABLE_INSTRUCTION_TRACE 0
+# else
+#  define SR_ENABLE_INSTRUCTION_TRACE 1
+# endif
+#endif
+#if SR_ENABLE_INSTRUCTION_TRACE
+# define SR_GPR(s, reg) ((s)->r[reg])
+# define SR_GPR_SYNC(code) ((void)0)
+# define SR_TRACE_BEGIN(s, pc, op) sr_begin((s), (pc), (op))
+# define SR_TRACE_END(s, addr, size) sr_end((s), (addr), (size))
+# define SR_DIRECT_TRACE_BEGIN(s, pc, op) sr_begin((s), (pc), (op))
+# define SR_DIRECT_TRACE_END(s, addr, size) sr_end((s), (addr), (size))
+#else
+# define SR_GPR(s, reg) r##reg
+# define SR_GPR_SYNC(code) code
+# define SR_TRACE_BEGIN(s, pc, op) ((void)0)
+# define SR_TRACE_END(s, addr, size) ((void)0)
+# define SR_DIRECT_TRACE_BEGIN(s, pc, op) ((void)0)
+# define SR_DIRECT_TRACE_END(s, addr, size) ((void)0)
+#endif"""
+
+
+GPR_CACHE_PREAMBLE = gpr_cache_preamble()
 
 
 def vreg_indices(reg, size):
@@ -140,7 +177,9 @@ class Unsupported(Exception):
 
 # Effect of a non-control instruction -> (c_statement, store_addr_expr_or_None, store_size).
 def effect(addr, w):
-    ext = cx.effect(addr, w)  # encodings added for KZL (BSHFL, cache, VFPU7/9, vf2i, vi2f, vmscl)
+    ext = cx.effect(
+        addr, w, local_gprs=True
+    )  # encodings added for KZL (BSHFL, cache, VFPU7/9, vf2i, vi2f, vmscl)
     if ext is not None:
         return ext
     op = w >> 26
@@ -737,16 +776,267 @@ def function_flow(elf, start, ranges, known):
     return insns, labels
 
 
+_GPR_WRITE_RE = re.compile(
+    r"SR_GPR\(s,\s*([1-9]|[12][0-9]|3[01])\)\s*=(?!=)"
+)
+_GPR_LOCAL_RE = re.compile(
+    r"SR_GPR\(s,\s*([1-9]|[12][0-9]|3[01])\)"
+)
+
+
+def gpr_writes(addr, w):
+    try:
+        statement = effect(addr, w)[0]
+    except Unsupported:
+        return set(range(1, 32))
+    return {int(match.group(1)) for match in _GPR_WRITE_RE.finditer(statement)}
+
+
+def _signed32(value):
+    return value - 0x100000000 if value & 0x80000000 else value
+
+
+def _read_readonly_u32(elf, address):
+    section = next(
+        (
+            item
+            for item in elf.sections
+            if item["flags"] & 2
+            and not item["flags"] & 1
+            and item["addr"] <= address
+            and address + 4 <= item["addr"] + item["size"]
+        ),
+        None,
+    )
+    if section is None:
+        return None
+    data = elf.read_at_vaddr(address, 4)
+    return struct.unpack("<I", data)[0] if data and len(data) == 4 else None
+
+
+def _constant_write(
+    elf, addr, w, dest, insns, labels, delay_slots, cache, active
+):
+    op = w >> 26
+    source = lambda reg: resolve_constant_gpr(
+        elf, addr, reg, insns, labels, delay_slots, cache, active
+    )
+    mask = 0xFFFFFFFF
+    if op == 0x0F and rt(w) == dest:
+        return (w & 0xFFFF) << 16
+    if op in (0x08, 0x09) and rt(w) == dest:
+        value = source(rs(w))
+        return None if value is None else (value + s16(w)) & mask
+    if op in (0x0C, 0x0D, 0x0E) and rt(w) == dest:
+        value = source(rs(w))
+        if value is None:
+            return None
+        immediate = w & 0xFFFF
+        return {
+            0x0C: value & immediate,
+            0x0D: value | immediate,
+            0x0E: value ^ immediate,
+        }[op] & mask
+    if op in (0x0A, 0x0B) and rt(w) == dest:
+        value = source(rs(w))
+        if value is None:
+            return None
+        immediate = s16(w)
+        if op == 0x0A:
+            return int(_signed32(value) < immediate)
+        return int(value < (immediate & mask))
+    if op == 0x23 and rt(w) == dest:
+        base = source(rs(w))
+        if base is None:
+            return None
+        return _read_readonly_u32(elf, (base + s16(w)) & mask)
+    if op == 0:
+        fn = funct(w)
+        left, right = source(rs(w)), source(rt(w))
+        shift = sa(w)
+        if rd(w) != dest:
+            return None
+        if fn == 0x00 and right is not None:
+            return (right << shift) & mask
+        if fn == 0x02 and right is not None:
+            return right >> shift
+        if fn == 0x03 and right is not None:
+            return (_signed32(right) >> shift) & mask
+        if fn in (0x04, 0x06, 0x07) and left is not None and right is not None:
+            amount = left & 31
+            if fn == 0x04:
+                return (right << amount) & mask
+            if fn == 0x06:
+                return right >> amount
+            return (_signed32(right) >> amount) & mask
+        if fn in (0x0A, 0x0B) and right is not None:
+            write = right == 0 if fn == 0x0A else right != 0
+            return source(rs(w)) if write else source(dest)
+        if fn in (0x16, 0x17) and left is not None:
+            bits = left if fn == 0x16 else (~left & mask)
+            return 32 if bits == 0 else 32 - bits.bit_length()
+        if left is None or right is None:
+            return None
+        if fn in (0x20, 0x21):
+            return (left + right) & mask
+        if fn in (0x22, 0x23):
+            return (left - right) & mask
+        if fn == 0x24:
+            return left & right
+        if fn == 0x25:
+            return left | right
+        if fn == 0x26:
+            return left ^ right
+        if fn == 0x27:
+            return ~(left | right) & mask
+        if fn == 0x2A:
+            return int(_signed32(left) < _signed32(right))
+        if fn == 0x2B:
+            return int(left < right)
+        if fn == 0x2C:
+            return max(_signed32(left), _signed32(right)) & mask
+        if fn == 0x2D:
+            return min(_signed32(left), _signed32(right)) & mask
+    if op == 0x1F:
+        fn = funct(w)
+        if fn == 0x00 and rt(w) == dest:
+            value = source(rs(w))
+            if value is None:
+                return None
+            pos, size = sa(w), ((w >> 11) & 0x1F) + 1
+            field_mask = mask if size >= 32 else (1 << size) - 1
+            return (value >> pos) & field_mask
+        if fn == 0x04 and rt(w) == dest:
+            old, value = source(dest), source(rs(w))
+            if old is None or value is None:
+                return None
+            pos, msb = sa(w), (w >> 11) & 0x1F
+            size = msb - pos + 1
+            field_mask = (
+                (mask if size >= 32 else (1 << size) - 1) << pos
+            ) & mask
+            return (old & ~field_mask) | ((value << pos) & field_mask)
+        if fn == 0x20 and rd(w) == dest:
+            value = source(rt(w))
+            if value is None:
+                return None
+            if sa(w) == 0x03:
+                return int.from_bytes(value.to_bytes(4, "little"), "big")
+            if sa(w) == 0x14:
+                return int(f"{value:032b}"[::-1], 2)
+    return None
+
+
+def resolve_constant_gpr(
+    elf, before, reg, insns, labels, delay_slots, cache=None, active=None
+):
+    if reg == 0:
+        return 0
+    if before in labels:
+        return None
+    if cache is None:
+        cache = {}
+    if active is None:
+        active = set()
+    key = (before, reg)
+    if key in cache:
+        return cache[key]
+    if key in active:
+        return None
+    active.add(key)
+    pc = before - 4
+    result = None
+    while pc in insns:
+        if pc in delay_slots:
+            break
+        word = read32(elf, pc)
+        if word is None or is_control(word):
+            break
+        if reg in gpr_writes(pc, word):
+            result = _constant_write(
+                elf, pc, word, reg, insns, labels, delay_slots, cache, active
+            )
+            break
+        if pc in labels:
+            break
+        pc -= 4
+    active.remove(key)
+    cache[key] = result
+    return result
+
+
+def constant_jalr_targets(elf, insns, labels, known):
+    delay_slots = {
+        addr + 4
+        for addr in insns
+        if (word := read32(elf, addr)) is not None and is_control(word)
+    }
+    cache = {}
+    targets = {}
+    for addr in insns:
+        word = read32(elf, addr)
+        if word is None or word >> 26 != 0 or funct(word) != 0x09:
+            continue
+        target = resolve_constant_gpr(
+            elf, addr, rs(word), insns, labels, delay_slots, cache
+        )
+        if target in known:
+            targets[addr] = target
+    return targets
+
+
+def finalize_gpr_cache(lines):
+    text = "\n".join(lines)
+    registers = sorted(
+        {int(match.group(1)) for match in _GPR_LOCAL_RE.finditer(text)}
+    )
+    declarations = ", ".join(
+        f"r{reg}=s->r[{reg}]" for reg in registers
+    )
+    flush = " ".join(f"s->r[{reg}]=r{reg};" for reg in registers)
+    reload = " ".join(f"r{reg}=s->r[{reg}];" for reg in registers)
+    text = text.replace(
+        "SR_GPR_LOCAL_DECLS(s);",
+        (
+            "#if !SR_ENABLE_INSTRUCTION_TRACE\n"
+            f"    uint32_t {declarations};\n"
+            "#endif"
+        )
+        if registers
+        else "(void)s;",
+    )
+    text = text.replace(
+        "SR_GPR_FLUSH(s)",
+        f"SR_GPR_SYNC(do {{ {flush} }} while (0))"
+        if registers
+        else "((void)0)",
+    )
+    text = text.replace(
+        "SR_GPR_RELOAD(s)",
+        f"SR_GPR_SYNC(do {{ {reload} }} while (0))"
+        if registers
+        else "((void)0)",
+    )
+    return text.split("\n")
+
+
 def normal_line(addr, w):
     eff, saddr, ssize = effect(addr, w)
-    return f"    sr_begin(s, 0x{addr:08x}u, 0x{w:08x}u); {eff} sr_end(s, {saddr if saddr else '0u'}, {ssize});"
+    return (
+        f"    SR_TRACE_BEGIN(s, 0x{addr:08x}u, 0x{w:08x}u); "
+        f"{eff} SR_TRACE_END(s, {saddr if saddr else '0u'}, {ssize});"
+    )
 
 
-def emit_function(elf, start, ranges, known):
+def emit_function(elf, start, ranges, known, stats=None):
     insns, labels = function_flow(elf, start, ranges, known)
+    direct_jalr = constant_jalr_targets(elf, insns, labels, known)
+    if stats is not None:
+        stats["constant_jalr"] = stats.get("constant_jalr", 0) + len(direct_jalr)
     out = []
     out.append(f"void f_{start:08x}(CpuState *s) {{")
     out.append("    SR_YIELD(s);")   # preemption point (no-op unless the scheduler is active)
+    out.append("    SR_GPR_LOCAL_DECLS(s);")
     # Instructions are emitted in address order, but execution must begin at the entry. When the
     # entry is not the lowest address (the function contains code reached via a back-edge to a
     # lower address), jump to the entry's label first; otherwise control would start mid-body.
@@ -777,67 +1067,115 @@ def emit_function(elf, start, ranges, known):
         ds_is_syscall = dsw is not None and (dsw >> 26) == 0 and (dsw & 0x3F) == 0x0C
 
         if op == 3 and addr in JAL_NEXT:  # jal .+8: get-PC idiom, link and fall through
-            out.extend(cx.emit_jal_next(addr, w, normal_line(ds, dsw)))
+            out.extend(
+                cx.emit_jal_next(
+                    addr, w, normal_line(ds, dsw), local_gprs=True
+                )
+            )
             continue
         if op == 3:  # jal
             target = jump_target(addr, w)
-            out.append(f"    sr_begin(s, 0x{addr:08x}u, 0x{w:08x}u); s->r[31] = 0x{(addr + 8) & 0xFFFFFFFF:08x}u; sr_end(s, 0u, 0);")
+            out.append(
+                f"    SR_TRACE_BEGIN(s, 0x{addr:08x}u, 0x{w:08x}u); "
+                f"SR_GPR(s, 31) = 0x{(addr + 8) & 0xFFFFFFFF:08x}u; "
+                "SR_TRACE_END(s, 0u, 0);"
+            )
             out.append(normal_line(ds, dsw))
+            out.append("    SR_GPR_FLUSH(s);")
             if target in known:
                 out.append(f"    f_{target:08x}(s);")
             else:
                 out.append(f"    dispatch(s, 0x{target:08x}u);")
+            out.append("    SR_GPR_RELOAD(s);")
             continue
         if op == 0 and fn == 0x09:  # jalr rd, rs
             # The target is read before the link and the delay slot, either of which may
             # overwrite rs.
             d, a = rd(w), rs(w)
-            link = f"s->r[{d}] = 0x{(addr + 8) & 0xFFFFFFFF:08x}u; " if d != 0 else ""
+            link = f"SR_GPR(s, {d}) = 0x{(addr + 8) & 0xFFFFFFFF:08x}u; " if d != 0 else ""
             out.append(f"    {{ uint32_t _t = {R(a)};")
-            out.append(f"    sr_begin(s, 0x{addr:08x}u, 0x{w:08x}u); {link}sr_end(s, 0u, 0);")
+            out.append(
+                f"    SR_TRACE_BEGIN(s, 0x{addr:08x}u, 0x{w:08x}u); "
+                f"{link}SR_TRACE_END(s, 0u, 0);"
+            )
             out.append(normal_line(ds, dsw))
-            out.append("    dispatch(s, _t); }")
+            out.append("    SR_GPR_FLUSH(s);")
+            if addr in direct_jalr:
+                target = direct_jalr[addr]
+                out.append(
+                    f"    if (_t == 0x{target:08x}u) f_{target:08x}(s); "
+                    "else dispatch(s, _t);"
+                )
+            else:
+                out.append("    dispatch(s, _t);")
+            out.append("    SR_GPR_RELOAD(s); }")
             continue
         if op == 0 and fn == 0x08 and addr in JUMPTABLES and not ds_is_syscall:  # switch / computed goto
-            out.extend(cx.emit_switch_jr(addr, w, normal_line(ds, dsw), JUMPTABLES[addr], known))
+            out.extend(
+                cx.emit_switch_jr(
+                    addr,
+                    w,
+                    normal_line(ds, dsw),
+                    JUMPTABLES[addr],
+                    known,
+                    local_gprs=True,
+                )
+            )
             continue
         if op == 0 and fn == 0x08:  # jr rs
             a = rs(w)
-            out.append(f"    sr_begin(s, 0x{addr:08x}u, 0x{w:08x}u); sr_end(s, 0u, 0);")
+            out.append(
+                f"    SR_TRACE_BEGIN(s, 0x{addr:08x}u, 0x{w:08x}u); "
+                "SR_TRACE_END(s, 0u, 0);"
+            )
             if ds_is_syscall:
+                out.append("    SR_GPR_FLUSH(s);")
                 out.append(f"    sr_hle_call(s, 0x{(dsw >> 6) & 0xFFFFF:x}u); return;")
             elif a == 31:
                 out.append(normal_line(ds, dsw))
-                out.append("    return;")
+                out.append("    SR_GPR_FLUSH(s); return;")
             else:  # computed tail call: read the target before the delay slot can change it
                 out.append(f"    {{ uint32_t _t = {R(a)};")
                 out.append(normal_line(ds, dsw))
-                out.append("    dispatch(s, _t); return; }")
+                out.append("    SR_GPR_FLUSH(s); dispatch(s, _t); return; }")
             continue
         if op == 2:  # j
             target = jump_target(addr, w)
-            out.append(f"    sr_begin(s, 0x{addr:08x}u, 0x{w:08x}u); sr_end(s, 0u, 0);")
+            out.append(
+                f"    SR_TRACE_BEGIN(s, 0x{addr:08x}u, 0x{w:08x}u); "
+                "SR_TRACE_END(s, 0u, 0);"
+            )
             out.append(normal_line(ds, dsw))
             if target in known and target != start:
-                out.append(f"    f_{target:08x}(s); return;")
+                out.append(f"    SR_GPR_FLUSH(s); f_{target:08x}(s); return;")
             else:
-                y = "SR_YIELD(s); " if target <= addr else ""   # backward j: loop edge
+                y = (
+                    "SR_GPR_YIELD(s, SR_GPR_FLUSH(s), SR_GPR_RELOAD(s)); "
+                    if target <= addr else ""
+                )   # backward j: loop edge
                 out.append(f"    {y}goto L_{target:08x};")
             continue
         # conditional branch. A backward target is a loop edge: yield when it is taken.
         target = branch_target(addr, w)
-        y = "SR_YIELD(s); " if target <= addr else ""
-        link = f"s->r[31] = 0x{(addr + 8) & 0xFFFFFFFF:08x}u; " if is_link(w) else ""
+        y = (
+            "SR_GPR_YIELD(s, SR_GPR_FLUSH(s), SR_GPR_RELOAD(s)); "
+            if target <= addr else ""
+        )
+        link = f"SR_GPR(s, 31) = 0x{(addr + 8) & 0xFFFFFFFF:08x}u; " if is_link(w) else ""
         out.append(f"    {{ uint32_t _c = {cond_expr(w)};")
-        out.append(f"      sr_begin(s, 0x{addr:08x}u, 0x{w:08x}u); {link}sr_end(s, 0u, 0);")
+        out.append(
+            f"      SR_TRACE_BEGIN(s, 0x{addr:08x}u, 0x{w:08x}u); "
+            f"{link}SR_TRACE_END(s, 0u, 0);"
+        )
         if is_likely(w):
             out.append(f"      if (_c) {{ {normal_line(ds, dsw).strip()} {y}goto L_{target:08x}; }} }}")
         else:
             out.append(f"   {normal_line(ds, dsw)}")
             out.append(f"      if (_c) {{ {y}goto L_{target:08x}; }} }}")
+    out.append("    SR_GPR_FLUSH(s);")
     out.append("}")
     out.append("")
-    return out
+    return finalize_gpr_cache(out)
 
 
 SR_TO_W = """static inline uint32_t sr_to_w(float x, uint32_t fn) {
@@ -904,11 +1242,12 @@ def main(argv):
             sys.stderr.write(f"warning: import table parse failed: {e}\n")
 
     includes = ['#include "recomp.h"', "#include <math.h>", "#include <string.h>"]
-    helpers = [SR_TO_W, "", cx.PREAMBLE, ""]
+    helpers = [SR_TO_W, "", GPR_CACHE_PREAMBLE, "", cx.PREAMBLE, ""]
     protos = [f"void f_{a:08x}(CpuState *s);" for a in sorted(known)]
     funcs = []     # one list of lines per guest function, in address order
     emitted = []
     stubbed = []
+    stats = {"constant_jalr": 0}
     for a in sorted(known):
         out = []
         funcs.append(out)
@@ -919,22 +1258,28 @@ def main(argv):
             if lib_nid is not None:
                 lib, nid = lib_nid
                 out.append(f"void f_{a:08x}(CpuState *s) {{  /* import: {lib} nid 0x{nid:08x} */")
-                out.append(f"    sr_begin(s, 0x{a:08x}u, 0x{w0:08x}u); sr_end(s, 0u, 0);")
-                out.append(f"    sr_begin(s, 0x{a + 4:08x}u, 0x{w1:08x}u);")
+                out.append(
+                    f"    SR_DIRECT_TRACE_BEGIN(s, 0x{a:08x}u, 0x{w0:08x}u); "
+                    "SR_DIRECT_TRACE_END(s, 0u, 0);"
+                )
+                out.append(f"    SR_DIRECT_TRACE_BEGIN(s, 0x{a + 4:08x}u, 0x{w1:08x}u);")
                 out.append(f"    sr_syscall(s, 0x{nid:08x}u);")
-                out.append(f"    sr_end(s, 0u, 0);")
+                out.append("    SR_DIRECT_TRACE_END(s, 0u, 0);")
                 out.append("}")
             else:
                 # No import-table entry (or non-PRX): keep the old HLE-boundary behavior.
                 out.append(f"void f_{a:08x}(CpuState *s) {{  /* import stub -> HLE boundary */")
-                out.append(f"    sr_begin(s, 0x{a:08x}u, 0x{w0:08x}u); sr_end(s, 0u, 0);")
+                out.append(
+                    f"    SR_DIRECT_TRACE_BEGIN(s, 0x{a:08x}u, 0x{w0:08x}u); "
+                    "SR_DIRECT_TRACE_END(s, 0u, 0);"
+                )
                 out.append(f"    sr_hle_call(s, 0u);")
                 out.append("}")
             out.append("")
             emitted.append(a)
             continue
         try:
-            out.extend(emit_function(elf, a, ranges, known))
+            out.extend(emit_function(elf, a, ranges, known, stats))
             emitted.append(a)
         except Unsupported as e:
             # Emit a loud-trapping stub so the dispatch table stays complete and reaching this
@@ -1008,6 +1353,7 @@ def main(argv):
             )
         print(f"wrote {out_dir}/{stem}.h + {split_summary} + {stem}_register.c: "
               f"{len(emitted)}/{len(known)} functions ({len(stubbed)} trapping stubs)")
+    print(f"direct constant jalr calls: {stats['constant_jalr']}")
     if stubbed:
         sp = os.path.join(os.path.dirname(args[1]) or ".", "stubs.txt")
         with open(sp, "w", encoding="ascii", newline="\n") as f:
