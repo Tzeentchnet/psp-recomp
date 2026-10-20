@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
+#include "input_config.h"
 #ifdef SR_SDL3VK
 #include "gpu_sdl3vk/sdl3vk.h"
 #include "gpu_sdl3vk/ge_gpu.h"
@@ -38,22 +39,29 @@ static BITMAPINFO s_bmi;
 static uint32_t s_buttons = 0;
 static LARGE_INTEGER s_freq, s_last;   /* frame pacing to ~60 Hz */
 
-/* PSP button bits (sceCtrl): SELECT 0x1, START 0x8, UP 0x10, RIGHT 0x20, DOWN 0x40, LEFT 0x80,
- * LTRIG 0x100, RTRIG 0x200, TRIANGLE 0x1000, CIRCLE 0x2000, CROSS 0x4000, SQUARE 0x8000. */
-static uint32_t read_keys(void) {
-    uint32_t b = 0;
-    #define K(vk,bit) do { if (GetAsyncKeyState(vk) & 0x8000) b |= (bit); } while (0)
-    K(VK_RETURN, 0x0008);              /* Enter  -> START  */
-    K(VK_RSHIFT, 0x0001); K(VK_LSHIFT, 0x0001); /* Shift -> SELECT */
-    K('X', 0x4000);                    /* X -> CROSS   (confirm) */
-    K('Z', 0x2000);                    /* Z -> CIRCLE  (back)    */
-    K('A', 0x8000);                    /* A -> SQUARE  */
-    K('S', 0x1000);                    /* S -> TRIANGLE */
-    K('Q', 0x0100);                    /* Q -> L */
-    K('W', 0x0200);                    /* W -> R */
-    K(VK_UP, 0x0010); K(VK_DOWN, 0x0040); K(VK_LEFT, 0x0080); K(VK_RIGHT, 0x0020);
-    #undef K
-    return b;
+static int win_key_code(int key) {
+    if ((key >= 'A' && key <= 'Z') || (key >= '0' && key <= '9')) return key;
+    switch (key) {
+    case SR_KEY_ENTER: return VK_RETURN;
+    case SR_KEY_LEFT_SHIFT: return VK_LSHIFT;
+    case SR_KEY_RIGHT_SHIFT: return VK_RSHIFT;
+    case SR_KEY_UP: return VK_UP;
+    case SR_KEY_RIGHT: return VK_RIGHT;
+    case SR_KEY_DOWN: return VK_DOWN;
+    case SR_KEY_LEFT: return VK_LEFT;
+    case SR_KEY_SPACE: return VK_SPACE;
+    case SR_KEY_TAB: return VK_TAB;
+    case SR_KEY_BACKSPACE: return VK_BACK;
+    case SR_KEY_LEFT_CTRL: return VK_LCONTROL;
+    case SR_KEY_RIGHT_CTRL: return VK_RCONTROL;
+    default: return 0;
+    }
+}
+
+static int win_key_down(void *context, int key) {
+    (void)context;
+    int vk = win_key_code(key);
+    return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
 /* ---- Gamepad support (XInput + DirectInput) ---------------------------------------------------
@@ -72,6 +80,18 @@ static PFN_XInputGetState s_xiGetState;
 
 static IDirectInput8A     *s_di;
 static IDirectInputDevice8A *s_dijoy;
+
+typedef struct PadState {
+    uint8_t down[SR_PAD_RIGHT_STICK + 1];
+    int x, y;
+    int has_stick;
+    int present;
+} PadState;
+
+static int pad_down(void *context, int button) {
+    PadState *state = (PadState *)context;
+    return button > 0 && button <= SR_PAD_RIGHT_STICK && state->down[button];
+}
 
 static BOOL CALLBACK di_enum_cb(const DIDEVICEINSTANCEA *inst, void *ctx) {
     (void)ctx;
@@ -106,37 +126,30 @@ static void pad_init(void) {
             s_xiGetState ? "ok" : "none", s_dijoy ? "ok" : "none");
 }
 
-static uint8_t axis_to_psp(int centred /* -32768..32767 */, int deadzone) {
-    if (centred > -deadzone && centred < deadzone) return 128;
-    int u = (centred + 32768) * 255 / 65535;
-    return (uint8_t)(u < 0 ? 0 : u > 255 ? 255 : u);
-}
-
-/* Poll connected pads. Returns the PSP button mask and (via lx/ly) the analog left stick. */
-static uint32_t read_pad(uint8_t *lx, uint8_t *ly) {
-    uint32_t b = 0; int have_stick = 0; int present = 0;
+static void read_pad(PadState *state) {
+    memset(state, 0, sizeof(*state));
     if (s_xiGetState) {
         XISTATE st;
         if (s_xiGetState(0, &st) == 0 /* ERROR_SUCCESS */) {
-            present = 1;
+            state->present = 1;
             WORD w = st.Gamepad.wButtons;
-            if (w & 0x1000) b |= 0x4000;   /* A -> CROSS    */
-            if (w & 0x2000) b |= 0x2000;   /* B -> CIRCLE   */
-            if (w & 0x4000) b |= 0x8000;   /* X -> SQUARE   */
-            if (w & 0x8000) b |= 0x1000;   /* Y -> TRIANGLE */
-            if (w & 0x0010) b |= 0x0008;   /* Start -> START  */
-            if (w & 0x0020) b |= 0x0001;   /* Back  -> SELECT */
-            if (w & 0x0100) b |= 0x0100;   /* LB -> L */
-            if (w & 0x0200) b |= 0x0200;   /* RB -> R */
-            if (st.Gamepad.bLeftTrigger  > 64) b |= 0x0100;
-            if (st.Gamepad.bRightTrigger > 64) b |= 0x0200;
-            if (w & 0x0001) b |= 0x0010;   /* DPad up    */
-            if (w & 0x0002) b |= 0x0040;   /* DPad down  */
-            if (w & 0x0004) b |= 0x0080;   /* DPad left  */
-            if (w & 0x0008) b |= 0x0020;   /* DPad right */
-            *lx = axis_to_psp(st.Gamepad.sThumbLX, 7849);
-            *ly = axis_to_psp(-st.Gamepad.sThumbLY, 7849);   /* PSP Y: up=0, down=255 */
-            have_stick = 1;
+            state->down[SR_PAD_SOUTH] = (w & 0x1000) != 0;
+            state->down[SR_PAD_EAST] = (w & 0x2000) != 0;
+            state->down[SR_PAD_WEST] = (w & 0x4000) != 0;
+            state->down[SR_PAD_NORTH] = (w & 0x8000) != 0;
+            state->down[SR_PAD_START] = (w & 0x0010) != 0;
+            state->down[SR_PAD_BACK] = (w & 0x0020) != 0;
+            state->down[SR_PAD_LEFT_SHOULDER] = (w & 0x0100) != 0;
+            state->down[SR_PAD_RIGHT_SHOULDER] = (w & 0x0200) != 0;
+            state->down[SR_PAD_LEFT_TRIGGER] = st.Gamepad.bLeftTrigger > 64;
+            state->down[SR_PAD_RIGHT_TRIGGER] = st.Gamepad.bRightTrigger > 64;
+            state->down[SR_PAD_DPAD_UP] = (w & 0x0001) != 0;
+            state->down[SR_PAD_DPAD_DOWN] = (w & 0x0002) != 0;
+            state->down[SR_PAD_DPAD_LEFT] = (w & 0x0004) != 0;
+            state->down[SR_PAD_DPAD_RIGHT] = (w & 0x0008) != 0;
+            state->x = st.Gamepad.sThumbLX;
+            state->y = -st.Gamepad.sThumbLY;
+            state->has_stick = 1;
         }
     }
     if (s_dijoy) {
@@ -144,33 +157,33 @@ static uint32_t read_pad(uint8_t *lx, uint8_t *ly) {
         HRESULT hr = IDirectInputDevice8_Poll(s_dijoy);
         if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) IDirectInputDevice8_Acquire(s_dijoy);
         if (SUCCEEDED(IDirectInputDevice8_GetDeviceState(s_dijoy, sizeof(js), &js))) {
-            present = 1;
+            state->present = 1;
             const unsigned char *bt = js.rgbButtons;     /* DualShock4 / generic HID order */
-            if (bt[1] & 0x80) b |= 0x4000;   /* Cross    -> CROSS    */
-            if (bt[2] & 0x80) b |= 0x2000;   /* Circle   -> CIRCLE   */
-            if (bt[0] & 0x80) b |= 0x8000;   /* Square   -> SQUARE   */
-            if (bt[3] & 0x80) b |= 0x1000;   /* Triangle -> TRIANGLE */
-            if (bt[4] & 0x80) b |= 0x0100;   /* L1 -> L */
-            if (bt[5] & 0x80) b |= 0x0200;   /* R1 -> R */
-            if (bt[6] & 0x80) b |= 0x0100;   /* L2 -> L */
-            if (bt[7] & 0x80) b |= 0x0200;   /* R2 -> R */
-            if (bt[8] & 0x80) b |= 0x0001;   /* Share/Select -> SELECT */
-            if (bt[9] & 0x80) b |= 0x0008;   /* Options/Start -> START */
+            state->down[SR_PAD_SOUTH] |= (bt[1] & 0x80) != 0;
+            state->down[SR_PAD_EAST] |= (bt[2] & 0x80) != 0;
+            state->down[SR_PAD_WEST] |= (bt[0] & 0x80) != 0;
+            state->down[SR_PAD_NORTH] |= (bt[3] & 0x80) != 0;
+            state->down[SR_PAD_LEFT_SHOULDER] |= (bt[4] & 0x80) != 0;
+            state->down[SR_PAD_RIGHT_SHOULDER] |= (bt[5] & 0x80) != 0;
+            state->down[SR_PAD_LEFT_TRIGGER] |= (bt[6] & 0x80) != 0;
+            state->down[SR_PAD_RIGHT_TRIGGER] |= (bt[7] & 0x80) != 0;
+            state->down[SR_PAD_BACK] |= (bt[8] & 0x80) != 0;
+            state->down[SR_PAD_START] |= (bt[9] & 0x80) != 0;
             DWORD pov = js.rgdwPOV[0];
             if ((pov & 0xFFFF) != 0xFFFF) {  /* hat: centidegrees, 0=up clockwise */
-                if (pov > 27000 || pov < 9000)  b |= 0x0010;   /* up    */
-                if (pov > 9000  && pov < 27000) b |= 0x0040;   /* down  */
-                if (pov > 18000)                 b |= 0x0080;   /* left  */
-                if (pov > 0 && pov < 18000)      b |= 0x0020;   /* right */
+                state->down[SR_PAD_DPAD_UP] |= pov >= 31500 || pov <= 4500;
+                state->down[SR_PAD_DPAD_RIGHT] |= pov >= 4500 && pov <= 13500;
+                state->down[SR_PAD_DPAD_DOWN] |= pov >= 13500 && pov <= 22500;
+                state->down[SR_PAD_DPAD_LEFT] |= pov >= 22500 && pov <= 31500;
             }
-            if (!have_stick) {               /* prefer XInput stick if both present */
-                *lx = axis_to_psp((int)js.lX - 32768, 6000);
-                *ly = axis_to_psp((int)js.lY - 32768, 6000);
+            if (!state->has_stick) {          /* prefer XInput stick if both present */
+                state->x = (int)js.lX - 32768;
+                state->y = (int)js.lY - 32768;
+                state->has_stick = 1;
             }
         }
     }
-    s_pad_present = present;
-    return b;
+    s_pad_present = state->present;
 }
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -180,6 +193,10 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 int gui_init(const char *title) {
+    if (!sr_input_init()) {
+        fprintf(stderr, "gui_init: input configuration failed\n");
+        return 0;
+    }
     const char *requested = getenv("SR_GPU");
     int explicit_gpu = requested && requested[0];
     int want_vk = 0;
@@ -424,9 +441,15 @@ void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
-    uint8_t lx = 128, ly = 128;
-    s_buttons = read_keys() | read_pad(&lx, &ly);
-    s_lx = lx; s_ly = ly;
+    PadState pad;
+    read_pad(&pad);
+    s_buttons = sr_input_buttons(
+        win_key_down, NULL, pad.present ? pad_down : NULL, &pad);
+    int key_x = 0, key_y = 0;
+    sr_input_keyboard_axis(win_key_down, NULL, &key_x, &key_y);
+    int raw_x = key_x || key_y ? key_x : pad.has_stick ? pad.x : 0;
+    int raw_y = key_x || key_y ? key_y : pad.has_stick ? pad.y : 0;
+    sr_input_analog(raw_x, raw_y, &s_lx, &s_ly);
 
     convert_fb(fbaddr, fmt, stride);
     HDC dc = GetDC(s_hwnd);

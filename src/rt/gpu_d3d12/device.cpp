@@ -24,6 +24,7 @@
 #include "shader_state.h"
 #include "texture.h"
 #include "vertex.h"
+#include "../input_sdl.h"
 extern "C" {
 #include "../recomp.h"
 }
@@ -1107,51 +1108,23 @@ static void poll_input(int *quit) {
         }
     }
 
-    uint32_t buttons = 0;
     const bool *keys = SDL_GetKeyboardState(nullptr);
-    if (keys[SDL_SCANCODE_RETURN]) buttons |= 0x0008;
-    if (keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT]) buttons |= 0x0001;
-    if (keys[SDL_SCANCODE_X]) buttons |= 0x4000;
-    if (keys[SDL_SCANCODE_Z]) buttons |= 0x2000;
-    if (keys[SDL_SCANCODE_A]) buttons |= 0x8000;
-    if (keys[SDL_SCANCODE_S]) buttons |= 0x1000;
-    if (keys[SDL_SCANCODE_Q]) buttons |= 0x0100;
-    if (keys[SDL_SCANCODE_W]) buttons |= 0x0200;
-    if (keys[SDL_SCANCODE_UP]) buttons |= 0x0010;
-    if (keys[SDL_SCANCODE_DOWN]) buttons |= 0x0040;
-    if (keys[SDL_SCANCODE_LEFT]) buttons |= 0x0080;
-    if (keys[SDL_SCANCODE_RIGHT]) buttons |= 0x0020;
-
-    uint8_t lx = 128, ly = 128;
     s_pad_present = s_pad != nullptr;
-    if (s_pad) {
-#define PAD_BUTTON(sdl_button, psp_button) \
-        do { if (SDL_GetGamepadButton(s_pad, sdl_button)) buttons |= (psp_button); } while (0)
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_SOUTH, 0x4000);
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_EAST, 0x2000);
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_WEST, 0x8000);
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_NORTH, 0x1000);
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_START, 0x0008);
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_BACK, 0x0001);
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0x0100);
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 0x0200);
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_DPAD_UP, 0x0010);
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_DPAD_DOWN, 0x0040);
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_DPAD_LEFT, 0x0080);
-        PAD_BUTTON(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 0x0020);
-#undef PAD_BUTTON
-        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8192)
-            buttons |= 0x0100;
-        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8192)
-            buttons |= 0x0200;
-        int ax = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTX);
-        int ay = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTY);
-        if (ax < -7849 || ax > 7849) lx = (uint8_t)((ax + 32768) * 255 / 65535);
-        if (ay < -7849 || ay > 7849) ly = (uint8_t)((ay + 32768) * 255 / 65535);
-    }
-    s_buttons = buttons;
-    s_lx = lx;
-    s_ly = ly;
+    s_buttons = sr_input_buttons(
+        sr_input_sdl_key_down, (void *)keys,
+        s_pad ? sr_input_sdl_pad_down : nullptr, s_pad);
+    int key_x = 0;
+    int key_y = 0;
+    sr_input_keyboard_axis(
+        sr_input_sdl_key_down, (void *)keys, &key_x, &key_y);
+    int pad_x =
+        s_pad ? SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTX) : 0;
+    int pad_y =
+        s_pad ? SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTY) : 0;
+    sr_input_analog(
+        key_x || key_y ? key_x : pad_x,
+        key_x || key_y ? key_y : pad_y,
+        &s_lx, &s_ly);
 }
 
 static bool same_list(

@@ -100,12 +100,35 @@ build/mygame/mygame.exe --image build/mygame/mygame_image.bin 0x08804000 <entry_
 ## Runtime Controls
 
 If you have a gamepad connected, SDL3 will map it automatically. Otherwise, use these keyboard mappings:
-- **Arrow Keys**: PSP D-pad
-- **I, K, J, L**: Analog Stick (Up, Down, Left, Right)
-- **Z / X**: Cross (A) / Circle (B)
+- **Arrow Keys**: PSP D-pad and analog stick
+- **X / Z**: Cross (A) / Circle (B)
 - **A / S**: Square (X) / Triangle (Y)
 - **Q / W**: L-Trigger / R-Trigger
-- **Enter / Space**: Start / Select
+- **Enter / Shift**: Start / Select
+
+On first windowed launch, the runtime writes
+`%LOCALAPPDATA%\KZLRecomp\input.ini`. Edit that file and restart to rebind
+keyboard/gamepad controls or change the radial analog response:
+
+```ini
+keyboard.cross = X
+keyboard.analog_up = up
+gamepad.cross = south
+gamepad.l = left_shoulder, left_trigger
+analog.deadzone = 0.24
+analog.curve = 1.0
+analog.invert_y = false
+```
+
+Bindings accept up to four comma-separated inputs or `none`. Keyboard inputs
+are `A`-`Z`, `0`-`9`, `enter`, `left_shift`, `right_shift`, `up`, `right`,
+`down`, `left`, `space`, `tab`, `backspace`, `left_ctrl`, and `right_ctrl`.
+Gamepad inputs are `south`, `east`, `west`, `north`, `start`, `back`,
+`left_shoulder`, `right_shoulder`, `left_trigger`, `right_trigger`, the four
+`dpad_*` names, `left_stick`, and `right_stick`. Invalid settings stop startup
+with a line-specific error instead of silently falling back. Set
+`SR_INPUT_CONFIG=<path>` to use another file, or `SR_INPUT_CONFIG=0` to use
+built-in defaults without reading or writing a file.
 
 ## Environment Settings
 

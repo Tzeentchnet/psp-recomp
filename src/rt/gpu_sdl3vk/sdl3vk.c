@@ -15,6 +15,7 @@
  * GPLv2+: it consumes ge.c, whose GE semantics are derived from PPSSPP. */
 
 #include "sdl3vk.h"
+#include "../input_sdl.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -284,48 +285,22 @@ static void poll_input(int *quit) {
         }
     }
 
-    uint32_t b = 0;
     const bool *k = SDL_GetKeyboardState(NULL);
-    /* Same bindings as the GDI front-end (gui.c read_keys). */
-    if (k[SDL_SCANCODE_RETURN]) b |= 0x0008;                       /* START   */
-    if (k[SDL_SCANCODE_LSHIFT] || k[SDL_SCANCODE_RSHIFT]) b |= 0x0001; /* SELECT */
-    if (k[SDL_SCANCODE_X]) b |= 0x4000;                            /* CROSS   */
-    if (k[SDL_SCANCODE_Z]) b |= 0x2000;                            /* CIRCLE  */
-    if (k[SDL_SCANCODE_A]) b |= 0x8000;                            /* SQUARE  */
-    if (k[SDL_SCANCODE_S]) b |= 0x1000;                            /* TRIANGLE*/
-    if (k[SDL_SCANCODE_Q]) b |= 0x0100;                            /* L       */
-    if (k[SDL_SCANCODE_W]) b |= 0x0200;                            /* R       */
-    if (k[SDL_SCANCODE_UP])    b |= 0x0010;
-    if (k[SDL_SCANCODE_DOWN])  b |= 0x0040;
-    if (k[SDL_SCANCODE_LEFT])  b |= 0x0080;
-    if (k[SDL_SCANCODE_RIGHT]) b |= 0x0020;
-
-    uint8_t lx = 128, ly = 128;
     s_pad_present = s_pad != NULL;
-    if (s_pad) {
-        #define PB(sdlb, bit) do { if (SDL_GetGamepadButton(s_pad, sdlb)) b |= (bit); } while (0)
-        PB(SDL_GAMEPAD_BUTTON_SOUTH, 0x4000);          /* CROSS    */
-        PB(SDL_GAMEPAD_BUTTON_EAST,  0x2000);          /* CIRCLE   */
-        PB(SDL_GAMEPAD_BUTTON_WEST,  0x8000);          /* SQUARE   */
-        PB(SDL_GAMEPAD_BUTTON_NORTH, 0x1000);          /* TRIANGLE */
-        PB(SDL_GAMEPAD_BUTTON_START, 0x0008);
-        PB(SDL_GAMEPAD_BUTTON_BACK,  0x0001);
-        PB(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,  0x0100);
-        PB(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 0x0200);
-        PB(SDL_GAMEPAD_BUTTON_DPAD_UP,    0x0010);
-        PB(SDL_GAMEPAD_BUTTON_DPAD_DOWN,  0x0040);
-        PB(SDL_GAMEPAD_BUTTON_DPAD_LEFT,  0x0080);
-        PB(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 0x0020);
-        #undef PB
-        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER)  > 8192) b |= 0x0100;
-        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8192) b |= 0x0200;
-        int ax = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTX);
-        int ay = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTY);
-        if (ax < -7849 || ax > 7849) lx = (uint8_t)((ax + 32768) * 255 / 65535);
-        if (ay < -7849 || ay > 7849) ly = (uint8_t)((ay + 32768) * 255 / 65535);
-    }
-    s_buttons = b;
-    s_lx = lx; s_ly = ly;
+    s_buttons = sr_input_buttons(
+        sr_input_sdl_key_down, (void *)k,
+        s_pad ? sr_input_sdl_pad_down : NULL, s_pad);
+    int key_x = 0, key_y = 0;
+    sr_input_keyboard_axis(
+        sr_input_sdl_key_down, (void *)k, &key_x, &key_y);
+    int pad_x =
+        s_pad ? SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTX) : 0;
+    int pad_y =
+        s_pad ? SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTY) : 0;
+    sr_input_analog(
+        key_x || key_y ? key_x : pad_x,
+        key_x || key_y ? key_y : pad_y,
+        &s_lx, &s_ly);
 }
 
 int sdl3vk_get_vk(Sdl3VkInfo *out) {

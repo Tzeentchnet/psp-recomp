@@ -48,6 +48,7 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/mpeg.c \
               src/rt/pgf.c \
               src/rt/gui.c \
+              src/rt/input_config.c \
               src/rt/audio.c \
               src/rt/sas_reverb.c \
               src/rt/h264_mf.c \
