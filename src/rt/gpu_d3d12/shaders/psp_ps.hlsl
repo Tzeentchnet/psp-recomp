@@ -11,6 +11,9 @@ cbuffer PSPConstants : register(b0) {
     float4 texenv;  /* rgb=GE_TEXENVCOLOR / 255 */
     float4 fogcol;  /* rgb=GE_FOGCOLOR / 255 */
     float4 texsize; /* xy=dimensions, zw=render-target sub-rect texel offset */
+    int4 color_test_state; /* x=func, y=reference RGB, z=mask RGB */
+    int4 stencil_state;    /* x=test, y=ops, z=write mask, w=fb format */
+    int4 dither_rows;      /* four packed signed-nibble rows */
 };
 
 struct PSInput {
@@ -114,11 +117,48 @@ float4 main(PSInput input) : SV_Target0 {
             color.rgb = lerp(fogcol.rgb * 255.0, color.rgb, fog);
         }
 
+        if ((flags & 512) != 0) {
+            int3 rgb = (int3)(color.rgb + 0.5);
+            int packed = rgb.r | (rgb.g << 8) | (rgb.b << 16);
+            int masked = packed & color_test_state.z;
+            int reference =
+                color_test_state.y & color_test_state.z;
+            bool pass =
+                color_test_state.x == 1 ||
+                (color_test_state.x == 2 && masked == reference) ||
+                (color_test_state.x == 3 && masked != reference);
+            if (!pass) discard;
+        }
+
         if ((flags & 128) != 0) {
             color.rgb *= saturate(color.a * (2.0 / 255.0));
         }
         if ((flags & 256) != 0) {
             color.rgb *= saturate(1.0 - color.a * (2.0 / 255.0));
+        }
+    }
+
+    if ((flags & 1024) != 0) {
+        int row = dither_rows[(int)input.position.y & 3];
+        int value =
+            (row >> (((int)input.position.x & 3) * 4)) & 15;
+        if (value >= 8) value -= 16;
+        color.rgb = clamp(
+            color.rgb + (float)value,
+            float3(0.0, 0.0, 0.0),
+            float3(255.0, 255.0, 255.0));
+    }
+
+    if ((flags & 2048) != 0) {
+        int stencil_pass = (stencil_state.y >> 16) & 7;
+        if ((stencil_state.x & 7) == 1) {
+            if (stencil_pass == 1) {
+                color.a = 0.0;
+            } else if (stencil_pass == 2) {
+                color.a = (float)(
+                    ((stencil_state.x >> 8) & 255) &
+                    ((stencil_state.x >> 16) & 255));
+            }
         }
     }
 

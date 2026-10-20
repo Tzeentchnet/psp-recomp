@@ -50,6 +50,10 @@ bool ged3d12_upload_alloc(
     return true;
 }
 
+ID3D12GraphicsCommandList *ged3d12_command_list(void) {
+    return nullptr;
+}
+
 static void reset_upload(void) {
     memset(s_upload, 0xcd, sizeof(s_upload));
     s_upload_cursor = 3;
@@ -141,6 +145,110 @@ static void test_present_viewports(void) {
     check_u32("pillarbox scissor right", (uint32_t)layout.scissor.right, 1913);
 }
 
+static void test_shader_constants(void) {
+    GeState state = {};
+    state.minz = 17;
+    state.maxz = 65000;
+    state.tex_enable = 1;
+    state.tex_addr = 0x04010000u;
+    state.tex_w = 128;
+    state.tex_h = 64;
+    state.tex_func = 4u | 0x100u | 0x10000u;
+    state.tex_filter = 0;
+    state.tex_env = 0x00332211u;
+    state.fog_enable = 1;
+    state.fog_color = 0x00665544u;
+    state.atest_enable = 1;
+    state.atest = 6u | (0x7fu << 8) | (0xf0u << 16);
+    state.blend_enable = 1;
+    state.blend_mode = 6;
+    state.color_test_enable = 1;
+    state.color_test = 2;
+    state.color_ref = 0x00a1b2c3u;
+    state.color_test_mask = 0x00f0ff0fu;
+    state.stencil_test_enable = 1;
+    state.stencil_test = 5u | (0x66u << 8) | (0xf0u << 16);
+    state.stencil_op = 1u | (2u << 8) | (3u << 16);
+    state.mask_alpha = 0x0f;
+    state.fbfmt = 2;
+    state.dither_enable = 1;
+    state.dith[0][0] = -4;
+    state.dith[0][1] = -1;
+    state.dith[0][2] = 0;
+    state.dith[0][3] = 7;
+
+    GeD3D12TextureBinding texture = {};
+    texture.handle = GE_D3D12_TEXTURE_HANDLE_NONE;
+    texture.framebuffer.handle = 9;
+    texture.framebuffer.x = 7;
+    texture.framebuffer.y = 11;
+    GeD3D12ShaderConstants constants = {};
+    ged3d12_shader_constants_build(
+        &state, 1, 0, &texture, &constants);
+    uint32_t flags = (uint32_t)constants.config[0] >> 8;
+    check_u32(
+        "shader texture function",
+        (uint32_t)constants.config[0] & 7u, 4);
+    check_u32(
+        "shader feature flags", flags,
+        GE_D3D12_SHADER_TEXTURE |
+        GE_D3D12_SHADER_TEXTURE_RGBA |
+        GE_D3D12_SHADER_COLOR_DOUBLE |
+        GE_D3D12_SHADER_FOG |
+        GE_D3D12_SHADER_DEPTH_RANGE |
+        GE_D3D12_SHADER_NEAREST |
+        GE_D3D12_SHADER_DOUBLE_SOURCE_ALPHA |
+        GE_D3D12_SHADER_COLOR_TEST |
+        GE_D3D12_SHADER_DITHER |
+        GE_D3D12_SHADER_STENCIL);
+    check_u32(
+        "shader alpha test", (uint32_t)constants.config[1],
+        state.atest);
+    check_u32(
+        "shader minimum depth", (uint32_t)constants.config[2], 17);
+    check_u32(
+        "shader maximum depth", (uint32_t)constants.config[3], 65000);
+    check_float(
+        "shader texture environment red",
+        constants.texture_environment[0], 0x11 / 255.0f);
+    check_float(
+        "shader fog blue", constants.fog_color[2], 0x66 / 255.0f);
+    check_float("shader texture width", constants.texture_size[0], 128.0f);
+    check_float("shader texture height", constants.texture_size[1], 64.0f);
+    check_float("shader alias x", constants.texture_size[2], 7.0f);
+    check_float("shader alias y", constants.texture_size[3], 11.0f);
+    check_u32("shader color function", constants.color_test[0], 2);
+    check_u32(
+        "shader color reference", constants.color_test[1], 0x00a1b2c3u);
+    check_u32(
+        "shader color mask", constants.color_test[2], 0x00f0ff0fu);
+    check_u32(
+        "shader stencil test", constants.stencil_test[0],
+        state.stencil_test);
+    check_u32(
+        "shader stencil operations", constants.stencil_test[1],
+        state.stencil_op);
+    check_u32("shader stencil write mask", constants.stencil_test[2], 0x0f);
+    check_u32("shader stencil format", constants.stencil_test[3], 2);
+    check_u32("shader dither row", constants.dither[0], 0x000070fcu);
+
+    state.clear = 1;
+    state.clear_mode = 0x700;
+    ged3d12_shader_constants_build(
+        &state, 1, 1, &texture, &constants);
+    flags = (uint32_t)constants.config[0] >> 8;
+    check_u32(
+        "clear shader flags", flags,
+        GE_D3D12_SHADER_CLEAR | GE_D3D12_SHADER_DITHER);
+    check_u32(
+        "clear alpha test disabled",
+        (uint32_t)constants.config[1], 1);
+    check_u32(
+        "clear color test disabled", constants.color_test[0], 1);
+    check_u32(
+        "clear stencil test disabled", constants.stencil_test[0], 1);
+}
+
 static void test_pipeline_keys(void) {
     GeD3D12PipelineKey base;
     GeD3D12PipelineKey key;
@@ -149,8 +257,11 @@ static void test_pipeline_keys(void) {
     check_u32("default blend disabled", base.blend_enable, 0);
     check_u32("default source blend", base.source_blend, D3D12_BLEND_ONE);
     check_u32("default destination blend", base.destination_blend, D3D12_BLEND_ZERO);
-    check_u32("default color mask", base.color_write_mask,
-              D3D12_COLOR_WRITE_ENABLE_ALL);
+    check_u32(
+        "default color mask", base.color_write_mask,
+        D3D12_COLOR_WRITE_ENABLE_RED |
+        D3D12_COLOR_WRITE_ENABLE_GREEN |
+        D3D12_COLOR_WRITE_ENABLE_BLUE);
     check_u32("default depth disabled", base.depth_enable, 0);
     check_u32("default culling", base.cull_mode, D3D12_CULL_MODE_NONE);
     check_u32("default render-target format", base.render_target_format,
@@ -206,6 +317,45 @@ static void test_pipeline_keys(void) {
     check_u32("clear depth function", key.depth_function,
               D3D12_COMPARISON_FUNC_ALWAYS);
     check_u32("clear culling disabled", key.cull_mode, D3D12_CULL_MODE_NONE);
+
+    memset(&s_state, 0, sizeof(s_state));
+    s_state.stencil_test_enable = 1;
+    s_state.stencil_test = 1;
+    s_state.stencil_op = 2u << 16;
+    s_state.fbfmt = 3;
+    ged3d12_pipeline_key_build(&s_state, 0, &key);
+    check_u32(
+        "stencil replace enables alpha write", key.color_write_mask,
+        D3D12_COLOR_WRITE_ENABLE_ALL);
+    s_state.stencil_op = 0;
+    ged3d12_pipeline_key_build(&s_state, 0, &key);
+    check_u32(
+        "stencil keep preserves alpha", key.color_write_mask,
+        D3D12_COLOR_WRITE_ENABLE_RED |
+        D3D12_COLOR_WRITE_ENABLE_GREEN |
+        D3D12_COLOR_WRITE_ENABLE_BLUE);
+    s_state.stencil_test = 2;
+    s_state.stencil_op = 2u << 16;
+    ged3d12_pipeline_key_build(&s_state, 0, &key);
+    check_u32(
+        "stencil compare preserves alpha", key.color_write_mask,
+        D3D12_COLOR_WRITE_ENABLE_RED |
+        D3D12_COLOR_WRITE_ENABLE_GREEN |
+        D3D12_COLOR_WRITE_ENABLE_BLUE);
+    s_state.stencil_test = 1;
+    s_state.mask_alpha = 0x0f;
+    s_state.fbfmt = 3;
+    ged3d12_pipeline_key_build(&s_state, 0, &key);
+    check_u32(
+        "partial 8888 stencil mask preserves alpha", key.color_write_mask,
+        D3D12_COLOR_WRITE_ENABLE_RED |
+        D3D12_COLOR_WRITE_ENABLE_GREEN |
+        D3D12_COLOR_WRITE_ENABLE_BLUE);
+    s_state.fbfmt = 2;
+    ged3d12_pipeline_key_build(&s_state, 0, &key);
+    check_u32(
+        "irrelevant 4444 stencil mask writes alpha", key.color_write_mask,
+        D3D12_COLOR_WRITE_ENABLE_ALL);
 
     memset(&s_state, 0, sizeof(s_state));
     s_state.blend_enable = 1;
@@ -619,6 +769,7 @@ int main(void) {
         fail("vertex capture initialization failed");
     } else {
         test_present_viewports();
+        test_shader_constants();
         test_pipeline_keys();
         test_texture_keys();
         test_framebuffer_keys();

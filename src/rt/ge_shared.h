@@ -62,6 +62,9 @@ typedef struct {
     int tgen_num;
     /* Alpha test: atest = func | ref<<8 | mask<<16 (funcs match ztest_px order). */
     int atest_enable; uint32_t atest;
+    /* Color test compares masked RGB; stencil uses destination alpha on the PSP. */
+    int color_test_enable; uint32_t color_test, color_ref, color_test_mask;
+    int stencil_test_enable; uint32_t stencil_test, stencil_op;
     /* Fog: colour = mix(fog_color, frag, clamp01((view_z + fog_end) * fog_slope)). */
     int fog_enable; float fog_end, fog_slope; uint32_t fog_color;
     /* Shading: 1 = gouraud (default), 0 = flat (provoking vertex = last). */
@@ -169,6 +172,13 @@ uint32_t  ge_zbuf_stride(void);
 void      ge_decode_tex_rgba(uint32_t *out);
 void      ge_decode_tex_rgba_level(uint32_t *out, int level);
 uint64_t  ge_texture_level_byte_size(const GeState *state, int level);
+int       ge_color_test_pass(
+              uint32_t test, uint32_t reference, uint32_t mask,
+              int red, int green, int blue);
+int       ge_stencil_test_pass(uint32_t test, uint8_t stencil);
+uint8_t   ge_stencil_apply(
+              uint32_t operation, uint32_t format, uint8_t stencil,
+              uint8_t reference);
 
 #ifdef __cplusplus
 }

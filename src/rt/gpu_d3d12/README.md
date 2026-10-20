@@ -11,7 +11,7 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 - a D3D12 device, direct and copy queues, timeline fences, and a three-buffer
   flip-discard swapchain;
 - shader-visible CBV/SRV/UAV descriptor rings plus RTV and DSV heaps;
-- a 16-DWORD `b0` GE-state root block, `t0` texture/`t1` CLUT table, dynamic
+- a 28-DWORD `b0` GE-state root block, `t0` texture/`t1` CLUT table, dynamic
   `s0` sampler table, and static clamp-nearest `s1`/clamp-linear `s2` samplers;
 - a shader-visible dynamic sampler ring partitioned by fenced frame;
 - a persistently mapped, three-frame upload ring;
@@ -44,7 +44,8 @@ GPU render targets.
 
 `pipeline_key.cpp` maps only PSO-static GE fields; shader constants, descriptors,
 scissor, and blend constants remain per-draw state and intentionally do not multiply the
-cache. Each captured batch stores its key before later GE commands mutate the live state.
+cache. Each captured batch stores its key and canonical 112-byte shader block before later
+GE commands mutate the live state.
 `pipeline.cpp` uses FNV-1a to select an open-addressed slot, confirms the full key on
 hits, compiles the embedded HLSL synchronously on misses, and binds the resulting PSO to
 the live command list. Draw submission is intentionally deferred while software
@@ -86,8 +87,9 @@ reads synchronously materialize overlapping color data; CPU writes materialize
 it before the store and invalidate overlapping framebuffer/texture views after
 the store. DMA, MPEG, and CPU block-transfer bulk writes follow the same
 pre-write contract. A full CPU-content hash catches unnotified edits to clean
-targets before GPU reuse. GPU-authoritative depth readback is deferred until the
-depth behavior in T-4.10 is implemented.
+targets before GPU reuse. GPU-owned depth readback remains inactive while native
+draw submission is disabled and must be enabled before native depth becomes
+authoritative.
 
 Compatible `TRXKICK` operations between distinct cached targets use an exact
 D3D12 image copy and update the guest-VRAM mirror. Format, stride, pixel-size,
@@ -95,7 +97,19 @@ aliasing, or bounds mismatches explicitly fall back to the CPU transfer path.
 
 `shaders/psp_vs.hlsl` and `shaders/psp_ps.hlsl` are the native Shader Model 6 ports of
 the Vulkan GE shaders. Their checked-in `*.inc` files contain stripped DXIL consumed by
-`device.cpp`. Regenerate or verify them with:
+`device.cpp`. `shader_state.cpp` snapshots texture functions, alpha/color tests, color
+doubling, fog, D16 `minz`/`maxz`, framebuffer-alias offsets, stencil state, and the signed
+4×4 dither matrix into the 28-DWORD root block. The pixel shader performs color test after
+fog and ordered dithering, while ordinary PSOs preserve destination alpha as PSP stencil.
+
+The fixed-function path can emit destination-independent, always-pass stencil depth-pass
+zero/replace operations when all stored stencil bits are writable. Other comparisons,
+stencil fail/depth-fail operations, invert/increment/decrement, partial 8888 masks, and
+exact post-blend dithering require destination color/depth access. They intentionally share
+the programmable destination path needed for the remaining blend and logic operations;
+native draws are not enabled before that path is complete.
+
+Regenerate or verify the shaders with:
 
 ```text
 python tools/compile_d3d12_shaders.py [--dxc path/to/dxc]
@@ -123,8 +137,8 @@ and live targets. Set `SR_D3D12_FRAMEBUFFER_SAFE=1` to force every cached target
 through a GPU readback after cached presentation; this is a diagnostic mode and
 intentionally stalls the graphics queue.
 
-Later phase-4 tasks submit the uploaded batches and populate the remaining per-draw
-shader state behind the existing framebuffer, descriptor, and invalidation model.
+Later phase-4 tasks add the destination-aware blend/logic path and submit the uploaded
+batches behind the existing framebuffer, descriptor, invalidation, and shader-state model.
 
 The root project keeps this dependency optional:
 

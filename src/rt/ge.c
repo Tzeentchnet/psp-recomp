@@ -13,8 +13,8 @@
  * programmable alpha test, alpha blending (full factor/equation set), 4x4 ordered dithering,
  * colour/alpha write masks, scissor, and a software 16-bit depth buffer.
  *
- * Not emulated: stencil ops (PSP stencil lives in destination alpha), logic ops, colour test,
- * bezier/spline patches, morphing, or automatic software-rasterizer mip selection.
+ * Not emulated: logic ops, bezier/spline patches, morphing, or automatic
+ * software-rasterizer mip selection.
  *
  * Each GE command word is (cmd<<24)|data24. Command numbers follow PPSSPP GECommands.h.
  */
@@ -180,9 +180,14 @@ static int ztest_px(int x, int y, uint16_t z) {
         case 7: pass = (z >= cur); break;
         default: pass = 1;
     }
-    if (pass && !ge.zwrite_disable) s_zbuf[idx] = z;
     if (!pass) stat_zfail();
     return pass;
+}
+
+static void zwrite_px(int x, int y, uint16_t z) {
+    if (!ge.ztest_enable || ge.zwrite_disable) return;
+    uint32_t idx = (uint32_t)(y * (int)zbuf_stride() + x);
+    if (idx < 272u * 512u) s_zbuf[idx] = z;
 }
 
 /* Clamp interpolated depth to the 16-bit range. minz/maxz are NOT a clamp: the PSP
@@ -890,6 +895,103 @@ static void read_fb_px(int x, int y, int *r, int *g, int *b, int *a) {
     else                     unpack_color(MEM_R16(ge_fb_addr() + off*2), ge.fbfmt&3, r,g,b,a);
 }
 
+int ge_color_test_pass(
+    uint32_t test, uint32_t reference, uint32_t mask,
+    int red, int green, int blue) {
+    uint32_t rgb =
+        ((uint32_t)red & 0xffu) |
+        (((uint32_t)green & 0xffu) << 8) |
+        (((uint32_t)blue & 0xffu) << 16);
+    mask &= 0xffffffu;
+    rgb &= mask;
+    reference &= mask;
+    switch (test & 3u) {
+        case 0: return 0;
+        case 1: return 1;
+        case 2: return rgb == reference;
+        default: return rgb != reference;
+    }
+}
+
+int ge_stencil_test_pass(uint32_t test, uint8_t stencil) {
+    uint8_t mask = (uint8_t)(test >> 16);
+    uint8_t reference = (uint8_t)(test >> 8) & mask;
+    uint8_t value = stencil & mask;
+    switch (test & 7u) {
+        case 0: return 0;
+        case 1: return 1;
+        case 2: return reference == value;
+        case 3: return reference != value;
+        case 4: return reference < value;
+        case 5: return reference <= value;
+        case 6: return reference > value;
+        default: return reference >= value;
+    }
+}
+
+uint8_t ge_stencil_apply(
+    uint32_t operation, uint32_t format, uint8_t stencil,
+    uint8_t reference) {
+    switch (operation & 7u) {
+        case 0:
+            return stencil;
+        case 1:
+            return 0;
+        case 2:
+            return reference;
+        case 3:
+            return (uint8_t)~stencil;
+        case 4:
+            if ((format & 3u) == 0u) return 0;
+            if ((format & 3u) == 1u) return 0xff;
+            if ((format & 3u) == 2u)
+                return stencil < 0xf0u
+                    ? (uint8_t)(stencil + 0x10u) : stencil;
+            return stencil < 0xffu ? (uint8_t)(stencil + 1u) : stencil;
+        case 5:
+            if ((format & 3u) == 0u) return 0;
+            if ((format & 3u) == 1u) return 0;
+            if ((format & 3u) == 2u)
+                return stencil >= 0x10u
+                    ? (uint8_t)(stencil - 0x10u) : stencil;
+            return stencil ? (uint8_t)(stencil - 1u) : stencil;
+        default:
+            return stencil;
+    }
+}
+
+static int pixel_in_bounds(int x, int y) {
+    return x >= 0 && x < 480 && y >= 0 && y < 272 &&
+           x >= ge.scis_x1 && x <= ge.scis_x2 &&
+           y >= ge.scis_y1 && y <= ge.scis_y2;
+}
+
+static uint8_t read_stencil_px(int x, int y) {
+    int r, g, b, a;
+    read_fb_px(x, y, &r, &g, &b, &a);
+    switch (ge.fbfmt & 3u) {
+        case 0: return 0;
+        case 1: return a >= 128 ? 0xff : 0;
+        default: return (uint8_t)a;
+    }
+}
+
+static void write_stencil_px(int x, int y, uint8_t stencil) {
+    if (!pixel_in_bounds(x, y) || (ge.fbfmt & 3u) == 0u) return;
+    int r, g, b, old_stencil;
+    read_fb_px(x, y, &r, &g, &b, &old_stencil);
+    int mask = ge.mask_alpha & 0xff;
+    int output =
+        ((int)stencil & ~mask) | (old_stencil & mask);
+    uint32_t color = pack_fb(r, g, b, output);
+    uint32_t stride = ge.fbw ? ge.fbw : 512;
+    uint32_t address =
+        ge_fb_addr() + (uint32_t)(y * (int)stride + x) *
+        ((ge.fbfmt & 3u) == 3u ? 4u : 2u);
+    if ((ge.fbfmt & 3u) == 3u) MEM_W32(address, color);
+    else MEM_W16(address, (uint16_t)color);
+}
+
 static int factor_component(int f, int chan, int sr, int sg, int sb, int sa, int dr, int dg, int db, int da, int srcSide) {
     int sv = chan==0?sr:(chan==1?sg:sb), dv = chan==0?dr:(chan==1?dg:db);
     int fixedA = chan==0?(ge.blend_fixa&0xFF):(chan==1?((ge.blend_fixa>>8)&0xFF):((ge.blend_fixa>>16)&0xFF));
@@ -914,9 +1016,11 @@ static int blend_chan(int s, int d, int sf, int df, int eq) {
     }
 }
 
-static void put_px_rgba(int x, int y, int r, int g, int b, int a) {
-    if (x<0||x>=480||y<0||y>=272) return;
-    if (x<ge.scis_x1||x>ge.scis_x2||y<ge.scis_y1||y>ge.scis_y2) return;
+static void put_px_rgba_raw(
+    int x, int y, int r, int g, int b, int source_alpha,
+    int stencil) {
+    int a = source_alpha;
+    if (!pixel_in_bounds(x, y)) return;
     if (s_stat_on > 0 && s_in3d && !ge.clear && s_pxpass < 6) {
         s_pxpass++;
         fprintf(stderr, "PXPASS f=%u xy=(%d,%d) rgba=(%d,%d,%d,%d) fbp=0x%08x blend=%d/%06x\n",
@@ -934,6 +1038,12 @@ static void put_px_rgba(int x, int y, int r, int g, int b, int a) {
         int write_color = (ge.clear_mode & 0x100) != 0;
         int write_alpha = (ge.clear_mode & 0x200) != 0;
         if (!write_color && !write_alpha) return;
+        if (ge.dither_enable) {
+            int d = ge.dith[y & 3][x & 3];
+            r = clamp8(r + d);
+            g = clamp8(g + d);
+            b = clamp8(b + d);
+        }
         if (!write_color || !write_alpha) {
             int dr,dg,db,da; read_fb_px(x,y,&dr,&dg,&db,&da);
             if (!write_color) { r=dr; g=dg; b=db; }
@@ -950,9 +1060,9 @@ static void put_px_rgba(int x, int y, int r, int g, int b, int a) {
             int gfb=factor_component((int)((ge.blend_mode>>4)&0xF),1,r,g,b,a,dr,dg,db,da,0);
             int bfb=factor_component((int)((ge.blend_mode>>4)&0xF),2,r,g,b,a,dr,dg,db,da,0);
             r=blend_chan(r,dr,rfa,rfb,eq); g=blend_chan(g,dg,gfa,gfb,eq); b=blend_chan(b,db,bfa,bfb,eq);
-            a=clamp8(a+da);
         }
-        if (ge.dither_enable && (ge.fbfmt & 3) != 3) {
+        a = stencil;
+        if (ge.dither_enable) {
             int d = ge.dith[y & 3][x & 3];
             r = clamp8(r + d); g = clamp8(g + d); b = clamp8(b + d);
         }
@@ -982,11 +1092,57 @@ static void put_px_rgba(int x, int y, int r, int g, int b, int a) {
     if (ge.clear) g_list_clearpx++;
 }
 
-/* put_px_rgba with depth test. */
+static void put_px_rgba(int x, int y, int r, int g, int b, int a) {
+    if (!pixel_in_bounds(x, y)) return;
+    if (ge.clear) {
+        put_px_rgba_raw(x, y, r, g, b, a, a);
+        return;
+    }
+    uint8_t stencil = read_stencil_px(x, y);
+    if (ge.stencil_test_enable) {
+        uint8_t reference =
+            (uint8_t)(ge.stencil_test >> 8) &
+            (uint8_t)(ge.stencil_test >> 16);
+        if (!ge_stencil_test_pass(ge.stencil_test, stencil)) {
+            stencil = ge_stencil_apply(
+                ge.stencil_op, ge.fbfmt, stencil, reference);
+            write_stencil_px(x, y, stencil);
+            return;
+        }
+        stencil = ge_stencil_apply(
+            ge.stencil_op >> 16, ge.fbfmt, stencil, reference);
+    }
+    put_px_rgba_raw(x, y, r, g, b, a, stencil);
+}
+
+/* put_px_rgba with stencil and depth tests. */
 static void put_px_rgba_z(int x, int y, uint16_t pz, int r, int g, int b, int a) {
-    if (x<0||x>=480||y<0||y>=272) return;
-    if (!ztest_px(x, y, pz)) return;
-    put_px_rgba(x, y, r, g, b, a);
+    if (!pixel_in_bounds(x, y)) return;
+    uint8_t stencil = read_stencil_px(x, y);
+    uint8_t reference =
+        (uint8_t)(ge.stencil_test >> 8) &
+        (uint8_t)(ge.stencil_test >> 16);
+    if (ge.stencil_test_enable &&
+        !ge_stencil_test_pass(ge.stencil_test, stencil)) {
+        stencil = ge_stencil_apply(
+            ge.stencil_op, ge.fbfmt, stencil, reference);
+        write_stencil_px(x, y, stencil);
+        return;
+    }
+    if (!ztest_px(x, y, pz)) {
+        if (ge.stencil_test_enable) {
+            stencil = ge_stencil_apply(
+                ge.stencil_op >> 8, ge.fbfmt, stencil, reference);
+            write_stencil_px(x, y, stencil);
+        }
+        return;
+    }
+    zwrite_px(x, y, pz);
+    if (ge.stencil_test_enable) {
+        stencil = ge_stencil_apply(
+            ge.stencil_op >> 16, ge.fbfmt, stencil, reference);
+    }
+    put_px_rgba_raw(x, y, r, g, b, a, stencil);
 }
 
 /* A rasterized vertex (GeVtx, ge_shared.h): screen position, reciprocal clip-w (for
@@ -1131,6 +1287,12 @@ static int shade(float u, float fv, int fog, int vr, int vg, int vb, int va, int
             r = fr + (((r - fr) * fog) >> 8);
             g = fg + (((g - fg) * fog) >> 8);
             b = fb + (((b - fb) * fog) >> 8);
+        }
+        if (ge.color_test_enable &&
+            !ge_color_test_pass(
+                ge.color_test, ge.color_ref, ge.color_test_mask,
+                r, g, b)) {
+            return 0;
         }
     }
     *or_=r; *og=g; *ob=b; *oa=a;
@@ -1822,7 +1984,11 @@ static void fill_sprite(const Vtx *p0, const Vtx *p1, int persp) {
         }
         int wc = (ge.clear_mode & 0x100) != 0, wa = (ge.clear_mode & 0x200) != 0;
         if (!wc && !wa) return;
-        if (wc && wa) { fill_rect_clear_fast(xa, ya, xb, yb, p1->r, p1->g, p1->b, p1->a); return; }
+        if (wc && wa && !ge.dither_enable) {
+            fill_rect_clear_fast(
+                xa, ya, xb, yb, p1->r, p1->g, p1->b, p1->a);
+            return;
+        }
         for (int y=ya; y<yb; y++) for (int x=xa; x<xb; x++)
             put_px_rgba(x, y, p1->r, p1->g, p1->b, p1->a);
         return;
@@ -2448,6 +2614,13 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
             /* ---- Fragment test / blend toggles ---- */
             case GE_ALPHATESTENABLE: ge.atest_enable = data & 1; break;
             case GE_ALPHATEST:       ge.atest        = data; break;
+            case GE_COLORTESTENABLE: ge.color_test_enable = data & 1; break;
+            case GE_COLORTEST:       ge.color_test = data; break;
+            case GE_COLORREF:        ge.color_ref = data; break;
+            case GE_COLORTESTMASK:   ge.color_test_mask = data; break;
+            case GE_STENCILTESTENABLE: ge.stencil_test_enable = data & 1; break;
+            case GE_STENCILTEST:     ge.stencil_test = data; break;
+            case GE_STENCILOP:       ge.stencil_op = data; break;
             case GE_ALPHABLENDENABLE: ge.blend_enable=data&1; break;
             case GE_FOGENABLE:  ge.fog_enable = data & 1; break;
             case GE_FOG1:       ge.fog_end   = decode_float24(data); break;
@@ -2465,11 +2638,8 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
             }
             case GE_MASKRGB:   ge.mask_rgb   = data; break;
             case GE_MASKALPHA: ge.mask_alpha = (int)(data & 0xFF); break;
-            /* Stencil lives in destination alpha on the PSP; not emulated. Logic ops and
-             * colour test are rare and also skipped (state consumed so lists stay quiet). */
-            case GE_STENCILTESTENABLE: case GE_STENCILTEST: case GE_STENCILOP: break;
             case GE_ANTIALIASENABLE: case GE_PATCHCULLENABLE: break;
-            case GE_COLORTESTENABLE: case GE_LOGICOPENABLE: break;
+            case GE_LOGICOPENABLE: break;
             case GE_PATCHDIVISION: case GE_PATCHPRIMITIVE: case GE_PATCHFACING: break;
 
             /* ---- Matrix capture ----

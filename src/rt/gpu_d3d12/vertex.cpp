@@ -106,6 +106,10 @@ static bool begin_primitive(
             "texture capture failed", s_batch_count + 1u, MAX_FRAME_BATCHES);
         return false;
     }
+    ged3d12_shader_constants_build(
+        ge_state_ptr(), perspective,
+        primitive == GE_D3D12_PRIMITIVE_SPRITE,
+        &batch->texture, &batch->shader);
     s_batch_count++;
     s_primitive_count[primitive]++;
     return true;

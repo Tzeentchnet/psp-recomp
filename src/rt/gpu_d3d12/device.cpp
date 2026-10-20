@@ -21,6 +21,7 @@
 #include "framebuffer.h"
 #include "pipeline.h"
 #include "present.h"
+#include "shader_state.h"
 #include "texture.h"
 #include "vertex.h"
 extern "C" {
@@ -417,7 +418,8 @@ static int create_root_signature(void) {
         D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[GE_D3D12_ROOT_GE_STATE].Constants.ShaderRegister = 0;
     parameters[GE_D3D12_ROOT_GE_STATE].Constants.RegisterSpace = 0;
-    parameters[GE_D3D12_ROOT_GE_STATE].Constants.Num32BitValues = 16;
+    parameters[GE_D3D12_ROOT_GE_STATE].Constants.Num32BitValues =
+        GE_D3D12_SHADER_CONSTANT_DWORDS;
     parameters[GE_D3D12_ROOT_GE_STATE].ShaderVisibility =
         D3D12_SHADER_VISIBILITY_PIXEL;
     parameters[GE_D3D12_ROOT_TEXTURES].ParameterType =
@@ -669,9 +671,10 @@ static int bind_default_root_state(void) {
     sampler_desc.MaxLOD = D3D12_FLOAT32_MAX;
     s_device->CreateSampler(&sampler_desc, sampler.cpu);
 
-    UINT constants[16] = {};
+    UINT constants[GE_D3D12_SHADER_CONSTANT_DWORDS] = {};
     s_command_list->SetGraphicsRoot32BitConstants(
-        GE_D3D12_ROOT_GE_STATE, 16, constants, 0);
+        GE_D3D12_ROOT_GE_STATE,
+        GE_D3D12_SHADER_CONSTANT_DWORDS, constants, 0);
     s_command_list->SetGraphicsRootDescriptorTable(
         GE_D3D12_ROOT_TEXTURES, srvs.gpu);
     s_command_list->SetGraphicsRootDescriptorTable(
@@ -755,7 +758,7 @@ static int device_init(void) {
     fprintf(stderr,
             "ged3d12: using %s (feature level %s, %u buffers, "
             "descriptors=%u srv/%u sampler/%u rtv/%u dsv, "
-            "root=b0[16]+t0-t1+s0+s1/s2, upload=%llu MiB, gamepad=%s)\n",
+            "root=b0[28]+t0-t1+s0+s1/s2, upload=%llu MiB, gamepad=%s)\n",
             adapter_name[0] ? adapter_name : "<unnamed adapter>",
             feature_level_name(levels.MaxSupportedFeatureLevel),
             FRAME_COUNT, SRV_DESCRIPTOR_COUNT, SAMPLER_DESCRIPTOR_COUNT,
@@ -1024,6 +1027,7 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
             !ged3d12_texture_bind(&vertices.batches[i].texture)) {
             return -2;
         }
+        ged3d12_shader_constants_bind(&vertices.batches[i].shader);
     }
     s_vertex_frames++;
     s_vertex_total += vertices.vertex_count;

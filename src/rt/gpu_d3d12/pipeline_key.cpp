@@ -66,10 +66,22 @@ static uint8_t color_write_mask(const GeState *state) {
     uint32_t green = (state->mask_rgb >> 8) & 0xff;
     uint32_t blue = (state->mask_rgb >> 16) & 0xff;
     uint32_t alpha = (uint32_t)state->mask_alpha & 0xff;
-    return (red >= 0x80 ? 0 : D3D12_COLOR_WRITE_ENABLE_RED) |
-           (green >= 0x80 ? 0 : D3D12_COLOR_WRITE_ENABLE_GREEN) |
-           (blue >= 0x80 ? 0 : D3D12_COLOR_WRITE_ENABLE_BLUE) |
-           (alpha >= 0x80 ? 0 : D3D12_COLOR_WRITE_ENABLE_ALPHA);
+    uint8_t mask =
+        (red >= 0x80 ? 0 : D3D12_COLOR_WRITE_ENABLE_RED) |
+        (green >= 0x80 ? 0 : D3D12_COLOR_WRITE_ENABLE_GREEN) |
+        (blue >= 0x80 ? 0 : D3D12_COLOR_WRITE_ENABLE_BLUE);
+    uint32_t stencil_pass = (state->stencil_op >> 16) & 7u;
+    uint32_t format = (uint32_t)state->fbfmt & 3u;
+    uint32_t alpha_bits =
+        format == 1u ? 0x80u : format == 2u ? 0xf0u : 0xffu;
+    if (state->stencil_test_enable &&
+        format != 0 &&
+        (state->stencil_test & 7u) == 1u &&
+        (alpha & alpha_bits) == 0 &&
+        (stencil_pass == 1u || stencil_pass == 2u)) {
+        mask |= D3D12_COLOR_WRITE_ENABLE_ALPHA;
+    }
+    return mask;
 }
 
 void ged3d12_pipeline_key_build(
@@ -86,7 +98,7 @@ void ged3d12_pipeline_key_build(
     };
     memset(out, 0, sizeof(*out));
     out->source_alpha_blend = D3D12_BLEND_ONE;
-    out->destination_alpha_blend = D3D12_BLEND_ONE;
+    out->destination_alpha_blend = D3D12_BLEND_ZERO;
     out->alpha_blend_operation = D3D12_BLEND_OP_ADD;
     out->color_write_mask = color_write_mask(state);
     out->render_target_format = DXGI_FORMAT_B8G8R8A8_UNORM;
