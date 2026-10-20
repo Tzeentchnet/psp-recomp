@@ -102,6 +102,10 @@ static void seed_from_init(const char *trace_path, CpuState *s) {
             sr_set_next_uid((uint32_t)strtoul(buf + 18, NULL, 16));
             continue;
         }
+        if (strncmp(buf, "# ge next_list_id=", 18) == 0) {
+            sr_ge_set_next_list_id((uint32_t)strtoul(buf + 18, NULL, 0));
+            continue;
+        }
         if (strncmp(buf, "# init", 6) != 0 || found)
             continue;
         found = 1;
@@ -193,7 +197,13 @@ have_image:;
         for (uint32_t i = 0; i < boot_arglen; i++) sr_w8(boot_argp + i, (uint8_t)boot_arg[i]);
         /* BOOT.BIN and the kernel consumed 0x110..0x11b before creating module_start (F-050). */
         sr_set_next_uid(0x11cu);
+#ifdef SR_INITIAL_GE_LIST_ID
+        sr_ge_set_next_list_id(SR_INITIAL_GE_LIST_ID);
+#endif
     } else {
+#ifdef SR_INITIAL_GE_LIST_ID
+        sr_ge_set_next_list_id(SR_INITIAL_GE_LIST_ID);
+#endif
         seed_from_init(ref_trace, &s);
         boot_arglen = s.r[4];
         boot_argp = s.r[5];
@@ -212,6 +222,10 @@ have_image:;
 
     int use_sched = standalone;
     for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--sched") == 0) use_sched = 1;
+#ifdef SR_BOOT_UID_GAP_ENTRY
+    if (use_sched && entry == SR_BOOT_UID_GAP_ENTRY)
+        sr_set_boot_uid_gap(SR_BOOT_UID_GAP_COUNT);
+#endif
     for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--gui") == 0) {
         if (!gui_init("PSP Recomp")) return 2;
         use_sched = 1;

@@ -41,3 +41,14 @@ both files must carry one:
 ```
 
 The diff tool only compares the step lines, ignoring this header.
+
+Oracle traces used to seed a runtime scheduler also carry deterministic subsystem state
+before the first step:
+
+```
+# kernel next_uid=0x11d
+# ge next_list_id=41
+```
+
+The runtime restores both counters before executing guest code. This keeps kernel handles
+and `sceGeListEnQueue` IDs aligned even when a skipped bootloader consumed objects first.

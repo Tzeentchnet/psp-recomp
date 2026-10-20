@@ -72,6 +72,7 @@ static uint32_t stack_arg(CpuState *s, int idx) {
 
 /* Single shared UID pool matching PPSSPP: uid = 0x110, 0x111, ... incrementing by 1. */
 static uint32_t s_uid = 0x110;
+static uint32_t s_boot_uid_gap;
 typedef struct { uint32_t uid, type; } UidObject;
 static UidObject *s_uid_objects;
 static uint32_t s_uid_object_count, s_uid_object_capacity;
@@ -121,7 +122,22 @@ uint32_t sr_uid_list(uint32_t type, uint32_t *out, uint32_t capacity) {
 }
 /* Continue UID numbering where the oracle's kernel is (trace header "# kernel next_uid="), so
  * handles returned to the game match the reference trace. */
-void sr_set_next_uid(uint32_t next) { s_uid = next; }
+void sr_set_next_uid(uint32_t next) {
+    s_uid = next;
+    s_boot_uid_gap = 0;
+}
+uint32_t sr_get_next_uid(void) { return s_uid; }
+void sr_set_boot_uid_gap(uint32_t count) { s_boot_uid_gap = count; }
+void sr_boot_uid_delay_checkpoint(void) {
+    if (!s_boot_uid_gap) return;
+    uint32_t first = s_uid;
+    s_uid += s_boot_uid_gap;
+    if (getenv("SR_THLOG"))
+        fprintf(
+            stderr, "bootloader exit consumed UID%s 0x%x..0x%x\n",
+            s_boot_uid_gap == 1 ? "" : "s", first, s_uid - 1);
+    s_boot_uid_gap = 0;
+}
 
 /* User memory, partition blocks, FPLs and thread stacks live in kmem.c (PPSSPP's BlockAllocator). */
 
@@ -199,7 +215,11 @@ static uint32_t h_StartThread(CpuState *s) {
 static uint32_t h_ExitThread(CpuState *s) { sched_exit_current((int32_t)A0); return 0; }
 static uint32_t h_ExitDeleteThread(CpuState *s) { sched_exit_delete_current((int32_t)A0); return 0; }
 static uint32_t h_DeleteThread(CpuState *s) { return (uint32_t)sched_delete_thread(A0); }
-static uint32_t h_DelayThread(CpuState *s) { sched_delay_current(A0); return 0; }
+static uint32_t h_DelayThread(CpuState *s) {
+    sr_boot_uid_delay_checkpoint();
+    sched_delay_current(A0);
+    return 0;
+}
 static uint32_t h_ChangeThreadPriority(CpuState *s) { sched_set_priority(A0, (int)A1); return 0; }
 static uint32_t h_TerminateDeleteThread(CpuState *s) {
     if (A0 == 0 || A0 == sched_current_uid()) return 0x80020197u;   /* ILLEGAL_THID */

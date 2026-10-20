@@ -109,6 +109,13 @@ static int s_cb_used[16];
 static int s_log = -1;
 static int gelog(void) { if (s_log < 0) s_log = getenv("SR_GELOG") ? 1 : 0; return s_log; }
 
+void sr_ge_set_next_list_id(uint32_t next) {
+    s_next_id = (int)(next % MAX_LISTS);
+}
+uint32_t sr_ge_get_next_list_id(void) {
+    return (uint32_t)s_next_id;
+}
+
 /* ---- display-list dump (SR_DLDUMP) ---- */
 static FILE *s_dump;
 static uint32_t s_dump_frame = 0xFFFFFFFFu;

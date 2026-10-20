@@ -177,6 +177,9 @@ extern int sr_hit_hle;
  * matter. */
 uint32_t sr_alloc_uid(void);
 void     sr_set_next_uid(uint32_t next);
+uint32_t sr_get_next_uid(void);
+void     sr_set_boot_uid_gap(uint32_t count);
+void     sr_boot_uid_delay_checkpoint(void);
 
 /* Kernel memory (src/rt/kmem.c): PPSSPP's BlockAllocator and the partitions built on it.
  * Allocation returns SR_BA_FAIL when no free block fits; *size is rounded up to the grain. */
@@ -212,6 +215,8 @@ uint32_t ge_get_frame(void);           /* vblank count the GE last saw (sr_vblan
 /* sceGe display lists (src/rt/gelist.c, PPSSPP GPUCommon port). */
 void     sr_ge_register(void);          /* sceGe_user HLE handlers */
 void     sr_ge_run_interrupts(CpuState *s);  /* deliver pending GE interrupts (outside interrupts) */
+void     sr_ge_set_next_list_id(uint32_t next);
+uint32_t sr_ge_get_next_list_id(void);
 /* Sub-interrupt handlers (src/rt/intr.c, PPSSPP sceKernelInterrupt port). */
 #define SR_INTR_GE     25
 #define SR_INTR_VBLANK 30
