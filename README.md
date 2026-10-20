@@ -183,6 +183,11 @@ Set these environment variables before running the game to control runtime featu
   runtime-vblank timing.
 - `PSP_VFPU_TABLES=<directory>`: Override the `assets/vfpu` lookup-table directory. The golden
   harness sets this explicitly so runtime execution does not depend on its working directory.
+- `SR_INTERP_MISS_LOG=<path>`: Write each distinct guest target that missed the generated
+  dispatch table once. The runtime executes supported misses through the reference interpreter.
+- `SR_INTERP_MAX_STEPS=<1..100000000>`: Bound one interpreter fallback invocation; the default
+  is 1,000,000 instructions. A syscall, unsupported instruction, memory fault, or exhausted
+  bound is a fatal error unless the diagnostic-only `SR_DISPATCH_PERMISSIVE=1` escape hatch is set.
 - `SR_GPU_GE` / `SR_VIDEO=gdi`: Legacy Vulkan/software and presenter overrides.
 - `SR_GPU_LOG=1`: Print GPU cache flushes and batch information to the console. D3D12
   includes list/draw identity, command PC/opcode, per-draw batch/vertex counts, presents,

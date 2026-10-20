@@ -2,6 +2,7 @@
 
 #include "recomp.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -317,6 +318,80 @@ void sr_vwrite(CpuState *s, const uint8_t *idx, float *d, int n, uint32_t dprefi
             s->v[idx[i]] = d[i];
 }
 
+static const char *sr_interp_reason_name(SrInterpStopReason reason) {
+    switch (reason) {
+        case SR_INTERP_RETURNED: return "returned";
+        case SR_INTERP_SYSCALL: return "syscall";
+        case SR_INTERP_UNIMPLEMENTED: return "unimplemented instruction";
+        case SR_INTERP_MEMORY_FAULT: return "memory fault";
+        case SR_INTERP_STEP_LIMIT: return "step limit";
+        case SR_INTERP_BREAK: return "break";
+    }
+    return "unknown";
+}
+
+static uint64_t sr_interp_step_limit(void) {
+    static uint64_t limit;
+    if (limit != 0) return limit;
+    const char *setting = getenv("SR_INTERP_MAX_STEPS");
+    if (!setting || !setting[0]) {
+        limit = 1000000;
+        return limit;
+    }
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(setting, &end, 10);
+    if (errno || end == setting || *end != '\0' ||
+        parsed == 0 || parsed > 100000000) {
+        fprintf(
+            stderr,
+            "SR_INTERP_MAX_STEPS must be an integer from 1 to 100000000, got '%s'\n",
+            setting);
+        abort();
+    }
+    limit = (uint64_t)parsed;
+    return limit;
+}
+
+static void sr_log_interp_miss(uint32_t target, const CpuState *s) {
+    static uint32_t *seen;
+    static size_t seen_count;
+    static size_t seen_capacity;
+    static FILE *log_file;
+    for (size_t i = 0; i < seen_count; i++)
+        if (seen[i] == target) return;
+    if (seen_count == seen_capacity) {
+        size_t capacity = seen_capacity ? seen_capacity * 2 : 32;
+        uint32_t *grown = (uint32_t *)realloc(seen, capacity * sizeof(*seen));
+        if (!grown) {
+            fprintf(stderr, "dispatch: cannot grow interpreter miss log\n");
+            abort();
+        }
+        seen = grown;
+        seen_capacity = capacity;
+    }
+    seen[seen_count++] = target;
+    fprintf(
+        stderr,
+        "dispatch: interpreter fallback at 0x%08x (pc=0x%08x ra=0x%08x)\n",
+        target, s->pc, s->r[31]);
+
+    const char *path = getenv("SR_INTERP_MISS_LOG");
+    if (!path || !path[0]) return;
+    if (!log_file) {
+        log_file = fopen(path, "w");
+        if (!log_file ||
+            fprintf(log_file, "# psp-recomp interpreter misses v1\n") < 0) {
+            fprintf(stderr, "dispatch: cannot create miss log %s\n", path);
+            abort();
+        }
+    }
+    if (fprintf(log_file, "0x%08x\n", target) < 0 || fflush(log_file) != 0) {
+        fprintf(stderr, "dispatch: cannot write miss log %s\n", path);
+        abort();
+    }
+}
+
 void dispatch(CpuState *s, uint32_t target) {
     if (getenv("SR_DISPLOG")) {
         /* Log first invocation of boot/state-machine handlers, to see which actually run. */
@@ -334,29 +409,30 @@ void dispatch(CpuState *s, uint32_t target) {
         fn(s);
         return;
     }
-    /* No recompiled target -- an indirect jump / jump table / unanalyzed code the analyzer
-     * never discovered as a function. By default this is a hard error (no silent no-op). For
-     * bring-up triage during the renderer work, SR_DISPATCHLOG reports each distinct missing
-     * target once, and SR_DISPATCH_PERMISSIVE additionally treats the miss as a call that did
-     * nothing and returned 0 (v0=0) so a render session survives the gap instead of aborting.
-     * Like SR_PERMISSIVE for HLE NIDs, this returns fake success and is therefore opt-in.
-     * See RENDERING.md section 7. */
-    {
-        static int permissive = -1, logging = -1;
-        if (permissive < 0) permissive = getenv("SR_DISPATCH_PERMISSIVE") ? 1 : 0;
-        if (logging < 0)    logging = (permissive || getenv("SR_DISPATCHLOG")) ? 1 : 0;
-        if (logging) {
-            static uint32_t seen[256]; static int n = 0; int known = 0;
-            for (int i = 0; i < n; i++) if (seen[i] == target) { known = 1; break; }
-            if (!known) {
-                if (n < 256) seen[n++] = target;
-                fprintf(stderr, "dispatch: no recompiled function at 0x%08x (pc=0x%08x)%s\n",
-                        target, s->pc, permissive ? " [permissive: no-op return]" : "");
-            }
-        }
-        if (permissive) { s->r[2] = 0; return; }
+    sr_log_interp_miss(target, s);
+    SrInterpStop stop;
+    if (sr_interpret_fallback(
+            s, target, s->r[31], sr_interp_step_limit(), &stop)) {
+        return;
     }
-    fprintf(stderr, "dispatch: no recompiled function at 0x%08x (pc=0x%08x)\n", target, s->pc);
+    fprintf(
+        stderr,
+        "dispatch: interpreter stopped at 0x%08x op=0x%08x after %llu steps: %s\n",
+        stop.pc, stop.op, (unsigned long long)stop.steps,
+        sr_interp_reason_name(stop.reason));
+    if (stop.reason == SR_INTERP_MEMORY_FAULT)
+        fprintf(stderr, "dispatch: memory fault at 0x%08x\n", stop.memory_address);
+    /* Bring-up-only escape hatch retained for diagnosing unsupported dynamic code. */
+    {
+        static int permissive = -1;
+        if (permissive < 0)
+            permissive = getenv("SR_DISPATCH_PERMISSIVE") ? 1 : 0;
+        if (permissive) {
+            fprintf(stderr, "dispatch: permissive no-op return after interpreter failure\n");
+            s->r[2] = 0;
+            return;
+        }
+    }
     fprintf(stderr, "dispatch: ra=0x%08x a0=0x%08x a1=0x%08x a2=0x%08x a3=0x%08x sp=0x%08x\n",
             s->r[31], s->r[4], s->r[5], s->r[6], s->r[7], s->r[29]);
     /* Dump user RAM so the missing code (runtime-loaded overlay / module) can be identified

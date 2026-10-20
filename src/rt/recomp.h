@@ -128,8 +128,26 @@ typedef struct SrDispatchEntry {
     uint32_t address;
     RecompFn function;
 } SrDispatchEntry;
+typedef enum SrInterpStopReason {
+    SR_INTERP_RETURNED = 0,
+    SR_INTERP_SYSCALL,
+    SR_INTERP_UNIMPLEMENTED,
+    SR_INTERP_MEMORY_FAULT,
+    SR_INTERP_STEP_LIMIT,
+    SR_INTERP_BREAK
+} SrInterpStopReason;
+typedef struct SrInterpStop {
+    SrInterpStopReason reason;
+    uint32_t pc;
+    uint32_t op;
+    uint32_t memory_address;
+    uint64_t steps;
+} SrInterpStop;
 void     sr_set_dispatch_table(const SrDispatchEntry *entries, uint32_t count);
 RecompFn sr_lookup(uint32_t addr);
+int      sr_interpret_fallback(
+             CpuState *s, uint32_t target, uint32_t return_pc,
+             uint64_t max_steps, SrInterpStop *stop);
 void     dispatch(CpuState *s, uint32_t target);
 
 /* Tracing. When a trace file is open, the generated code reports each instruction. sr_begin

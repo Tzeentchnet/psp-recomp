@@ -380,12 +380,16 @@ static StopReason Execute(CpuState *s, Memory *mem, uint32_t op) {
 	}
 }
 
-StepResult Run(CpuState *s, Memory *mem, unsigned long long max_steps, TraceSink *sink) {
+StepResult Run(
+	CpuState *s, Memory *mem, unsigned long long max_steps, TraceSink *sink,
+	bool stop_at_pc, uint32_t stop_pc) {
 	for (unsigned long long i = 0; i < max_steps; i++) {
+		if (stop_at_pc && i != 0 && !s->in_delay_slot && s->pc == stop_pc)
+			return {StopReason::kTargetReached, s->pc, 0, i};
 		uint32_t pc = s->pc;
 		uint32_t op = mem->Read32(pc);
 		if (mem->last_fault())
-			return {StopReason::kMemoryFault, pc, op};
+			return {StopReason::kMemoryFault, pc, op, i};
 
 		uint32_t store_addr = 0;
 		int store_size = 0;
@@ -401,11 +405,13 @@ StepResult Run(CpuState *s, Memory *mem, unsigned long long max_steps, TraceSink
 		if (sink) sink->EndStep(s, store_addr, store_size, mem);
 
 		if (mem->last_fault())
-			return {StopReason::kMemoryFault, pc, op};
+			return {StopReason::kMemoryFault, pc, op, i + 1};
 		if (reason != StopReason::kRunning)
-			return {reason, pc, op};
+			return {reason, pc, op, i + 1};
 	}
-	return {StopReason::kStepLimit, s->pc, 0};
+	if (stop_at_pc && !s->in_delay_slot && s->pc == stop_pc)
+		return {StopReason::kTargetReached, s->pc, 0, max_steps};
+	return {StopReason::kStepLimit, s->pc, 0, max_steps};
 }
 
 }  // namespace ref

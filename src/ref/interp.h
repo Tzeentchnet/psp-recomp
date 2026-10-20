@@ -18,12 +18,14 @@ enum class StopReason {
 	kMemoryFault,      // load/store outside modeled memory
 	kBreak,            // break instruction
 	kStepLimit,        // reached the caller's instruction budget
+	kTargetReached,    // reached the caller's requested return PC
 };
 
 struct StepResult {
 	StopReason reason = StopReason::kRunning;
 	uint32_t pc = 0;       // pc of the instruction involved when stopping
 	uint32_t op = 0;       // the instruction word
+	unsigned long long steps = 0;
 };
 
 // Writes one trace line per executed instruction in the TRACE_FORMAT.md shape. The sink owns
@@ -44,6 +46,8 @@ private:
 // Execute up to max_steps instructions starting from s->pc. Stops on the first non-running
 // condition (syscall, unimplemented op, fault, break) or when the budget is exhausted.
 // When sink is non-null, every executed instruction is traced.
-StepResult Run(CpuState *s, Memory *mem, unsigned long long max_steps, TraceSink *sink);
+StepResult Run(
+	CpuState *s, Memory *mem, unsigned long long max_steps, TraceSink *sink,
+	bool stop_at_pc = false, uint32_t stop_pc = 0);
 
 }  // namespace ref

@@ -23,8 +23,12 @@ public:
 	static constexpr uint32_t kRamBase = 0x08000000;
 	static constexpr uint32_t kRamSize = 0x04000000;  // 64 MB
 	static constexpr uint32_t kPhysMask = 0x1FFFFFFF;
+	using ReadCallback = bool (*)(void *, uint32_t, void *, std::size_t);
+	using WriteCallback = bool (*)(void *, uint32_t, const void *, std::size_t);
 
 	Memory() : ram_(kRamSize, 0) {}
+	Memory(void *context, ReadCallback read, WriteCallback write)
+		: context_(context), read_(read), write_(write) {}
 
 	// Translate a guest virtual address to an index into the RAM buffer. Returns false for
 	// addresses outside modeled RAM so callers trap instead of corrupting host memory.
@@ -50,6 +54,14 @@ public:
 
 private:
 	template <typename T> T Load(uint32_t addr) const {
+		if (read_) {
+			T value{};
+			if (!read_(context_, addr, &value, sizeof(value))) {
+				fault_ = true;
+				fault_addr_ = addr;
+			}
+			return value;
+		}
 		uint32_t idx;
 		if (!Translate(addr, &idx) || idx + sizeof(T) > kRamSize) {
 			fault_ = true;
@@ -61,6 +73,13 @@ private:
 		return v;
 	}
 	template <typename T> void Store(uint32_t addr, T v) {
+		if (write_) {
+			if (!write_(context_, addr, &v, sizeof(v))) {
+				fault_ = true;
+				fault_addr_ = addr;
+			}
+			return;
+		}
 		uint32_t idx;
 		if (!Translate(addr, &idx) || idx + sizeof(T) > kRamSize) {
 			fault_ = true;
@@ -71,6 +90,9 @@ private:
 	}
 
 	std::vector<uint8_t> ram_;
+	void *context_ = nullptr;
+	ReadCallback read_ = nullptr;
+	WriteCallback write_ = nullptr;
 	mutable bool fault_ = false;
 	mutable uint32_t fault_addr_ = 0;
 };
@@ -89,12 +111,20 @@ struct CpuState {
 	// fcr31 bit 23 on every compare), so c.cond.s does not show up as an fcr31 write in the
 	// trace. The reference interpreter models it the same way and bc1t/bc1f read it.
 	uint32_t fpcond = 0;
+	union {
+		float v[128];
+		uint32_t vi[128];
+	};
+	uint32_t vfpuCtrl[16] = {0};
 
 	// Branch/delay-slot bookkeeping, matching the MIPS r4k model PPSSPP uses.
 	uint32_t next_pc = 0;
 	bool in_delay_slot = false;
 
-	CpuState() { for (int i = 0; i < 32; i++) fi[i] = 0; }
+	CpuState() {
+		for (int i = 0; i < 32; i++) fi[i] = 0;
+		for (int i = 0; i < 128; i++) vi[i] = 0;
+	}
 };
 
 }  // namespace ref

@@ -38,6 +38,8 @@ RT_D3D12_TEXTURE_KEY_O := $(BUILD_DIR)/gpu_d3d12_texture_key.o
 RT_SRCS    := src/rt/recomp.c \
               src/rt/dispatch_table.c \
               src/rt/fpu_mode.c \
+src/rt/interp_runtime.cpp \
+src/ref/interp.cpp \
               src/rt/vfpu_interp.c \
               src/rt/vfpu_asin.c \
               src/rt/hle.c \

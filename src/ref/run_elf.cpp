@@ -98,6 +98,7 @@ const char *ReasonName(StopReason r) {
 		case StopReason::kMemoryFault: return "memory-fault";
 		case StopReason::kBreak: return "break";
 		case StopReason::kStepLimit: return "step-limit";
+		case StopReason::kTargetReached: return "target-reached";
 	}
 	return "?";
 }
