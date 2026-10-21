@@ -21,6 +21,7 @@ import codegen_ext as cx
 # `jal .+8` (get-PC) sites that must link without calling.
 JUMPTABLES = {}
 JAL_NEXT = set()
+HOST_FUNCTIONS = {}
 
 R = lambda i: "0u" if i == 0 else f"SR_GPR(s, {i})"       # cached in release, direct in trace
 F = lambda i: f"s->f[{i}]"
@@ -1209,9 +1210,10 @@ def main(argv):
         elif o.startswith("--jumptables="):
             JUMPTABLES.update(cx.load_jumptables(o.split("=", 1)[1]))
         elif o.startswith("--overrides="):
-            gotos, jal_next = cx.load_overrides(o.split("=", 1)[1])
+            gotos, jal_next, host_functions = cx.load_overrides(o.split("=", 1)[1])
             JUMPTABLES.update(gotos)
             JAL_NEXT.update(jal_next)
+            HOST_FUNCTIONS.update(host_functions)
         elif o.startswith("--hot-functions="):
             hot_path = o.split("=", 1)[1]
     elf = Elf(args[0], base=base)
@@ -1220,8 +1222,15 @@ def main(argv):
     known = set(a for a in known if in_ranges(a, ranges))
     # A jal .+8 target is the rest of the same function, not an entry point.
     known -= {a + 8 for a in JAL_NEXT}
-    if JUMPTABLES or JAL_NEXT:
-        print(f"hints: {len(JUMPTABLES)} jump tables / computed gotos, {len(JAL_NEXT)} jal .+8 sites")
+    unknown_host_functions = set(HOST_FUNCTIONS) - known
+    if unknown_host_functions:
+        addresses = ", ".join(f"0x{a:08x}" for a in sorted(unknown_host_functions))
+        raise ValueError(f"host function overrides are not guest function entries: {addresses}")
+    if JUMPTABLES or JAL_NEXT or HOST_FUNCTIONS:
+        print(
+            f"hints: {len(JUMPTABLES)} jump tables / computed gotos, "
+            f"{len(JAL_NEXT)} jal .+8 sites, {len(HOST_FUNCTIONS)} host functions"
+        )
 
     # Import stubs live in .sceStub.text. In the file each is "jr $ra; <placeholder>"; the
     # syscall is written into the delay slot by the loader at run time, so we cannot read it
@@ -1251,6 +1260,13 @@ def main(argv):
     for a in sorted(known):
         out = []
         funcs.append(out)
+        if a in HOST_FUNCTIONS:
+            out.append(f"void f_{a:08x}(CpuState *s) {{  /* host function override */")
+            out.append(f"    {HOST_FUNCTIONS[a]}(s);")
+            out.append("}")
+            out.append("")
+            emitted.append(a)
+            continue
         if is_stub(a):
             w0 = read32(elf, a) or 0x03E00008          # jr $ra
             w1 = read32(elf, a + 4) or 0               # delay slot (PPSSPP patches a syscall)

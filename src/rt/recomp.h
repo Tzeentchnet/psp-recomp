@@ -239,6 +239,9 @@ int      gui_message(
              const char *text, int yes_no, int allow_cancel, int default_no);
 void     gui_present(uint32_t fbaddr, int fmt, uint32_t stride);
 int gui_capture_next(const char *path);
+int sr_kzl_patch_offline_menu(uint8_t *data, uint32_t size);
+void sr_kzl_killzone_com_disabled(CpuState *s);
+void sr_kzl_downloads_unavailable(CpuState *s);
 uint32_t sr_present_count(void);
 uint32_t sr_atrac_remaining_frames(
     uint32_t buffered, uint32_t block_align, int streamed);

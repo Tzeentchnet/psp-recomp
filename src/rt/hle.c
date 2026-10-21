@@ -1472,6 +1472,63 @@ static uint32_t h_RtcGetCurrentClock(CpuState *s) {
 static uint32_t h_StdFd(CpuState *s) { (void)s; return 1; }   /* a std file descriptor */
 static uint32_t h_F919F628(CpuState *s) { (void)s; return 0x001a0b00; }   /* matches PPSSPP reference */
 
+static uint8_t *find_host_bytes(
+    uint8_t *start, uint8_t *end, const char *needle) {
+    size_t length = strlen(needle);
+    if ((size_t)(end - start) < length) return NULL;
+    for (uint8_t *at = start; at <= end - length; at++)
+        if (memcmp(at, needle, length) == 0) return at;
+    return NULL;
+}
+
+int sr_kzl_patch_offline_menu(uint8_t *data, uint32_t size) {
+    static const char button[] = "name=\"website\"";
+    static const char selectable[] = "selectable=\"true\"";
+    static const char href[] =
+        "href=\"static://script.mainmenu.StartBrowserHome\"";
+    uint8_t *cursor = data;
+    uint8_t *end = data + size;
+    int patched = 0;
+
+    while (cursor < end) {
+        uint8_t *tag = find_host_bytes(cursor, end, button);
+        if (!tag) break;
+        uint8_t *tag_end = (uint8_t *)memchr(tag, '>', (size_t)(end - tag));
+        if (!tag_end) break;
+        uint8_t *select = find_host_bytes(tag, tag_end, selectable);
+        uint8_t *action = find_host_bytes(tag, tag_end, href);
+        if (select && action && tag_end > select && tag_end[-1] == ' ') {
+            uint8_t *value = select + strlen("selectable=\"");
+            uint8_t *spare = tag_end - 1;
+            memmove(value + 5, value + 4, (size_t)(spare - (value + 4)));
+            memcpy(value, "false", 5);
+            patched++;
+        }
+        cursor = tag_end + 1;
+    }
+    if (patched && getenv("SR_IOLOG"))
+        fprintf(stderr, "menu: disabled %d KILLZONE.COM button tag%s\n",
+                patched, patched == 1 ? "" : "s");
+    return patched;
+}
+
+void sr_kzl_killzone_com_disabled(CpuState *s) {
+    static int logged;
+    if (!logged) {
+        fprintf(stderr, "killzone.com: disabled because the website is retired\n");
+        logged = 1;
+    }
+    s->r[2] = 0x80020325u;   /* SCE_KERNEL_ERROR_UNSUP */
+}
+
+void sr_kzl_downloads_unavailable(CpuState *s) {
+    static const char message[] =
+        "Downloads are unavailable because the original PSP online service has shut down.";
+    fprintf(stderr, "downloads: %s\n", message);
+    gui_message(message, 0, 0, 0);
+    s->r[2] = 0x80020325u;   /* SCE_KERNEL_ERROR_UNSUP */
+}
+
 /* ---- IoFileMgrForUser: file IO from the game ISO (src/rt/iso.c) ---- */
 
 static void guest_cstr(uint32_t addr, char *out, int max) {
@@ -1747,6 +1804,7 @@ static uint32_t io_read(uint32_t fd, uint32_t dst, uint32_t count) {
         uint32_t n = count - done; if (n > sizeof(tmp)) n = sizeof(tmp);
         if (f->host) { size_t got = fread(tmp, 1, n, f->host); if (got < n) n = (uint32_t)got; }
         else iso_read(f->lba, f->off + done, tmp, n);
+        sr_kzl_patch_offline_menu(tmp, n);
         for (uint32_t k = 0; k < n; k++) MEM_W8(dst + done + k, tmp[k]);
         done += n;
         if (n == 0) break;
@@ -3416,7 +3474,8 @@ static int sas_vag_block(SasVoice *v) {
     if (flags == 7) return 0;                            /* end marker block */
     int pred = (hdr >> 4) & 0xF, shift = hdr & 0xF;
     if (pred > 4) pred = 0;
-    if (flags == 6) v->loop_start = (int)v->pos;         /* loop start block */
+    if (flags == 6 && v->loop_start >= 0)
+        v->loop_start = (int)v->pos;                     /* loop start block */
     for (int i = 0; i < 28; i++) {
         int byte = MEM_R8(a + 2 + (i >> 1));
         int nib = (i & 1) ? (byte >> 4) : (byte & 0xF);

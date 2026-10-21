@@ -67,6 +67,35 @@ class DispatchGenerationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid hot function address"):
                 codegen.load_hot_functions(path)
 
+    def test_loads_host_function_override(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(temporary, "overrides.toml")
+            with open(path, "w", encoding="ascii") as stream:
+                stream.write(
+                    "[[host_function]]\n"
+                    "at = 0x089baac8\n"
+                    'handler = "sr_kzl_downloads_unavailable"\n'
+                )
+            gotos, jal_next, host_functions = codegen.cx.load_overrides(path)
+            self.assertEqual(gotos, {})
+            self.assertEqual(jal_next, set())
+            self.assertEqual(
+                host_functions,
+                {0x089BAAC8: "sr_kzl_downloads_unavailable"},
+            )
+
+    def test_rejects_invalid_host_function_handler(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(temporary, "overrides.toml")
+            with open(path, "w", encoding="ascii") as stream:
+                stream.write(
+                    "[[host_function]]\n"
+                    "at = 0x089baac8\n"
+                    'handler = "not-a-c-identifier"\n'
+                )
+            with self.assertRaisesRegex(ValueError, "invalid C handler"):
+                codegen.cx.load_overrides(path)
+
     def test_chunks_functions_without_splitting_them(self):
         functions = [
             ["first line", "first second"],

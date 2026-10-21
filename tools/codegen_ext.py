@@ -281,13 +281,24 @@ def switch_labels(table, known):
 
 
 def load_overrides(path):
-    """config/kzl_overrides.toml -> (computed gotos keyed by jr, set of jal-next sites).
-    Computed gotos have the same shape as jump tables, so emit_switch_jr() handles both."""
+    """Load computed gotos, jal-next sites, and guest functions replaced by host handlers."""
+    import re
     import tomllib
     with open(path, "rb") as f:
         cfg = tomllib.load(f)
     gotos = {g["jr"]: g for g in cfg.get("computed_goto", [])}
-    return gotos, {j["at"] for j in cfg.get("jal_next", [])}
+    host_functions = {}
+    for entry in cfg.get("host_function", []):
+        address = entry.get("at")
+        handler = entry.get("handler")
+        if not isinstance(address, int):
+            raise ValueError("host_function.at must be an integer address")
+        if not isinstance(handler, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", handler):
+            raise ValueError(f"host_function at 0x{address:08x} has an invalid C handler")
+        if address in host_functions:
+            raise ValueError(f"duplicate host_function at 0x{address:08x}")
+        host_functions[address] = handler
+    return gotos, {j["at"] for j in cfg.get("jal_next", [])}, host_functions
 
 
 def emit_jal_next(pc, w, delay_line, local_gprs=False):
