@@ -1433,12 +1433,15 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
     return ok;
 }
 
+/* The destination is a write-combined upload heap: build each scaled row in cached memory and
+ * only write it out, never read the heap back to duplicate rows. */
+static uint32_t s_scaled_present_row[PSP_W * 8];
+
 static void convert_framebuffer(
     uint8_t *destination, UINT row_pitch, uint32_t scale,
     uint32_t fbaddr, int format, uint32_t stride) {
     for (int y = 0; y < PSP_H; y++) {
-        uint32_t *row = reinterpret_cast<uint32_t *>(
-            destination + (UINT64)y * scale * row_pitch);
+        uint32_t *row = s_scaled_present_row;
         for (int x = 0; x < PSP_W; x++) {
             uint32_t index = (uint32_t)y * stride + (uint32_t)x;
             int red, green, blue;
@@ -1469,10 +1472,10 @@ static void convert_framebuffer(
             for (uint32_t sx = 0; sx < scale; sx++)
                 row[(uint32_t)x * scale + sx] = color;
         }
-        for (uint32_t sy = 1; sy < scale; sy++)
+        for (uint32_t sy = 0; sy < scale; sy++)
             memcpy(
                 destination + ((UINT64)y * scale + sy) * row_pitch,
-                row, row_pitch);
+                row, (size_t)PSP_W * scale * 4u);
     }
 }
 

@@ -615,17 +615,18 @@ static uint32_t h_MpegRegistStream(CpuState *s) { return mpeg_regist_stream(A0, 
 static uint32_t h_MpegUnRegistStream(CpuState *s) { return mpeg_unregist_stream(A0, A1); }
 static uint32_t h_MpegQueryStreamOffset(CpuState *s) { return mpeg_query_stream_offset(A0, A1, A2); }
 static uint32_t h_MpegQueryStreamSize(CpuState *s) { return mpeg_query_stream_size(A0, A1); }
-/* PPSSPP returns these via hleDelayResult so the playback thread yields (it does not busy-poll the
- * ring). Mirror that: delay the calling thread a frame-ish, longer when there is no data yet, so the
- * feeder/display threads run and the movie paces instead of hanging the scheduler. */
+/* PPSSPP returns both getters via hleDelayResult(..., 100) with or without data
+ * (mpegDecodeErrorDelayMs is also 100 us), so the playback thread still yields. KZL drives the
+ * whole movie from one thread that polls the audio AU every pass; the earlier 3/8 ms delays
+ * stacked onto that loop and pushed video frames 40-70 ms apart. */
 static uint32_t h_MpegGetAvcAu(CpuState *s) {
     uint32_t r = mpeg_get_avc_au(A0, A1, A2, A3);
-    sched_delay_current(r == 0x80618001u ? 8000u : 3000u);
+    sched_delay_current(100);
     return r;
 }
 static uint32_t h_MpegGetAtracAu(CpuState *s) {
     uint32_t r = mpeg_get_atrac_au(A0, A1, A2, A3);
-    sched_delay_current(r == 0x80618001u ? 8000u : 3000u);
+    sched_delay_current(100);
     return r;
 }
 /* PPSSPP charges real decode latency (sceMpeg.cpp: avcDecodeDelayMs=5400, atracDecodeDelayMs=3000,

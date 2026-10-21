@@ -39,6 +39,7 @@ static uint64_t s_last_log_frames;
 static LARGE_INTEGER s_start_qpc;
 static LARGE_INTEGER s_qpc_frequency;
 static int s_playback_started;
+static uint64_t s_underruns;       /* times the device queue drained after playback started */
 
 class VoiceCallback final : public IXAudio2VoiceCallback {
 public:
@@ -93,6 +94,18 @@ static void fill_device_queue(void) {
         state.BuffersQueued < s_min_device_buffers) {
         s_min_device_buffers = state.BuffersQueued;
     }
+    if (s_playback_started && state.BuffersQueued == 0) {
+        s_playback_started = 0;     /* one underrun per drain; the next submit re-arms it */
+        s_underruns++;
+        if (s_log) {
+            LARGE_INTEGER now = {};
+            QueryPerformanceCounter(&now);
+            fprintf(stderr, "audio: XAudio2 underrun #%llu at %.3f s\n",
+                    (unsigned long long)s_underruns,
+                    (now.QuadPart - s_start_qpc.QuadPart) /
+                        (double)s_qpc_frequency.QuadPart);
+        }
+    }
     if (state.BuffersQueued > s_max_device_buffers)
         s_max_device_buffers = state.BuffersQueued;
     while (state.BuffersQueued < BUFFER_COUNT && !s_voice_error) {
@@ -130,7 +143,7 @@ static void log_progress(void) {
         stderr,
         "audio: XAudio2 played=%llu device=%u blocks/%u frames (%.2f ms) "
         "clock_drift=%.2f ms max_guest_queue=%llu dropped=%llu "
-        "resynced=%llu silent_blocks=%llu\n",
+        "resynced=%llu silent_blocks=%llu underruns=%llu\n",
         (unsigned long long)stats.completed_frames,
         state.BuffersQueued,
         state.BuffersQueued * BLOCK_FRAMES,
@@ -139,7 +152,8 @@ static void log_progress(void) {
         (unsigned long long)stats.max_queued_frames,
         (unsigned long long)stats.dropped_frames,
         (unsigned long long)stats.resynced_frames,
-        (unsigned long long)stats.silent_blocks);
+        (unsigned long long)stats.silent_blocks,
+        (unsigned long long)s_underruns);
 }
 
 static DWORD WINAPI feeder(void *) {
@@ -190,6 +204,7 @@ extern "C" int sr_audio_init(void) {
     s_max_device_buffers = 0;
     s_last_log_frames = 0;
     s_playback_started = 0;
+    s_underruns = 0;
     sr_audio_mixer_init(&s_mixer);
     InitializeCriticalSection(&s_lock);
     s_lock_initialized = 1;
@@ -300,7 +315,8 @@ extern "C" void sr_audio_shutdown(void) {
             stderr,
             "audio: XAudio2 shutdown played=%llu frames (%.2f ms), "
             "clock_drift=%.2f ms, device_buffers=%u..%u, "
-            "max_guest_queue=%llu, dropped=%llu, resynced=%llu, silent_blocks=%llu%s\n",
+            "max_guest_queue=%llu, dropped=%llu, resynced=%llu, silent_blocks=%llu, "
+            "underruns=%llu%s\n",
             (unsigned long long)stats.completed_frames,
             played_ms, played_ms - elapsed_ms,
             s_playback_started ? s_min_device_buffers : 0u,
@@ -309,6 +325,7 @@ extern "C" void sr_audio_shutdown(void) {
             (unsigned long long)stats.dropped_frames,
             (unsigned long long)stats.resynced_frames,
             (unsigned long long)stats.silent_blocks,
+            (unsigned long long)s_underruns,
             s_voice_error ? ", voice_error" : "");
     }
 

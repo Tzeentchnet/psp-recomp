@@ -105,6 +105,10 @@ static bool s_initialized;
 static bool s_log;
 static bool s_legacy_depth_uploads;
 static bool s_legacy_feedback_snapshots;
+/* Upload heaps are write-combined: scaled rows are built here, then only written to the heap.
+ * Duplicating rows by reading the heap back cost ~56 ms per movie frame at 2x. */
+static uint32_t s_scaled_color_row[GE_D3D12_FRAMEBUFFER_WIDTH * 8u];
+static uint16_t s_scaled_depth_row[GE_D3D12_FRAMEBUFFER_WIDTH * 8u];
 
 static bool check_hr(HRESULT hr, const char *operation) {
     if (SUCCEEDED(hr)) return true;
@@ -437,8 +441,7 @@ static bool upload_color(ColorTarget *target) {
         }
         const uint8_t *source =
             static_cast<const uint8_t *>(SR_HOST((uint32_t)row_address));
-        uint32_t *row =
-            destination + y * s_render_scale * physical_width;
+        uint32_t *row = s_scaled_color_row;
         if (bytes_per_pixel == 4) {
             const uint32_t *pixels =
                 reinterpret_cast<const uint32_t *>(source);
@@ -458,10 +461,11 @@ static bool upload_color(ColorTarget *target) {
                     row[x * s_render_scale + sx] = pixel;
             }
         }
-        for (uint32_t sy = 1; sy < s_render_scale; sy++)
+        for (uint32_t sy = 0; sy < s_render_scale; sy++)
             memcpy(
-                row + sy * physical_width, row,
-                (size_t)row_pitch);
+                destination +
+                    (y * s_render_scale + sy) * physical_width,
+                row, (size_t)row_pitch);
     }
 
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
@@ -509,9 +513,7 @@ static bool upload_depth(DepthTarget *depth) {
     uint16_t *destination_pixels =
         static_cast<uint16_t *>(upload.cpu);
     for (uint32_t y = 0; y < GE_D3D12_FRAMEBUFFER_HEIGHT; y++) {
-        uint16_t *row =
-            destination_pixels +
-            y * s_render_scale * physical_width;
+        uint16_t *row = s_scaled_depth_row;
         for (uint32_t x = 0; x < GE_D3D12_FRAMEBUFFER_WIDTH; x++) {
             uint16_t pixel =
                 source_pixels[
@@ -519,10 +521,11 @@ static bool upload_depth(DepthTarget *depth) {
             for (uint32_t sx = 0; sx < s_render_scale; sx++)
                 row[x * s_render_scale + sx] = pixel;
         }
-        for (uint32_t sy = 1; sy < s_render_scale; sy++)
+        for (uint32_t sy = 0; sy < s_render_scale; sy++)
             memcpy(
-                row + sy * physical_width, row,
-                (size_t)row_pitch);
+                destination_pixels +
+                    (y * s_render_scale + sy) * physical_width,
+                row, (size_t)row_pitch);
     }
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
     transition(command_list, depth->resource, &depth->state,
