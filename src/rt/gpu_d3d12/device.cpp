@@ -1,8 +1,4 @@
-/* D3D12 device and presentation foundation.
- *
- * GE primitives continue through the software rasterizer until native render-target and
- * presentation stages submit the captured batches. Its finished 480x272 framebuffer is uploaded
- * through the same per-frame ring that later draw data will use. */
+/* D3D12 device and presentation backend. */
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -24,6 +20,7 @@
 #include "shader_state.h"
 #include "texture.h"
 #include "vertex.h"
+#include "../graphics_config.h"
 #include "../input_sdl.h"
 extern "C" {
 #include "../recomp.h"
@@ -47,6 +44,9 @@ static const uint8_t k_psp_vs_dxil[] =
 ;
 static const uint8_t k_psp_ps_dxil[] =
 #include "shaders/psp_ps.inc"
+;
+static const uint8_t k_psp_ps_direct_dxil[] =
+#include "shaders/psp_ps_direct.inc"
 ;
 
 struct UploadSlab {
@@ -105,7 +105,12 @@ static uint8_t s_dsv_used[DSV_DESCRIPTOR_COUNT];
 
 static FrameContext s_frames[FRAME_COUNT];
 static ID3D12GraphicsCommandList *s_command_list;
+static ID3D12GraphicsCommandList5 *s_command_list5;
 static UINT s_active_frame = UINT32_MAX;
+static D3D12_SHADING_RATE s_direct_shading_rate =
+    D3D12_SHADING_RATE_1X1;
+static D3D12_SHADING_RATE s_current_shading_rate =
+    D3D12_SHADING_RATE_1X1;
 
 static ID3D12Resource *s_upload;
 static uint8_t *s_upload_map;
@@ -116,8 +121,9 @@ static int s_pad_present;
 static char s_capture_path[1024];
 static int s_vertex_log;
 static int s_gpu_log;
+static UINT64 s_gpu_log_start;
+static UINT64 s_gpu_log_end;
 static int s_framebuffer_safe;
-static int s_destination_safe;
 static UINT s_state_dump_index;
 static UINT64 s_gpu_log_flushes;
 static UINT64 s_gpu_log_draws;
@@ -126,12 +132,96 @@ static UINT64 s_vertex_total;
 static UINT64 s_vertex_batches;
 static UINT64 s_constant_updates;
 static UINT64 s_constant_reuses;
+static UINT64 s_direct_draws;
+static UINT64 s_manual_draws;
+static int s_stage_log;
+static LARGE_INTEGER s_stage_frequency;
+
+struct StageTimingTotals {
+    double begin;
+    double vertices;
+    double framebuffer;
+    double textures;
+    double draws;
+    double present;
+    double submit;
+    uint32_t samples;
+};
+
+static StageTimingTotals s_stage_totals;
 static UINT64 s_vertex_primitives[GE_D3D12_PRIMITIVE_COUNT];
 static UINT s_vertex_max;
 
 static int env_enabled(const char *name) {
     const char *value = getenv(name);
     return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static LONGLONG stage_counter(void) {
+    if (!s_stage_log) return 0;
+    LARGE_INTEGER value;
+    QueryPerformanceCounter(&value);
+    return value.QuadPart;
+}
+
+static double stage_milliseconds(LONGLONG begin, LONGLONG end) {
+    return (double)(end - begin) * 1000.0 /
+           (double)s_stage_frequency.QuadPart;
+}
+
+static void record_stage_timings(
+    LONGLONG start, LONGLONG begin_done,
+    LONGLONG vertices_done, LONGLONG framebuffer_done,
+    LONGLONG textures_done, LONGLONG draws_done,
+    LONGLONG present_done, LONGLONG submit_done) {
+    if (!s_stage_log) return;
+    s_stage_totals.begin +=
+        stage_milliseconds(start, begin_done);
+    s_stage_totals.vertices +=
+        stage_milliseconds(begin_done, vertices_done);
+    s_stage_totals.framebuffer +=
+        stage_milliseconds(vertices_done, framebuffer_done);
+    s_stage_totals.textures +=
+        stage_milliseconds(framebuffer_done, textures_done);
+    s_stage_totals.draws +=
+        stage_milliseconds(textures_done, draws_done);
+    s_stage_totals.present +=
+        stage_milliseconds(draws_done, present_done);
+    s_stage_totals.submit +=
+        stage_milliseconds(present_done, submit_done);
+    s_stage_totals.samples++;
+    if (s_stage_totals.samples < 120u) return;
+    const double divisor = (double)s_stage_totals.samples;
+    fprintf(
+        stderr,
+        "GED3D12 stages presents=%llu-%llu samples=%u "
+        "begin=%.2f vertices=%.2f framebuffer=%.2f textures=%.2f "
+        "draws=%.2f present=%.2f submit=%.2f ms\n",
+        (unsigned long long)(s_vertex_frames - s_stage_totals.samples + 1u),
+        (unsigned long long)s_vertex_frames,
+        s_stage_totals.samples,
+        s_stage_totals.begin / divisor,
+        s_stage_totals.vertices / divisor,
+        s_stage_totals.framebuffer / divisor,
+        s_stage_totals.textures / divisor,
+        s_stage_totals.draws / divisor,
+        s_stage_totals.present / divisor,
+        s_stage_totals.submit / divisor);
+    memset(&s_stage_totals, 0, sizeof(s_stage_totals));
+}
+
+static UINT64 env_u64(const char *name, UINT64 fallback) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+    char *end = nullptr;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    return end && !*end ? (UINT64)parsed : fallback;
+}
+
+static int gpu_log_active(UINT64 present) {
+    return s_gpu_log &&
+           present >= s_gpu_log_start &&
+           present <= s_gpu_log_end;
 }
 
 static const char *primitive_name(uint8_t primitive) {
@@ -225,6 +315,7 @@ static void release_device(void) {
         RELEASE_COM(s_frames[i].allocator);
         memset(&s_frames[i], 0, sizeof(s_frames[i]));
     }
+    RELEASE_COM(s_command_list5);
     RELEASE_COM(s_command_list);
     RELEASE_COM(s_swapchain);
     RELEASE_COM(s_root_signature);
@@ -615,6 +706,33 @@ static int create_frame_resources(void) {
     return 1;
 }
 
+static void configure_variable_rate_shading(void) {
+    const char *vrs = getenv("SR_D3D12_VRS");
+    if (vrs && strcmp(vrs, "0") == 0) {
+        s_direct_shading_rate = D3D12_SHADING_RATE_1X1;
+        return;
+    }
+    D3D12_FEATURE_DATA_D3D12_OPTIONS6 options = {};
+    HRESULT options_result = s_device->CheckFeatureSupport(
+        D3D12_FEATURE_D3D12_OPTIONS6, &options, sizeof(options));
+    HRESULT list_result = s_command_list->QueryInterface(
+        IID_PPV_ARGS(&s_command_list5));
+    if (FAILED(options_result) || FAILED(list_result)) {
+        RELEASE_COM(s_command_list5);
+        s_direct_shading_rate = D3D12_SHADING_RATE_1X1;
+        return;
+    }
+    s_direct_shading_rate = ged3d12_shader_shading_rate(
+        ged3d12_framebuffer_scale(), options.VariableShadingRateTier,
+        options.AdditionalShadingRatesSupported != FALSE);
+}
+
+static const char *shading_rate_name(D3D12_SHADING_RATE rate) {
+    if (rate == D3D12_SHADING_RATE_4X4) return "4x4";
+    if (rate == D3D12_SHADING_RATE_2X2) return "2x2";
+    return "1x1";
+}
+
 static int acquire_backbuffers(void) {
     D3D12_CPU_DESCRIPTOR_HANDLE rtv =
         s_rtv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -781,12 +899,31 @@ static int bind_default_root_state(void) {
 }
 
 static int device_init(void) {
+    uint32_t render_scale;
+    char graphics_error[256];
     if (!s_window || !s_hwnd) {
         fprintf(stderr, "ged3d12: SDL3 window must be initialized first\n");
         return 0;
     }
     if (s_device) {
         fprintf(stderr, "ged3d12: device already initialized\n");
+        return 0;
+    }
+    if (!sr_graphics_config_init()) {
+        fprintf(stderr, "ged3d12: graphics configuration failed\n");
+        return 0;
+    }
+    if (!sr_graphics_effective_scale(
+            &render_scale, graphics_error, sizeof(graphics_error))) {
+        fprintf(
+            stderr, "ged3d12: invalid graphics configuration: %s\n",
+            graphics_error);
+        return 0;
+    }
+    if (!ged3d12_framebuffer_configure(render_scale)) {
+        fprintf(
+            stderr, "ged3d12: cannot configure %ux internal resolution\n",
+            render_scale);
         return 0;
     }
 
@@ -811,6 +948,7 @@ static int device_init(void) {
         release_device();
         return 0;
     }
+    configure_variable_rate_shading();
     if (!ged3d12_vertex_capture_init()) {
         release_device();
         return 0;
@@ -828,9 +966,14 @@ static int device_init(void) {
         return 0;
     }
     s_vertex_log = env_enabled("SR_D3D12_VERTEX_LOG");
+    s_stage_log = env_enabled("SR_D3D12_STAGE_LOG");
+    if (s_stage_log)
+        QueryPerformanceFrequency(&s_stage_frequency);
+    memset(&s_stage_totals, 0, sizeof(s_stage_totals));
     s_gpu_log = env_enabled("SR_GPU_LOG");
+    s_gpu_log_start = env_u64("SR_GPU_LOG_START", 0);
+    s_gpu_log_end = env_u64("SR_GPU_LOG_END", UINT64_MAX);
     s_framebuffer_safe = env_enabled("SR_D3D12_FRAMEBUFFER_SAFE");
-    s_destination_safe = env_enabled("SR_D3D12_DESTINATION_SAFE");
     s_state_dump_index = 0;
     s_gpu_log_flushes = 0;
     s_gpu_log_draws = 0;
@@ -839,6 +982,8 @@ static int device_init(void) {
     s_vertex_batches = 0;
     s_constant_updates = 0;
     s_constant_reuses = 0;
+    s_direct_draws = 0;
+    s_manual_draws = 0;
     s_vertex_max = 0;
     memset(s_vertex_primitives, 0, sizeof(s_vertex_primitives));
 
@@ -864,13 +1009,15 @@ static int device_init(void) {
             "ged3d12: using %s (feature level %s, %u buffers, "
             "descriptors=%u srv/%u sampler/%u rtv/%u dsv, "
             "root=b0[40]+t0-t3+s0+s1/s2+space1:t0, upload=%llu MiB, "
-            "gamepad=%s)\n",
+            "direct-vrs=%s, gamepad=%s)\n",
             adapter_name[0] ? adapter_name : "<unnamed adapter>",
             feature_level_name(levels.MaxSupportedFeatureLevel),
             FRAME_COUNT, SRV_DESCRIPTOR_COUNT, SAMPLER_DESCRIPTOR_COUNT,
             RTV_DESCRIPTOR_COUNT, DSV_DESCRIPTOR_COUNT,
             (unsigned long long)(UPLOAD_BYTES / (1024 * 1024)),
+            shading_rate_name(s_direct_shading_rate),
             s_pad ? "yes" : "no");
+    fprintf(stderr, "ged3d12: native GE draw submission enabled\n");
     return 1;
 }
 
@@ -894,6 +1041,7 @@ static int begin_frame(UINT *frame_index) {
     s_command_list->SetDescriptorHeaps(
         (UINT)(sizeof(heaps) / sizeof(heaps[0])), heaps);
     s_command_list->SetGraphicsRootSignature(s_root_signature);
+    s_current_shading_rate = D3D12_SHADING_RATE_1X1;
     s_active_frame = index;
     if (!bind_default_root_state()) {
         s_active_frame = UINT32_MAX;
@@ -1109,9 +1257,11 @@ static void poll_input(int *quit) {
     }
 
     const bool *keys = SDL_GetKeyboardState(nullptr);
+    Uint32 mouse = SDL_GetMouseState(nullptr, nullptr);
     s_pad_present = s_pad != nullptr;
     s_buttons = sr_input_buttons(
         sr_input_sdl_key_down, (void *)keys,
+        sr_input_sdl_mouse_down, &mouse,
         s_pad ? sr_input_sdl_pad_down : nullptr, s_pad);
     int key_x = 0;
     int key_y = 0;
@@ -1142,6 +1292,9 @@ static bool same_draw(
 static void log_draw_batches(
     const GeD3D12VertexFrame *frame, UINT first) {
     const GeD3D12VertexBatch *batch = &frame->batches[first];
+    const GeD3D12Vertex *v0 = &frame->vertices[batch->first];
+    const GeD3D12Vertex *v1 =
+        &frame->vertices[batch->first + batch->count - 2u];
     UINT end = first + 1;
     uint32_t vertices = batch->count;
     while (end < frame->batch_count &&
@@ -1153,13 +1306,32 @@ static void log_draw_batches(
         stderr,
         "GED3D12 draw present=%llu list=%u@0x%08x draw=%u "
         "pc=0x%08x op=0x%08x batches=%u vertices=%u primitive=%s "
-        "framebuffer=%u/%u texture=%u\n",
+        "framebuffer=%u/%u texture=%u alias=%u "
+        "texaddr=0x%08x texfmt=%u texsize=%.0fx%.0f "
+        "flags=0x%x atest=0x%x "
+        "depth=0x%x mask=0x%x blend=0x%x fixed=%06x/%06x "
+        "scissor=%d,%d-%d,%d xy=%.1f,%.1f-%.1f,%.1f "
+        "uv=%.1f,%.1f-%.1f,%.1f rw=%.3g/%.3g "
+        "rgba=%08x/%08x\n",
         (unsigned long long)(s_vertex_frames + 1),
         batch->list_id, batch->list_addr, batch->draw_serial,
         batch->draw_pc, batch->draw_op, end - first, vertices,
         primitive_name(batch->primitive),
         batch->framebuffer.color_handle, batch->framebuffer.depth_handle,
-        batch->texture.handle);
+        batch->texture.handle, batch->texture.framebuffer.handle,
+        batch->texture.address, batch->texture.format,
+        batch->shader.texture_size[0], batch->shader.texture_size[1],
+        (uint32_t)batch->shader.config[0] >> 8,
+        (uint32_t)batch->shader.config[1],
+        batch->shader.fragment[3],
+        batch->shader.fragment[0],
+        batch->shader.blend[0] ? batch->shader.blend[1] : 0,
+        batch->shader.blend[2], batch->shader.blend[3],
+        batch->shader.scissor[0], batch->shader.scissor[1],
+        batch->shader.scissor[2], batch->shader.scissor[3],
+        v0->x, v0->y, v1->x, v1->y,
+        v0->u, v0->v, v1->u, v1->v, v0->rw, v1->rw,
+        v0->rgba, v1->rgba);
     s_gpu_log_draws++;
 }
 
@@ -1169,8 +1341,6 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
     GeD3D12ShaderConstantCache constant_cache = {};
     bool ok = true;
     if (frame->vertex_count) {
-        s_command_list->SetGraphicsRootShaderResourceView(
-            GE_D3D12_ROOT_VERTICES, frame->buffer.BufferLocation);
         s_command_list->IASetPrimitiveTopology(
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     }
@@ -1198,33 +1368,68 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
                 batch->draw_serial, batch->draw_pc, batch->draw_op);
             pix_begin_event(label);
             open_draw = batch;
-            if (s_gpu_log) log_draw_batches(frame, i);
+            if (gpu_log_active(s_vertex_frames + 1))
+                log_draw_batches(frame, i);
         }
-        if (!ged3d12_pipeline_bind(&batch->pipeline) ||
-            !ged3d12_framebuffer_bind(&batch->framebuffer) ||
-            (s_destination_safe &&
+        bool exact_pipeline = false;
+        bool direct_requested =
+            (((uint32_t)batch->shader.config[0] >> 8) &
+             GE_D3D12_SHADER_DIRECT) != 0;
+        bool direct = false;
+        if (!ged3d12_pipeline_bind(
+                &batch->pipeline, &exact_pipeline) ||
+            !ged3d12_framebuffer_bind(&batch->framebuffer)) {
+            ok = false;
+            break;
+        }
+        direct = direct_requested && exact_pipeline;
+        if ((!direct &&
              !ged3d12_framebuffer_bind_destination(
                  &batch->framebuffer)) ||
             !ged3d12_texture_bind(&batch->texture)) {
             ok = false;
             break;
         }
+        GeD3D12ShaderConstants fallback_shader;
+        const GeD3D12ShaderConstants *shader = &batch->shader;
+        if (direct_requested && !direct) {
+            fallback_shader = batch->shader;
+            fallback_shader.config[0] &=
+                ~(int32_t)(GE_D3D12_SHADER_DIRECT << 8);
+            shader = &fallback_shader;
+        }
         if (ged3d12_shader_constants_bind(
-                &constant_cache, &batch->shader)) {
+                &constant_cache, shader)) {
             s_constant_updates++;
         } else {
             s_constant_reuses++;
         }
+        ged3d12_set_coarse_shading(direct);
+        s_command_list->SetGraphicsRootShaderResourceView(
+            GE_D3D12_ROOT_VERTICES,
+            frame->buffer.BufferLocation +
+                (UINT64)batch->first * sizeof(GeD3D12Vertex));
+        s_command_list->DrawInstanced(
+            batch->count, 1, 0, 0);
+        if (!ged3d12_framebuffer_mark_rendered(
+                &batch->framebuffer)) {
+            ok = false;
+            break;
+        }
+        if (direct) s_direct_draws++;
+        else s_manual_draws++;
     }
     if (open_draw) pix_end_event();
     if (open_list) pix_end_event();
     return ok;
 }
 
-static void convert_framebuffer(uint8_t *destination, UINT row_pitch,
-                                uint32_t fbaddr, int format, uint32_t stride) {
+static void convert_framebuffer(
+    uint8_t *destination, UINT row_pitch, uint32_t scale,
+    uint32_t fbaddr, int format, uint32_t stride) {
     for (int y = 0; y < PSP_H; y++) {
-        uint32_t *row = reinterpret_cast<uint32_t *>(destination + (UINT64)y * row_pitch);
+        uint32_t *row = reinterpret_cast<uint32_t *>(
+            destination + (UINT64)y * scale * row_pitch);
         for (int x = 0; x < PSP_W; x++) {
             uint32_t index = (uint32_t)y * stride + (uint32_t)x;
             int red, green, blue;
@@ -1249,13 +1454,21 @@ static void convert_framebuffer(uint8_t *destination, UINT row_pitch,
                     blue = ((pixel >> 11) & 0x1f) << 3;
                 }
             }
-            row[x] = 0xff000000u | ((uint32_t)red << 16) |
-                     ((uint32_t)green << 8) | (uint32_t)blue;
+            uint32_t color =
+                0xff000000u | ((uint32_t)red << 16) |
+                ((uint32_t)green << 8) | (uint32_t)blue;
+            for (uint32_t sx = 0; sx < scale; sx++)
+                row[(uint32_t)x * scale + sx] = color;
         }
+        for (uint32_t sy = 1; sy < scale; sy++)
+            memcpy(
+                destination + ((UINT64)y * scale + sy) * row_pitch,
+                row, row_pitch);
     }
 }
 
 static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
+    LONGLONG stage_start = stage_counter();
     int quit = 0;
     poll_input(&quit);
     if (quit) return 0;
@@ -1263,12 +1476,25 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
 
     UINT frame_index;
     if (!begin_frame(&frame_index)) return -2;
+    LONGLONG stage_begin_done = stage_counter();
 
     GeD3D12VertexFrame vertices = {};
     if (!ged3d12_vertex_upload_pending(&vertices)) return -2;
+    UINT64 next_vertex_frame = s_vertex_frames + 1u;
+    if ((s_vertex_log &&
+         (next_vertex_frame <= 3u ||
+          next_vertex_frame % 120u == 0u)) ||
+        gpu_log_active(next_vertex_frame)) {
+        vertices.hash = ged3d12_vertex_hash(
+            vertices.vertices, vertices.vertex_count);
+    }
+    LONGLONG stage_vertices_done = stage_counter();
     if (!ged3d12_framebuffer_prepare_pending()) return -2;
+    LONGLONG stage_framebuffer_done = stage_counter();
     if (!ged3d12_texture_prepare_pending()) return -2;
+    LONGLONG stage_textures_done = stage_counter();
     if (!record_vertex_batches(&vertices)) return -2;
+    LONGLONG stage_draws_done = stage_counter();
     s_vertex_frames++;
     s_vertex_total += vertices.vertex_count;
     s_vertex_batches += vertices.batch_count;
@@ -1278,14 +1504,16 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     if (s_vertex_log && (s_vertex_frames <= 3 || s_vertex_frames % 120 == 0)) {
         fprintf(stderr,
                 "ged3d12: vertex present=%llu vertices=%u batches=%u hash=%016llx "
-                "max=%u constants=%llu/%llu\n",
+                "max=%u constants=%llu/%llu direct=%llu manual=%llu\n",
                 (unsigned long long)s_vertex_frames,
                 vertices.vertex_count, vertices.batch_count,
                 (unsigned long long)vertices.hash, s_vertex_max,
                 (unsigned long long)s_constant_updates,
-                (unsigned long long)s_constant_reuses);
+                (unsigned long long)s_constant_reuses,
+                (unsigned long long)s_direct_draws,
+                (unsigned long long)s_manual_draws);
     }
-    if (s_gpu_log) {
+    if (gpu_log_active(s_vertex_frames)) {
         fprintf(
             stderr,
             "GED3D12 present=%llu frame=%u vertices=%u batches=%u "
@@ -1298,15 +1526,24 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     D3D12_TEXTURE_COPY_LOCATION source = {};
     D3D12_BOX source_box = {};
     const D3D12_BOX *source_box_ptr = nullptr;
+    uint32_t source_address = fbaddr;
+    uint32_t source_format = (uint32_t)format;
+    uint32_t source_stride = stride;
     bool cached_framebuffer = ged3d12_framebuffer_present_source(
-        fbaddr, (uint32_t)format, stride, &source, &source_box);
+        source_address, source_format, source_stride,
+        &source, &source_box);
     if (cached_framebuffer) {
         source_box_ptr = &source_box;
     } else {
+        const UINT scale = ged3d12_framebuffer_scale();
+        const UINT source_width = PSP_W * scale;
+        const UINT source_height = PSP_H * scale;
         const UINT row_pitch =
-            (PSP_W * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+            (source_width * 4 +
+             D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
             ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-        const UINT64 upload_size = (UINT64)row_pitch * PSP_H;
+        const UINT64 upload_size =
+            (UINT64)row_pitch * source_height;
         GeD3D12UploadSlice upload = {};
         if (!ged3d12_upload_alloc(
                 upload_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
@@ -1314,15 +1551,16 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
             return -2;
         }
         memset(upload.cpu, 0, (size_t)upload_size);
-        convert_framebuffer(static_cast<uint8_t *>(upload.cpu), row_pitch,
-                            fbaddr, format, stride);
+        convert_framebuffer(
+            static_cast<uint8_t *>(upload.cpu), row_pitch, scale,
+            fbaddr, format, stride);
         source.pResource = upload.resource;
         source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         source.PlacedFootprint.Offset = upload.offset;
         source.PlacedFootprint.Footprint.Format =
             DXGI_FORMAT_B8G8R8A8_UNORM;
-        source.PlacedFootprint.Footprint.Width = PSP_W;
-        source.PlacedFootprint.Footprint.Height = PSP_H;
+        source.PlacedFootprint.Footprint.Width = source_width;
+        source.PlacedFootprint.Footprint.Height = source_height;
         source.PlacedFootprint.Footprint.Depth = 1;
         source.PlacedFootprint.Footprint.RowPitch = row_pitch;
     }
@@ -1339,6 +1577,7 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     if (capture_requested && !ged3d12_present_capture_record()) return -2;
     if (!check_hr(s_command_list->Close(), "close graphics command list"))
         return -2;
+    LONGLONG stage_present_done = stage_counter();
 
     ID3D12CommandList *lists[] = {s_command_list};
     s_graphics_queue->ExecuteCommandLists(1, lists);
@@ -1370,6 +1609,11 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
         fprintf(stderr, "ged3d12: safe framebuffer readback failed\n");
         return -2;
     }
+    LONGLONG stage_submit_done = stage_counter();
+    record_stage_timings(
+        stage_start, stage_begin_done, stage_vertices_done,
+        stage_framebuffer_done, stage_textures_done,
+        stage_draws_done, stage_present_done, stage_submit_done);
     return 1;
 }
 
@@ -1378,7 +1622,7 @@ static void device_shutdown(void) {
         fprintf(stderr,
                 "ged3d12: vertex capture presents=%llu vertices=%llu batches=%llu "
                 "max=%u constants=%llu/%llu tri=%llu sprite=%llu "
-                "line=%llu point=%llu\n",
+                "line=%llu point=%llu direct=%llu manual=%llu\n",
                 (unsigned long long)s_vertex_frames,
                 (unsigned long long)s_vertex_total,
                 (unsigned long long)s_vertex_batches,
@@ -1388,7 +1632,9 @@ static void device_shutdown(void) {
                 (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_TRIANGLE],
                 (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_SPRITE],
                 (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_LINE],
-                (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_POINT]);
+                (unsigned long long)s_vertex_primitives[GE_D3D12_PRIMITIVE_POINT],
+                (unsigned long long)s_direct_draws,
+                (unsigned long long)s_manual_draws);
     }
     if (s_gpu_log) {
         fprintf(
@@ -1480,8 +1726,21 @@ D3D12_SHADER_BYTECODE ged3d12_pixel_shader(void) {
     D3D12_SHADER_BYTECODE shader = {k_psp_ps_dxil, sizeof(k_psp_ps_dxil)};
     return shader;
 }
+D3D12_SHADER_BYTECODE ged3d12_direct_pixel_shader(void) {
+    D3D12_SHADER_BYTECODE shader = {
+        k_psp_ps_direct_dxil, sizeof(k_psp_ps_direct_dxil),
+    };
+    return shader;
+}
 bool ged3d12_graphics_wait_idle(void) {
     return wait_queue_idle(
         s_graphics_queue, s_graphics_fence, &s_next_graphics_fence,
         s_graphics_event, "wait for D3D12 texture cache eviction") != 0;
+}
+void ged3d12_set_coarse_shading(bool enabled) {
+    D3D12_SHADING_RATE rate =
+        enabled ? s_direct_shading_rate : D3D12_SHADING_RATE_1X1;
+    if (!s_command_list5 || rate == s_current_shading_rate) return;
+    s_command_list5->RSSetShadingRate(rate, nullptr);
+    s_current_shading_rate = rate;
 }

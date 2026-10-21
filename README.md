@@ -108,20 +108,51 @@ build/mygame/mygame.exe --image build/mygame/mygame_image.bin 0x08804000 <entry_
 
 ## Runtime Controls
 
-If you have a gamepad connected, SDL3 will map it automatically. Otherwise, use these keyboard mappings:
-- **Arrow Keys**: PSP D-pad and analog stick
-- **X / Z**: Cross (A) / Circle (B)
-- **A / S**: Square (X) / Triangle (Y)
-- **Q / W**: L-Trigger / R-Trigger
+SDL3 maps connected gamepads automatically, and gamepad, mouse, and keyboard
+input can be mixed at any time. The default PC mappings are:
+- **WASD**: PSP analog stick movement
+- **Arrow Keys**: PSP D-pad
+- **Left Mouse / F**: Square (fire)
+- **Right Mouse / E**: R (aim)
+- **Middle Mouse / R**: Triangle (reload)
+- **Mouse X1 / G**: Circle (grenade)
+- **Mouse X2 / Q**: L (strafe/roll modifier)
+- **Space**: Cross (interact/confirm)
 - **Enter / Shift**: Start / Select
 
-On first windowed launch, the runtime writes
-`%LOCALAPPDATA%\KZLRecomp\input.ini`. Edit that file and restart to rebind
-keyboard/gamepad controls or change the radial analog response:
+Gamepads use the left stick, D-pad, standard south/east/west/north face
+buttons, and either shoulder or trigger for L/R.
+
+On first windowed launch, the runtime opens a native graphics settings dialog
+and writes `graphics.ini` beside the executable. D3D12 and 2x internal
+resolution (960x544) are the defaults:
 
 ```ini
-keyboard.cross = X
-keyboard.analog_up = up
+renderer = d3d12
+internal_resolution = 2
+```
+
+Run `kzl.exe --configure` to reopen the dialog without starting the game.
+`renderer` accepts `auto`, `d3d12`, `sw`, or `vk`; unavailable backends fail
+explicitly at startup. `internal_resolution` accepts every integer from 1
+through 8 and applies to D3D12 color/depth targets, feedback snapshots,
+copies, readback, and presentation. PSP-visible framebuffer addresses,
+coordinates, and captures remain at their original logical resolution.
+On Variable Rate Shading hardware, direct draws retain scaled geometry,
+coverage and D16 depth while shading at approximately one fragment per logical
+PSP pixel. Set `SR_D3D12_VRS=0` to force full-rate shading; on the measured RTX
+5070, the default 2x path sustains 65.51-69.70 FPS while full-rate shading
+drops moving gameplay to about 40 FPS.
+
+The runtime also writes `input.ini` beside the executable. Edit that portable
+file and restart to rebind keyboard/gamepad controls or change the radial
+analog response:
+
+```ini
+keyboard.cross = space
+keyboard.analog_up = W
+mouse.square = left
+mouse.r = right
 gamepad.cross = south
 gamepad.l = left_shoulder, left_trigger
 analog.deadzone = 0.24
@@ -132,60 +163,89 @@ analog.invert_y = false
 Bindings accept up to four comma-separated inputs or `none`. Keyboard inputs
 are `A`-`Z`, `0`-`9`, `enter`, `left_shift`, `right_shift`, `up`, `right`,
 `down`, `left`, `space`, `tab`, `backspace`, `left_ctrl`, and `right_ctrl`.
+Mouse inputs are `left`, `right`, `middle`, `x1`, and `x2`.
 Gamepad inputs are `south`, `east`, `west`, `north`, `start`, `back`,
 `left_shoulder`, `right_shoulder`, `left_trigger`, `right_trigger`, the four
 `dpad_*` names, `left_stick`, and `right_stick`. Invalid settings stop startup
 with a line-specific error instead of silently falling back. Set
 `SR_INPUT_CONFIG=<path>` to use another file, or `SR_INPUT_CONFIG=0` to use
-built-in defaults without reading or writing a file.
+built-in defaults without reading or writing a file. An untouched generated v1
+config is migrated automatically to the v2 PC defaults; customized v1 files
+retain their keyboard/gamepad choices and inherit the new mouse defaults.
+Set `SR_GRAPHICS_CONFIG=<path>` or `SR_SETTINGS_DIR=<directory>` for isolated
+automation. `SR_GRAPHICS_CONFIG=0` uses the built-in graphics defaults without
+opening the first-run launcher or reading/writing a file.
 
 ## Environment Settings
 
 Set these environment variables before running the game to control runtime features:
-- Audio uses the native Windows XAudio2 2.9 backend at 44.1 kHz stereo. Four
-  256-frame source buffers bound the device queue to 23.22 ms; PSP output
-  channels still mix through the shared saturation ring before submission.
+- Audio uses the native Windows XAudio2 2.9 backend at 44.1 kHz stereo. Eight
+  256-frame source-buffer slots provide up to 46.44 ms of device coverage.
+  The feeder submits only available guest PCM instead of pre-rendering silence,
+  and Output2 preserves the PSP's two-buffer completion contract. PSP channels
+  still mix through the shared saturation ring before submission.
 - `SR_AUDIO_LOG=1`: Print device-buffer lead, guest queue/resync/drop counters,
   played time, and host-clock drift every three seconds and at shutdown.
 - `SR_NOAUDIO=1`: Disable host playback. Blocking PSP audio calls retain their
   virtual-duration scheduler fallback, which is useful for deterministic tests.
+- `SR_MPEGLOG=1`: Print PMF ring-buffer, H.264 negotiation, frame, audio, and
+  A/V-drift diagnostics.
 - `SR_NO_DIALOGS=1`: Suppress native message boxes and choose their configured
   default button. Netconf and Game Sharing remain deterministic offline cancels.
 - `SR_SAVEDATA_MIGRATE=1`: After loading a legacy plaintext save produced by an
   older runtime build, rewrite it in PSP/PPSSPP-compatible secure format using
   the game's live key.
+- When `SR_GPU` is unset, the renderer comes from `graphics.ini`; `auto` uses
+  D3D12 in a D3D12-enabled build and otherwise retains the build's default.
 - `SR_GPU=vk`: Use the Vulkan GE backend (SDL3/Vulkan build).
-- `SR_GPU=sw`: Use the reference software rasterizer.
+- `SR_GPU=sw`: Explicitly use the reference software rasterizer.
 - `SR_GPU=d3d12`: Use the SDL3/D3D12 device backend when compiled with `SR_D3D12`.
-  The software GE remains authoritative while native batches are staged. Each batch captures a 160-byte
-  destination-aware fragment block; the HLSL path reads ordered BGRA8 color and R16 depth snapshots to reproduce
-  PSP stencil, depth, blending, dithering, logic operations, native packing, and component masks. The resizable
-  swapchain preserves the exact 480:272 display aspect and clears letterbox or pillarbox space to black. The shared
-  CPU frontend blends all morph attributes before eight-bone skinning and tessellates Bezier/B-spline commands with
-  the GE's quantized scalar evaluator before emitting ordinary backend triangles, lines, or points. The vertex
-  shader raw-loads that canonical 32-byte stream through a root SRV; primitives from one logical GE command share
-  one captured state record, and unchanged fragment blocks reuse their previous root constants.
+  Successful primitive hooks suppress CPU rasterization and submit native draws into GPU-owned targets. Each batch
+  captures a 160-byte fragment block. Clear, opaque, source-alpha, additive, subtractive, min/max, and compatible
+  fixed-factor draws use native D3D12 color/depth state without destination copies. Unusual doubled factors,
+  per-bit masks, stencil, logic operations, and post-blend dithering retain the ordered BGRA8/R16 snapshot path.
+  Cached color targets use a scaled 512x512 texture envelope for PSP power-of-two framebuffer sampling while
+  rendering the visible 512x272 region at the selected 1x-8x internal resolution. CLUT32 reinterpretations of a live 8888 target remain
+  GPU-resident: ordered feedback snapshots and per-draw palettes replace stale guest-memory texture decodes.
+  The resizable swapchain preserves the exact 480:272 display aspect and clears letterbox or pillarbox space to
+  black. The shared CPU frontend blends all morph attributes before eight-bone skinning and tessellates
+  Bezier/B-spline commands with the GE's quantized scalar evaluator.
 - `SR_D3D12_FRAMEBUFFER_LOG=1`: Print persistent color/depth target allocation and cache statistics.
 - `SR_D3D12_FRAMEBUFFER_SAFE=1`: Read cached color targets back after presentation to validate GPU/CPU ownership.
-- `SR_D3D12_DESTINATION_SAFE=1`: Copy and bind color/depth destination snapshots for every staged batch. This is
-  an intentionally expensive resource-transition diagnostic; native draw submission remains disabled.
+- `SR_D3D12_SCALE=1` through `8`: Override `graphics.ini` for one process.
+- `SR_D3D12_VRS=0`: Disable coarse shading for direct scaled draws. This keeps
+  every fragment at the selected internal resolution at a substantial cost.
+- `SR_D3D12_STAGE_LOG=1`: Report 120-frame CPU averages for fence/begin,
+  vertex upload, framebuffer and texture preparation, draw recording,
+  presentation, and submission.
 - `SR_D3D12_PSO_LOG=1`: Print ubershader, asynchronous GE PSO, pipeline-library, and final cache statistics.
-- `SR_D3D12_PSO_CACHE=<path>`: Override the default
-  `%LOCALAPPDATA%\KZLRecomp\cache\d3d12-pipelines.bin` pipeline-library path. Set it to `0` to disable disk
-  persistence; the exact ubershader fallback and asynchronous in-memory cache remain active.
+- `SR_D3D12_PSO_CACHE=<path>`: Opt into pipeline-library disk persistence at the specified path.
+  Disk persistence is disabled by default because some drivers reject a library they previously serialized;
+  the exact ubershader fallback and asynchronous in-memory cache remain active.
 - `SR_D3D12_WARP=1`: Select Microsoft WARP instead of a hardware adapter.
 - **F10** (D3D12 window): Write a complete textual GE state dump in the working directory.
   PIX for Windows can display nested list/draw events embedded in each D3D12 command list;
   install it with `winget install --id Microsoft.PIX --exact`.
 - `PSPRECOMP_CAPTURE_MANIFEST=<path>` and `PSPRECOMP_CAPTURE_DIR=<directory>`: Capture the
   strict 50-frame golden manifest. With the D3D12 backend, frames are read back from the
-  480x272 GPU display texture after presentation conversion; other presenters use the
+  scaled GPU display texture after presentation conversion and center-sample it back to
+  480x272; other presenters use the
   authoritative guest framebuffer. A successful sequence writes `capture.complete`.
 - `SR_PADSCRIPT=<path>`: Inject deterministic controller pulses. Golden pad-script v3 entries
   contain a PPSSPP vblank index, a runtime presentation index, a shared PSP button mask, and
   backend-specific widths; the runtime consumes presentation-timed values so turbo scheduler
   variance cannot consume inputs before a menu appears. Legacy three-column and v2 scripts retain
   runtime-vblank timing.
+- `SR_FAST_FORWARD_PRESENT=<present>`: Run scheduler and presentation pacing as fast as the host
+  allows until the requested presentation, keep host audio dormant during that phase, then align
+  virtual time to the host clock and start real-time XAudio2 playback. This is intended for
+  deterministic in-game testing rather than normal play.
+- `SR_PERF_LOG=1`: Measure presentation intervals and split time between game/GE work and the
+  graphics backend. `SR_PERF_START=<present>` selects the first measured presentation and
+  `SR_PERF_WINDOW=<1..600>` selects the reporting window. `SR_PERF_MIN_FPS=<fps>` terminates with
+  failure when a completed window falls below the required average, while
+  `SR_EXIT_AFTER_PRESENT=<present>` makes unattended benchmarks exit cleanly with final audio
+  synchronization statistics.
 - `PSP_VFPU_TABLES=<directory>`: Override the `assets/vfpu` lookup-table directory. The golden
   harness sets this explicitly so runtime execution does not depend on its working directory.
 - `SR_INTERP_MISS_LOG=<path>`: Write each distinct guest target that missed the generated
@@ -197,4 +257,6 @@ Set these environment variables before running the game to control runtime featu
 - `SR_GPU_LOG=1`: Print GPU cache flushes and batch information to the console. D3D12
   includes list/draw identity, command PC/opcode, per-draw batch/vertex counts, presents,
   and a shutdown summary.
+- `SR_GPU_LOG_START=<present>` / `SR_GPU_LOG_END=<present>`: Restrict verbose
+  D3D12 draw/present logging to an inclusive presentation range.
 - `SR_IOLOG=1`: Print all file system access logs.

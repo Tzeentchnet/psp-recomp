@@ -286,9 +286,11 @@ static void poll_input(int *quit) {
     }
 
     const bool *k = SDL_GetKeyboardState(NULL);
+    Uint32 mouse = SDL_GetMouseState(NULL, NULL);
     s_pad_present = s_pad != NULL;
     s_buttons = sr_input_buttons(
         sr_input_sdl_key_down, (void *)k,
+        sr_input_sdl_mouse_down, &mouse,
         s_pad ? sr_input_sdl_pad_down : NULL, s_pad);
     int key_x = 0, key_y = 0;
     sr_input_keyboard_axis(

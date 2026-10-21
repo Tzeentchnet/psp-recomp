@@ -70,6 +70,15 @@ enum SrInputPad {
     SR_PAD_RIGHT_STICK,
 };
 
+enum SrInputMouse {
+    SR_MOUSE_NONE = 0,
+    SR_MOUSE_LEFT,
+    SR_MOUSE_RIGHT,
+    SR_MOUSE_MIDDLE,
+    SR_MOUSE_X1,
+    SR_MOUSE_X2,
+};
+
 typedef struct SrInputBinding {
     int values[SR_INPUT_MAX_BINDINGS];
     int count;
@@ -77,6 +86,7 @@ typedef struct SrInputBinding {
 
 typedef struct SrInputConfig {
     SrInputBinding keyboard[SR_INPUT_ACTIONS];
+    SrInputBinding mouse[SR_INPUT_ACTIONS];
     SrInputBinding gamepad[SR_INPUT_ACTIONS];
     SrInputBinding analog_keyboard[SR_INPUT_ANALOG_DIRECTIONS];
     double deadzone;
@@ -92,6 +102,7 @@ int sr_input_config_parse(
 uint32_t sr_input_config_buttons(
     const SrInputConfig *config,
     SrInputDownFn key_down, void *key_context,
+    SrInputDownFn mouse_down, void *mouse_context,
     SrInputDownFn pad_down, void *pad_context);
 void sr_input_config_keyboard_axis(
     const SrInputConfig *config, SrInputDownFn key_down, void *context,
@@ -103,6 +114,7 @@ void sr_input_config_analog(
 int sr_input_init(void);
 uint32_t sr_input_buttons(
     SrInputDownFn key_down, void *key_context,
+    SrInputDownFn mouse_down, void *mouse_context,
     SrInputDownFn pad_down, void *pad_context);
 void sr_input_keyboard_axis(
     SrInputDownFn key_down, void *context, int *x, int *y);

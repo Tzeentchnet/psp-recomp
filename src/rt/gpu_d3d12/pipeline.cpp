@@ -15,7 +15,7 @@
 #define PIPELINE_CACHE_CAPACITY 512u
 #define PIPELINE_CACHE_PATH_CAPACITY 1024u
 #define PIPELINE_LIBRARY_MAX_BYTES (64u * 1024u * 1024u)
-#define PIPELINE_LIBRARY_VERSION 2u
+#define PIPELINE_LIBRARY_VERSION 4u
 #define PIPELINE_NAME_CAPACITY 48u
 
 enum PipelineEntryState {
@@ -149,27 +149,18 @@ static bool ensure_parent_directories(const char *path) {
 
 static bool configure_cache_path(void) {
     const char *override_path = getenv("SR_D3D12_PSO_CACHE");
-    if (override_path && strcmp(override_path, "0") == 0) {
-        if (s_log) fprintf(stderr, "ged3d12: PSO disk cache disabled\n");
+    if (!override_path || !override_path[0] ||
+        strcmp(override_path, "0") == 0) {
+        if (s_log) {
+            fprintf(stderr,
+                    "ged3d12: PSO disk cache disabled; set "
+                    "SR_D3D12_PSO_CACHE to opt in\n");
+        }
         return false;
     }
 
-    int count;
-    if (override_path && override_path[0]) {
-        count = snprintf(
-            s_cache_path, sizeof(s_cache_path), "%s", override_path);
-    } else {
-        const char *local = getenv("LOCALAPPDATA");
-        if (!local || !local[0]) {
-            fprintf(stderr,
-                    "ged3d12: LOCALAPPDATA is unset; "
-                    "set SR_D3D12_PSO_CACHE to enable the PSO disk cache\n");
-            return false;
-        }
-        count = snprintf(
-            s_cache_path, sizeof(s_cache_path),
-            "%s\\KZLRecomp\\cache\\d3d12-pipelines.bin", local);
-    }
+    int count = snprintf(
+        s_cache_path, sizeof(s_cache_path), "%s", override_path);
     if (count < 0 || (size_t)count >= sizeof(s_cache_path)) {
         fprintf(stderr, "ged3d12: PSO cache path is too long\n");
         s_cache_path[0] = '\0';
@@ -196,12 +187,20 @@ static uint64_t pipeline_shader_hash(void) {
     uint64_t hash = UINT64_C(14695981039346656037);
     uint32_t version = PIPELINE_LIBRARY_VERSION;
     uint32_t key_size = sizeof(GeD3D12PipelineKey);
+    uint32_t legacy_pixel =
+        env_enabled("SR_D3D12_LEGACY_PIXEL_SHADER") ? 1u : 0u;
     hash = hash_bytes(hash, &version, sizeof(version));
     hash = hash_bytes(hash, &key_size, sizeof(key_size));
+    hash = hash_bytes(hash, &legacy_pixel, sizeof(legacy_pixel));
     D3D12_SHADER_BYTECODE vertex = ged3d12_vertex_shader();
     D3D12_SHADER_BYTECODE pixel = ged3d12_pixel_shader();
+    D3D12_SHADER_BYTECODE direct_pixel =
+        ged3d12_direct_pixel_shader();
     hash = hash_bytes(hash, vertex.pShaderBytecode, vertex.BytecodeLength);
-    return hash_bytes(hash, pixel.pShaderBytecode, pixel.BytecodeLength);
+    hash = hash_bytes(hash, pixel.pShaderBytecode, pixel.BytecodeLength);
+    return hash_bytes(
+        hash, direct_pixel.pShaderBytecode,
+        direct_pixel.BytecodeLength);
 }
 
 static void *read_library_blob(SIZE_T *blob_size) {
@@ -265,6 +264,7 @@ static void *read_library_blob(SIZE_T *blob_size) {
 }
 
 static void initialize_pipeline_library(void) {
+    if (!s_cache_path[0]) return;
     ID3D12Device1 *device = nullptr;
     HRESULT hr = ged3d12_device()->QueryInterface(IID_PPV_ARGS(&device));
     if (FAILED(hr)) {
@@ -311,7 +311,7 @@ static void pipeline_name(
     const GeD3D12PipelineKey *key,
     wchar_t name[PIPELINE_NAME_CAPACITY]) {
     static const wchar_t hex[] = L"0123456789abcdef";
-    static const wchar_t prefix[] = L"sr-pso-v1-";
+    static const wchar_t prefix[] = L"sr-pso-v4-";
     size_t offset = 0;
     for (; prefix[offset]; offset++) name[offset] = prefix[offset];
     const uint8_t *bytes = reinterpret_cast<const uint8_t *>(key);
@@ -327,7 +327,10 @@ static D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc(
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
     desc.pRootSignature = ged3d12_root_signature();
     desc.VS = ged3d12_vertex_shader();
-    desc.PS = ged3d12_pixel_shader();
+    desc.PS = (ged3d12_pipeline_uber_compatible(key) ||
+               env_enabled("SR_D3D12_LEGACY_PIXEL_SHADER"))
+        ? ged3d12_pixel_shader()
+        : ged3d12_direct_pixel_shader();
 
     D3D12_RENDER_TARGET_BLEND_DESC *blend =
         &desc.BlendState.RenderTarget[0];
@@ -810,23 +813,16 @@ void ged3d12_pipeline_cache_shutdown(void) {
     s_cache_path[0] = '\0';
 }
 
-bool ged3d12_pipeline_bind(const GeD3D12PipelineKey *key) {
+bool ged3d12_pipeline_bind(
+    const GeD3D12PipelineKey *key, bool *exact) {
     if (!s_ready || !key) {
         fprintf(stderr, "ged3d12: invalid pipeline cache lookup\n");
         return false;
     }
-    if (!ged3d12_pipeline_uber_compatible(key)) {
-        fprintf(stderr,
-                "ged3d12: PSO key is not ubershader-compatible "
-                "(hash=%016llx)\n",
-                (unsigned long long)ged3d12_pipeline_key_hash(key));
-        EnterCriticalSection(&s_lock);
-        s_stats.failures++;
-        LeaveCriticalSection(&s_lock);
-        return false;
-    }
 
     ID3D12PipelineState *pipeline = s_uber_pipeline;
+    bool exact_pipeline =
+        ged3d12_pipeline_uber_compatible(key);
     bool wake_worker = false;
     EnterCriticalSection(&s_lock);
     s_stats.lookups++;
@@ -852,6 +848,7 @@ bool ged3d12_pipeline_bind(const GeD3D12PipelineKey *key) {
         }
         if (found && found->state == PIPELINE_ENTRY_READY) {
             pipeline = found->pipeline;
+            exact_pipeline = true;
             s_stats.hits++;
         } else if (found) {
             s_stats.fallback_binds++;
@@ -879,6 +876,7 @@ bool ged3d12_pipeline_bind(const GeD3D12PipelineKey *key) {
         LeaveCriticalSection(&s_lock);
     }
     ged3d12_command_list()->SetPipelineState(pipeline);
+    if (exact) *exact = exact_pipeline;
     return true;
 }
 

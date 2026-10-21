@@ -1,4 +1,4 @@
-/* Generated from psp_vs.hlsl (vs_6_0) by tools/compile_d3d12_shaders.py.
+/* Generated from psp_vs.hlsl (vs_6_0, main) by tools/compile_d3d12_shaders.py.
  * source SHA-256: 3CA6BA705D8CE394701D0E6420259A05AA9801BE60861FD43DD95E60ACB01E98
  * DXIL SHA-256:   3746BA875A9340FBF3430C538C699427A18BC89D161EC45B79109D0947C440F4 */
 {

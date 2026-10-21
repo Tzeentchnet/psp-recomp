@@ -14,6 +14,7 @@ extern "C" {
 
 #define MAX_TARGETS 16u
 #define MAX_DEPTHS 16u
+#define MAX_SNAPSHOT_DIRTY_RECTS 256u
 #define RELEASE_COM(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
 
 struct ColorTarget {
@@ -48,6 +49,13 @@ struct DepthTarget {
     bool pending_upload;
 };
 
+struct SnapshotRect {
+    uint16_t left;
+    uint16_t top;
+    uint16_t right;
+    uint16_t bottom;
+};
+
 static ColorTarget s_targets[MAX_TARGETS];
 static DepthTarget s_depths[MAX_DEPTHS];
 static ColorTarget *s_active_target;
@@ -76,20 +84,125 @@ static uint32_t s_target_count;
 static uint32_t s_depth_count;
 static uint64_t s_captures;
 static uint64_t s_uploads;
+static uint64_t s_depth_uploads;
 static uint64_t s_readbacks;
 static uint64_t s_aliases;
 static uint64_t s_invalidations;
+static uint64_t s_transfer_attempts;
+static uint64_t s_transfer_fallbacks;
 static uint64_t s_transfers;
 static uint64_t s_present_hits;
 static uint64_t s_destination_snapshots;
+static uint64_t s_feedback_snapshots;
+static uint64_t s_feedback_snapshot_pixels;
+static uint64_t s_feedback_snapshot_reuses;
+static ColorTarget *s_feedback_snapshot_target;
+static SnapshotRect s_snapshot_dirty[MAX_SNAPSHOT_DIRTY_RECTS];
+static uint32_t s_snapshot_dirty_count;
+static bool s_snapshot_dirty_all;
+static uint32_t s_render_scale = 1u;
 static bool s_initialized;
 static bool s_log;
+static bool s_legacy_depth_uploads;
+static bool s_legacy_feedback_snapshots;
 
 static bool check_hr(HRESULT hr, const char *operation) {
     if (SUCCEEDED(hr)) return true;
     fprintf(stderr, "ged3d12: %s failed (HRESULT 0x%08lx)\n",
             operation, (unsigned long)hr);
     return false;
+}
+
+static uint32_t render_width(void) {
+    return GE_D3D12_FRAMEBUFFER_WIDTH * s_render_scale;
+}
+
+static uint32_t render_height(void) {
+    return GE_D3D12_FRAMEBUFFER_HEIGHT * s_render_scale;
+}
+
+static uint32_t texture_height(void) {
+    return GE_D3D12_FRAMEBUFFER_TEXTURE_HEIGHT * s_render_scale;
+}
+
+static void reset_feedback_snapshot_tracking(void) {
+    s_feedback_snapshot_target = nullptr;
+    s_snapshot_dirty_count = 0;
+    s_snapshot_dirty_all = false;
+}
+
+static SnapshotRect feedback_source_rect(
+    const GeD3D12FramebufferAlias *alias) {
+    SnapshotRect rect = {
+        alias->snapshot_left,
+        alias->snapshot_top,
+        alias->snapshot_right,
+        alias->snapshot_bottom,
+    };
+    if (rect.right <= rect.left || rect.bottom <= rect.top ||
+        rect.right > GE_D3D12_FRAMEBUFFER_WIDTH ||
+        rect.bottom > GE_D3D12_FRAMEBUFFER_TEXTURE_HEIGHT) {
+        rect.left = 0;
+        rect.top = 0;
+        rect.right = GE_D3D12_FRAMEBUFFER_WIDTH;
+        rect.bottom = GE_D3D12_FRAMEBUFFER_TEXTURE_HEIGHT;
+    }
+    return rect;
+}
+
+static bool rects_overlap(
+    const SnapshotRect *left, const SnapshotRect *right) {
+    return left->left < right->right &&
+           right->left < left->right &&
+           left->top < right->bottom &&
+           right->top < left->bottom;
+}
+
+static bool feedback_snapshot_needs_refresh(
+    ColorTarget *target, const GeD3D12FramebufferAlias *alias) {
+    if (s_legacy_feedback_snapshots ||
+        s_feedback_snapshot_target != target ||
+        s_snapshot_dirty_all) {
+        return true;
+    }
+    SnapshotRect source = feedback_source_rect(alias);
+    for (uint32_t i = 0; i < s_snapshot_dirty_count; i++)
+        if (rects_overlap(&source, &s_snapshot_dirty[i]))
+            return true;
+    return false;
+}
+
+static void feedback_snapshot_mark_dirty(
+    ColorTarget *target,
+    const GeD3D12FramebufferBinding *binding) {
+    if (target != s_feedback_snapshot_target ||
+        s_snapshot_dirty_all) {
+        return;
+    }
+    SnapshotRect rect = {
+        binding->draw_left,
+        binding->draw_top,
+        binding->draw_right,
+        binding->draw_bottom,
+    };
+    if (rect.right <= rect.left || rect.bottom <= rect.top ||
+        rect.right > GE_D3D12_FRAMEBUFFER_WIDTH ||
+        rect.bottom > GE_D3D12_FRAMEBUFFER_HEIGHT ||
+        s_snapshot_dirty_count >= MAX_SNAPSHOT_DIRTY_RECTS) {
+        s_snapshot_dirty_all = true;
+        return;
+    }
+    s_snapshot_dirty[s_snapshot_dirty_count++] = rect;
+}
+
+bool ged3d12_framebuffer_configure(uint32_t scale) {
+    if (s_initialized || scale < 1u || scale > 8u) return false;
+    s_render_scale = scale;
+    return true;
+}
+
+uint32_t ged3d12_framebuffer_scale(void) {
+    return s_render_scale;
 }
 
 static void transition(
@@ -181,8 +294,8 @@ static bool create_color_resource(ColorTarget *target) {
     heap.VisibleNodeMask = 1;
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = GE_D3D12_FRAMEBUFFER_WIDTH;
-    desc.Height = GE_D3D12_FRAMEBUFFER_HEIGHT;
+    desc.Width = render_width();
+    desc.Height = texture_height();
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
     desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -212,8 +325,8 @@ static bool create_depth_resource(DepthTarget *depth) {
     heap.VisibleNodeMask = 1;
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = GE_D3D12_FRAMEBUFFER_WIDTH;
-    desc.Height = GE_D3D12_FRAMEBUFFER_HEIGHT;
+    desc.Width = render_width();
+    desc.Height = render_height();
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
     desc.Format = DXGI_FORMAT_R16_TYPELESS;
@@ -287,9 +400,11 @@ static bool immediate_submit(void) {
 }
 
 static bool upload_color(ColorTarget *target) {
-    const uint32_t row_pitch = GE_D3D12_FRAMEBUFFER_WIDTH * 4u;
+    const uint32_t physical_width = render_width();
+    const uint32_t physical_texture_height = texture_height();
+    const uint32_t row_pitch = physical_width * 4u;
     const uint64_t upload_size =
-        (uint64_t)row_pitch * GE_D3D12_FRAMEBUFFER_HEIGHT;
+        (uint64_t)row_pitch * physical_texture_height;
     uint64_t source_size = ged3d12_framebuffer_key_bytes(&target->key);
     uint64_t source_last = (uint64_t)target->key.address + source_size - 1u;
     if (!source_size || source_last > UINT32_MAX ||
@@ -307,25 +422,46 @@ static bool upload_color(ColorTarget *target) {
     uint32_t format = target->key.format;
     uint32_t stride = target->key.stride;
     uint32_t bytes_per_pixel = target_bytes_per_pixel(target);
-    const uint8_t *source =
-        static_cast<const uint8_t *>(SR_HOST(target->key.address));
-    for (uint32_t y = 0; y < GE_D3D12_FRAMEBUFFER_HEIGHT; y++) {
-        uint32_t *row = destination + y * GE_D3D12_FRAMEBUFFER_WIDTH;
+    memset(destination, 0, (size_t)upload_size);
+    for (uint32_t y = 0;
+         y < GE_D3D12_FRAMEBUFFER_TEXTURE_HEIGHT; y++) {
+        uint64_t row_address =
+            (uint64_t)target->key.address +
+            (uint64_t)y * stride * bytes_per_pixel;
+        uint64_t row_last =
+            row_address + (uint64_t)stride * bytes_per_pixel - 1u;
+        if (row_last > UINT32_MAX ||
+            !sr_inrange((uint32_t)row_address) ||
+            !sr_inrange((uint32_t)row_last)) {
+            break;
+        }
+        const uint8_t *source =
+            static_cast<const uint8_t *>(SR_HOST((uint32_t)row_address));
+        uint32_t *row =
+            destination + y * s_render_scale * physical_width;
         if (bytes_per_pixel == 4) {
             const uint32_t *pixels =
-                reinterpret_cast<const uint32_t *>(source + y * stride * 4u);
-            for (uint32_t x = 0; x < stride; x++)
-                row[x] = ged3d12_framebuffer_decode_pixel(
+                reinterpret_cast<const uint32_t *>(source);
+            for (uint32_t x = 0; x < stride; x++) {
+                uint32_t pixel = ged3d12_framebuffer_decode_pixel(
                     pixels[x], format);
+                for (uint32_t sx = 0; sx < s_render_scale; sx++)
+                    row[x * s_render_scale + sx] = pixel;
+            }
         } else {
             const uint16_t *pixels =
-                reinterpret_cast<const uint16_t *>(source + y * stride * 2u);
-            for (uint32_t x = 0; x < stride; x++)
-                row[x] = ged3d12_framebuffer_decode_pixel(
+                reinterpret_cast<const uint16_t *>(source);
+            for (uint32_t x = 0; x < stride; x++) {
+                uint32_t pixel = ged3d12_framebuffer_decode_pixel(
                     pixels[x], format);
+                for (uint32_t sx = 0; sx < s_render_scale; sx++)
+                    row[x * s_render_scale + sx] = pixel;
+            }
         }
-        memset(row + stride, 0,
-               (GE_D3D12_FRAMEBUFFER_WIDTH - stride) * sizeof(uint32_t));
+        for (uint32_t sy = 1; sy < s_render_scale; sy++)
+            memcpy(
+                row + sy * physical_width, row,
+                (size_t)row_pitch);
     }
 
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
@@ -341,9 +477,9 @@ static bool upload_color(ColorTarget *target) {
     source_location.PlacedFootprint.Footprint.Format =
         DXGI_FORMAT_B8G8R8A8_UNORM;
     source_location.PlacedFootprint.Footprint.Width =
-        GE_D3D12_FRAMEBUFFER_WIDTH;
+        physical_width;
     source_location.PlacedFootprint.Footprint.Height =
-        GE_D3D12_FRAMEBUFFER_HEIGHT;
+        physical_texture_height;
     source_location.PlacedFootprint.Footprint.Depth = 1;
     source_location.PlacedFootprint.Footprint.RowPitch = row_pitch;
     command_list->CopyTextureRegion(
@@ -358,15 +494,36 @@ static bool upload_color(ColorTarget *target) {
 }
 
 static bool upload_depth(DepthTarget *depth) {
-    const uint32_t row_pitch = GE_D3D12_FRAMEBUFFER_WIDTH * 2u;
+    const uint32_t physical_width = render_width();
+    const uint32_t physical_height = render_height();
+    const uint32_t row_pitch = physical_width * 2u;
     const uint64_t upload_size =
-        (uint64_t)row_pitch * GE_D3D12_FRAMEBUFFER_HEIGHT;
+        (uint64_t)row_pitch * physical_height;
     GeD3D12UploadSlice upload = {};
     if (!ged3d12_upload_alloc(
             upload_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, &upload)) {
         return false;
     }
-    memcpy(upload.cpu, ge_zbuf_ptr(), (size_t)upload_size);
+    const uint16_t *source_pixels =
+        static_cast<const uint16_t *>(ge_zbuf_ptr());
+    uint16_t *destination_pixels =
+        static_cast<uint16_t *>(upload.cpu);
+    for (uint32_t y = 0; y < GE_D3D12_FRAMEBUFFER_HEIGHT; y++) {
+        uint16_t *row =
+            destination_pixels +
+            y * s_render_scale * physical_width;
+        for (uint32_t x = 0; x < GE_D3D12_FRAMEBUFFER_WIDTH; x++) {
+            uint16_t pixel =
+                source_pixels[
+                    y * GE_D3D12_FRAMEBUFFER_WIDTH + x];
+            for (uint32_t sx = 0; sx < s_render_scale; sx++)
+                row[x * s_render_scale + sx] = pixel;
+        }
+        for (uint32_t sy = 1; sy < s_render_scale; sy++)
+            memcpy(
+                row + sy * physical_width, row,
+                (size_t)row_pitch);
+    }
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
     transition(command_list, depth->resource, &depth->state,
                D3D12_RESOURCE_STATE_COPY_DEST);
@@ -378,8 +535,8 @@ static bool upload_depth(DepthTarget *depth) {
     source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     source.PlacedFootprint.Offset = upload.offset;
     source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_D16_UNORM;
-    source.PlacedFootprint.Footprint.Width = GE_D3D12_FRAMEBUFFER_WIDTH;
-    source.PlacedFootprint.Footprint.Height = GE_D3D12_FRAMEBUFFER_HEIGHT;
+    source.PlacedFootprint.Footprint.Width = physical_width;
+    source.PlacedFootprint.Footprint.Height = physical_height;
     source.PlacedFootprint.Footprint.Depth = 1;
     source.PlacedFootprint.Footprint.RowPitch = row_pitch;
     command_list->CopyTextureRegion(
@@ -387,10 +544,14 @@ static bool upload_depth(DepthTarget *depth) {
     transition(command_list, depth->resource, &depth->state,
                D3D12_RESOURCE_STATE_DEPTH_WRITE);
     depth->pending_upload = false;
+    s_depth_uploads++;
     return true;
 }
 
 static bool readback_color(ColorTarget *target) {
+    const uint32_t physical_width = render_width();
+    const uint32_t physical_height = render_height();
+    const uint32_t sample_offset = s_render_scale / 2u;
     if (!target->gpu_newer) return true;
     if (!immediate_begin()) return false;
     transition(s_immediate_list, target->resource, &target->state,
@@ -404,21 +565,24 @@ static bool readback_color(ColorTarget *target) {
     destination.PlacedFootprint.Footprint.Format =
         DXGI_FORMAT_B8G8R8A8_UNORM;
     destination.PlacedFootprint.Footprint.Width =
-        GE_D3D12_FRAMEBUFFER_WIDTH;
+        physical_width;
     destination.PlacedFootprint.Footprint.Height =
-        GE_D3D12_FRAMEBUFFER_HEIGHT;
+        physical_height;
     destination.PlacedFootprint.Footprint.Depth = 1;
     destination.PlacedFootprint.Footprint.RowPitch =
-        GE_D3D12_FRAMEBUFFER_WIDTH * 4u;
+        physical_width * 4u;
+    D3D12_BOX source_box = {
+        0, 0, 0,
+        physical_width, physical_height, 1,
+    };
     s_immediate_list->CopyTextureRegion(
-        &destination, 0, 0, 0, &source, nullptr);
+        &destination, 0, 0, 0, &source, &source_box);
     transition(s_immediate_list, target->resource, &target->state,
                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (!immediate_submit()) return false;
 
     const uint64_t bytes =
-        (uint64_t)GE_D3D12_FRAMEBUFFER_WIDTH *
-        GE_D3D12_FRAMEBUFFER_HEIGHT * 4u;
+        (uint64_t)physical_width * physical_height * 4u;
     D3D12_RANGE read_range = {0, (SIZE_T)bytes};
     void *mapped = nullptr;
     if (!check_hr(s_readback->Map(0, &read_range, &mapped),
@@ -430,7 +594,8 @@ static bool readback_color(ColorTarget *target) {
         static_cast<uint8_t *>(SR_HOST(target->key.address));
     for (uint32_t y = 0; y < GE_D3D12_FRAMEBUFFER_HEIGHT; y++) {
         const uint32_t *row =
-            source_pixels + y * GE_D3D12_FRAMEBUFFER_WIDTH;
+            source_pixels +
+            (y * s_render_scale + sample_offset) * physical_width;
         if (target->key.format == 3u) {
             uint32_t *destination_row =
                 reinterpret_cast<uint32_t *>(
@@ -438,7 +603,8 @@ static bool readback_color(ColorTarget *target) {
             for (uint32_t x = 0; x < target->key.stride; x++)
                 destination_row[x] =
                     ged3d12_framebuffer_encode_pixel(
-                        row[x], target->key.format);
+                        row[x * s_render_scale + sample_offset],
+                        target->key.format);
         } else {
             uint16_t *destination_row =
                 reinterpret_cast<uint16_t *>(
@@ -446,7 +612,8 @@ static bool readback_color(ColorTarget *target) {
             for (uint32_t x = 0; x < target->key.stride; x++)
                 destination_row[x] = (uint16_t)
                     ged3d12_framebuffer_encode_pixel(
-                        row[x], target->key.format);
+                        row[x * s_render_scale + sample_offset],
+                        target->key.format);
         }
     }
     D3D12_RANGE written = {0, 0};
@@ -626,8 +793,8 @@ static bool create_auxiliary_resources(void) {
     default_heap.VisibleNodeMask = 1;
     D3D12_RESOURCE_DESC texture = {};
     texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    texture.Width = GE_D3D12_FRAMEBUFFER_WIDTH;
-    texture.Height = GE_D3D12_FRAMEBUFFER_HEIGHT;
+    texture.Width = render_width();
+    texture.Height = texture_height();
     texture.DepthOrArraySize = 1;
     texture.MipLevels = 1;
     texture.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -641,6 +808,7 @@ static bool create_auxiliary_resources(void) {
     }
     s_snapshot_state = D3D12_RESOURCE_STATE_COPY_DEST;
 
+    texture.Height = render_height();
     texture.Format = DXGI_FORMAT_R16_TYPELESS;
     if (!check_hr(ged3d12_device()->CreateCommittedResource(
             &default_heap, D3D12_HEAP_FLAG_NONE, &texture,
@@ -657,8 +825,7 @@ static bool create_auxiliary_resources(void) {
     readback_heap.VisibleNodeMask = 1;
     D3D12_RESOURCE_DESC buffer = {};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buffer.Width = (uint64_t)GE_D3D12_FRAMEBUFFER_WIDTH *
-                   GE_D3D12_FRAMEBUFFER_HEIGHT * 4u;
+    buffer.Width = (uint64_t)render_width() * render_height() * 4u;
     buffer.Height = 1;
     buffer.DepthOrArraySize = 1;
     buffer.MipLevels = 1;
@@ -719,11 +886,24 @@ bool ged3d12_framebuffer_cache_init(void) {
     s_next_color_serial = 1;
     s_next_depth_serial = 1;
     s_target_count = s_depth_count = 0;
-    s_captures = s_uploads = s_readbacks = s_aliases = 0;
-    s_invalidations = s_transfers = s_present_hits = 0;
+    s_captures = s_uploads = s_depth_uploads = 0;
+    s_readbacks = s_aliases = 0;
+    s_invalidations = s_transfer_attempts = s_transfer_fallbacks = 0;
+    s_transfers = s_present_hits = 0;
     s_destination_snapshots = 0;
+    s_feedback_snapshots = s_feedback_snapshot_pixels = 0;
+    s_feedback_snapshot_reuses = 0;
+    reset_feedback_snapshot_tracking();
     const char *log = getenv("SR_D3D12_FRAMEBUFFER_LOG");
     s_log = log && log[0] && strcmp(log, "0") != 0;
+    s_legacy_depth_uploads =
+        getenv("SR_D3D12_LEGACY_DEPTH_UPLOADS") != nullptr;
+    s_legacy_feedback_snapshots =
+        getenv("SR_D3D12_LEGACY_FEEDBACK_SNAPSHOTS") != nullptr;
+    fprintf(
+        stderr, "ged3d12: internal resolution %ux (%ux%u visible)\n",
+        s_render_scale, 480u * s_render_scale,
+        GE_D3D12_FRAMEBUFFER_HEIGHT * s_render_scale);
     s_initialized = true;
     if (!create_auxiliary_resources() || !create_immediate_context()) {
         ged3d12_framebuffer_cache_shutdown();
@@ -740,18 +920,28 @@ void ged3d12_framebuffer_cache_shutdown(void) {
     }
     if (s_log && s_initialized) {
         fprintf(stderr,
-                "ged3d12: framebuffer cache captures=%llu uploads=%llu "
-                "readbacks=%llu aliases=%llu invalidations=%llu transfers=%llu "
+                "ged3d12: framebuffer cache captures=%llu "
+                "color_uploads=%llu depth_uploads=%llu "
+                "readbacks=%llu aliases=%llu invalidations=%llu "
+                "transfer_attempts=%llu fallbacks=%llu transfers=%llu "
                 "present_hits=%llu destination_snapshots=%llu "
+                "feedback_snapshots=%llu feedback_reuses=%llu "
+                "feedback_pixels=%llu "
                 "colors=%u depths=%u\n",
                 (unsigned long long)s_captures,
                 (unsigned long long)s_uploads,
+                (unsigned long long)s_depth_uploads,
                 (unsigned long long)s_readbacks,
                 (unsigned long long)s_aliases,
                 (unsigned long long)s_invalidations,
+                (unsigned long long)s_transfer_attempts,
+                (unsigned long long)s_transfer_fallbacks,
                 (unsigned long long)s_transfers,
                 (unsigned long long)s_present_hits,
                 (unsigned long long)s_destination_snapshots,
+                (unsigned long long)s_feedback_snapshots,
+                (unsigned long long)s_feedback_snapshot_reuses,
+                (unsigned long long)s_feedback_snapshot_pixels,
                 s_target_count, s_depth_count);
     }
     for (uint32_t i = 0; i < MAX_TARGETS; i++)
@@ -772,14 +962,18 @@ void ged3d12_framebuffer_cache_shutdown(void) {
     s_snapshot_descriptor_generation = 0;
     s_destination_descriptors.ptr = 0;
     s_destination_descriptor_generation = 0;
+    reset_feedback_snapshot_tracking();
     s_initialized = false;
     s_log = false;
+    s_legacy_depth_uploads = false;
+    s_legacy_feedback_snapshots = false;
     sr_gpu_vram_watch_reads(0);
     sr_gpu_vram_watch_writes(0);
 }
 
 bool ged3d12_framebuffer_capture(GeD3D12FramebufferBinding *out) {
     if (!out || !s_initialized) return false;
+    memset(out, 0, sizeof(*out));
     out->color_handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
     out->depth_handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
     GeD3D12FramebufferKey key = {};
@@ -799,7 +993,8 @@ bool ged3d12_framebuffer_capture(GeD3D12FramebufferBinding *out) {
     }
     if (depth->capture_generation != s_capture_generation) {
         depth->capture_generation = s_capture_generation;
-        depth->pending_upload = true;
+        if (s_legacy_depth_uploads)
+            depth->pending_upload = true;
     }
     target->lru = s_lru++;
     depth->lru = s_lru++;
@@ -811,6 +1006,17 @@ bool ged3d12_framebuffer_capture(GeD3D12FramebufferBinding *out) {
 
 bool ged3d12_framebuffer_prepare_pending(void) {
     if (!s_initialized) return false;
+    if (s_log && s_capture_generation > 1u &&
+        (s_capture_generation - 1u) % 120u == 0) {
+        fprintf(
+            stderr,
+            "ged3d12: feedback through generation=%llu "
+            "snapshots=%llu reuses=%llu pixels=%llu\n",
+            (unsigned long long)(s_capture_generation - 1u),
+            (unsigned long long)s_feedback_snapshots,
+            (unsigned long long)s_feedback_snapshot_reuses,
+            (unsigned long long)s_feedback_snapshot_pixels);
+    }
     for (uint32_t i = 0; i < MAX_TARGETS; i++) {
         ColorTarget *target = &s_targets[i];
         if (target->occupied && !target->pending_upload &&
@@ -835,6 +1041,7 @@ bool ged3d12_framebuffer_prepare_pending(void) {
         }
     }
     s_active_target = nullptr;
+    reset_feedback_snapshot_tracking();
     s_descriptor_generation++;
     if (!s_descriptor_generation) s_descriptor_generation++;
     s_capture_generation++;
@@ -858,12 +1065,12 @@ bool ged3d12_framebuffer_bind(const GeD3D12FramebufferBinding *binding) {
                D3D12_RESOURCE_STATE_DEPTH_WRITE);
     command_list->OMSetRenderTargets(1, &target->rtv, FALSE, &depth->dsv);
     D3D12_VIEWPORT viewport = {};
-    viewport.Width = (float)GE_D3D12_FRAMEBUFFER_WIDTH;
-    viewport.Height = (float)GE_D3D12_FRAMEBUFFER_HEIGHT;
+    viewport.Width = (float)render_width();
+    viewport.Height = (float)render_height();
     viewport.MaxDepth = 1.0f;
     D3D12_RECT scissor = {
-        0, 0, (LONG)GE_D3D12_FRAMEBUFFER_WIDTH,
-        (LONG)GE_D3D12_FRAMEBUFFER_HEIGHT,
+        0, 0, (LONG)render_width(),
+        (LONG)render_height(),
     };
     command_list->RSSetViewports(1, &viewport);
     command_list->RSSetScissorRects(1, &scissor);
@@ -891,7 +1098,18 @@ bool ged3d12_framebuffer_bind_destination(
                D3D12_RESOURCE_STATE_COPY_DEST);
     transition(command_list, s_depth_snapshot, &s_depth_snapshot_state,
                D3D12_RESOURCE_STATE_COPY_DEST);
-    command_list->CopyResource(s_snapshot, target->resource);
+    D3D12_TEXTURE_COPY_LOCATION color_source = {};
+    color_source.pResource = target->resource;
+    color_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION color_destination = {};
+    color_destination.pResource = s_snapshot;
+    color_destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_BOX color_box = {
+        0, 0, 0,
+        render_width(), render_height(), 1,
+    };
+    command_list->CopyTextureRegion(
+        &color_destination, 0, 0, 0, &color_source, &color_box);
     command_list->CopyResource(s_depth_snapshot, depth->resource);
     if (s_log && !s_destination_snapshots)
         fprintf(stderr, "ged3d12: destination snapshots active\n");
@@ -959,6 +1177,7 @@ bool ged3d12_framebuffer_mark_rendered(
     }
     target->gpu_newer = true;
     target->pending_upload = false;
+    feedback_snapshot_mark_dirty(target, binding);
     update_read_watch();
     return true;
 }
@@ -990,8 +1209,41 @@ bool ged3d12_framebuffer_texture_alias(
     return false;
 }
 
+bool ged3d12_framebuffer_texture_feedback(
+    const GeState *state, GeD3D12FramebufferAlias *out) {
+    if (!out || !state || !s_initialized) return false;
+    memset(out, 0, sizeof(*out));
+    out->handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
+    if ((state->tex_filter & 4u) != 0 && state->tex_max_level > 0)
+        return false;
+    uint32_t stride = ge_texture_buffer_width(state->tex_fmt, state->tex_bufw);
+    for (uint32_t i = 0; i < MAX_TARGETS; i++) {
+        ColorTarget *target = &s_targets[i];
+        GeD3D12FramebufferAlias alias = {};
+        if (!target->occupied ||
+            !ged3d12_framebuffer_feedback_alias(
+                &target->key, state->tex_addr, stride,
+                (uint32_t)state->tex_w, (uint32_t)state->tex_h,
+                state->tex_fmt, state->tex_swizzle != 0, &alias)) {
+            continue;
+        }
+        alias.handle = color_handle(i, target);
+        *out = alias;
+        target->lru = s_lru++;
+        s_aliases++;
+        return true;
+    }
+    return false;
+}
+
 static bool create_alias_descriptors(
-    ID3D12Resource *resource, D3D12_GPU_DESCRIPTOR_HANDLE *gpu) {
+    ID3D12Resource *resource, const GeD3D12UploadSlice *clut,
+    D3D12_GPU_DESCRIPTOR_HANDLE *gpu) {
+    if (clut && (!clut->resource || clut->size < 2048u ||
+                 (clut->offset & 3u) != 0 ||
+                 clut->offset / 4u > UINT_MAX)) {
+        return false;
+    }
     GeD3D12DescriptorSlice descriptors = {};
     if (!ged3d12_srv_alloc(2, &descriptors)) return false;
     D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
@@ -1009,14 +1261,22 @@ static bool create_alias_descriptors(
     D3D12_CPU_DESCRIPTOR_HANDLE null_cpu = descriptors.cpu;
     null_cpu.ptr += ged3d12_device()->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    ged3d12_device()->CreateShaderResourceView(
-        nullptr, &null_view, null_cpu);
+    if (clut) {
+        null_view.Buffer.FirstElement = (UINT)(clut->offset / 4u);
+        null_view.Buffer.NumElements = 512u;
+        ged3d12_device()->CreateShaderResourceView(
+            clut->resource, &null_view, null_cpu);
+    } else {
+        ged3d12_device()->CreateShaderResourceView(
+            nullptr, &null_view, null_cpu);
+    }
     *gpu = descriptors.gpu;
     return true;
 }
 
 bool ged3d12_framebuffer_texture_bind(
     const GeD3D12FramebufferAlias *alias,
+    const GeD3D12UploadSlice *clut,
     D3D12_GPU_DESCRIPTOR_HANDLE *descriptors) {
     if (!alias || !descriptors || !s_initialized) return false;
     ColorTarget *target = color_from_handle(alias->handle);
@@ -1026,25 +1286,42 @@ bool ged3d12_framebuffer_texture_bind(
     }
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
     if (target == s_active_target) {
-        transition(command_list, target->resource, &target->state,
-                   D3D12_RESOURCE_STATE_COPY_SOURCE);
-        transition(command_list, s_snapshot, &s_snapshot_state,
-                   D3D12_RESOURCE_STATE_COPY_DEST);
-        D3D12_TEXTURE_COPY_LOCATION source = {};
-        source.pResource = target->resource;
-        source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        D3D12_TEXTURE_COPY_LOCATION destination = {};
-        destination.pResource = s_snapshot;
-        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        command_list->CopyTextureRegion(
-            &destination, 0, 0, 0, &source, nullptr);
-        transition(command_list, s_snapshot, &s_snapshot_state,
-                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        transition(command_list, target->resource, &target->state,
-                   D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if (feedback_snapshot_needs_refresh(target, alias)) {
+            transition(command_list, target->resource, &target->state,
+                       D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(command_list, s_snapshot, &s_snapshot_state,
+                       D3D12_RESOURCE_STATE_COPY_DEST);
+            command_list->CopyResource(s_snapshot, target->resource);
+            transition(command_list, s_snapshot, &s_snapshot_state,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            transition(command_list, target->resource, &target->state,
+                       D3D12_RESOURCE_STATE_RENDER_TARGET);
+            s_feedback_snapshot_target = target;
+            s_snapshot_dirty_count = 0;
+            s_snapshot_dirty_all = false;
+            s_feedback_snapshots++;
+            s_feedback_snapshot_pixels +=
+                (uint64_t)render_width() * texture_height();
+            if (s_log && s_feedback_snapshots <= 32u) {
+                SnapshotRect source = feedback_source_rect(alias);
+                fprintf(
+                    stderr,
+                    "ged3d12: feedback snapshot #%llu "
+                    "request=%u,%u-%u,%u scale=%u\n",
+                    (unsigned long long)s_feedback_snapshots,
+                    source.left, source.top,
+                    source.right, source.bottom, s_render_scale);
+            }
+        } else {
+            s_feedback_snapshot_reuses++;
+        }
+        if (clut) {
+            return create_alias_descriptors(
+                s_snapshot, clut, descriptors);
+        }
         if (s_snapshot_descriptor_generation != s_descriptor_generation) {
             if (!create_alias_descriptors(
-                    s_snapshot, &s_snapshot_descriptors)) {
+                    s_snapshot, nullptr, &s_snapshot_descriptors)) {
                 return false;
             }
             s_snapshot_descriptor_generation = s_descriptor_generation;
@@ -1054,9 +1331,13 @@ bool ged3d12_framebuffer_texture_bind(
     }
     transition(command_list, target->resource, &target->state,
                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (clut) {
+        return create_alias_descriptors(
+            target->resource, clut, descriptors);
+    }
     if (target->descriptor_generation != s_descriptor_generation) {
         if (!create_alias_descriptors(
-                target->resource, &target->descriptors)) {
+                target->resource, nullptr, &target->descriptors)) {
             return false;
         }
         target->descriptor_generation = s_descriptor_generation;
@@ -1089,8 +1370,8 @@ bool ged3d12_framebuffer_present_source(
         source_box->left = 0;
         source_box->top = 0;
         source_box->front = 0;
-        source_box->right = 480;
-        source_box->bottom = GE_D3D12_FRAMEBUFFER_HEIGHT;
+        source_box->right = 480u * s_render_scale;
+        source_box->bottom = render_height();
         source_box->back = 1;
         s_active_target = nullptr;
         target->lru = s_lru++;
@@ -1167,6 +1448,7 @@ void ged3d12_framebuffer_read(uint32_t address, uint32_t bytes) {
 
 int ged3d12_framebuffer_transfer(uint32_t start_data) {
     if (!s_initialized) return false;
+    s_transfer_attempts++;
     GeD3D12Transfer transfer = {};
     if (!ged3d12_transfer_build(
             ge_state_ptr(), start_data, &transfer)) {
@@ -1206,9 +1488,26 @@ int ged3d12_framebuffer_transfer(uint32_t start_data) {
     }
     if (!source || !destination ||
         !readback_color(source) || !readback_color(destination)) {
+        s_transfer_fallbacks++;
+        if (s_log && s_transfer_fallbacks <= 32u) {
+            fprintf(
+                stderr,
+                "ged3d12: transfer fallback #%llu "
+                "src=0x%08x/%u dst=0x%08x/%u size=%ux%u bpp=%u\n",
+                (unsigned long long)s_transfer_fallbacks,
+                transfer.source_address, transfer.source_stride,
+                transfer.destination_address, transfer.destination_stride,
+                transfer.width, transfer.height,
+                transfer.bytes_per_pixel);
+        }
         return false;
     }
-    if (!immediate_begin()) return false;
+    if (!ged3d12_transfer_scale_coordinates(
+            s_render_scale, &source_box,
+            &destination_x, &destination_y) ||
+        !immediate_begin()) {
+        return false;
+    }
     transition(s_immediate_list, source->resource, &source->state,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
     transition(s_immediate_list, destination->resource, &destination->state,

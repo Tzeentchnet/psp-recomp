@@ -277,6 +277,8 @@ uint32_t mpeg_avc_decode_mode(uint32_t mpegAddr, uint32_t modeAddr) {
     int pixelMode = (int)MEM_R32(modeAddr + 4);
     if (pixelMode >= 0 && pixelMode <= 3) ctx->pixelMode = pixelMode;
     else fprintf(stderr, "sceMpegAvcDecodeMode: unknown pixel mode %d\n", pixelMode);
+    if (getenv("SR_MPEGLOG"))
+        fprintf(stderr, "MpegAvcDecodeMode pixelMode=%d\n", pixelMode);
     return 0;
 }
 
@@ -640,8 +642,8 @@ uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth
     if (getenv("SR_MPEGLOG")) {
         static int n = 0;
         if (n++ < 32 || (n & 0xFF) == 0)
-            fprintf(stderr, "MpegAvcDecode #%d buf=0x%x fw=%u pts=%lld packets=%u/%u dec=%d frames=%d end=%d\n",
-                    n, buffer, frameWidth, (long long)ctx->videoPts,
+            fprintf(stderr, "MpegAvcDecode #%d buf=0x%x fw=%u mode=%d pts=%lld packets=%u/%u dec=%d frames=%d end=%d\n",
+                    n, buffer, frameWidth, ctx->pixelMode, (long long)ctx->videoPts,
                     ctx->consumedPackets, ctx->totalPackets, gotFrame, ctx->h264Frames, ctx->videoEnd);
     }
     return 0;

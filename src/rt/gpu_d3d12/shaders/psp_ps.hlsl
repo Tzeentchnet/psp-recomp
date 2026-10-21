@@ -2,13 +2,14 @@
  * dithering, logic operations, and write masks follow the software GE ordering. */
 
 Texture2D<float4> psp_texture : register(t0);
+Buffer<uint> psp_clut : register(t1);
 Texture2D<float4> destination_color : register(t2);
 Texture2D<float> destination_depth : register(t3);
 SamplerState psp_sampler : register(s0);
 
 cbuffer PSPConstants : register(b0) {
     int4 cfg;       /* x=texfunc|flags<<8, y=alpha test, z=minz, w=maxz */
-    float4 texenv;  /* rgb=GE_TEXENVCOLOR / 255 */
+    float4 texenv;  /* rgb=GE_TEXENVCOLOR / 255, w=internal resolution scale */
     float4 fogcol;  /* rgb=GE_FOGCOLOR / 255 */
     float4 texsize; /* xy=dimensions, zw=render-target sub-rect texel offset */
     int4 color_test_state; /* x=func, y=reference RGB, z=mask RGB */
@@ -117,6 +118,62 @@ int4 unpack_native(uint pixel, int format) {
         (int)((pixel >> 16) & 255), (int)((pixel >> 24) & 255));
 }
 
+int feedback_coordinate(int value, int size, bool clamp_value) {
+    if (clamp_value) return clamp(value, 0, size - 1);
+    int wrapped = value % size;
+    return wrapped < 0 ? wrapped + size : wrapped;
+}
+
+float4 feedback_texel(int2 coordinate) {
+    int2 dimensions = max((int2)texsize.xy, int2(1, 1));
+    int render_scale = max((int)(texenv.w + 0.5), 1);
+    uint clut_format = (uint)color_test_state.w;
+    coordinate.x = feedback_coordinate(
+        coordinate.x, dimensions.x, (clut_format & (1u << 30)) != 0);
+    coordinate.y = feedback_coordinate(
+        coordinate.y, dimensions.y, (clut_format & (1u << 31)) != 0);
+    coordinate += (int2)texsize.zw;
+    coordinate =
+        coordinate * render_scale + render_scale / 2;
+
+    float4 source = psp_texture.Load(int3(coordinate, 0));
+    uint4 bytes = (uint4)(source * 255.0 + 0.5);
+    uint index = bytes.r | (bytes.g << 8) |
+                 (bytes.b << 16) | (bytes.a << 24);
+    uint shift = (clut_format >> 2) & 31;
+    uint mask = (clut_format >> 8) & 255;
+    uint start = ((clut_format >> 16) & 31) << 4;
+    uint format = clut_format & 3;
+    uint start_mask = format == 3 ? 255 : 511;
+    index = ((index >> shift) & mask) | (start & start_mask);
+
+    uint color;
+    if (format == 3) {
+        color = psp_clut[index & 511];
+    } else {
+        index &= 1023;
+        uint packed = psp_clut[index >> 1];
+        color = (packed >> ((index & 1) * 16)) & 65535;
+    }
+    return (float4)unpack_native(color, (int)format);
+}
+
+float4 sample_feedback(float2 uv, bool nearest) {
+    if (nearest) return feedback_texel((int2)floor(uv));
+    float2 position = uv - 0.5;
+    int2 base = (int2)floor(position);
+    float2 weight = position - (float2)base;
+    float4 upper = lerp(
+        feedback_texel(base),
+        feedback_texel(base + int2(1, 0)),
+        weight.x);
+    float4 lower = lerp(
+        feedback_texel(base + int2(0, 1)),
+        feedback_texel(base + int2(1, 1)),
+        weight.x);
+    return lerp(upper, lower, weight.y);
+}
+
 int factor_value(
     int factor, int channel, int4 source, int4 destination,
     int fixed_color, bool source_side) {
@@ -208,9 +265,11 @@ int4 apply_write_mask(
         format);
 }
 
-PSOutput main(PSInput input, bool front_facing : SV_IsFrontFace) {
-    int flags = cfg.x >> 8;
-    int source_depth = (int)(input.position.z * 65535.0 + 0.5);
+int4 shade_source(
+    PSInput input, bool front_facing,
+    out int source_depth, out int flags) {
+    flags = cfg.x >> 8;
+    source_depth = (int)(input.position.z * 65535.0 + 0.5);
 
     if ((flags & 4096) != 0 && !front_facing) {
         discard;
@@ -231,7 +290,10 @@ PSOutput main(PSInput input, bool front_facing : SV_IsFrontFace) {
             uv += texsize.zw;
 
             float4 texture_color =
-                psp_texture.Sample(psp_sampler, uv / texsize.xy) * 255.0;
+                (flags & 16384) != 0
+                    ? sample_feedback(uv, (flags & 64) != 0)
+                    : psp_texture.Sample(
+                          psp_sampler, uv / texsize.xy) * 255.0;
             int texture_function = cfg.x & 7;
             bool texture_rgba = (flags & 2) != 0;
             float color_scale = (flags & 4) != 0 ? 2.0 : 1.0;
@@ -297,17 +359,57 @@ PSOutput main(PSInput input, bool front_facing : SV_IsFrontFace) {
         }
     }
 
-    int4 source = clamp(
+    return clamp(
         (int4)(shaded + 0.5),
         int4(0, 0, 0, 0), int4(255, 255, 255, 255));
-    int2 pixel = (int2)input.position.xy;
+}
+
+float4 main_direct(
+    PSInput input, bool front_facing : SV_IsFrontFace) : SV_Target0 {
+    int source_depth;
+    int flags;
+    int4 result = shade_source(
+        input, front_facing, source_depth, flags);
+    int render_scale = max((int)(texenv.w + 0.5), 1);
+    int2 pixel = (int2)input.position.xy / render_scale;
     int format = stencil_state.w & 3;
+    if ((flags & 1024) != 0)
+        result.rgb += dither_value(pixel);
+    result = clamp(
+        result, int4(0, 0, 0, 0),
+        int4(255, 255, 255, 255));
+    result = unpack_native(pack_native(result, format), format);
+    return (float4)result * (1.0 / 255.0);
+}
+
+PSOutput main(PSInput input, bool front_facing : SV_IsFrontFace) {
+    int source_depth;
+    int flags;
+    int4 source = shade_source(
+        input, front_facing, source_depth, flags);
+    int render_scale = max((int)(texenv.w + 0.5), 1);
+    int2 render_pixel = (int2)input.position.xy;
+    int2 pixel = render_pixel / render_scale;
+    int format = stencil_state.w & 3;
+    if ((flags & 8192) != 0) {
+        int4 result = source;
+        if ((flags & 1024) != 0)
+            result.rgb += dither_value(pixel);
+        result = clamp(
+            result, int4(0, 0, 0, 0),
+            int4(255, 255, 255, 255));
+        result = unpack_native(pack_native(result, format), format);
+        PSOutput output;
+        output.color = (float4)result * (1.0 / 255.0);
+        output.depth = (float)source_depth * (1.0 / 65535.0);
+        return output;
+    }
     int4 old_storage = (int4)(
-        destination_color.Load(int3(pixel, 0)) * 255.0 + 0.5);
+        destination_color.Load(int3(render_pixel, 0)) * 255.0 + 0.5);
     int4 destination = old_storage;
     if (format == 0) destination.a = 0;
     int old_depth = (int)(
-        destination_depth.Load(int3(pixel, 0)) * 65535.0 + 0.5);
+        destination_depth.Load(int3(render_pixel, 0)) * 65535.0 + 0.5);
 
     int4 result = source;
     int output_depth = old_depth;

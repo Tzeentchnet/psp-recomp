@@ -1,4 +1,4 @@
-/* Generated from present_ps.hlsl (ps_6_0) by tools/compile_d3d12_shaders.py.
+/* Generated from present_ps.hlsl (ps_6_0, main) by tools/compile_d3d12_shaders.py.
  * source SHA-256: 8CD751B479143AC25CDC5BBE2904E3169A158BBD61D19BDE408300523C1BC3F7
  * DXIL SHA-256:   003F50BA64462294946380E2DE78A36D01D0E53C3522DB2311FBCC28B2A2DEAF */
 {

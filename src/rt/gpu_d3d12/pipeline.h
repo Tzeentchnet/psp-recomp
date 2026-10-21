@@ -46,7 +46,8 @@ bool ged3d12_pipeline_uber_compatible(
 
 bool ged3d12_pipeline_cache_init(void);
 void ged3d12_pipeline_cache_shutdown(void);
-bool ged3d12_pipeline_bind(const GeD3D12PipelineKey *key);
+bool ged3d12_pipeline_bind(
+    const GeD3D12PipelineKey *key, bool *exact);
 GeD3D12PipelineStats ged3d12_pipeline_stats(void);
 
 static_assert(sizeof(GeD3D12PipelineKey) == 16, "D3D12 PSO key ABI changed");

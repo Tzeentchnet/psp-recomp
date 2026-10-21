@@ -11,9 +11,10 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 - a D3D12 device, direct and copy queues, timeline fences, and a three-buffer
   flip-discard swapchain;
 - shader-visible CBV/SRV/UAV descriptor rings plus RTV and DSV heaps;
-- a 40-DWORD `b0` GE-state root block, `t0` texture plus `t2`/`t3` destination
-  tables, dynamic `s0` sampler table, static clamp-nearest `s1`/clamp-linear `s2` samplers,
-  and a vertex-visible space-1 `t0` raw-buffer root SRV;
+- a 40-DWORD `b0` GE-state root block, `t0` texture, `t1` CLUT, and `t2`/`t3`
+  destination tables, dynamic `s0` sampler table, static clamp-nearest
+  `s1`/clamp-linear `s2` samplers, and a vertex-visible space-1 `t0` raw-buffer
+  root SRV;
 - a shader-visible dynamic sampler ring partitioned by fenced frame;
 - a persistently mapped, three-frame upload ring;
 - capture of `ge.c`'s fully decoded primitive stream into the HLSL shader's exact
@@ -32,10 +33,14 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
   snapshots, and compatible `TRXKICK` image copies;
 - lazy CPU visibility for GPU-newer eDRAM color targets, including pre-write
   preservation for generated stores, DMA, MPEG output, and block transfers;
-- a persistent 480×272 display texture and fullscreen-triangle presentation pass
-  that preserve the exact PSP aspect ratio through window resizing;
-- direct presentation from compatible cached 512×272 targets, with software-GE
-  framebuffer upload retained for uncached and movie frames.
+- a persistent `(480×scale)×(272×scale)` display texture and fullscreen-triangle
+  presentation pass that preserve the exact PSP aspect ratio through window resizing;
+- direct presentation from compatible cached targets, with a scaled 512×512 color
+  envelope for PSP power-of-two sampling and a scaled 512×272 render region;
+- Tier-1/2 Variable Rate Shading for direct scaled draws, keeping geometry,
+  coverage and D16 depth at internal resolution while matching fragment density
+  to the PSP grid; exact destination-aware draws and presentation stay 1×1;
+- guest-VRAM upload retained for CPU-written movie frames.
 
 `vertex.cpp` deliberately consumes the existing `GeVtx` backend seam instead of
 duplicating PSP vertex decoding. `ge.c` remains authoritative for all raw attribute
@@ -43,11 +48,12 @@ formats, morph-before-skin decoding, through mode, indices, GE-exact CPU Bezier/
 tessellation, transform/lighting, clipping, and primitive assembly. Generated patch
 triangles, lines, and points cross the same `GeBackend` seam as ordinary primitives.
 Captured vertices are copied into the active fenced upload-ring partition during
-presentation. `psp_vs.hlsl` indexes the upload GPU address with `SV_VertexID` and performs
+presentation. Their diagnostic FNV hash is computed only when vertex/GPU logging
+will consume it. `psp_vs.hlsl` indexes the upload GPU address with `SV_VertexID` and performs
 two aligned raw loads, so PSOs need no fixed input layout or per-frame IA vertex-buffer bind.
 Accepted primitives with the same immutable list/draw identity, kind and perspective mode
-append to one batch. The hooks still return zero, so the reference software rasterizer
-remains authoritative until native batches are submitted to GPU render targets.
+append to one batch. Successful hooks return one, suppress the software rasterizer, and
+submit `DrawInstanced` calls into the captured GPU framebuffer.
 
 `pipeline_key.cpp` maps only PSO-static GE fields; shader constants, descriptors,
 scissor, and blend constants remain per-draw state and intentionally do not multiply the
@@ -59,8 +65,8 @@ compiles on the command-recording thread. The pixel shader uses `SV_IsFrontFace`
 fallback culling, while a worker prewarms the hardware-cull variant and promotes later
 misses after a full-key check. A versioned, shader-hashed, key-sized, adapter-LUID-scoped
 `ID3D12PipelineLibrary` is capped at 64 MiB and published through a flushed temporary file
-plus atomic replace. Draw submission is intentionally deferred while software presentation
-remains the reference path.
+plus atomic replace. Draw submission uses the exact ubershader while specialized cull
+pipelines compile asynchronously.
 
 `texture_key.cpp` separates resource identity from sampling state. The 96-byte texture
 key retains the legal PSP mip chain, aligned buffer widths, format/swizzle state, and
@@ -80,27 +86,38 @@ waits for the graphics queue before evicting its 128 least-recently used version
 writes drive invalidation.
 
 `framebuffer_key.cpp` canonicalizes color/depth identity and exact PSP transfer
-rectangles. `framebuffer.cpp` owns fixed-size BGRA8 color resources and D16 depth
-resources, their RTV/DSV/SRV descriptors, explicit resource states, immediate
-copy/readback commands, and serial-protected LRU lifetime. Multiple views of the
-same address survive within one captured generation; an older GPU-newer view is
-materialized before a format or stride reinterpretation is uploaded.
+rectangles. `framebuffer.cpp` owns BGRA8 color resources and D16 depth resources
+at the configured 1x-8x integer scale, their RTV/DSV/SRV descriptors, explicit
+resource states, immediate copy/readback commands, and serial-protected LRU
+lifetime. Guest uploads replicate logical texels into scaled storage; CPU
+readback center-samples each logical pixel, and `TRXKICK` rectangles scale only
+for the GPU copy while retaining PSP coordinates in guest memory. Multiple views
+of the same address survive within one captured generation; an older GPU-newer
+view is materialized before a format or stride reinterpretation is uploaded.
+Depth stays GPU-owned across capture generations and is uploaded again only
+after creation or a real CPU/DMA invalidation.
 
 Exact unswizzled, single-level texture views can alias a cached target when their
-format, stride, offset, and bounds match. Same-target feedback samples from a
-snapshot copied before the target is rebound. Presentation copies only the
-visible 480×272 rectangle from a compatible cached target. Because native draws
-are not enabled yet, each captured target is currently refreshed from the
-authoritative software framebuffer.
+format, stride, offset, and bounds match. Color resources retain a scaled 512×512
+texture envelope so the PSP's common 512×272 framebuffer-as-512×512-texture pattern
+stays GPU-resident with correct normalized coordinates. Same-target feedback samples from
+a snapshot copied before the target is rebound. A CLUT32 view of a compatible live
+8888 target follows the same ordered snapshot path instead of decoding stale guest
+VRAM: `texture.cpp` captures and deduplicates the draw's 2 KiB palette, binds it as an
+R32 buffer at `t1`, and the pixel shader reconstructs the packed 32-bit index before
+applying the PSP shift/mask/start lookup and nearest or linear filtering. Presentation
+copies only the scaled visible 480×272 rectangle from a compatible cached target.
+The shader derives logical pixel coordinates from `SV_Position / scale` so the
+PSP dither matrix remains stable while destination color/depth loads use physical
+scaled coordinates.
 
 GPU-newer color targets activate fast-gated VRAM callbacks in `recomp.h`. CPU
 reads synchronously materialize overlapping color data; CPU writes materialize
 it before the store and invalidate overlapping framebuffer/texture views after
 the store. DMA, MPEG, and CPU block-transfer bulk writes follow the same
 pre-write contract. A full CPU-content hash catches unnotified edits to clean
-targets before GPU reuse. GPU-owned depth readback remains inactive while native
-draw submission is disabled and must be enabled before native depth becomes
-authoritative.
+targets before GPU reuse. GPU-owned color is materialized lazily; depth remains
+GPU-resident because the guest CPU path does not consume the cached depth image.
 
 Compatible `TRXKICK` operations between distinct cached targets use an exact
 D3D12 image copy and update the guest-VRAM mirror. Format, stride, pixel-size,
@@ -113,8 +130,12 @@ D16 `minz`/`maxz`, framebuffer aliases, stencil/depth state, exact blend and fix
 state, logic operations, native masks/formats, clear state, scissor, and the signed 4×4
 dither matrix into the 40-DWORD root block. The pixel shader reads ordered destination
 color/depth snapshots at `t2`/`t3` and performs PSP fragment ordering, native packing,
-component masks, and `SV_Depth` preservation manually. Native draw replay remains disabled
-until software raster suppression and GPU target ownership switch atomically.
+component masks, and `SV_Depth` preservation manually for states that require destination
+access. Channel-aligned clear/source-replace and hardware-mappable blend/depth states take
+a direct branch and use specialized fixed-function PSOs, avoiding all destination copies.
+Until an asynchronous specialized PSO is ready, the draw clears its direct flag and falls
+back to the exact snapshot ubershader. Draw submission and the GPU-newer ownership mark
+occur together before presentation.
 
 Regenerate or verify the shaders with:
 
@@ -136,11 +157,13 @@ Set `SR_D3D12_VERTEX_LOG=1` to print compact capture counts and content hashes f
 first three presents and every 120th present, plus a shutdown summary.
 Set `SR_GPU_LOG=1` to print every D3D12 GE flush, one line per logical GE draw, each
 present, and a shutdown summary. Draw lines include the list address, command PC/opcode,
-captured batch/vertex counts, and framebuffer/texture handles.
+captured batch/vertex counts, framebuffer/texture handles, shader state, scissor, and
+screen/texture coordinates. `SR_GPU_LOG_START` and `SR_GPU_LOG_END` restrict verbose
+draw/present lines to an inclusive presentation range.
 Set `SR_D3D12_PSO_LOG=1` to print ubershader setup, asynchronous PSO sources, disk-cache
-writes, and a shutdown cache summary. `SR_D3D12_PSO_CACHE=<path>` overrides the default
-`%LOCALAPPDATA%\KZLRecomp\cache\d3d12-pipelines.bin`; set it to `0` to disable only disk
-persistence.
+writes, and a shutdown cache summary. `SR_D3D12_PSO_CACHE=<path>` opts into
+pipeline-library persistence. It is disabled by default because some drivers reject
+a library they previously serialized; the in-memory asynchronous cache remains active.
 Set `SR_D3D12_TEXTURE_LOG=1` to print texture-version misses and a shutdown summary of
 lookups, hits, uploads, invalidations, evictions, and live entries.
 Set `SR_D3D12_FRAMEBUFFER_LOG=1` to print target creation and a shutdown summary of

@@ -1,9 +1,11 @@
-/* Interactive front-end: presents through the selected GE backend and feeds keyboard/gamepad
- * input to sceCtrl. The dependency-free Win32/GDI path remains the software fallback. */
+/* Interactive front-end: presents through the selected GE backend and feeds keyboard, mouse,
+ * and gamepad input to sceCtrl. The dependency-free Win32/GDI path remains the software fallback. */
 
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
+#include "graphics_config.h"
+#include "graphics_settings.h"
 #include "input_config.h"
 #ifdef SR_SDL3VK
 #include "gpu_sdl3vk/sdl3vk.h"
@@ -62,6 +64,20 @@ static int win_key_down(void *context, int key) {
     (void)context;
     int vk = win_key_code(key);
     return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
+static int win_mouse_down(void *context, int button) {
+    (void)context;
+    int vk = 0;
+    switch (button) {
+    case SR_MOUSE_LEFT: vk = VK_LBUTTON; break;
+    case SR_MOUSE_RIGHT: vk = VK_RBUTTON; break;
+    case SR_MOUSE_MIDDLE: vk = VK_MBUTTON; break;
+    case SR_MOUSE_X1: vk = VK_XBUTTON1; break;
+    case SR_MOUSE_X2: vk = VK_XBUTTON2; break;
+    default: return 0;
+    }
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
 /* ---- Gamepad support (XInput + DirectInput) ---------------------------------------------------
@@ -193,12 +209,36 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 int gui_init(const char *title) {
+    const SrGraphicsConfig *graphics;
+    const char *environment;
+    const char *requested;
+    int explicit_gpu;
+    if (!sr_graphics_config_init()) {
+        fprintf(stderr, "gui_init: graphics configuration failed\n");
+        return 0;
+    }
+    if (sr_graphics_config_first_run()) {
+        int result = sr_graphics_settings_show(
+            "Killzone: Liberation Graphics");
+        if (result <= 0) {
+            if (!result)
+                fprintf(stderr, "gui_init: first-run graphics setup cancelled\n");
+            return 0;
+        }
+    }
     if (!sr_input_init()) {
         fprintf(stderr, "gui_init: input configuration failed\n");
         return 0;
     }
-    const char *requested = getenv("SR_GPU");
-    int explicit_gpu = requested && requested[0];
+    graphics = sr_graphics_config_get();
+    environment = getenv("SR_GPU");
+    requested = environment;
+    explicit_gpu = requested && requested[0];
+    if (!explicit_gpu && graphics &&
+        graphics->renderer != SR_GRAPHICS_RENDERER_AUTO) {
+        requested = sr_graphics_renderer_name(graphics->renderer);
+        explicit_gpu = requested && requested[0];
+    }
     int want_vk = 0;
     int want_d3d12 = 0;
     if (explicit_gpu) {
@@ -209,12 +249,22 @@ int gui_init(const char *title) {
         } else if (strcmp(requested, "d3d12") == 0) {
             want_d3d12 = 1;
         } else {
-            fprintf(stderr, "gui_init: invalid SR_GPU=%s (expected d3d12, vk, or sw)\n", requested);
+            fprintf(
+                stderr,
+                "gui_init: invalid renderer %s "
+                "(expected d3d12, vk, or sw)\n",
+                requested);
             return 0;
         }
     } else {
         const char *legacy = getenv("SR_GPU_GE");
-        want_vk = legacy && legacy[0] && strcmp(legacy, "0") != 0;
+        if (legacy) {
+            want_vk = legacy[0] && strcmp(legacy, "0") != 0;
+#ifdef SR_D3D12
+        } else {
+            want_d3d12 = 1;
+#endif
+        }
     }
 
 #ifdef SR_D3D12
@@ -461,7 +511,8 @@ void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
     PadState pad;
     read_pad(&pad);
     s_buttons = sr_input_buttons(
-        win_key_down, NULL, pad.present ? pad_down : NULL, &pad);
+        win_key_down, NULL, win_mouse_down, NULL,
+        pad.present ? pad_down : NULL, &pad);
     int key_x = 0, key_y = 0;
     sr_input_keyboard_axis(win_key_down, NULL, &key_x, &key_y);
     int raw_x = key_x || key_y ? key_x : pad.has_stick ? pad.x : 0;
@@ -482,8 +533,11 @@ pace:
      * already paces vblanks to real time (the default): pacing twice on unaligned grids makes
      * frames miss their vblank and costs a whole extra period (30/20 fps quantization). */
     {
-        extern int sched_vbl_paced(void);
-        if (sched_vbl_paced()) { QueryPerformanceCounter(&s_last); return; }
+        if (getenv("SR_NOVBPACE") ||
+            sched_vbl_paced() || sched_fast_forwarding()) {
+            QueryPerformanceCounter(&s_last);
+            return;
+        }
     }
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     double dt = (double)(now.QuadPart - s_last.QuadPart) / (double)s_freq.QuadPart;

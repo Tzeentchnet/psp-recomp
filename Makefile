@@ -53,6 +53,9 @@ src/ref/interp.cpp \
               src/rt/mpeg.c \
               src/rt/pgf.c \
               src/rt/gui.c \
+              src/rt/settings_path.c \
+              src/rt/graphics_config.c \
+              src/rt/graphics_settings.c \
               src/rt/input_config.c \
               src/rt/startup_check.c \
               src/rt/audio_mixer.c \
@@ -117,6 +120,7 @@ $(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h \
                src/rt/gpu_d3d12/vertex.h \
                src/rt/gpu_d3d12/texture.h \
                src/rt/gpu_d3d12/shaders/psp_vs.inc src/rt/gpu_d3d12/shaders/psp_ps.inc \
+               src/rt/gpu_d3d12/shaders/psp_ps_direct.inc \
                src/rt/ge_shared.h src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/device.cpp -o $@

@@ -18,6 +18,7 @@
 
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 int     sr_sched_on = 0;
@@ -168,6 +169,9 @@ void sched_wait_vblank(void) {
  * delay waits, so everything runs as fast as the host allows. */
 static uint64_t s_vtime_us = 0;
 static int s_pace_on = -1;
+static int s_permanent_turbo;
+static int s_fast_forwarding;
+static uint32_t s_fast_forward_present;
 static LARGE_INTEGER s_qfreq;
 static LONGLONG s_qpc0;
 static double s_vbl_next;            /* QPC counts: when the next vblank is due */
@@ -179,19 +183,75 @@ static void vbl_next_us_sync(void) {
 
 static void pace_setup(void) {
     if (s_pace_on >= 0) return;
-    s_pace_on = getenv("SR_NOVBPACE") ? 0 : 1;
+    s_permanent_turbo = getenv("SR_NOVBPACE") ? 1 : 0;
+    const char *fast_forward = getenv("SR_FAST_FORWARD_PRESENT");
+    if (fast_forward && fast_forward[0]) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(fast_forward, &end, 10);
+        if (!end || *end || !parsed || parsed > UINT32_MAX) {
+            fprintf(
+                stderr,
+                "SR_FAST_FORWARD_PRESENT: expected a positive presentation, got %s\n",
+                fast_forward);
+            _Exit(2);
+        }
+        s_fast_forward_present = (uint32_t)parsed;
+    }
+    s_fast_forwarding =
+        !s_permanent_turbo && s_fast_forward_present &&
+        sr_present_count() < s_fast_forward_present;
+    s_pace_on = !s_permanent_turbo && !s_fast_forwarding;
     timeBeginPeriod(1);
     QueryPerformanceFrequency(&s_qfreq);
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
     s_qpc0 = c.QuadPart;
     s_vbl_next = (double)c.QuadPart;
     vbl_next_us_sync();
+    if (s_fast_forwarding) {
+        fprintf(
+            stderr,
+            "scheduler: fast-forwarding to presentation %u\n",
+            s_fast_forward_present);
+    }
+}
+
+static void pace_update_mode(void) {
+    pace_setup();
+    if (!s_fast_forwarding ||
+        sr_present_count() < s_fast_forward_present) {
+        return;
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    s_fast_forwarding = 0;
+    s_pace_on = 1;
+    s_qpc0 =
+        now.QuadPart -
+        (LONGLONG)((double)s_vtime_us * (double)s_qfreq.QuadPart / 1000000.0);
+    s_vbl_next = (double)now.QuadPart;
+    vbl_next_us_sync();
+    fprintf(
+        stderr,
+        "scheduler: real-time pacing enabled at presentation %u\n",
+        sr_present_count());
 }
 
 /* True when the scheduler paces vblanks to real time (the default). gui_present uses this to
  * skip its own legacy 60 Hz sleep: two independent pacers stack and push frames past the
  * vblank period (the second one then costs a whole extra frame). */
-int sched_vbl_paced(void) { pace_setup(); return s_pace_on > 0; }
+int sched_vbl_paced(void) {
+    pace_update_mode();
+    return s_pace_on > 0;
+}
+
+int sched_fast_forwarding(void) {
+    if (s_pace_on < 0) {
+        const char *fast_forward = getenv("SR_FAST_FORWARD_PRESENT");
+        if (!fast_forward || !fast_forward[0]) return 0;
+    }
+    pace_update_mode();
+    return s_fast_forwarding;
+}
 
 static uint64_t qpc_us(void) {
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
@@ -227,7 +287,7 @@ static void sleep_until_us(uint64_t target_us) {
  * made the GE fast. Pacing the vblank itself makes every wait ratio correct.
  * SR_NOVBPACE=1 disables (turbo / old behaviour). */
 static void vblank_pace(void) {
-    pace_setup();
+    pace_update_mode();
     if (!s_pace_on) { s_vtime_us += 16667; return; }   /* turbo: virtual frame per vblank */
     double period = (double)s_qfreq.QuadPart / 59.94;
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
@@ -245,7 +305,7 @@ static void vblank_pace(void) {
 
 /* Microseconds of virtual time until the next vblank is due (0 when overdue). */
 static uint64_t vblank_due_us(void) {
-    pace_setup();
+    pace_update_mode();
     if (!s_pace_on) return 0;
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     if ((double)now.QuadPart >= s_vbl_next) return 0;

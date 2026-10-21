@@ -1158,8 +1158,13 @@ static int hook_sprite(const GeVtx *p0, const GeVtx *p1, int persp) {
         v1 = p1->v / (p1->rw != 0.0f ? p1->rw : 1.0f);
     }
     float uw = (u1 - u0) / (xb - xa), vw = (v1 - v0) / (yb - ya);
-    float ua = u0 - 0.5f * uw, ub = u1 - 0.5f * uw;
-    float va = v0 - 0.5f * vw, vb = v1 - 0.5f * vw;
+    int linear =
+        (s_ge->tex_filter & 1u) != 0 ||
+        ((s_ge->tex_filter >> 8) & 1u) != 0;
+    float ua = linear ? u0 : u0 - 0.5f * uw;
+    float ub = linear ? u1 : u1 - 0.5f * uw;
+    float va = linear ? v0 : v0 - 0.5f * vw;
+    float vb = linear ? v1 : v1 - 0.5f * vw;
 
     float z = p1->z, fog = p1->fog;
     int r = p1->r, g = p1->g, bb_ = p1->b, a = p1->a;

@@ -13,6 +13,7 @@ extern "C" {
 
 #define MAX_TEXTURES 512u
 #define EVICT_TEXTURES 128u
+#define MAX_CLUTS 256u
 #define MAX_PENDING_DECODE_BYTES (64ull * 1024ull * 1024ull)
 #define RELEASE_COM(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
 
@@ -42,7 +43,18 @@ struct SamplerBinding {
     D3D12_GPU_DESCRIPTOR_HANDLE gpu;
 };
 
+struct ClutEntry {
+    uint8_t data[2048];
+    uint64_t hash;
+    uint64_t lru;
+    uint64_t capture_generation;
+    uint64_t upload_generation;
+    GeD3D12UploadSlice upload;
+    bool occupied;
+};
+
 static TextureEntry s_textures[MAX_TEXTURES];
+static ClutEntry s_cluts[MAX_CLUTS];
 static SamplerBinding s_samplers[256];
 static uint32_t s_sampler_count;
 static uint32_t s_texture_count;
@@ -74,6 +86,75 @@ static uint64_t fnv64(uint64_t hash, const void *data, size_t size) {
         hash *= UINT64_C(1099511628211);
     }
     return hash;
+}
+
+static bool capture_clut(const GeState *state, uint16_t *handle) {
+    uint64_t hash = fnv64(
+        UINT64_C(14695981039346656037),
+        state->clutram, sizeof(state->clutram));
+    ClutEntry *entry = nullptr;
+    uint32_t slot = 0;
+    for (uint32_t i = 0; i < MAX_CLUTS; i++) {
+        ClutEntry *candidate = &s_cluts[i];
+        if (candidate->occupied && candidate->hash == hash &&
+            memcmp(candidate->data, state->clutram,
+                   sizeof(candidate->data)) == 0) {
+            entry = candidate;
+            slot = i;
+            break;
+        }
+    }
+    if (!entry) {
+        for (uint32_t i = 0; i < MAX_CLUTS; i++) {
+            ClutEntry *candidate = &s_cluts[i];
+            if (!candidate->occupied) {
+                entry = candidate;
+                slot = i;
+                break;
+            }
+            if (candidate->capture_generation != s_capture_generation &&
+                (!entry || candidate->lru < entry->lru)) {
+                entry = candidate;
+                slot = i;
+            }
+        }
+        if (!entry || entry->capture_generation == s_capture_generation) {
+            fprintf(stderr,
+                    "ged3d12: framebuffer feedback CLUT cache exhausted\n");
+            return false;
+        }
+        memset(entry, 0, sizeof(*entry));
+        memcpy(entry->data, state->clutram, sizeof(entry->data));
+        entry->hash = hash;
+        entry->occupied = true;
+    }
+    entry->lru = s_lru++;
+    entry->capture_generation = s_capture_generation;
+    *handle = (uint16_t)slot;
+    return true;
+}
+
+static bool prepare_clut(
+    uint16_t handle, const GeD3D12UploadSlice **upload) {
+    if (handle >= MAX_CLUTS || !s_cluts[handle].occupied) {
+        fprintf(stderr, "ged3d12: stale framebuffer feedback CLUT\n");
+        return false;
+    }
+    ClutEntry *entry = &s_cluts[handle];
+    if (entry->upload_generation != s_descriptor_generation) {
+        GeD3D12UploadSlice allocated = {};
+        if (!ged3d12_upload_alloc(
+                sizeof(entry->data), 4u, &allocated)) {
+            fprintf(stderr,
+                    "ged3d12: could not upload framebuffer feedback CLUT\n");
+            return false;
+        }
+        memcpy(allocated.cpu, entry->data, sizeof(entry->data));
+        entry->upload = allocated;
+        entry->upload_generation = s_descriptor_generation;
+    }
+    *upload = &entry->upload;
+    return true;
 }
 
 static bool texture_memory(
@@ -369,6 +450,7 @@ bool ged3d12_texture_cache_init(void) {
         return false;
     }
     memset(s_textures, 0, sizeof(s_textures));
+    memset(s_cluts, 0, sizeof(s_cluts));
     s_sampler_count = 0;
     s_texture_count = 0;
     s_next_serial = 1;
@@ -400,6 +482,7 @@ void ged3d12_texture_cache_shutdown(void) {
     for (uint32_t i = 0; i < MAX_TEXTURES; i++)
         release_entry(&s_textures[i]);
     memset(s_samplers, 0, sizeof(s_samplers));
+    memset(s_cluts, 0, sizeof(s_cluts));
     s_sampler_count = 0;
     s_initialized = false;
     s_log = false;
@@ -410,11 +493,22 @@ bool ged3d12_texture_capture(GeD3D12TextureBinding *out) {
     memset(out, 0, sizeof(*out));
     out->handle = GE_D3D12_TEXTURE_HANDLE_NONE;
     out->framebuffer.handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
+    out->clut_handle = GE_D3D12_CLUT_HANDLE_NONE;
     const GeState *state = ge_state_ptr();
+    out->address = state->tex_addr;
+    out->width = (uint16_t)state->tex_w;
+    out->height = (uint16_t)state->tex_h;
+    out->format = (uint8_t)state->tex_fmt;
     ged3d12_texture_sampler_build(state, &out->sampler);
     if (!state->tex_enable || state->clear || !state->tex_addr) return true;
     if (ged3d12_framebuffer_texture_alias(
             state, &out->framebuffer)) {
+        return true;
+    }
+    if (ged3d12_framebuffer_texture_feedback(
+            state, &out->framebuffer)) {
+        if (!capture_clut(state, &out->clut_handle)) return false;
+        out->flags |= GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT;
         return true;
     }
 
@@ -496,13 +590,17 @@ bool ged3d12_texture_capture(GeD3D12TextureBinding *out) {
     out->handle = (entry->serial << 16) | slot;
     s_misses++;
     if (s_log) {
+        uint32_t nonzero_pixels = 0;
+        for (uint32_t i = 0; i < entry->pixel_count; i++)
+            nonzero_pixels += entry->pixels[i] != 0;
         fprintf(stderr,
                 "ged3d12: texture miss key=%016llx content=%016llx "
-                "fmt=%u %ux%u mips=%u slot=%u\n",
+                "fmt=%u %ux%u mips=%u slot=%u nonzero=%u/%u\n",
                 (unsigned long long)key_hash,
                 (unsigned long long)content_hash,
                 key.format, key.width[0], key.height[0],
-                key.mip_count, slot);
+                key.mip_count, slot, nonzero_pixels,
+                entry->pixel_count);
     }
     return true;
 }
@@ -525,9 +623,17 @@ bool ged3d12_texture_prepare_pending(void) {
 bool ged3d12_texture_bind(const GeD3D12TextureBinding *binding) {
     if (!binding || !s_initialized) return false;
     D3D12_GPU_DESCRIPTOR_HANDLE descriptors = {};
+    const GeD3D12UploadSlice *clut = nullptr;
+    if ((binding->flags & GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT) != 0) {
+        if (binding->framebuffer.handle ==
+                GE_D3D12_FRAMEBUFFER_HANDLE_NONE ||
+            !prepare_clut(binding->clut_handle, &clut)) {
+            return false;
+        }
+    }
     if (binding->framebuffer.handle != GE_D3D12_FRAMEBUFFER_HANDLE_NONE) {
         if (!ged3d12_framebuffer_texture_bind(
-                &binding->framebuffer, &descriptors)) {
+                &binding->framebuffer, clut, &descriptors)) {
             return false;
         }
     } else if (binding->handle != GE_D3D12_TEXTURE_HANDLE_NONE) {

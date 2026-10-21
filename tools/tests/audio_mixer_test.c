@@ -23,6 +23,7 @@ int main(void) {
 
     sr_audio_mixer_init(&mixer);
     check_i64("initial queue", sr_audio_mixer_queued(&mixer, 0), 0);
+    check_i64("initial available", sr_audio_mixer_available(&mixer), 0);
     check_i64(
         "push first", sr_audio_mixer_push(
             &mixer, 0, first, 2, 0x8000, 0x8000), 2);
@@ -30,7 +31,9 @@ int main(void) {
         "push second", sr_audio_mixer_push(
             &mixer, 1, second, 2, 0x4000, 0x4000), 2);
     check_i64("queued before render", sr_audio_mixer_queued(&mixer, 0), 2);
+    check_i64("available before render", sr_audio_mixer_available(&mixer), 2);
     sr_audio_mixer_render(&mixer, output, 2);
+    check_i64("available after render", sr_audio_mixer_available(&mixer), 0);
     check_i64("mixed frame 0 left", output[0], 2500);
     check_i64("mixed frame 0 right", output[1], 500);
     check_i64("mixed frame 1 left", output[2], -500);

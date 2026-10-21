@@ -1,16 +1,13 @@
 #include "present.h"
 
 #include "device.h"
+#include "framebuffer.h"
 
 #include <limits.h>
 #include <stdio.h>
 
 #define PSP_WIDTH 480u
 #define PSP_HEIGHT 272u
-#define CAPTURE_ROW_PITCH \
-    ((PSP_WIDTH * 4u + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) & \
-     ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u))
-#define CAPTURE_BYTES ((UINT64)CAPTURE_ROW_PITCH * PSP_HEIGHT)
 #define RELEASE_COM(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
 
 static const uint8_t k_present_vs_dxil[] =
@@ -25,6 +22,11 @@ static ID3D12Resource *s_capture_readback;
 static ID3D12RootSignature *s_present_root_signature;
 static ID3D12PipelineState *s_present_pipeline;
 static D3D12_RESOURCE_STATES s_display_state;
+static UINT s_render_scale;
+static UINT s_display_width;
+static UINT s_display_height;
+static UINT s_capture_row_pitch;
+static UINT64 s_capture_bytes;
 
 static bool check_hr(HRESULT hr, const char *operation) {
     if (SUCCEEDED(hr)) return true;
@@ -55,8 +57,11 @@ static bool create_display_texture(void) {
 
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = PSP_WIDTH;
-    desc.Height = PSP_HEIGHT;
+    s_render_scale = ged3d12_framebuffer_scale();
+    s_display_width = PSP_WIDTH * s_render_scale;
+    s_display_height = PSP_HEIGHT * s_render_scale;
+    desc.Width = s_display_width;
+    desc.Height = s_display_height;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
     desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -80,7 +85,13 @@ static bool create_capture_readback(void) {
 
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = CAPTURE_BYTES;
+    s_capture_row_pitch =
+        (s_display_width * 4u +
+         D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
+        ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+    s_capture_bytes =
+        (UINT64)s_capture_row_pitch * s_display_height;
+    desc.Width = s_capture_bytes;
     desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
@@ -205,6 +216,11 @@ void ged3d12_present_shutdown(void) {
     RELEASE_COM(s_capture_readback);
     RELEASE_COM(s_display_texture);
     s_display_state = D3D12_RESOURCE_STATE_COMMON;
+    s_render_scale = 0;
+    s_display_width = 0;
+    s_display_height = 0;
+    s_capture_row_pitch = 0;
+    s_capture_bytes = 0;
 }
 
 bool ged3d12_present_record(
@@ -252,6 +268,7 @@ bool ged3d12_present_record(
         backbuffer_rtv, clear_color, 0, nullptr);
     command_list->OMSetRenderTargets(
         1, &backbuffer_rtv, FALSE, nullptr);
+    ged3d12_set_coarse_shading(false);
 
     GeD3D12PresentViewport layout = {};
     ged3d12_present_viewport(output_width, output_height, &layout);
@@ -285,10 +302,10 @@ bool ged3d12_present_capture_record(void) {
     destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     destination.PlacedFootprint.Footprint.Format =
         DXGI_FORMAT_B8G8R8A8_UNORM;
-    destination.PlacedFootprint.Footprint.Width = PSP_WIDTH;
-    destination.PlacedFootprint.Footprint.Height = PSP_HEIGHT;
+    destination.PlacedFootprint.Footprint.Width = s_display_width;
+    destination.PlacedFootprint.Footprint.Height = s_display_height;
     destination.PlacedFootprint.Footprint.Depth = 1;
-    destination.PlacedFootprint.Footprint.RowPitch = CAPTURE_ROW_PITCH;
+    destination.PlacedFootprint.Footprint.RowPitch = s_capture_row_pitch;
     command_list->CopyTextureRegion(
         &destination, 0, 0, 0, &source, nullptr);
 
@@ -301,7 +318,7 @@ bool ged3d12_present_capture_record(void) {
 
 bool ged3d12_present_capture_write(const char *path) {
     if (!path || !path[0] || !s_capture_readback) return false;
-    D3D12_RANGE read_range = {0, (SIZE_T)CAPTURE_BYTES};
+    D3D12_RANGE read_range = {0, (SIZE_T)s_capture_bytes};
     uint8_t *data = nullptr;
     if (!check_hr(s_capture_readback->Map(
             0, &read_range, reinterpret_cast<void **>(&data)),
@@ -312,13 +329,19 @@ bool ged3d12_present_capture_write(const char *path) {
     FILE *file = fopen(path, "wb");
     bool failed = !file ||
         fprintf(file, "P6\n%u %u\n255\n", PSP_WIDTH, PSP_HEIGHT) < 0;
+    const UINT sample_offset = s_render_scale / 2u;
     for (UINT y = 0; y < PSP_HEIGHT && !failed; y++) {
-        const uint8_t *row = data + (UINT64)y * CAPTURE_ROW_PITCH;
+        const uint8_t *row =
+            data +
+            (UINT64)(y * s_render_scale + sample_offset) *
+                s_capture_row_pitch;
         for (UINT x = 0; x < PSP_WIDTH; x++) {
+            const UINT source_x =
+                x * s_render_scale + sample_offset;
             const uint8_t rgb[3] = {
-                row[x * 4 + 2],
-                row[x * 4 + 1],
-                row[x * 4],
+                row[source_x * 4 + 2],
+                row[source_x * 4 + 1],
+                row[source_x * 4],
             };
             if (fwrite(rgb, 1, sizeof(rgb), file) != sizeof(rgb)) {
                 failed = true;

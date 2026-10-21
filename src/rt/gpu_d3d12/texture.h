@@ -10,6 +10,11 @@
 
 #define GE_D3D12_TEXTURE_LEVELS 8
 #define GE_D3D12_TEXTURE_HANDLE_NONE UINT32_MAX
+#define GE_D3D12_CLUT_HANDLE_NONE UINT16_MAX
+
+enum GeD3D12TextureBindingFlag : uint8_t {
+    GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT = 1u,
+};
 
 struct GeD3D12TextureKey {
     uint32_t address[GE_D3D12_TEXTURE_LEVELS];
@@ -39,6 +44,12 @@ struct GeD3D12TextureBinding {
     uint32_t handle;
     GeD3D12FramebufferAlias framebuffer;
     GeD3D12TextureSampler sampler;
+    uint32_t address;
+    uint16_t width;
+    uint16_t height;
+    uint16_t clut_handle;
+    uint8_t format;
+    uint8_t flags;
 };
 
 void ged3d12_texture_key_build(
@@ -66,7 +77,7 @@ static_assert(
     sizeof(GeD3D12TextureSampler) == 8,
     "D3D12 texture sampler key must remain canonical");
 static_assert(
-    sizeof(GeD3D12TextureBinding) == 20,
+    sizeof(GeD3D12TextureBinding) == 40,
     "D3D12 texture binding ABI changed");
 
 #endif

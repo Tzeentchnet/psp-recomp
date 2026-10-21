@@ -35,6 +35,18 @@ static inline int sr_input_sdl_key_down(void *context, int key) {
     return scancode != SDL_SCANCODE_UNKNOWN && keys[scancode];
 }
 
+static inline int sr_input_sdl_mouse_down(void *context, int button) {
+    Uint32 state = *(const Uint32 *)context;
+    switch (button) {
+    case SR_MOUSE_LEFT: return (state & SDL_BUTTON_LMASK) != 0;
+    case SR_MOUSE_RIGHT: return (state & SDL_BUTTON_RMASK) != 0;
+    case SR_MOUSE_MIDDLE: return (state & SDL_BUTTON_MMASK) != 0;
+    case SR_MOUSE_X1: return (state & SDL_BUTTON_X1MASK) != 0;
+    case SR_MOUSE_X2: return (state & SDL_BUTTON_X2MASK) != 0;
+    default: return 0;
+    }
+}
+
 static inline int sr_input_sdl_pad_down(void *context, int button) {
     SDL_Gamepad *pad = (SDL_Gamepad *)context;
     switch (button) {

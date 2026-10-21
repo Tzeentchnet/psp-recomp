@@ -154,6 +154,165 @@ static void put_vertex(
     vertex->rgba = r | (g << 8) | (b << 16) | (a << 24);
 }
 
+static void feedback_axis_bounds(
+    float minimum, float maximum, uint32_t size, uint32_t offset,
+    bool clamp_value, bool nearest,
+    uint16_t *first_out, uint16_t *end_out) {
+    int first;
+    int end;
+    if (!size || !isfinite(minimum) || !isfinite(maximum)) {
+        *first_out = (uint16_t)offset;
+        *end_out = (uint16_t)(
+            offset + size > GE_D3D12_FRAMEBUFFER_WIDTH
+                ? GE_D3D12_FRAMEBUFFER_WIDTH : offset + size);
+        return;
+    }
+    if (minimum > maximum) {
+        float swap = minimum;
+        minimum = maximum;
+        maximum = swap;
+    }
+    if (nearest) {
+        first = (int)floorf(minimum + 0.5f);
+        end = (int)floorf(maximum + 0.5f) + 1;
+    } else {
+        first = (int)floorf(minimum - 0.5f);
+        end = (int)floorf(maximum - 0.5f) + 2;
+    }
+    if (!clamp_value && (first < 0 || end > (int)size)) {
+        first = 0;
+        end = (int)size;
+    } else {
+        if (first < 0) first = 0;
+        if (first >= (int)size) first = (int)size - 1;
+        if (end <= first) end = first + 1;
+        if (end > (int)size) end = (int)size;
+    }
+    first += (int)offset;
+    end += (int)offset;
+    if (first < 0) first = 0;
+    if (end > (int)GE_D3D12_FRAMEBUFFER_WIDTH)
+        end = GE_D3D12_FRAMEBUFFER_WIDTH;
+    if (first >= end) {
+        first = 0;
+        end = GE_D3D12_FRAMEBUFFER_WIDTH;
+    }
+    *first_out = (uint16_t)first;
+    *end_out = (uint16_t)end;
+}
+
+void ged3d12_vertex_feedback_bounds(
+    GeD3D12TextureBinding *texture,
+    const GeD3D12Vertex *vertices, uint32_t count) {
+    if (!texture || !vertices || !count ||
+        texture->framebuffer.handle ==
+            GE_D3D12_FRAMEBUFFER_HANDLE_NONE) {
+        return;
+    }
+    float minimum_u = INFINITY;
+    float minimum_v = INFINITY;
+    float maximum_u = -INFINITY;
+    float maximum_v = -INFINITY;
+    for (uint32_t i = 0; i < count; i++) {
+        float rw = fmaxf(fabsf(vertices[i].rw), 1e-20f);
+        float u = vertices[i].u / rw;
+        float v = vertices[i].v / rw;
+        minimum_u = fminf(minimum_u, u);
+        minimum_v = fminf(minimum_v, v);
+        maximum_u = fmaxf(maximum_u, u);
+        maximum_v = fmaxf(maximum_v, v);
+    }
+    bool nearest =
+        !texture->sampler.min_linear &&
+        !texture->sampler.mag_linear;
+    GeD3D12FramebufferAlias *alias = &texture->framebuffer;
+    uint16_t left;
+    uint16_t top;
+    uint16_t right;
+    uint16_t bottom;
+    feedback_axis_bounds(
+        minimum_u, maximum_u, texture->width, alias->x,
+        texture->sampler.clamp_u != 0, nearest, &left, &right);
+    feedback_axis_bounds(
+        minimum_v, maximum_v, texture->height, alias->y,
+        texture->sampler.clamp_v != 0, nearest, &top, &bottom);
+    if (alias->snapshot_right > alias->snapshot_left &&
+        alias->snapshot_bottom > alias->snapshot_top) {
+        if (left < alias->snapshot_left) alias->snapshot_left = left;
+        if (top < alias->snapshot_top) alias->snapshot_top = top;
+        if (right > alias->snapshot_right) alias->snapshot_right = right;
+        if (bottom > alias->snapshot_bottom) alias->snapshot_bottom = bottom;
+    } else {
+        alias->snapshot_left = left;
+        alias->snapshot_top = top;
+        alias->snapshot_right = right;
+        alias->snapshot_bottom = bottom;
+    }
+}
+
+void ged3d12_vertex_draw_bounds(
+    GeD3D12FramebufferBinding *framebuffer,
+    const GeD3D12Vertex *vertices, uint32_t count) {
+    if (!framebuffer || !vertices || !count) return;
+    float minimum_x = INFINITY;
+    float minimum_y = INFINITY;
+    float maximum_x = -INFINITY;
+    float maximum_y = -INFINITY;
+    for (uint32_t i = 0; i < count; i++) {
+        minimum_x = fminf(minimum_x, vertices[i].x);
+        minimum_y = fminf(minimum_y, vertices[i].y);
+        maximum_x = fmaxf(maximum_x, vertices[i].x);
+        maximum_y = fmaxf(maximum_y, vertices[i].y);
+    }
+    int left = isfinite(minimum_x) ? (int)floorf(minimum_x) : 0;
+    int top = isfinite(minimum_y) ? (int)floorf(minimum_y) : 0;
+    int right = isfinite(maximum_x)
+        ? (int)ceilf(maximum_x) : GE_D3D12_FRAMEBUFFER_WIDTH;
+    int bottom = isfinite(maximum_y)
+        ? (int)ceilf(maximum_y) : GE_D3D12_FRAMEBUFFER_HEIGHT;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > (int)GE_D3D12_FRAMEBUFFER_WIDTH)
+        right = GE_D3D12_FRAMEBUFFER_WIDTH;
+    if (bottom > (int)GE_D3D12_FRAMEBUFFER_HEIGHT)
+        bottom = GE_D3D12_FRAMEBUFFER_HEIGHT;
+    if (right <= left || bottom <= top) {
+        left = 0;
+        top = 0;
+        right = GE_D3D12_FRAMEBUFFER_WIDTH;
+        bottom = GE_D3D12_FRAMEBUFFER_HEIGHT;
+    }
+    if (framebuffer->draw_right > framebuffer->draw_left &&
+        framebuffer->draw_bottom > framebuffer->draw_top) {
+        if (left < framebuffer->draw_left)
+            framebuffer->draw_left = (uint16_t)left;
+        if (top < framebuffer->draw_top)
+            framebuffer->draw_top = (uint16_t)top;
+        if (right > framebuffer->draw_right)
+            framebuffer->draw_right = (uint16_t)right;
+        if (bottom > framebuffer->draw_bottom)
+            framebuffer->draw_bottom = (uint16_t)bottom;
+    } else {
+        framebuffer->draw_left = (uint16_t)left;
+        framebuffer->draw_top = (uint16_t)top;
+        framebuffer->draw_right = (uint16_t)right;
+        framebuffer->draw_bottom = (uint16_t)bottom;
+    }
+}
+
+static void update_batch_bounds(uint32_t first, uint32_t count) {
+    if (!s_batch_count || first > s_vertex_count ||
+        count > s_vertex_count - first) {
+        return;
+    }
+    ged3d12_vertex_draw_bounds(
+        &s_batches[s_batch_count - 1u].framebuffer,
+        &s_vertices[first], count);
+    ged3d12_vertex_feedback_bounds(
+        &s_batches[s_batch_count - 1u].texture,
+        &s_vertices[first], count);
+}
+
 bool ged3d12_vertex_capture_init(void) {
     if (s_vertices || s_batches) {
         fprintf(stderr, "ged3d12: decoded vertex capture already initialized\n");
@@ -208,7 +367,8 @@ int ged3d12_vertex_capture_tri(
                color_b->r, color_b->g, color_b->b, color_b->a);
     put_vertex(c->x, c->y, c->z, c->rw, c->u, c->v, c->fog,
                c->r, c->g, c->b, c->a);
-    return 0;
+    update_batch_bounds(first, 3);
+    return 1;
 }
 
 int ged3d12_vertex_capture_sprite(
@@ -235,10 +395,14 @@ int ged3d12_vertex_capture_sprite(
     }
     float texel_width = (u1 - u0) / (xb - xa);
     float texel_height = (v1 - v0) / (yb - ya);
-    float ua = u0 - 0.5f * texel_width;
-    float ub = u1 - 0.5f * texel_width;
-    float va = v0 - 0.5f * texel_height;
-    float vb = v1 - 0.5f * texel_height;
+    const GeState *state = ge_state_ptr();
+    bool linear =
+        (state->tex_filter & 1u) != 0 ||
+        ((state->tex_filter >> 8) & 1u) != 0;
+    float ua = linear ? u0 : u0 - 0.5f * texel_width;
+    float ub = linear ? u1 : u1 - 0.5f * texel_width;
+    float va = linear ? v0 : v0 - 0.5f * texel_height;
+    float vb = linear ? v1 : v1 - 0.5f * texel_height;
 
     float z = p1->z;
     float fog = p1->fog;
@@ -248,7 +412,8 @@ int ged3d12_vertex_capture_sprite(
     put_vertex(xb, ya, z, 1.0f, ub, va, fog, p1->r, p1->g, p1->b, p1->a);
     put_vertex(xb, yb, z, 1.0f, ub, vb, fog, p1->r, p1->g, p1->b, p1->a);
     put_vertex(xa, yb, z, 1.0f, ua, vb, fog, p1->r, p1->g, p1->b, p1->a);
-    return 0;
+    update_batch_bounds(first, 6);
+    return 1;
 }
 
 int ged3d12_vertex_capture_line(
@@ -290,7 +455,8 @@ int ged3d12_vertex_capture_line(
                b->r, b->g, b->b, b->a);
     put_vertex(bx + ex - nx, by + ey - ny, b->z, b->rw, b->u, b->v, b->fog,
                b->r, b->g, b->b, b->a);
-    return 0;
+    update_batch_bounds(first, 6);
+    return 1;
 }
 
 int ged3d12_vertex_capture_point(const GeVtx *a, int perspective) {
@@ -308,10 +474,13 @@ int ged3d12_vertex_capture_point(const GeVtx *a, int perspective) {
     put_vertex(x0 + 1.0f, y0, a->z, a->rw, a->u, a->v, a->fog, a->r, a->g, a->b, a->a);
     put_vertex(x0 + 1.0f, y0 + 1.0f, a->z, a->rw, a->u, a->v, a->fog, a->r, a->g, a->b, a->a);
     put_vertex(x0, y0 + 1.0f, a->z, a->rw, a->u, a->v, a->fog, a->r, a->g, a->b, a->a);
-    return 0;
+    update_batch_bounds(first, 6);
+    return 1;
 }
 
-static uint64_t hash_vertices(const GeD3D12Vertex *vertices, uint32_t count) {
+uint64_t ged3d12_vertex_hash(
+    const GeD3D12Vertex *vertices, uint32_t count) {
+    if (!vertices && count) return 0;
     const uint8_t *bytes = reinterpret_cast<const uint8_t *>(vertices);
     size_t size = (size_t)count * sizeof(*vertices);
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -351,11 +520,12 @@ bool ged3d12_vertex_upload_pending(GeD3D12VertexFrame *out) {
     out->buffer.BufferLocation = upload.gpu;
     out->buffer.SizeInBytes = (UINT)size;
     out->buffer.StrideInBytes = sizeof(*s_vertices);
+    out->vertices = s_vertices;
     out->batches = s_batches;
     out->vertex_count = s_vertex_count;
     out->batch_count = s_batch_count;
     memcpy(out->primitive_count, s_primitive_count, sizeof(out->primitive_count));
-    out->hash = hash_vertices(s_vertices, s_vertex_count);
+    out->hash = 0;
 
     s_vertex_count = 0;
     s_batch_count = 0;

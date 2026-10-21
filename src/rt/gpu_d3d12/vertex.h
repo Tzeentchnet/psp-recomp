@@ -46,6 +46,7 @@ struct GeD3D12VertexBatch {
 
 struct GeD3D12VertexFrame {
     D3D12_VERTEX_BUFFER_VIEW buffer;
+    const GeD3D12Vertex *vertices;
     const GeD3D12VertexBatch *batches;
     uint32_t vertex_count;
     uint32_t batch_count;
@@ -56,7 +57,7 @@ struct GeD3D12VertexFrame {
 bool ged3d12_vertex_capture_init(void);
 void ged3d12_vertex_capture_shutdown(void);
 
-/* These hooks deliberately return zero until native PSOs replace the software rasterizer. */
+/* Successful hooks take ownership of the primitive and suppress software rasterization. */
 int ged3d12_vertex_capture_tri(
     const GeVtx *a, const GeVtx *b, const GeVtx *c, int perspective);
 int ged3d12_vertex_capture_sprite(
@@ -66,14 +67,22 @@ int ged3d12_vertex_capture_line(
 int ged3d12_vertex_capture_point(const GeVtx *a, int perspective);
 
 bool ged3d12_vertex_upload_pending(GeD3D12VertexFrame *out);
+uint64_t ged3d12_vertex_hash(
+    const GeD3D12Vertex *vertices, uint32_t count);
 void ged3d12_vertex_pending_counts(
     uint32_t *vertex_count, uint32_t *batch_count);
+void ged3d12_vertex_feedback_bounds(
+    GeD3D12TextureBinding *texture,
+    const GeD3D12Vertex *vertices, uint32_t count);
+void ged3d12_vertex_draw_bounds(
+    GeD3D12FramebufferBinding *framebuffer,
+    const GeD3D12Vertex *vertices, uint32_t count);
 
 static_assert(sizeof(GeD3D12Vertex) == 32, "D3D12 GE vertex ABI must remain 32 bytes");
 static_assert(offsetof(GeD3D12Vertex, rw) == 12, "D3D12 GE position ABI changed");
 static_assert(offsetof(GeD3D12Vertex, u) == 16, "D3D12 GE texture ABI changed");
 static_assert(offsetof(GeD3D12Vertex, fog) == 24, "D3D12 GE fog ABI changed");
 static_assert(offsetof(GeD3D12Vertex, rgba) == 28, "D3D12 GE color ABI changed");
-static_assert(sizeof(GeD3D12VertexBatch) == 236, "D3D12 GE batch ABI changed");
+static_assert(sizeof(GeD3D12VertexBatch) == 264, "D3D12 GE batch ABI changed");
 
 #endif

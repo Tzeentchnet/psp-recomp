@@ -38,6 +38,7 @@ void sr_audio_mixer_render(
     SrAudioMixer *mixer, int16_t *stereo, int frames);
 void sr_audio_mixer_complete(SrAudioMixer *mixer, int frames);
 int sr_audio_mixer_queued(const SrAudioMixer *mixer, int channel);
+int sr_audio_mixer_available(const SrAudioMixer *mixer);
 const SrAudioMixerStats *sr_audio_mixer_stats(const SrAudioMixer *mixer);
 
 #ifdef __cplusplus

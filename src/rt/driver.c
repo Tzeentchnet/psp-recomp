@@ -10,6 +10,8 @@
  */
 
 #define _CRT_SECURE_NO_WARNINGS
+#include "graphics_config.h"
+#include "graphics_settings.h"
 #include "recomp.h"
 #include "startup_check.h"
 
@@ -140,6 +142,16 @@ int main(int argc, char **argv) {
 
     SetUnhandledExceptionFilter(sr_crash_filter);
 
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--configure") == 0) {
+            int result;
+            if (!sr_graphics_config_init()) return 2;
+            result = sr_graphics_settings_show(
+                "Killzone: Liberation Graphics");
+            return result < 0 ? 2 : 0;
+        }
+    }
+
     /* Normal runtime path: the generated image is already rebased and relocated by prxload.py.
      * The KZL bootloader passes module_start one argument block: "modulename\0". */
     if (argc >= 6 && strcmp(argv[1], "--boot") == 0) {
@@ -173,7 +185,8 @@ int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: driver <elf> <ref-trace> <out-trace>\n"
                         "       driver --image <image.bin> <base-hex> <entry-hex> <ref-trace> <out-trace>\n"
-                        "       driver --boot <image.bin> <base-hex> <entry-hex> <out-trace>\n");
+                        "       driver --boot <image.bin> <base-hex> <entry-hex> <out-trace>\n"
+                        "       driver --configure\n");
         return 2;
     }
     {

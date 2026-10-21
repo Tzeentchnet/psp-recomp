@@ -2,6 +2,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 #include "input_config.h"
+#include "settings_path.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -9,10 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 static const char *const s_action_names[SR_INPUT_ACTIONS] = {
     "select", "start", "up", "right", "down", "left",
@@ -67,6 +64,14 @@ static const NameValue s_pad_names[] = {
     {"right_stick", SR_PAD_RIGHT_STICK},
 };
 
+static const NameValue s_mouse_names[] = {
+    {"left", SR_MOUSE_LEFT},
+    {"right", SR_MOUSE_RIGHT},
+    {"middle", SR_MOUSE_MIDDLE},
+    {"x1", SR_MOUSE_X1},
+    {"x2", SR_MOUSE_X2},
+};
+
 static SrInputConfig s_config;
 static int s_initialized;
 static char s_config_path[1024];
@@ -117,11 +122,17 @@ void sr_input_config_defaults(SrInputConfig *config) {
     binding_set(&config->keyboard[SR_INPUT_DOWN], SR_KEY_DOWN, 0, 0, 0);
     binding_set(&config->keyboard[SR_INPUT_LEFT], SR_KEY_LEFT, 0, 0, 0);
     binding_set(&config->keyboard[SR_INPUT_L], 'Q', 0, 0, 0);
-    binding_set(&config->keyboard[SR_INPUT_R], 'W', 0, 0, 0);
-    binding_set(&config->keyboard[SR_INPUT_TRIANGLE], 'S', 0, 0, 0);
-    binding_set(&config->keyboard[SR_INPUT_CIRCLE], 'Z', 0, 0, 0);
-    binding_set(&config->keyboard[SR_INPUT_CROSS], 'X', 0, 0, 0);
-    binding_set(&config->keyboard[SR_INPUT_SQUARE], 'A', 0, 0, 0);
+    binding_set(&config->keyboard[SR_INPUT_R], 'E', 0, 0, 0);
+    binding_set(&config->keyboard[SR_INPUT_TRIANGLE], 'R', 0, 0, 0);
+    binding_set(&config->keyboard[SR_INPUT_CIRCLE], 'G', 0, 0, 0);
+    binding_set(&config->keyboard[SR_INPUT_CROSS], SR_KEY_SPACE, 0, 0, 0);
+    binding_set(&config->keyboard[SR_INPUT_SQUARE], 'F', 0, 0, 0);
+
+    binding_set(&config->mouse[SR_INPUT_L], SR_MOUSE_X2, 0, 0, 0);
+    binding_set(&config->mouse[SR_INPUT_R], SR_MOUSE_RIGHT, 0, 0, 0);
+    binding_set(&config->mouse[SR_INPUT_TRIANGLE], SR_MOUSE_MIDDLE, 0, 0, 0);
+    binding_set(&config->mouse[SR_INPUT_CIRCLE], SR_MOUSE_X1, 0, 0, 0);
+    binding_set(&config->mouse[SR_INPUT_SQUARE], SR_MOUSE_LEFT, 0, 0, 0);
 
     binding_set(&config->gamepad[SR_INPUT_SELECT], SR_PAD_BACK, 0, 0, 0);
     binding_set(&config->gamepad[SR_INPUT_START], SR_PAD_START, 0, 0, 0);
@@ -138,13 +149,30 @@ void sr_input_config_defaults(SrInputConfig *config) {
     binding_set(&config->gamepad[SR_INPUT_CROSS], SR_PAD_SOUTH, 0, 0, 0);
     binding_set(&config->gamepad[SR_INPUT_SQUARE], SR_PAD_WEST, 0, 0, 0);
 
-    binding_set(&config->analog_keyboard[SR_INPUT_ANALOG_UP], SR_KEY_UP, 0, 0, 0);
-    binding_set(&config->analog_keyboard[SR_INPUT_ANALOG_RIGHT], SR_KEY_RIGHT, 0, 0, 0);
-    binding_set(&config->analog_keyboard[SR_INPUT_ANALOG_DOWN], SR_KEY_DOWN, 0, 0, 0);
-    binding_set(&config->analog_keyboard[SR_INPUT_ANALOG_LEFT], SR_KEY_LEFT, 0, 0, 0);
+    binding_set(&config->analog_keyboard[SR_INPUT_ANALOG_UP], 'W', 0, 0, 0);
+    binding_set(&config->analog_keyboard[SR_INPUT_ANALOG_RIGHT], 'D', 0, 0, 0);
+    binding_set(&config->analog_keyboard[SR_INPUT_ANALOG_DOWN], 'S', 0, 0, 0);
+    binding_set(&config->analog_keyboard[SR_INPUT_ANALOG_LEFT], 'A', 0, 0, 0);
     config->deadzone = 0.24;
     config->curve = 1.0;
     config->invert_y = 0;
+}
+
+static void legacy_defaults(SrInputConfig *config) {
+    sr_input_config_defaults(config);
+    binding_set(&config->keyboard[SR_INPUT_R], 'W', 0, 0, 0);
+    binding_set(&config->keyboard[SR_INPUT_TRIANGLE], 'S', 0, 0, 0);
+    binding_set(&config->keyboard[SR_INPUT_CIRCLE], 'Z', 0, 0, 0);
+    binding_set(&config->keyboard[SR_INPUT_CROSS], 'X', 0, 0, 0);
+    binding_set(&config->keyboard[SR_INPUT_SQUARE], 'A', 0, 0, 0);
+    binding_set(
+        &config->analog_keyboard[SR_INPUT_ANALOG_UP], SR_KEY_UP, 0, 0, 0);
+    binding_set(
+        &config->analog_keyboard[SR_INPUT_ANALOG_RIGHT], SR_KEY_RIGHT, 0, 0, 0);
+    binding_set(
+        &config->analog_keyboard[SR_INPUT_ANALOG_DOWN], SR_KEY_DOWN, 0, 0, 0);
+    binding_set(
+        &config->analog_keyboard[SR_INPUT_ANALOG_LEFT], SR_KEY_LEFT, 0, 0, 0);
 }
 
 static int find_name(
@@ -168,8 +196,14 @@ static int parse_pad_token(const char *text) {
         s_pad_names, sizeof(s_pad_names) / sizeof(s_pad_names[0]), text);
 }
 
+static int parse_mouse_token(const char *text) {
+    if (text_equal(text, "none")) return SR_MOUSE_NONE;
+    return find_name(
+        s_mouse_names, sizeof(s_mouse_names) / sizeof(s_mouse_names[0]), text);
+}
+
 static int parse_binding(
-    SrInputBinding *binding, char *value, int gamepad,
+    SrInputBinding *binding, char *value, int binding_type,
     int line, char *error, size_t error_size) {
     binding->count = 0;
     char *cursor = value;
@@ -177,7 +211,10 @@ static int parse_binding(
         char *comma = strchr(cursor, ',');
         if (comma) *comma = 0;
         char *token = trim(cursor);
-        int parsed = gamepad ? parse_pad_token(token) : parse_key_token(token);
+        int parsed =
+            binding_type == 1 ? parse_pad_token(token) :
+            binding_type == 2 ? parse_mouse_token(token) :
+            parse_key_token(token);
         if (parsed < 0) {
             set_error(error, error_size, line, "unknown binding", token);
             return 0;
@@ -258,7 +295,7 @@ int sr_input_config_parse(
 
         int setting = -1;
         SrInputBinding *binding = NULL;
-        int gamepad = 0;
+        int binding_type = 0;
         if (strncmp(name, "keyboard.", 9) == 0) {
             const char *suffix = name + 9;
             int action = action_index(suffix);
@@ -267,7 +304,7 @@ int sr_input_config_parse(
                 setting = action;
                 binding = &config->keyboard[action];
             } else if (analog >= 0) {
-                setting = SR_INPUT_ACTIONS * 2 + analog;
+                setting = SR_INPUT_ACTIONS * 3 + analog;
                 binding = &config->analog_keyboard[analog];
             }
         } else if (strncmp(name, "gamepad.", 8) == 0) {
@@ -275,14 +312,21 @@ int sr_input_config_parse(
             if (action >= 0) {
                 setting = SR_INPUT_ACTIONS + action;
                 binding = &config->gamepad[action];
-                gamepad = 1;
+                binding_type = 1;
+            }
+        } else if (strncmp(name, "mouse.", 6) == 0) {
+            int action = action_index(name + 6);
+            if (action >= 0) {
+                setting = SR_INPUT_ACTIONS * 2 + action;
+                binding = &config->mouse[action];
+                binding_type = 2;
             }
         } else if (text_equal(name, "analog.deadzone")) {
-            setting = SR_INPUT_ACTIONS * 2 + SR_INPUT_ANALOG_DIRECTIONS;
+            setting = SR_INPUT_ACTIONS * 3 + SR_INPUT_ANALOG_DIRECTIONS;
         } else if (text_equal(name, "analog.curve")) {
-            setting = SR_INPUT_ACTIONS * 2 + SR_INPUT_ANALOG_DIRECTIONS + 1;
+            setting = SR_INPUT_ACTIONS * 3 + SR_INPUT_ANALOG_DIRECTIONS + 1;
         } else if (text_equal(name, "analog.invert_y")) {
-            setting = SR_INPUT_ACTIONS * 2 + SR_INPUT_ANALOG_DIRECTIONS + 2;
+            setting = SR_INPUT_ACTIONS * 3 + SR_INPUT_ANALOG_DIRECTIONS + 2;
         }
         if (setting < 0) {
             set_error(error, error_size, line_number, "unknown setting", name);
@@ -296,7 +340,8 @@ int sr_input_config_parse(
 
         if (binding) {
             if (!parse_binding(
-                    binding, value, gamepad, line_number, error, error_size))
+                    binding, value, binding_type,
+                    line_number, error, error_size))
                 return 0;
         } else if (text_equal(name, "analog.invert_y")) {
             if (text_equal(value, "true") || strcmp(value, "1") == 0)
@@ -350,10 +395,12 @@ static int binding_down(
 uint32_t sr_input_config_buttons(
     const SrInputConfig *config,
     SrInputDownFn key_down, void *key_context,
+    SrInputDownFn mouse_down, void *mouse_context,
     SrInputDownFn pad_down, void *pad_context) {
     uint32_t buttons = 0;
     for (int i = 0; i < SR_INPUT_ACTIONS; i++) {
         if (binding_down(&config->keyboard[i], key_down, key_context) ||
+            binding_down(&config->mouse[i], mouse_down, mouse_context) ||
             binding_down(&config->gamepad[i], pad_down, pad_context))
             buttons |= s_action_bits[i];
     }
@@ -409,7 +456,7 @@ static int write_default_config(const char *path) {
     FILE *file = fopen(path, "wb");
     if (!file) return 0;
     static const char text[] =
-        "# KZL input config v1\n"
+        "# KZL input config v2\n"
         "keyboard.select = left_shift, right_shift\n"
         "keyboard.start = enter\n"
         "keyboard.up = up\n"
@@ -417,15 +464,21 @@ static int write_default_config(const char *path) {
         "keyboard.down = down\n"
         "keyboard.left = left\n"
         "keyboard.l = Q\n"
-        "keyboard.r = W\n"
-        "keyboard.triangle = S\n"
-        "keyboard.circle = Z\n"
-        "keyboard.cross = X\n"
-        "keyboard.square = A\n"
-        "keyboard.analog_up = up\n"
-        "keyboard.analog_right = right\n"
-        "keyboard.analog_down = down\n"
-        "keyboard.analog_left = left\n"
+        "keyboard.r = E\n"
+        "keyboard.triangle = R\n"
+        "keyboard.circle = G\n"
+        "keyboard.cross = space\n"
+        "keyboard.square = F\n"
+        "keyboard.analog_up = W\n"
+        "keyboard.analog_right = D\n"
+        "keyboard.analog_down = S\n"
+        "keyboard.analog_left = A\n"
+        "mouse.l = x2\n"
+        "mouse.r = right\n"
+        "mouse.triangle = middle\n"
+        "mouse.circle = x1\n"
+        "mouse.cross = none\n"
+        "mouse.square = left\n"
         "gamepad.select = back\n"
         "gamepad.start = start\n"
         "gamepad.up = dpad_up\n"
@@ -481,7 +534,37 @@ static char *read_config(const char *path, char *error, size_t error_size) {
     return text;
 }
 
+static int binding_equal(
+    const SrInputBinding *left, const SrInputBinding *right) {
+    if (left->count != right->count) return 0;
+    for (int i = 0; i < left->count; i++)
+        if (left->values[i] != right->values[i]) return 0;
+    return 1;
+}
+
+static int is_legacy_default_config(const SrInputConfig *config) {
+    SrInputConfig legacy;
+    legacy_defaults(&legacy);
+    for (int i = 0; i < SR_INPUT_ACTIONS; i++) {
+        if (!binding_equal(&config->keyboard[i], &legacy.keyboard[i]) ||
+            !binding_equal(&config->gamepad[i], &legacy.gamepad[i])) {
+            return 0;
+        }
+    }
+    for (int i = 0; i < SR_INPUT_ANALOG_DIRECTIONS; i++) {
+        if (!binding_equal(
+                &config->analog_keyboard[i],
+                &legacy.analog_keyboard[i])) {
+            return 0;
+        }
+    }
+    return config->deadzone == legacy.deadzone &&
+           config->curve == legacy.curve &&
+           config->invert_y == legacy.invert_y;
+}
+
 int sr_input_init(void) {
+    char error[512];
     if (s_initialized) return 1;
     sr_input_config_defaults(&s_config);
     const char *override = getenv("SR_INPUT_CONFIG");
@@ -500,33 +583,12 @@ int sr_input_init(void) {
         }
         strcpy(s_config_path, override);
     } else {
-        const char *local = getenv("LOCALAPPDATA");
-        if (!local || !local[0]) {
-            s_config_path[0] = 0;
-            s_initialized = 1;
-            fprintf(stderr, "input: LOCALAPPDATA is unset; using defaults\n");
-            return 1;
-        }
-        int length = snprintf(
-            s_config_path, sizeof(s_config_path),
-            "%s\\KZLRecomp\\input.ini", local);
-        if (length < 0 || (size_t)length >= sizeof(s_config_path)) {
-            fprintf(stderr, "input: default config path is too long\n");
+        if (!sr_settings_path(
+                "input.ini", s_config_path, sizeof(s_config_path),
+                error, sizeof(error))) {
+            fprintf(stderr, "input: %s\n", error);
             return 0;
         }
-#ifdef _WIN32
-        char directory[1024];
-        snprintf(directory, sizeof(directory), "%s\\KZLRecomp", local);
-        if (!CreateDirectoryA(directory, NULL) &&
-            GetLastError() != ERROR_ALREADY_EXISTS) {
-            fprintf(
-                stderr, "input: cannot create %s (error %lu); using defaults\n",
-                directory, (unsigned long)GetLastError());
-            s_config_path[0] = 0;
-            s_initialized = 1;
-            return 1;
-        }
-#endif
         FILE *existing = fopen(s_config_path, "rb");
         if (!existing) {
             if (!write_default_config(s_config_path)) {
@@ -543,7 +605,6 @@ int sr_input_init(void) {
         fclose(existing);
     }
 
-    char error[512];
     char *text = read_config(s_config_path, error, sizeof(error));
     if (!text) {
         fprintf(stderr, "input: %s\n", error);
@@ -551,11 +612,26 @@ int sr_input_init(void) {
     }
     SrInputConfig parsed;
     sr_input_config_defaults(&parsed);
+    int legacy_version =
+        strstr(text, "# KZL input config v1") != NULL;
     int ok = sr_input_config_parse(&parsed, text, error, sizeof(error));
     free(text);
     if (!ok) {
         fprintf(stderr, "input: invalid %s: %s\n", s_config_path, error);
         return 0;
+    }
+    if (!required && legacy_version && is_legacy_default_config(&parsed)) {
+        sr_input_config_defaults(&parsed);
+        if (!write_default_config(s_config_path)) {
+            fprintf(
+                stderr,
+                "input: cannot write migrated %s; using migrated defaults\n",
+                s_config_path);
+        } else {
+            fprintf(
+                stderr, "input: migrated default config to v2 %s\n",
+                s_config_path);
+        }
     }
     s_config = parsed;
     s_initialized = 1;
@@ -567,9 +643,11 @@ int sr_input_init(void) {
 
 uint32_t sr_input_buttons(
     SrInputDownFn key_down, void *key_context,
+    SrInputDownFn mouse_down, void *mouse_context,
     SrInputDownFn pad_down, void *pad_context) {
     return sr_input_config_buttons(
-        &s_config, key_down, key_context, pad_down, pad_context);
+        &s_config, key_down, key_context,
+        mouse_down, mouse_context, pad_down, pad_context);
 }
 
 void sr_input_keyboard_axis(

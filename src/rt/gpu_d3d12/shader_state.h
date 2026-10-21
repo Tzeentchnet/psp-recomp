@@ -24,6 +24,8 @@ enum GeD3D12ShaderFlag : uint32_t {
     GE_D3D12_SHADER_DITHER = 1024u,
     GE_D3D12_SHADER_STENCIL = 2048u,
     GE_D3D12_SHADER_CULL_BACK = 4096u,
+    GE_D3D12_SHADER_DIRECT = 8192u,
+    GE_D3D12_SHADER_FRAMEBUFFER_CLUT = 16384u,
 };
 
 struct GeD3D12ShaderConstants {
@@ -49,6 +51,10 @@ void ged3d12_shader_constants_build(
     int triangle_semantics,
     const GeD3D12TextureBinding *texture,
     GeD3D12ShaderConstants *out);
+bool ged3d12_shader_direct_compatible(const GeState *state);
+D3D12_SHADING_RATE ged3d12_shader_shading_rate(
+    uint32_t scale, D3D12_VARIABLE_SHADING_RATE_TIER tier,
+    bool additional_rates);
 bool ged3d12_shader_constants_cache_update(
     GeD3D12ShaderConstantCache *cache,
     const GeD3D12ShaderConstants *constants);

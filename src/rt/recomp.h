@@ -239,6 +239,9 @@ int      gui_message(
              const char *text, int yes_no, int allow_cancel, int default_no);
 void     gui_present(uint32_t fbaddr, int fmt, uint32_t stride);
 int gui_capture_next(const char *path);
+uint32_t sr_present_count(void);
+uint32_t sr_atrac_remaining_frames(
+    uint32_t buffered, uint32_t block_align, int streamed);
 
 typedef uint32_t (*HleFn)(CpuState *s);
 void     sr_hle_register(uint32_t nid, const char *name, HleFn fn);
@@ -285,6 +288,8 @@ void     sched_delay_current(uint32_t usec);        /* block current thread for 
 void     sched_preempt(void);                       /* yield now if a higher-priority thread is ready */
 void     sched_block_on(uint32_t obj);              /* block current thread until sched_wake(obj) */
 void     sched_wait_vblank(void);                   /* block current thread until the next delivered vblank */
+int      sched_vbl_paced(void);
+int      sched_fast_forwarding(void);
 int      sched_block_on_timeout(uint32_t obj, uint32_t usec);  /* returns 1 if timed out */
 int      sched_wake(uint32_t obj);                  /* ready all threads blocked on obj; returns how many */
 void     sched_run_interrupt(CpuState *s, uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2);

@@ -1,5 +1,6 @@
 #include "framebuffer.h"
 
+#include <limits.h>
 #include <string.h>
 
 static uint32_t framebuffer_address(uint32_t raw) {
@@ -126,20 +127,16 @@ uint32_t ged3d12_framebuffer_encode_pixel(
     }
 }
 
-bool ged3d12_framebuffer_alias(
+static bool framebuffer_alias_layout(
     const GeD3D12FramebufferKey *target,
     uint32_t texture_address, uint32_t texture_stride,
     uint32_t texture_width, uint32_t texture_height,
-    uint32_t texture_format, bool swizzled,
+    uint32_t bytes_per_pixel,
     GeD3D12FramebufferAlias *out) {
-    if (!out) return false;
-    memset(out, 0, sizeof(*out));
-    out->handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
-    if (!target || swizzled || texture_format != target->format ||
-        texture_stride != target->stride || !texture_width || !texture_height) {
+    if (!target || texture_stride != target->stride ||
+        !texture_width || !texture_height) {
         return false;
     }
-    uint32_t bytes_per_pixel = framebuffer_bytes_per_pixel(target->format);
     uint32_t target_address = target->address & 0x1fffffffu;
     uint32_t source_address = texture_address & 0x1fffffffu;
     uint64_t target_size = ged3d12_framebuffer_key_bytes(target);
@@ -153,12 +150,46 @@ bool ged3d12_framebuffer_alias(
     uint32_t x = pixel_offset % target->stride;
     uint32_t y = pixel_offset / target->stride;
     if (x + texture_width > target->stride ||
-        y + texture_height > GE_D3D12_FRAMEBUFFER_HEIGHT) {
+        y + texture_height > GE_D3D12_FRAMEBUFFER_TEXTURE_HEIGHT) {
         return false;
     }
     out->x = (uint16_t)x;
     out->y = (uint16_t)y;
     return true;
+}
+
+bool ged3d12_framebuffer_alias(
+    const GeD3D12FramebufferKey *target,
+    uint32_t texture_address, uint32_t texture_stride,
+    uint32_t texture_width, uint32_t texture_height,
+    uint32_t texture_format, bool swizzled,
+    GeD3D12FramebufferAlias *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    out->handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
+    if (!target || swizzled || texture_format != target->format) return false;
+    return framebuffer_alias_layout(
+        target, texture_address, texture_stride,
+        texture_width, texture_height,
+        framebuffer_bytes_per_pixel(target->format), out);
+}
+
+bool ged3d12_framebuffer_feedback_alias(
+    const GeD3D12FramebufferKey *target,
+    uint32_t texture_address, uint32_t texture_stride,
+    uint32_t texture_width, uint32_t texture_height,
+    uint32_t texture_format, bool swizzled,
+    GeD3D12FramebufferAlias *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    out->handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
+    if (!target || swizzled || target->format != 3u ||
+        texture_format != 7u) {
+        return false;
+    }
+    return framebuffer_alias_layout(
+        target, texture_address, texture_stride,
+        texture_width, texture_height, 4u, out);
 }
 
 bool ged3d12_transfer_build(
@@ -247,5 +278,27 @@ bool ged3d12_transfer_coordinates(
     source_box->back = 1;
     *destination_x = dest_x;
     *destination_y = dest_y;
+    return true;
+}
+
+bool ged3d12_transfer_scale_coordinates(
+    uint32_t scale, D3D12_BOX *source_box,
+    UINT *destination_x, UINT *destination_y) {
+    if (!scale || scale > 8u || !source_box ||
+        !destination_x || !destination_y ||
+        source_box->left > UINT_MAX / scale ||
+        source_box->top > UINT_MAX / scale ||
+        source_box->right > UINT_MAX / scale ||
+        source_box->bottom > UINT_MAX / scale ||
+        *destination_x > UINT_MAX / scale ||
+        *destination_y > UINT_MAX / scale) {
+        return false;
+    }
+    source_box->left *= scale;
+    source_box->top *= scale;
+    source_box->right *= scale;
+    source_box->bottom *= scale;
+    *destination_x *= scale;
+    *destination_y *= scale;
     return true;
 }

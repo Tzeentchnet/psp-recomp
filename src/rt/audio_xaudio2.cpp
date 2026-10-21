@@ -12,9 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern "C" int sched_fast_forwarding(void);
+
 #define SAMPLE_RATE 44100
 #define BLOCK_FRAMES 256
-#define BUFFER_COUNT 4
+#define BUFFER_COUNT 8
 
 static SrAudioMixer s_mixer;
 static CRITICAL_SECTION s_lock;
@@ -36,6 +38,7 @@ static UINT32 s_max_device_buffers;
 static uint64_t s_last_log_frames;
 static LARGE_INTEGER s_start_qpc;
 static LARGE_INTEGER s_qpc_frequency;
+static int s_playback_started;
 
 class VoiceCallback final : public IXAudio2VoiceCallback {
 public:
@@ -86,12 +89,19 @@ static int submit_block(void) {
 static void fill_device_queue(void) {
     XAUDIO2_VOICE_STATE state = {};
     s_source->GetState(&state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if (state.BuffersQueued < s_min_device_buffers)
+    if (s_playback_started &&
+        state.BuffersQueued < s_min_device_buffers) {
         s_min_device_buffers = state.BuffersQueued;
+    }
     if (state.BuffersQueued > s_max_device_buffers)
         s_max_device_buffers = state.BuffersQueued;
     while (state.BuffersQueued < BUFFER_COUNT && !s_voice_error) {
+        EnterCriticalSection(&s_lock);
+        int available = sr_audio_mixer_available(&s_mixer);
+        LeaveCriticalSection(&s_lock);
+        if (available < BLOCK_FRAMES) break;
         if (!submit_block()) break;
+        s_playback_started = 1;
         state.BuffersQueued++;
         if (state.BuffersQueued > s_max_device_buffers)
             s_max_device_buffers = state.BuffersQueued;
@@ -110,17 +120,26 @@ static void log_progress(void) {
 
     XAUDIO2_VOICE_STATE state = {};
     s_source->GetState(&state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    double elapsed_ms =
+        (now.QuadPart - s_start_qpc.QuadPart) * 1000.0 /
+        s_qpc_frequency.QuadPart;
+    double played_ms = stats.completed_frames * 1000.0 / SAMPLE_RATE;
     fprintf(
         stderr,
         "audio: XAudio2 played=%llu device=%u blocks/%u frames (%.2f ms) "
-        "max_guest_queue=%llu dropped=%llu resynced=%llu\n",
+        "clock_drift=%.2f ms max_guest_queue=%llu dropped=%llu "
+        "resynced=%llu silent_blocks=%llu\n",
         (unsigned long long)stats.completed_frames,
         state.BuffersQueued,
         state.BuffersQueued * BLOCK_FRAMES,
         state.BuffersQueued * BLOCK_FRAMES * 1000.0 / SAMPLE_RATE,
+        played_ms - elapsed_ms,
         (unsigned long long)stats.max_queued_frames,
         (unsigned long long)stats.dropped_frames,
-        (unsigned long long)stats.resynced_frames);
+        (unsigned long long)stats.resynced_frames,
+        (unsigned long long)stats.silent_blocks);
 }
 
 static DWORD WINAPI feeder(void *) {
@@ -170,6 +189,7 @@ extern "C" int sr_audio_init(void) {
     s_min_device_buffers = BUFFER_COUNT;
     s_max_device_buffers = 0;
     s_last_log_frames = 0;
+    s_playback_started = 0;
     sr_audio_mixer_init(&s_mixer);
     InitializeCriticalSection(&s_lock);
     s_lock_initialized = 1;
@@ -195,9 +215,6 @@ extern "C" int sr_audio_init(void) {
     s_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     if (SUCCEEDED(result) && !s_event) result = HRESULT_FROM_WIN32(GetLastError());
     if (SUCCEEDED(result)) {
-        fill_device_queue();
-        s_min_device_buffers = BUFFER_COUNT;
-        s_max_device_buffers = BUFFER_COUNT;
         result = s_source->Start(0);
         QueryPerformanceCounter(&s_start_qpc);
     }
@@ -229,14 +246,17 @@ extern "C" int sr_audio_init(void) {
 extern "C" void sr_audio_push(
     int channel, const int16_t *stereo, int frames,
     int volume_left, int volume_right) {
+    if (sched_fast_forwarding()) return;
     if (!sr_audio_init() || frames <= 0) return;
     EnterCriticalSection(&s_lock);
     sr_audio_mixer_push(
         &s_mixer, channel, stereo, frames, volume_left, volume_right);
     LeaveCriticalSection(&s_lock);
+    if (s_event) SetEvent(s_event);
 }
 
 extern "C" int sr_audio_queued(int channel) {
+    if (sched_fast_forwarding()) return -1;
     if (!s_ok || s_voice_error) return -1;
     EnterCriticalSection(&s_lock);
     int queued = sr_audio_mixer_queued(&s_mixer, channel);
@@ -245,6 +265,7 @@ extern "C" int sr_audio_queued(int channel) {
 }
 
 extern "C" int sr_audio_device_latency_frames(void) {
+    if (sched_fast_forwarding()) return -1;
     if (!s_ok || !s_source) return -1;
     XAUDIO2_VOICE_STATE state = {};
     s_source->GetState(&state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
@@ -282,7 +303,8 @@ extern "C" void sr_audio_shutdown(void) {
             "max_guest_queue=%llu, dropped=%llu, resynced=%llu, silent_blocks=%llu%s\n",
             (unsigned long long)stats.completed_frames,
             played_ms, played_ms - elapsed_ms,
-            s_min_device_buffers, s_max_device_buffers,
+            s_playback_started ? s_min_device_buffers : 0u,
+            s_max_device_buffers,
             (unsigned long long)stats.max_queued_frames,
             (unsigned long long)stats.dropped_frames,
             (unsigned long long)stats.resynced_frames,

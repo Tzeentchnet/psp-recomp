@@ -87,6 +87,18 @@ int sr_audio_mixer_queued(const SrAudioMixer *mixer, int channel) {
     return queued > INT_MAX ? INT_MAX : (int)queued;
 }
 
+int sr_audio_mixer_available(const SrAudioMixer *mixer) {
+    uint64_t end = mixer->submit;
+    for (int channel = 0; channel < SR_AUDIO_CHANNELS; channel++) {
+        if (mixer->channel_started[channel] &&
+            mixer->channel_write[channel] > end) {
+            end = mixer->channel_write[channel];
+        }
+    }
+    uint64_t available = end - mixer->submit;
+    return available > INT_MAX ? INT_MAX : (int)available;
+}
+
 const SrAudioMixerStats *sr_audio_mixer_stats(const SrAudioMixer *mixer) {
     return &mixer->stats;
 }

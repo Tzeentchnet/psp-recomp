@@ -2,9 +2,8 @@
  *
  * The game feeds 2048-byte MPEG-PS packets into the mpeg ring buffer; mpeg.c hands those
  * bytes here. We demux the program stream into H.264 and ATRAC3+ elementary streams, then run
- * video through the OS H.264 decoder MFT
- * (msmpeg2vdec.dll) in low-latency mode, converting each NV12 frame into the guest video
- * buffer in the PSP pixel format the game asked for.
+ * video through the OS H.264 decoder MFT (msmpeg2vdec.dll), converting each NV12 frame
+ * into the guest video buffer in the PSP pixel format the game asked for.
  *
  * Pull model: sr_h264_feed() only demuxes (cheap); sr_h264_frame() pushes video ES chunks into
  * the MFT until it yields one frame, while sr_h264_audio_frame() returns complete ATRAC3+
@@ -34,8 +33,8 @@ static const GUID L_MFVideoFormat_NV12  = {0x3231564E,0x0000,0x0010,{0x80,0x00,0
 static const GUID L_MF_MT_MAJOR_TYPE    = {0x48eba18e,0xf8c9,0x4687,{0xbf,0x11,0x0a,0x74,0xc9,0xf9,0x6a,0x8f}};
 static const GUID L_MF_MT_SUBTYPE       = {0xf7e34c9a,0x42e8,0x4714,{0xb7,0x4b,0xcb,0x29,0xd7,0x2c,0x35,0xe5}};
 static const GUID L_MF_MT_FRAME_SIZE    = {0x1652c33d,0xd6b2,0x4012,{0xb8,0x34,0x72,0x03,0x08,0x49,0xa3,0x7d}};
+static const GUID L_MF_MT_FRAME_RATE    = {0xc459a2e8,0x3d2c,0x4e44,{0xb1,0x32,0xfe,0xe5,0x15,0x6c,0x7b,0xb0}};
 static const GUID L_MF_MT_DEFAULT_STRIDE= {0x644b4e48,0x1e02,0x4516,{0xb0,0xeb,0xc0,0x1c,0xa9,0xd4,0x9a,0xc6}};
-static const GUID L_MF_LOW_LATENCY      = {0x9c27891a,0xed7a,0x40e1,{0x88,0xe8,0xb2,0x27,0x27,0xa0,0x24,0xee}};
 
 #ifndef MF_E_TRANSFORM_NEED_MORE_INPUT
 #define MF_E_TRANSFORM_NEED_MORE_INPUT ((HRESULT)0xC00D6D72L)
@@ -53,16 +52,18 @@ typedef struct {
     int used;
     IMFTransform *xf;
     int outW, outH, outStride;
+    int spsSet, ppsSet;
+    uint64_t submittedFrames, returnedFrames;
     int failed;
     int drained;
     /* MPEG-PS input accumulation (unparsed tail) */
     uint8_t *ps; uint32_t psLen, psCap, psPos;
     /* demuxed H.264 ES byte fifo + chunk table (one chunk per video PES payload) */
     uint8_t *es; uint32_t esLen, esCap;
-    EsChunk *ck; uint32_t nCk, capCk, curCk;
+    EsChunk *ck; uint32_t nCk, capCk, esPos;
     uint8_t *audio; uint32_t audioLen, audioCap, audioPos;
     EsChunk *audioCk; uint32_t nAudioCk, capAudioCk;
-    LONGLONG fakeTime;             /* synthetic input timestamp when the PES had no PTS */
+    LONGLONG fakeTime;             /* monotonic 100 ns timestamp for frame-aligned NAL samples */
 } Dec;
 
 #define MAX_DEC 4
@@ -118,16 +119,22 @@ static void audio_append(Dec *d, const uint8_t *p, uint32_t n, int64_t pts) {
 
 /* Drop consumed bytes so the fifos stay small (the ring is ~1.2MB; the game feeds as we drain). */
 static void es_compact(Dec *d) {
-    if (d->curCk == 0 || d->curCk < d->nCk / 2 || d->esLen < (1u << 20)) return;
-    uint32_t base = d->ck[d->curCk].off;
+    if (!d->esPos || d->esPos < (1u << 20)) return;
+    uint32_t base = d->esPos;
     memmove(d->es, d->es + base, d->esLen - base);
     d->esLen -= base;
-    uint32_t live = d->nCk - d->curCk;
-    for (uint32_t i = 0; i < live; i++) {
-        d->ck[i] = d->ck[d->curCk + i];
-        d->ck[i].off -= base;
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < d->nCk; i++) {
+        uint32_t end = d->ck[i].off + d->ck[i].len;
+        if (end <= base) continue;
+        uint32_t start = d->ck[i].off > base ? d->ck[i].off : base;
+        d->ck[live] = d->ck[i];
+        d->ck[live].off = start - base;
+        d->ck[live].len = end - start;
+        live++;
     }
-    d->nCk = live; d->curCk = 0;
+    d->nCk = live;
+    d->esPos = 0;
 }
 
 /* ---- MPEG program-stream demux --------------------------------------------------------- */
@@ -230,15 +237,16 @@ static int dec_open(Dec *d) {
         fprintf(stderr, "h264: H.264 decoder MFT unavailable (hr=0x%08lx)\n", (unsigned long)hr);
         return 0;
     }
-    IMFAttributes *at = NULL;
-    if (SUCCEEDED(IMFTransform_GetAttributes(d->xf, &at)) && at) {
-        IMFAttributes_SetUINT32(at, &L_MF_LOW_LATENCY, 1);
-        IMFAttributes_Release(at);
-    }
     IMFMediaType *mt = NULL;
     if (FAILED(MFCreateMediaType(&mt))) return 0;
     IMFMediaType_SetGUID(mt, &L_MF_MT_MAJOR_TYPE, &L_MFMediaType_Video);
     IMFMediaType_SetGUID(mt, &L_MF_MT_SUBTYPE, &L_MFVideoFormat_H264);
+    IMFMediaType_SetUINT64(
+        mt, &L_MF_MT_FRAME_SIZE,
+        ((UINT64)480u << 32) | (UINT64)272u);
+    IMFMediaType_SetUINT64(
+        mt, &L_MF_MT_FRAME_RATE,
+        ((UINT64)30000u << 32) | (UINT64)1001u);
     hr = IMFTransform_SetInputType(d->xf, 0, mt, 0);
     IMFMediaType_Release(mt);
     if (FAILED(hr)) {
@@ -251,27 +259,80 @@ static int dec_open(Dec *d) {
     return 1;
 }
 
-/* Push the next demuxed ES chunk into the MFT. Returns 1 on progress, 0 when the MFT is not
- * accepting (caller should drain output first), -1 on hard failure. */
-static int feed_one(Dec *d) {
-    EsChunk *c = &d->ck[d->curCk];
+static int find_nal_start(
+    const uint8_t *data, uint32_t length, uint32_t from,
+    uint32_t *offset, uint32_t *header) {
+    for (uint32_t i = from; i + 3u < length; i++) {
+        if (data[i] != 0 || data[i + 1] != 0) continue;
+        if (data[i + 2] == 1) {
+            *offset = i;
+            *header = i + 3u;
+            return 1;
+        }
+        if (i + 4u < length && data[i + 2] == 0 && data[i + 3] == 1) {
+            *offset = i;
+            *header = i + 4u;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Feed one Annex-B NAL per sample. The Microsoft decoder establishes SPS/PPS state from
+ * parameter-set samples before accepting IDR/P slices; combining all of them behind one
+ * AUD made it negotiate dimensions but conceal the pictures. */
+static int feed_one(Dec *d, int eos) {
+    uint32_t begin = 0, header = 0;
+    if (!find_nal_start(
+            d->es, d->esLen, d->esPos, &begin, &header)) {
+        return 0;
+    }
+    uint32_t end = 0, next_header = 0;
+    if (!find_nal_start(
+            d->es, d->esLen, header + 1u, &end, &next_header)) {
+        if (!eos) return 0;
+        end = d->esLen;
+    }
+    if (end <= begin) return -1;
+    uint32_t length = end - begin;
+    uint8_t nal_type = d->es[header] & 31u;
+    int vcl = nal_type == 1u || nal_type == 5u;
+    if (nal_type == 9u ||
+        (nal_type == 8u && !d->spsSet) ||
+        ((nal_type != 7u && nal_type != 8u) &&
+         (!d->spsSet || !d->ppsSet))) {
+        d->esPos = end;
+        es_compact(d);
+        return 1;
+    }
     IMFSample *smp = NULL; IMFMediaBuffer *mb = NULL;
     BYTE *base = NULL;
     int ret = -1;
-    if (FAILED(MFCreateMemoryBuffer(c->len, &mb))) return -1;
+    if (FAILED(MFCreateMemoryBuffer(length, &mb))) return -1;
     if (SUCCEEDED(IMFMediaBuffer_Lock(mb, &base, NULL, NULL))) {
-        memcpy(base, d->es + c->off, c->len);
+        memcpy(base, d->es + begin, length);
         IMFMediaBuffer_Unlock(mb);
-        IMFMediaBuffer_SetCurrentLength(mb, c->len);
+        IMFMediaBuffer_SetCurrentLength(mb, length);
         if (SUCCEEDED(MFCreateSample(&smp))) {
             IMFSample_AddBuffer(smp, mb);
-            /* 90 kHz -> 100 ns; synthesize a monotonic time when the PES had no PTS (the MFT
-             * wants timestamps but we never read them back -- frame pacing is the game's). */
-            LONGLONG t = c->pts >= 0 ? (LONGLONG)c->pts * 1000 / 9 : d->fakeTime;
-            d->fakeTime = t + 1;
+            LONGLONG t = d->fakeTime;
             IMFSample_SetSampleTime(smp, t);
+            IMFSample_SetSampleDuration(smp, 333667);
+            if (nal_type == 5u)
+                IMFSample_SetUINT32(
+                    smp, &MFSampleExtension_CleanPoint, TRUE);
             HRESULT hr = IMFTransform_ProcessInput(d->xf, 0, smp, 0);
-            if (SUCCEEDED(hr)) { d->curCk++; es_compact(d); ret = 1; }
+            if (SUCCEEDED(hr)) {
+                d->esPos = end;
+                if (nal_type == 7u) d->spsSet = 1;
+                if (nal_type == 8u) d->ppsSet = 1;
+                if (vcl) {
+                    d->fakeTime += 333667;
+                    d->submittedFrames++;
+                }
+                es_compact(d);
+                ret = 1;
+            }
             else ret = (hr == MF_E_NOTACCEPTING) ? 0 : -1;
             IMFSample_Release(smp);
         }
@@ -284,11 +345,14 @@ static uint8_t clamp8(int v) { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; }
 
 /* NV12 -> PSP pixel format (BT.601 limited range). dst is the guest video buffer (host ptr),
  * frameWidth its stride in pixels; PSP movie buffers are 272 rows tall. */
-static void convert_frame(Dec *d, const uint8_t *src, uint32_t srcLen,
-                          uint8_t *dst, int frameWidth, int pixelMode) {
+static int convert_frame(Dec *d, const uint8_t *src, uint32_t srcLen,
+                         uint8_t *dst, int frameWidth, int pixelMode) {
     int stride = d->outStride > 0 ? d->outStride : d->outW;
     int w = d->outW, h = d->outH;
-    if ((uint32_t)(stride * h + stride * h / 2) > srcLen) return;   /* malformed */
+    if (stride <= 0 || w <= 0 || h <= 0 ||
+        (uint64_t)(uint32_t)stride * (uint32_t)h * 3u / 2u > srcLen) {
+        return 0;
+    }
     if (w > frameWidth) w = frameWidth;
     if (h > 272) h = 272;
     const uint8_t *yp = src, *uvp = src + (size_t)stride * d->outH;
@@ -321,52 +385,124 @@ static void convert_frame(Dec *d, const uint8_t *src, uint32_t srcLen,
             }
         }
     }
+    return 1;
+}
+
+static void release_output_objects(
+    IMFSample *provided_sample, IMFMediaBuffer *provided_buffer,
+    IMFSample *output_sample) {
+    if (output_sample && output_sample != provided_sample)
+        IMFSample_Release(output_sample);
+    if (provided_sample) IMFSample_Release(provided_sample);
+    if (provided_buffer) IMFMediaBuffer_Release(provided_buffer);
 }
 
 /* Try to pull one decoded frame. 1 = frame written to dst, 0 = need more input, -1 = failure. */
 static int pump_out(Dec *d, uint8_t *dst, int frameWidth, int pixelMode) {
+    int discarded = 0;
     for (;;) {
         MFT_OUTPUT_STREAM_INFO si;
         memset(&si, 0, sizeof(si));
         if (FAILED(IMFTransform_GetOutputStreamInfo(d->xf, 0, &si))) return -1;
-        DWORD cb = si.cbSize ? si.cbSize
-                             : (DWORD)((d->outW > 0 ? d->outW : 512) * (d->outH > 0 ? d->outH : 288) * 3 / 2 + 4096);
-        IMFSample *smp = NULL; IMFMediaBuffer *mb = NULL;
-        if (FAILED(MFCreateSample(&smp))) return -1;
-        if (FAILED(MFCreateMemoryBuffer(cb, &mb))) { IMFSample_Release(smp); return -1; }
-        IMFSample_AddBuffer(smp, mb);
+        DWORD cb =
+            si.cbSize ? si.cbSize :
+            (DWORD)((d->outW > 0 ? d->outW : 512) *
+                    (d->outH > 0 ? d->outH : 288) * 3 / 2 + 4096);
+        int provides_samples =
+            (si.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
+        IMFSample *provided_sample = NULL;
+        IMFMediaBuffer *provided_buffer = NULL;
+        if (!provides_samples) {
+            if (FAILED(MFCreateSample(&provided_sample))) return -1;
+            if (FAILED(MFCreateMemoryBuffer(cb, &provided_buffer))) {
+                IMFSample_Release(provided_sample);
+                return -1;
+            }
+            if (FAILED(IMFSample_AddBuffer(
+                    provided_sample, provided_buffer))) {
+                release_output_objects(
+                    provided_sample, provided_buffer, NULL);
+                return -1;
+            }
+        }
         MFT_OUTPUT_DATA_BUFFER ob;
         memset(&ob, 0, sizeof(ob));
-        ob.pSample = smp;
+        ob.pSample = provided_sample;
         DWORD status = 0;
         HRESULT hr = IMFTransform_ProcessOutput(d->xf, 0, 1, &ob, &status);
         if (ob.pEvents) IUnknown_Release((IUnknown *)ob.pEvents);
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-            IMFMediaBuffer_Release(mb); IMFSample_Release(smp);
+            release_output_objects(
+                provided_sample, provided_buffer, ob.pSample);
             if (!negotiate_output(d)) return -1;
             continue;                       /* output size may have changed: retry */
         }
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            IMFMediaBuffer_Release(mb); IMFSample_Release(smp);
+            release_output_objects(
+                provided_sample, provided_buffer, ob.pSample);
             return 0;
         }
         if (FAILED(hr)) {
-            IMFMediaBuffer_Release(mb); IMFSample_Release(smp);
+            release_output_objects(
+                provided_sample, provided_buffer, ob.pSample);
             if (mflog()) fprintf(stderr, "h264: ProcessOutput hr=0x%08lx\n", (unsigned long)hr);
             return -1;
         }
+        IMFSample *output_sample = ob.pSample;
+        if (!output_sample) {
+            release_output_objects(
+                provided_sample, provided_buffer, output_sample);
+            if (mflog()) fprintf(stderr, "h264: ProcessOutput returned no sample\n");
+            return -1;
+        }
+        if (d->returnedFrames >= d->submittedFrames) {
+            if (mflog() && d->returnedFrames < 4u) {
+                fprintf(
+                    stderr,
+                    "h264: discarded pre-VCL output #%llu\n",
+                    (unsigned long long)(d->returnedFrames + 1u));
+            }
+            release_output_objects(
+                provided_sample, provided_buffer, output_sample);
+            if (++discarded >= 8) return 0;
+            continue;
+        }
+        if (mflog()) {
+            static int logged;
+            if (!logged) {
+                fprintf(
+                    stderr,
+                    "h264: output flags=0x%lx cb=%lu sample=%s\n",
+                    (unsigned long)si.dwFlags, (unsigned long)si.cbSize,
+                    output_sample == provided_sample ? "caller" : "decoder");
+                logged = 1;
+            }
+        }
+        int converted = dst == NULL;
         if (dst) {
             IMFMediaBuffer *cbuf = NULL;
-            if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(smp, &cbuf)) && cbuf) {
+            if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(
+                    output_sample, &cbuf)) && cbuf) {
                 BYTE *base = NULL; DWORD cur = 0;
                 if (SUCCEEDED(IMFMediaBuffer_Lock(cbuf, &base, NULL, &cur))) {
-                    convert_frame(d, base, cur, dst, frameWidth, pixelMode);
+                    converted =
+                        convert_frame(
+                            d, base, cur, dst, frameWidth, pixelMode);
                     IMFMediaBuffer_Unlock(cbuf);
                 }
                 IMFMediaBuffer_Release(cbuf);
             }
         }
-        IMFMediaBuffer_Release(mb); IMFSample_Release(smp);
+        if (!converted) {
+            release_output_objects(
+                provided_sample, provided_buffer, output_sample);
+            if (mflog())
+                fprintf(stderr, "h264: could not convert decoded output frame\n");
+            return -1;
+        }
+        d->returnedFrames++;
+        release_output_objects(
+            provided_sample, provided_buffer, output_sample);
         return 1;
     }
 }
@@ -473,8 +609,8 @@ int sr_h264_frame(int id, int eos, uint8_t *dst, int frameWidth, int pixelMode) 
         int r = pump_out(d, dst, frameWidth, pixelMode);
         if (r > 0) return 1;
         if (r < 0) { d->failed = 1; return -1; }
-        if (d->curCk < d->nCk) {
-            int f = feed_one(d);
+        if (d->esPos < d->esLen) {
+            int f = feed_one(d, eos);
             if (f < 0) { d->failed = 1; return -1; }
             if (f == 0) return 0;           /* MFT full but no output: shouldn't happen */
         } else if (eos && !d->drained) {

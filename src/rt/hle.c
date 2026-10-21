@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>
 #include <wchar.h>
 #include <setjmp.h>
 #include <direct.h>
@@ -801,6 +802,17 @@ static void atrac_consume_frame(Atrac *a) {
     a->frameOffset = a->ringRead;
 }
 
+uint32_t sr_atrac_remaining_frames(
+    uint32_t buffered, uint32_t block_align, int streamed) {
+    return streamed && block_align
+        ? buffered / block_align : UINT32_MAX;
+}
+
+static uint32_t atrac_remaining_frames(const Atrac *a) {
+    return sr_atrac_remaining_frames(
+        a->buffered, (uint32_t)a->blockAlign, a->streamed);
+}
+
 static uint32_t atrac_prepare_decoder(Atrac *a, int sample) {
     atrac_destroy_decoder(a);
     a->decoder = sr_atrac_decoder_create(a->codec, a->channels, a->blockAlign);
@@ -883,6 +895,12 @@ static uint32_t h_AtracDecodeData(CpuState *s) {
         const uint8_t *frame = atrac_frame_data(a);
         if (!frame) {
             a->internalError = 0x80630023u;
+            if (atrac_log()) {
+                fprintf(
+                    stderr,
+                    "ATRAC: starved id=%u buffered=%u file=%u/%u\n",
+                    A0, a->buffered, a->fileReadOffset, a->fileSize);
+            }
             return 0x80630023u;
         }
         int primed_samples = 0;
@@ -964,15 +982,13 @@ static uint32_t h_AtracDecodeData(CpuState *s) {
     }
     if (decAddr) MEM_W32(decAddr, (uint32_t)n);
     if (finAddr) MEM_W32(finAddr, (uint32_t)finished);
-    if (remAddr) MEM_W32(remAddr, 0xFFFFFFFFu);            /* ALLDATA_IS_ON_MEMORY */
+    if (remAddr) MEM_W32(remAddr, atrac_remaining_frames(a));
     return 0;
 }
 static uint32_t h_AtracGetRemainFrame(CpuState *s) {
     Atrac *a = atrac_of(A0);
     if (!a) return 0x80630002u;
-    uint32_t frames = a->streamed
-        ? a->buffered / (uint32_t)a->blockAlign : 0xFFFFFFFFu;
-    if (A1) MEM_W32(A1, frames);
+    if (A1) MEM_W32(A1, atrac_remaining_frames(a));
     return 0;
 }
 static uint32_t h_AtracGetStreamDataInfo(CpuState *s) {
@@ -2349,6 +2365,7 @@ static uint32_t h_IoChangeAsyncPriority(CpuState *s) {
  * the buffer's duration and forwards samples to the shared XAudio2 mixer. */
 static int s_audio_ch[9], s_audio_fmt[9];   /* fmt: 0=stereo, 1=mono; [8] = Output2 SRC channel */
 static uint32_t s_audio_len[9];
+#define AUDIO_SRC_CH 8
 static uint32_t h_AudioChReserve(CpuState *s) {
     int ch = (int)A0;
     if (ch < 0) { for (int i = 0; i < 8; i++) if (!s_audio_ch[i]) { ch = i; break; } }
@@ -2384,8 +2401,10 @@ static uint32_t audio_output(CpuState *s, uint32_t ch, uint32_t buf, int voll, i
         sched_delay_current(n ? (n * 1000000u / 44100u) : 1000u);
         return n;
     }
-    while ((q = sr_audio_queued((int)ch)) > (int)n)
-        sched_delay_current((uint32_t)(q - (int)n) * 1000000u / 44100u);
+    int queue_target = ch == AUDIO_SRC_CH ? (int)n : 0;
+    while ((q = sr_audio_queued((int)ch)) > queue_target)
+        sched_delay_current(
+            (uint32_t)(q - queue_target) * 1000000u / 44100u);
     return n;
 }
 static uint32_t h_AudioOutputBlocking(CpuState *s) {
@@ -2399,7 +2418,6 @@ static uint32_t h_AudioOutputPannedBlocking(CpuState *s) {
 static uint32_t h_AudioRestLen(CpuState *s) { (void)s; return 0; }         /* never backed up */
 
 /* sceAudioOutput2*: the SRC channel (PPSSPP sceAudio.cpp), stereo at 44.1 kHz here. */
-#define AUDIO_SRC_CH 8
 #define ERR_AUDIO_CHANNEL_NOT_RESERVED     0x80260008u
 #define ERR_AUDIO_CHANNEL_ALREADY_RESERVED 0x80268002u
 #define ERR_AUDIO_INVALID_VOLUME           0x8026000Bu
@@ -2543,6 +2561,10 @@ static int s_ctrl_w = 1, s_ctrl_r = 0;   /* start with one sample available */
 static uint32_t s_present_count = 0;
 #define CTRL_WAIT_OBJ 0xC471D000u
 
+uint32_t sr_present_count(void) {
+    return s_present_count;
+}
+
 /* sceCtrl: sticks centred. To drive past the skippable intro movie and confirmation prompts
  * without a human, pulse START/CROSS/CIRCLE for a few frames on a periodic cadence (edge presses,
  * so the game sees press+release). Disable with SR_NOINPUT for a truly neutral pad. */
@@ -2637,6 +2659,39 @@ static uint32_t h_CtrlButtons(void) {
 void sr_ctrl_sample(void) {
     uint8_t lx = 128, ly = 128;
     if (gui_on()) gui_analog(&lx, &ly);
+    {
+        static int initialized;
+        static int enabled;
+        static uint8_t scripted_lx, scripted_ly;
+        static uint32_t start, end = UINT32_MAX;
+        if (!initialized) {
+            initialized = 1;
+            const char *value = getenv("SR_ANALOG");
+            if (value && value[0]) {
+                unsigned x, y;
+                char extra;
+                if (sscanf(value, "%u,%u%c", &x, &y, &extra) != 2 ||
+                    x > 255u || y > 255u) {
+                    fprintf(
+                        stderr,
+                        "SR_ANALOG: expected <0..255>,<0..255>, got %s\n",
+                        value);
+                    _Exit(2);
+                }
+                scripted_lx = (uint8_t)x;
+                scripted_ly = (uint8_t)y;
+                const char *start_text = getenv("SR_ANALOG_START");
+                const char *end_text = getenv("SR_ANALOG_END");
+                if (start_text) start = (uint32_t)strtoul(start_text, NULL, 10);
+                if (end_text) end = (uint32_t)strtoul(end_text, NULL, 10);
+                enabled = 1;
+            }
+        }
+        if (enabled && s_present_count >= start && s_present_count <= end) {
+            lx = scripted_lx;
+            ly = scripted_ly;
+        }
+    }
     s_ctrl_ring[s_ctrl_w].btn = h_CtrlButtons();
     s_ctrl_ring[s_ctrl_w].lx = lx;
     s_ctrl_ring[s_ctrl_w].ly = ly;
@@ -2831,6 +2886,156 @@ static void frame_capture_complete(
     _Exit(0);
 }
 
+#define PRESENT_PERF_MAX_SAMPLES 600
+
+typedef struct PresentPerf {
+    LARGE_INTEGER frequency;
+    LONGLONG previous_entry;
+    double previous_backend_ms;
+    double frame_ms[PRESENT_PERF_MAX_SAMPLES];
+    double frontend_ms[PRESENT_PERF_MAX_SAMPLES];
+    double backend_ms[PRESENT_PERF_MAX_SAMPLES];
+    uint32_t start;
+    uint32_t window;
+    uint32_t samples;
+    uint32_t exit_after;
+    double minimum_fps;
+    int initialized;
+    int enabled;
+} PresentPerf;
+
+static PresentPerf s_present_perf;
+
+static int compare_double(const void *left, const void *right) {
+    double a = *(const double *)left;
+    double b = *(const double *)right;
+    return (a > b) - (a < b);
+}
+
+static uint32_t env_present_value(
+    const char *name, uint32_t fallback) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (!end || *end || parsed > UINT32_MAX) {
+        fprintf(stderr, "%s: expected an unsigned integer, got %s\n", name, value);
+        _Exit(2);
+    }
+    return (uint32_t)parsed;
+}
+
+static void present_perf_init(void) {
+    if (s_present_perf.initialized) return;
+    s_present_perf.initialized = 1;
+    s_present_perf.enabled = getenv("SR_PERF_LOG") ? 1 : 0;
+    s_present_perf.start = env_present_value("SR_PERF_START", 1);
+    s_present_perf.window = env_present_value("SR_PERF_WINDOW", 120);
+    s_present_perf.exit_after =
+        env_present_value("SR_EXIT_AFTER_PRESENT", 0);
+    const char *minimum_fps = getenv("SR_PERF_MIN_FPS");
+    if (minimum_fps && minimum_fps[0]) {
+        char *end = NULL;
+        s_present_perf.minimum_fps = strtod(minimum_fps, &end);
+        if (!end || *end || s_present_perf.minimum_fps <= 0.0) {
+            fprintf(
+                stderr, "SR_PERF_MIN_FPS: expected a positive number, got %s\n",
+                minimum_fps);
+            _Exit(2);
+        }
+    }
+    if (!s_present_perf.window ||
+        s_present_perf.window > PRESENT_PERF_MAX_SAMPLES) {
+        fprintf(
+            stderr, "SR_PERF_WINDOW: expected 1..%u, got %u\n",
+            PRESENT_PERF_MAX_SAMPLES, s_present_perf.window);
+        _Exit(2);
+    }
+    QueryPerformanceFrequency(&s_present_perf.frequency);
+}
+
+static LONGLONG present_perf_entry(void) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
+static void present_perf_finish(
+    uint32_t present, LONGLONG entry, LONGLONG exit) {
+    present_perf_init();
+    double ticks_per_ms =
+        (double)s_present_perf.frequency.QuadPart / 1000.0;
+    double backend_ms = (double)(exit - entry) / ticks_per_ms;
+    if (s_present_perf.enabled &&
+        present > s_present_perf.start &&
+        s_present_perf.previous_entry) {
+        double frame_ms =
+            (double)(entry - s_present_perf.previous_entry) / ticks_per_ms;
+        uint32_t index = s_present_perf.samples++;
+        s_present_perf.frame_ms[index] = frame_ms;
+        s_present_perf.frontend_ms[index] =
+            frame_ms > s_present_perf.previous_backend_ms
+                ? frame_ms - s_present_perf.previous_backend_ms : 0.0;
+        s_present_perf.backend_ms[index] = backend_ms;
+        if (s_present_perf.samples == s_present_perf.window) {
+            double sorted[PRESENT_PERF_MAX_SAMPLES];
+            double frame_sum = 0.0;
+            double frontend_sum = 0.0;
+            double backend_sum = 0.0;
+            double frame_max = 0.0;
+            double backend_max = 0.0;
+            for (uint32_t i = 0; i < s_present_perf.samples; i++) {
+                sorted[i] = s_present_perf.frame_ms[i];
+                frame_sum += s_present_perf.frame_ms[i];
+                frontend_sum += s_present_perf.frontend_ms[i];
+                backend_sum += s_present_perf.backend_ms[i];
+                if (s_present_perf.frame_ms[i] > frame_max)
+                    frame_max = s_present_perf.frame_ms[i];
+                if (s_present_perf.backend_ms[i] > backend_max)
+                    backend_max = s_present_perf.backend_ms[i];
+            }
+            qsort(
+                sorted, s_present_perf.samples,
+                sizeof(sorted[0]), compare_double);
+            uint32_t p95_index =
+                (s_present_perf.samples * 95u + 99u) / 100u - 1u;
+            double average = frame_sum / s_present_perf.samples;
+            double fps = 1000.0 / average;
+            fprintf(
+                stderr,
+                "PERF presents=%u-%u samples=%u fps=%.2f "
+                "frame_ms avg=%.2f p95=%.2f max=%.2f "
+                "frontend_ms avg=%.2f backend_ms avg=%.2f max=%.2f\n",
+                present - s_present_perf.samples + 1u, present,
+                s_present_perf.samples, fps,
+                average, sorted[p95_index], frame_max,
+                frontend_sum / s_present_perf.samples,
+                backend_sum / s_present_perf.samples, backend_max);
+            if (s_present_perf.minimum_fps > 0.0 &&
+                fps < s_present_perf.minimum_fps) {
+                fprintf(
+                    stderr,
+                    "PERF FAILED: %.2f FPS is below the %.2f FPS minimum\n",
+                    fps, s_present_perf.minimum_fps);
+                sr_audio_shutdown();
+                sr_trace_close();
+                fflush(stderr);
+                _Exit(3);
+            }
+            s_present_perf.samples = 0;
+        }
+    }
+    s_present_perf.previous_entry = entry;
+    s_present_perf.previous_backend_ms = backend_ms;
+    if (s_present_perf.exit_after &&
+        present >= s_present_perf.exit_after) {
+        sr_audio_shutdown();
+        sr_trace_close();
+        fflush(stderr);
+        _Exit(0);
+    }
+}
+
 static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
     char capture_path[1024];
     int capture_requested = 0;
@@ -2838,6 +3043,8 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
 
     s_framebuf = A0;
     s_last_flip_vcount = s_vcount;
+    present_perf_init();
+    LONGLONG perf_entry = present_perf_entry();
     if (s_framebuf) {
         s_present_count++;
         capture_requested = frame_capture_path(
@@ -2856,6 +3063,10 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
     /* Interactive window: show this finished frame and sample the keyboard (A1=bufferwidth,
      * A2=pixelformat 0=5650/1=5551/2=4444/3=8888). */
     if (gui_on() && s_framebuf) gui_present(s_framebuf, (int)A2, A1);
+    if (s_framebuf) {
+        LONGLONG perf_exit = present_perf_entry();
+        present_perf_finish(s_present_count, perf_entry, perf_exit);
+    }
     if (capture_requested)
         frame_capture_complete(
             s_framebuf, (int)A2, A1 ? A1 : 512,

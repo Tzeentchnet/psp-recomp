@@ -1674,11 +1674,18 @@ static int shade(float u, float fv, int fog, int vr, int vg, int vb, int va, int
  * persp=0 (through-mode): affine UV; depth test only if the list enabled it. */
 /* SR_PIXWHO=x,y probe pixel (shared by the triangle, sprite and clear paths). */
 static int s_who_x = -2, s_who_y = -2;
+static uint32_t s_who_after;
 static void who_init(void) {
     if (s_who_x != -2) return;
     const char *wp = getenv("SR_PIXWHO");
+    const char *after = getenv("SR_PIXWHO_AFTER");
     s_who_x = s_who_y = -1;
     if (wp) sscanf(wp, "%d,%d", &s_who_x, &s_who_y);
+    if (after) s_who_after = (uint32_t)strtoul(after, NULL, 10);
+}
+
+static int who_active(void) {
+    return s_ge_frame >= s_who_after;
 }
 
 static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
@@ -1778,7 +1785,8 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
                     if (zi < 272u*512u) s_zbuf[zi] = clamp_z(iz);
                 }
                 who_init();
-                if (x == s_who_x && y == s_who_y && s_pixwho_n < 400) {
+                if (who_active() &&
+                    x == s_who_x && y == s_who_y && s_pixwho_n < 400) {
                     s_pixwho_n++;
                     fprintf(stderr, "PIXWHO f=%u CLEARTRI mode=0x%03x z=%.0f persp=%d rgba=(%d,%d,%d,%d)\n",
                             s_ge_frame, ge.clear_mode, iz, persp, C->r, C->g, C->b, C->a);
@@ -1811,7 +1819,8 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
              * which draw owns a misrendered region without guessing from geometry. */
             {
                 who_init();
-                if (x == s_who_x && y == s_who_y && s_pixwho_n < 400) {
+                if (who_active() &&
+                    x == s_who_x && y == s_who_y && s_pixwho_n < 400) {
                     s_pixwho_n++;
                     uint32_t zidx = (uint32_t)(y * (int)zbuf_stride() + x);
                     unsigned curz = zidx < 272u*512u ? s_zbuf[zidx] : 99999u;
@@ -2365,7 +2374,9 @@ static void fill_sprite(const Vtx *p0, const Vtx *p1, int persp) {
         if (ge.clear_mode & 0x400)
             zbuf_fill_rect(xa, ya, xb - 1, yb - 1, (uint16_t)p1->z);
         who_init();
-        if (s_who_x >= xa && s_who_x < xb && s_who_y >= ya && s_who_y < yb && s_pixwho_n < 400) {
+        if (who_active() &&
+            s_who_x >= xa && s_who_x < xb &&
+            s_who_y >= ya && s_who_y < yb && s_pixwho_n < 400) {
             s_pixwho_n++;
             fprintf(stderr, "PIXWHO f=%u CLEARSPR mode=0x%03x z=%.0f rect=(%d,%d)-(%d,%d) rgba=(%d,%d,%d,%d)\n",
                     s_ge_frame, ge.clear_mode, p1->z, xa, ya, xb, yb, p1->r, p1->g, p1->b, p1->a);
@@ -2397,10 +2408,15 @@ static void fill_sprite(const Vtx *p0, const Vtx *p1, int persp) {
     if (persp) s_stat.spr3d++; else s_stat.spr2d++;
     float uw =(xb>xa)?(u1-u0)/(float)(xb-xa):0;
     float uvv=(yb>ya)?(v1-v0)/(float)(yb-ya):0;
+    int linear =
+        (ge.tex_filter & 1u) != 0 ||
+        ((ge.tex_filter >> 8) & 1u) != 0;
+    float sample_x = linear ? 0.5f : 0.0f;
+    float sample_y = linear ? 0.5f : 0.0f;
     for (int y=ya; y<yb; y++) {
-        float fv = v0 + (y-ya)*uvv;
+        float fv = v0 + ((float)(y - ya) + sample_y) * uvv;
         for (int x=xa; x<xb; x++) {
-            float u = u0 + (x-xa)*uw;
+            float u = u0 + ((float)(x - xa) + sample_x) * uw;
             int r,g,b,a;
             if (!shade(u,fv,fog,p1->r,p1->g,p1->b,p1->a,&r,&g,&b,&a)) continue;
             if (use_z) put_px_rgba_z(x,y,pz,r,g,b,a);

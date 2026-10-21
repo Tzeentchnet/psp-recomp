@@ -68,7 +68,9 @@ ID3D12DescriptorHeap *ged3d12_dsv_heap(void);
 ID3D12RootSignature *ged3d12_root_signature(void);
 D3D12_SHADER_BYTECODE ged3d12_vertex_shader(void);
 D3D12_SHADER_BYTECODE ged3d12_pixel_shader(void);
+D3D12_SHADER_BYTECODE ged3d12_direct_pixel_shader(void);
 bool ged3d12_graphics_wait_idle(void);
+void ged3d12_set_coarse_shading(bool enabled);
 
 /* Allocations are valid until the current frame slot is reused after its fence completes. */
 bool ged3d12_upload_alloc(UINT64 size, UINT64 alignment, GeD3D12UploadSlice *out);

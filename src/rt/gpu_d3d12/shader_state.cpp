@@ -2,6 +2,7 @@
 
 #include "device.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static float color_channel(uint32_t color, uint32_t shift) {
@@ -18,6 +19,58 @@ static uint32_t clamp_scissor_end(int value, uint32_t limit) {
     return (uint32_t)value < limit ? (uint32_t)value + 1u : limit;
 }
 
+static bool blend_factor_compatible(
+    uint32_t factor, uint32_t fixed_color) {
+    return factor <= 5u ||
+           (factor == 10u &&
+            (fixed_color & 0xffffffu) == 0u) ||
+           (factor == 10u &&
+            (fixed_color & 0xffffffu) == 0xffffffu);
+}
+
+bool ged3d12_shader_direct_compatible(const GeState *state) {
+    static int disabled = -1;
+    if (disabled < 0)
+        disabled = getenv("SR_D3D12_DISABLE_DIRECT") ? 1 : 0;
+    if (disabled) return false;
+    if (!state) return false;
+    if (state->clear) return false;
+    if (state->stencil_test_enable || state->logic_op_enable ||
+        state->mask_rgb != 0u) {
+        return false;
+    }
+    if (!state->blend_enable) return true;
+    uint32_t mode = state->blend_mode;
+    uint32_t source_factor = mode & 0xfu;
+    uint32_t destination_factor = (mode >> 4) & 0xfu;
+    uint32_t equation = (mode >> 8) & 7u;
+    if (source_factor == 10u && destination_factor == 10u &&
+        equation == 0u &&
+        (state->blend_fixa & 0xffffffu) == 0xffffffu &&
+        (state->blend_fixb & 0xffffffu) == 0u) {
+        return true;
+    }
+    return state->fbfmt == 3u &&
+           !state->dither_enable &&
+           equation <= 4u &&
+           blend_factor_compatible(
+               source_factor, state->blend_fixa) &&
+           blend_factor_compatible(
+               destination_factor, state->blend_fixb);
+}
+
+D3D12_SHADING_RATE ged3d12_shader_shading_rate(
+    uint32_t scale, D3D12_VARIABLE_SHADING_RATE_TIER tier,
+    bool additional_rates) {
+    if (tier == D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED ||
+        scale < 2u) {
+        return D3D12_SHADING_RATE_1X1;
+    }
+    if (scale >= 4u && additional_rates)
+        return D3D12_SHADING_RATE_4X4;
+    return D3D12_SHADING_RATE_2X2;
+}
+
 void ged3d12_shader_constants_build(
     const GeState *state, int perspective, int sprite_semantics,
     int triangle_semantics,
@@ -25,6 +78,8 @@ void ged3d12_shader_constants_build(
     GeD3D12ShaderConstants *out) {
     memset(out, 0, sizeof(*out));
     if (!state) return;
+    uint32_t render_scale = ged3d12_framebuffer_scale();
+    if (!render_scale) render_scale = 1u;
 
     uint32_t flags = 0;
     bool clear = state->clear != 0;
@@ -45,6 +100,11 @@ void ged3d12_shader_constants_build(
             !((state->tex_filter >> 8) & 1u)) {
             flags |= GE_D3D12_SHADER_NEAREST;
         }
+        if (texture &&
+            (texture->flags &
+             GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT) != 0) {
+            flags |= GE_D3D12_SHADER_FRAMEBUFFER_CLUT;
+        }
     }
     if (!clear && state->color_test_enable)
         flags |= GE_D3D12_SHADER_COLOR_TEST;
@@ -54,6 +114,8 @@ void ged3d12_shader_constants_build(
         flags |= GE_D3D12_SHADER_STENCIL;
     if (!clear && triangle_semantics && state->cull_enable)
         flags |= GE_D3D12_SHADER_CULL_BACK;
+    if (ged3d12_shader_direct_compatible(state))
+        flags |= GE_D3D12_SHADER_DIRECT;
 
     out->config[0] =
         (int32_t)((state->tex_func & 7u) | (flags << 8));
@@ -64,6 +126,7 @@ void ged3d12_shader_constants_build(
     out->texture_environment[0] = color_channel(state->tex_env, 0);
     out->texture_environment[1] = color_channel(state->tex_env, 8);
     out->texture_environment[2] = color_channel(state->tex_env, 16);
+    out->texture_environment[3] = (float)render_scale;
     out->fog_color[0] = color_channel(state->fog_color, 0);
     out->fog_color[1] = color_channel(state->fog_color, 8);
     out->fog_color[2] = color_channel(state->fog_color, 16);
@@ -83,6 +146,10 @@ void ged3d12_shader_constants_build(
             ? state->color_test & 3u : 1u;
     out->color_test[1] = state->color_ref & 0xffffffu;
     out->color_test[2] = state->color_test_mask & 0xffffffu;
+    out->color_test[3] =
+        state->clut_fmt |
+        (texture && texture->sampler.clamp_u ? 1u << 30 : 0u) |
+        (texture && texture->sampler.clamp_v ? 1u << 31 : 0u);
     out->stencil_test[0] =
         !clear && state->stencil_test_enable
             ? state->stencil_test : 1u;
@@ -122,14 +189,16 @@ void ged3d12_shader_constants_build(
         state->scis_x2, GE_D3D12_FRAMEBUFFER_WIDTH);
     uint32_t scissor_bottom = clamp_scissor_end(
         state->scis_y2, GE_D3D12_FRAMEBUFFER_HEIGHT);
-    out->scissor[0] = (int32_t)scissor_left;
-    out->scissor[1] = (int32_t)scissor_top;
+    out->scissor[0] = (int32_t)(scissor_left * render_scale);
+    out->scissor[1] = (int32_t)(scissor_top * render_scale);
     out->scissor[2] =
         (int32_t)(scissor_right < scissor_left
-            ? scissor_left : scissor_right);
+            ? scissor_left * render_scale
+            : scissor_right * render_scale);
     out->scissor[3] =
         (int32_t)(scissor_bottom < scissor_top
-            ? scissor_top : scissor_bottom);
+            ? scissor_top * render_scale
+            : scissor_bottom * render_scale);
 }
 
 bool ged3d12_shader_constants_cache_update(
