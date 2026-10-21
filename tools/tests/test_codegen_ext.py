@@ -18,6 +18,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
+import codegen as cg  # noqa: E402
 import codegen_ext as cx  # noqa: E402
 
 # Stand-in runtime: the CpuState fields and prefix helpers the emitted code touches, written
@@ -170,6 +171,38 @@ def ref_vx2i(sub, s, n):
     return d[:2 if n == 1 else 4]
 
 
+def ref_vi2x(sub, source, n):
+    signed = [
+        value - (1 << 32) if value & 0x80000000 else value
+        for value in (source + [0, 0, 0, 0])[:4]
+    ]
+    unsigned = [value & 0xFFFFFFFF for value in signed]
+    if sub == 28:
+        packed = 0
+        for lane, value in enumerate(signed):
+            if value < 0:
+                value = 0
+            packed |= ((value >> 23) & 0xFF) << (lane * 8)
+        return [packed]
+    if sub == 29:
+        packed = 0
+        for lane, value in enumerate(unsigned):
+            packed |= (value >> 24) << (lane * 8)
+        return [packed]
+    result = []
+    for lane in range((n + 1) // 2):
+        low = signed[lane * 2]
+        high = signed[lane * 2 + 1]
+        if sub == 30:
+            low = max(low, 0) >> 15
+            high = max(high, 0) >> 15
+        else:
+            low = unsigned[lane * 2] >> 16
+            high = unsigned[lane * 2 + 1] >> 16
+        result.append((low & 0xFFFF) | ((high & 0xFFFF) << 16))
+    return result
+
+
 def ref_vsgn(x):
     if math.isnan(x):
         b = f2u(x)
@@ -232,6 +265,63 @@ def build(suite, rnd):
             si, di = cx.vreg_indices(0, n), cx.vreg_indices(8, oz)
             w = enc34(1, sub, 0, 8, n)
             suite.add(f"vx2i_{sub}_n{n}_{s[0]:08x}", setv(si, s), cx.effect(0, w)[0], di, ref_vx2i(sub, s, n))
+
+    # VFPU7 vi2uc/vi2c/vi2us/vi2s: integer lane packing after source prefixes.
+    vi2x_cases = (
+        (28, 4, [0x7FFFFFFF, 0x80000000, 0x01000000, 0xFFFFFFFF]),
+        (29, 4, [0x80000000, 0x7F000000, 0xFF000000, 0x01000000]),
+        (30, 3, [0x7FFFFFFF, 0x80000000, 0x40000000]),
+        (31, 1, [0x89ABCDEF]),
+        (31, 2, [0x12345678, 0xFEDCBA98]),
+        (31, 4, [0x12345678, 0xFEDCBA98, 0x80000000, 0x7FFFFFFF]),
+    )
+    for sub, n, source in vi2x_cases:
+        out_n = 1 if sub in (28, 29) else (n + 1) // 2
+        si = cg.vreg_indices(0, n)
+        di = cg.vreg_indices(8, out_n)
+        suite.add(
+            f"vi2x7_{sub}_n{n}",
+            setv(si, source),
+            cg.vfpu_effect(0, enc34(1, sub, 0, 8, n))[0],
+            di,
+            ref_vi2x(sub, source, n),
+        )
+
+    # Source swizzle swaps lanes 0/1 before signed-halfword packing.
+    source = [0x11112222, 0x33334444, 0x55556666, 0x77778888]
+    si, di = cg.vreg_indices(0, 4), cg.vreg_indices(8, 2)
+    suite.add(
+        "vi2x7_sprefix",
+        setv(si, source) + ["s->vfpuCtrl[0]=0xe1u;"],
+        cg.vfpu_effect(0, enc34(1, 31, 0, 8, 4))[0],
+        di,
+        ref_vi2x(31, [source[1], source[0], source[2], source[3]], 4),
+    )
+
+    # D saturation applies to the packed float bit pattern.
+    si, di = cg.vreg_indices(0, 4), cg.vreg_indices(8, 1)
+    source = [0, 0, 0, 0x40000000]
+    suite.add(
+        "vi2x7_dsat",
+        setv(si, source) + ["s->vfpuCtrl[2]=1u;"],
+        cg.vfpu_effect(0, enc34(1, 29, 0, 8, 4))[0],
+        di,
+        [f2u(1.0)],
+    )
+
+    # D write mask preserves packed destination lane 1.
+    source = [0x11112222, 0x33334444, 0x55556666, 0x77778888]
+    si, di = cg.vreg_indices(0, 4), cg.vreg_indices(8, 2)
+    expected = ref_vi2x(31, source, 4)
+    suite.add(
+        "vi2x7_dmask",
+        setv(si, source)
+        + setv(di, [0xDEADBEEF, 0xCAFEBABE])
+        + ["s->vfpuCtrl[2]=0x200u;"],
+        cg.vfpu_effect(0, enc34(1, 31, 0, 8, 4))[0],
+        di,
+        [expected[0], 0xCAFEBABE],
+    )
 
     # vfad: horizontal sum, sequential float32 accumulation from +0
     for n in (2, 3, 4):

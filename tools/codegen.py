@@ -1359,13 +1359,17 @@ def main(argv):
             lib_nid = impmap.get(a)
             if lib_nid is not None:
                 lib, nid = lib_nid
+                escaped_lib = lib.replace("\\", "\\\\").replace('"', '\\"')
                 out.append(f"void f_{a:08x}(CpuState *s) {{  /* import: {lib} nid 0x{nid:08x} */")
                 out.append(
                     f"    SR_DIRECT_TRACE_BEGIN(s, 0x{a:08x}u, 0x{w0:08x}u); "
                     "SR_DIRECT_TRACE_END(s, 0u, 0);"
                 )
                 out.append(f"    SR_DIRECT_TRACE_BEGIN(s, 0x{a + 4:08x}u, 0x{w1:08x}u);")
-                out.append(f"    sr_syscall(s, 0x{nid:08x}u);")
+                out.append(
+                    f'    sr_syscall_lib(s, "{escaped_lib}", '
+                    f"0x{nid:08x}u);"
+                )
                 out.append("    SR_DIRECT_TRACE_END(s, 0u, 0);")
                 out.append("}")
             else:
