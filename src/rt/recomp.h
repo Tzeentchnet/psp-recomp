@@ -242,6 +242,7 @@ int gui_capture_next(const char *path);
 int sr_kzl_patch_offline_menu(uint8_t *data, uint32_t size);
 void sr_kzl_killzone_com_disabled(CpuState *s);
 void sr_kzl_downloads_unavailable(CpuState *s);
+void sr_kzl_twinstick_apply_aim(CpuState *s);
 uint32_t sr_present_count(void);
 uint32_t sr_atrac_remaining_frames(
     uint32_t buffered, uint32_t block_align, int streamed);

@@ -84,6 +84,20 @@ typedef struct SrInputBinding {
     int count;
 } SrInputBinding;
 
+typedef struct SrInputSticks {
+    int movement_x;
+    int movement_y;
+    int aim_x;
+    int aim_y;
+} SrInputSticks;
+
+typedef struct SrInputTwinStickState {
+    uint32_t dpad_buttons;
+    float aim_x;
+    float aim_y;
+    int aim_active;
+} SrInputTwinStickState;
+
 typedef struct SrInputConfig {
     SrInputBinding keyboard[SR_INPUT_ACTIONS];
     SrInputBinding mouse[SR_INPUT_ACTIONS];
@@ -92,11 +106,20 @@ typedef struct SrInputConfig {
     double deadzone;
     double curve;
     int invert_y;
+    int twin_stick_enabled;
+    double movement_deadzone;
+    double movement_curve;
+    int movement_invert_y;
+    double aim_deadzone;
+    double aim_curve;
+    int aim_invert_x;
+    int aim_invert_y;
 } SrInputConfig;
 
 typedef int (*SrInputDownFn)(void *context, int value);
 
 void sr_input_config_defaults(SrInputConfig *config);
+void sr_input_config_apply_twin_stick_defaults(SrInputConfig *config);
 int sr_input_config_parse(
     SrInputConfig *config, const char *text, char *error, size_t error_size);
 uint32_t sr_input_config_buttons(
@@ -110,6 +133,13 @@ void sr_input_config_keyboard_axis(
 void sr_input_config_analog(
     const SrInputConfig *config, int raw_x, int raw_y,
     uint8_t *lx, uint8_t *ly);
+uint32_t sr_input_config_gamepad_sticks(
+    const SrInputConfig *config,
+    SrInputTwinStickState *state,
+    uint32_t buttons,
+    const SrInputSticks *sticks,
+    uint8_t *lx,
+    uint8_t *ly);
 
 int sr_input_init(void);
 uint32_t sr_input_buttons(
@@ -119,6 +149,29 @@ uint32_t sr_input_buttons(
 void sr_input_keyboard_axis(
     SrInputDownFn key_down, void *context, int *x, int *y);
 void sr_input_analog(int raw_x, int raw_y, uint8_t *lx, uint8_t *ly);
+uint32_t sr_input_gamepad_sticks(
+    uint32_t buttons,
+    const SrInputSticks *sticks,
+    uint8_t *lx,
+    uint8_t *ly);
+void sr_input_gamepad_disconnected(void);
+int sr_input_twin_stick_enabled(void);
+int sr_input_twin_stick_aim(float *x, float *y);
+const SrInputConfig *sr_input_config_get(void);
+const char *sr_input_action_name(int action);
+int sr_input_config_format_gamepad_binding(
+    const SrInputConfig *config,
+    int action,
+    char *text,
+    size_t text_size);
+int sr_input_config_save(
+    const SrInputConfig *config,
+    char *error,
+    size_t error_size);
+int sr_input_config_reload(char *error, size_t error_size);
+int sr_input_start_hot_reload(void);
+void sr_input_stop_hot_reload(void);
+void sr_input_poll_reload(void);
 const char *sr_input_config_path(void);
 
 #ifdef __cplusplus

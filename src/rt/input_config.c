@@ -6,10 +6,12 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <io.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>
 
 static const char *const s_action_names[SR_INPUT_ACTIONS] = {
     "select", "start", "up", "right", "down", "left",
@@ -20,6 +22,28 @@ static const uint32_t s_action_bits[SR_INPUT_ACTIONS] = {
     0x0001, 0x0008, 0x0010, 0x0020, 0x0040, 0x0080,
     0x0100, 0x0200, 0x1000, 0x2000, 0x4000, 0x8000,
 };
+
+enum {
+    SETTING_ANALOG_DEADZONE =
+        SR_INPUT_ACTIONS * 3 + SR_INPUT_ANALOG_DIRECTIONS,
+    SETTING_ANALOG_CURVE,
+    SETTING_ANALOG_INVERT_Y,
+    SETTING_TWIN_STICK_ENABLED,
+    SETTING_MOVEMENT_DEADZONE,
+    SETTING_MOVEMENT_CURVE,
+    SETTING_MOVEMENT_INVERT_Y,
+    SETTING_AIM_DEADZONE,
+    SETTING_AIM_CURVE,
+    SETTING_AIM_INVERT_X,
+    SETTING_AIM_INVERT_Y,
+};
+
+#define PSP_CTRL_UP 0x0010u
+#define PSP_CTRL_RIGHT 0x0020u
+#define PSP_CTRL_DOWN 0x0040u
+#define PSP_CTRL_LEFT 0x0080u
+#define TWIN_STICK_DPAD_PRESS 32
+#define TWIN_STICK_DPAD_RELEASE 24
 
 static const char *const s_analog_names[SR_INPUT_ANALOG_DIRECTIONS] = {
     "analog_up", "analog_right", "analog_down", "analog_left",
@@ -73,8 +97,12 @@ static const NameValue s_mouse_names[] = {
 };
 
 static SrInputConfig s_config;
+static SrInputTwinStickState s_twin_stick_state;
 static int s_initialized;
 static char s_config_path[1024];
+static HANDLE s_reload_thread;
+static HANDLE s_reload_stop_event;
+static volatile LONG s_reload_requested;
 
 static int text_equal(const char *left, const char *right) {
     while (*left && *right) {
@@ -156,6 +184,35 @@ void sr_input_config_defaults(SrInputConfig *config) {
     config->deadzone = 0.24;
     config->curve = 1.0;
     config->invert_y = 0;
+    config->twin_stick_enabled = 0;
+    config->movement_deadzone = 0.24;
+    config->movement_curve = 1.0;
+    config->movement_invert_y = 0;
+    config->aim_deadzone = 0.24;
+    config->aim_curve = 1.0;
+    config->aim_invert_x = 0;
+    config->aim_invert_y = 0;
+}
+
+void sr_input_config_apply_twin_stick_defaults(SrInputConfig *config) {
+    if (!config) return;
+    binding_set(
+        &config->gamepad[SR_INPUT_L],
+        SR_PAD_LEFT_SHOULDER, 0, 0, 0);
+    binding_set(
+        &config->gamepad[SR_INPUT_R],
+        SR_PAD_LEFT_TRIGGER, 0, 0, 0);
+    binding_set(
+        &config->gamepad[SR_INPUT_SQUARE],
+        SR_PAD_WEST, SR_PAD_RIGHT_TRIGGER, 0, 0);
+    config->twin_stick_enabled = 1;
+    config->movement_deadzone = 0.24;
+    config->movement_curve = 1.0;
+    config->movement_invert_y = 0;
+    config->aim_deadzone = 0.24;
+    config->aim_curve = 1.0;
+    config->aim_invert_x = 0;
+    config->aim_invert_y = 1;
 }
 
 static void legacy_defaults(SrInputConfig *config) {
@@ -322,11 +379,27 @@ int sr_input_config_parse(
                 binding_type = 2;
             }
         } else if (text_equal(name, "analog.deadzone")) {
-            setting = SR_INPUT_ACTIONS * 3 + SR_INPUT_ANALOG_DIRECTIONS;
+            setting = SETTING_ANALOG_DEADZONE;
         } else if (text_equal(name, "analog.curve")) {
-            setting = SR_INPUT_ACTIONS * 3 + SR_INPUT_ANALOG_DIRECTIONS + 1;
+            setting = SETTING_ANALOG_CURVE;
         } else if (text_equal(name, "analog.invert_y")) {
-            setting = SR_INPUT_ACTIONS * 3 + SR_INPUT_ANALOG_DIRECTIONS + 2;
+            setting = SETTING_ANALOG_INVERT_Y;
+        } else if (text_equal(name, "twin_stick.enabled")) {
+            setting = SETTING_TWIN_STICK_ENABLED;
+        } else if (text_equal(name, "movement.deadzone")) {
+            setting = SETTING_MOVEMENT_DEADZONE;
+        } else if (text_equal(name, "movement.curve")) {
+            setting = SETTING_MOVEMENT_CURVE;
+        } else if (text_equal(name, "movement.invert_y")) {
+            setting = SETTING_MOVEMENT_INVERT_Y;
+        } else if (text_equal(name, "aim.deadzone")) {
+            setting = SETTING_AIM_DEADZONE;
+        } else if (text_equal(name, "aim.curve")) {
+            setting = SETTING_AIM_CURVE;
+        } else if (text_equal(name, "aim.invert_x")) {
+            setting = SETTING_AIM_INVERT_X;
+        } else if (text_equal(name, "aim.invert_y")) {
+            setting = SETTING_AIM_INVERT_Y;
         }
         if (setting < 0) {
             set_error(error, error_size, line_number, "unknown setting", name);
@@ -343,17 +416,33 @@ int sr_input_config_parse(
                     binding, value, binding_type,
                     line_number, error, error_size))
                 return 0;
-        } else if (text_equal(name, "analog.invert_y")) {
+        } else if (
+            text_equal(name, "analog.invert_y") ||
+            text_equal(name, "twin_stick.enabled") ||
+            text_equal(name, "movement.invert_y") ||
+            text_equal(name, "aim.invert_x") ||
+            text_equal(name, "aim.invert_y")) {
+            int parsed;
             if (text_equal(value, "true") || strcmp(value, "1") == 0)
-                config->invert_y = 1;
+                parsed = 1;
             else if (text_equal(value, "false") || strcmp(value, "0") == 0)
-                config->invert_y = 0;
+                parsed = 0;
             else {
                 set_error(
                     error, error_size, line_number,
                     "expected true or false", value);
                 return 0;
             }
+            if (text_equal(name, "analog.invert_y"))
+                config->invert_y = parsed;
+            else if (text_equal(name, "twin_stick.enabled"))
+                config->twin_stick_enabled = parsed;
+            else if (text_equal(name, "movement.invert_y"))
+                config->movement_invert_y = parsed;
+            else if (text_equal(name, "aim.invert_x"))
+                config->aim_invert_x = parsed;
+            else
+                config->aim_invert_y = parsed;
         } else {
             char *end = NULL;
             errno = 0;
@@ -362,14 +451,22 @@ int sr_input_config_parse(
                 set_error(error, error_size, line_number, "invalid number", value);
                 return 0;
             }
-            if (text_equal(name, "analog.deadzone")) {
+            if (
+                text_equal(name, "analog.deadzone") ||
+                text_equal(name, "movement.deadzone") ||
+                text_equal(name, "aim.deadzone")) {
                 if (parsed < 0.0 || parsed > 0.95) {
                     set_error(
                         error, error_size, line_number,
                         "deadzone must be between 0 and 0.95", value);
                     return 0;
                 }
-                config->deadzone = parsed;
+                if (text_equal(name, "analog.deadzone"))
+                    config->deadzone = parsed;
+                else if (text_equal(name, "movement.deadzone"))
+                    config->movement_deadzone = parsed;
+                else
+                    config->aim_deadzone = parsed;
             } else {
                 if (parsed < 0.1 || parsed > 4.0) {
                     set_error(
@@ -377,7 +474,12 @@ int sr_input_config_parse(
                         "curve must be between 0.1 and 4", value);
                     return 0;
                 }
-                config->curve = parsed;
+                if (text_equal(name, "analog.curve"))
+                    config->curve = parsed;
+                else if (text_equal(name, "movement.curve"))
+                    config->movement_curve = parsed;
+                else
+                    config->aim_curve = parsed;
             }
         }
     }
@@ -422,25 +524,25 @@ void sr_input_config_keyboard_axis(
     if (y) *y = down == up ? 0 : down ? 32767 : -32768;
 }
 
-void sr_input_config_analog(
-    const SrInputConfig *config, int raw_x, int raw_y,
-    uint8_t *lx, uint8_t *ly) {
+static void transform_analog(
+    double deadzone, double curve, int invert_x, int invert_y,
+    int raw_x, int raw_y, uint8_t *lx, uint8_t *ly) {
     double x = raw_x < 0 ? raw_x / 32768.0 : raw_x / 32767.0;
     double y = raw_y < 0 ? raw_y / 32768.0 : raw_y / 32767.0;
-    if (config->invert_y) y = -y;
+    if (invert_x) x = -x;
+    if (invert_y) y = -y;
     double magnitude = sqrt(x * x + y * y);
-    if (magnitude <= config->deadzone || magnitude == 0.0) {
+    if (magnitude <= deadzone || magnitude == 0.0) {
         if (lx) *lx = 128;
         if (ly) *ly = 128;
         return;
     }
     double direction_magnitude = magnitude;
     if (magnitude > 1.0) magnitude = 1.0;
-    double scaled =
-        (magnitude - config->deadzone) / (1.0 - config->deadzone);
+    double scaled = (magnitude - deadzone) / (1.0 - deadzone);
     if (scaled < 0.0) scaled = 0.0;
     if (scaled > 1.0) scaled = 1.0;
-    scaled = pow(scaled, config->curve);
+    scaled = pow(scaled, curve);
     double factor = scaled / direction_magnitude;
     int output_x = (int)(127.5 + x * factor * 127.5 + 0.5);
     int output_y = (int)(127.5 + y * factor * 127.5 + 0.5);
@@ -452,49 +554,259 @@ void sr_input_config_analog(
     if (ly) *ly = (uint8_t)output_y;
 }
 
+void sr_input_config_analog(
+    const SrInputConfig *config, int raw_x, int raw_y,
+    uint8_t *lx, uint8_t *ly) {
+    transform_analog(
+        config->deadzone, config->curve, 0, config->invert_y,
+        raw_x, raw_y, lx, ly);
+}
+
+static uint32_t dpad_axis(
+    uint32_t previous, int value, uint32_t negative, uint32_t positive) {
+    if (value <= -TWIN_STICK_DPAD_PRESS) return negative;
+    if (value >= TWIN_STICK_DPAD_PRESS) return positive;
+    if ((previous & negative) && value <= -TWIN_STICK_DPAD_RELEASE)
+        return negative;
+    if ((previous & positive) && value >= TWIN_STICK_DPAD_RELEASE)
+        return positive;
+    return 0;
+}
+
+static float twin_stick_axis(uint8_t value) {
+    int centered = (int)value - 128;
+    return centered < 0 ? centered / 128.0f : centered / 127.0f;
+}
+
+uint32_t sr_input_config_gamepad_sticks(
+    const SrInputConfig *config,
+    SrInputTwinStickState *state,
+    uint32_t buttons,
+    const SrInputSticks *sticks,
+    uint8_t *lx,
+    uint8_t *ly) {
+    if (!config->twin_stick_enabled) {
+        memset(state, 0, sizeof(*state));
+        sr_input_config_analog(
+            config, sticks->movement_x, sticks->movement_y, lx, ly);
+        return buttons;
+    }
+
+    uint8_t movement_x;
+    uint8_t movement_y;
+    transform_analog(
+        config->movement_deadzone,
+        config->movement_curve,
+        0,
+        config->movement_invert_y,
+        sticks->movement_x,
+        sticks->movement_y,
+        &movement_x,
+        &movement_y);
+    transform_analog(
+        config->aim_deadzone,
+        config->aim_curve,
+        config->aim_invert_x,
+        config->aim_invert_y,
+        sticks->aim_x,
+        sticks->aim_y,
+        lx,
+        ly);
+    state->aim_x = twin_stick_axis(lx ? *lx : 128);
+    state->aim_y = twin_stick_axis(ly ? *ly : 128);
+    state->aim_active =
+        state->aim_x * state->aim_x + state->aim_y * state->aim_y >
+        0.0001f;
+
+    uint32_t previous = state->dpad_buttons;
+    state->dpad_buttons =
+        dpad_axis(
+            previous, (int)movement_x - 128,
+            PSP_CTRL_LEFT, PSP_CTRL_RIGHT) |
+        dpad_axis(
+            previous, (int)movement_y - 128,
+            PSP_CTRL_UP, PSP_CTRL_DOWN);
+    return buttons | state->dpad_buttons;
+}
+
+const char *sr_input_action_name(int action) {
+    if (action < 0 || action >= SR_INPUT_ACTIONS) return NULL;
+    return s_action_names[action];
+}
+
+static const char *binding_value_name(
+    const NameValue *names,
+    size_t count,
+    int value,
+    char single_character[2]) {
+    for (size_t i = 0; i < count; i++)
+        if (names[i].value == value) return names[i].name;
+    if (value > 0 && value < 128 && isalnum((unsigned char)value)) {
+        single_character[0] = (char)value;
+        single_character[1] = 0;
+        return single_character;
+    }
+    return NULL;
+}
+
+static int format_binding(
+    const SrInputBinding *binding,
+    const NameValue *names,
+    size_t name_count,
+    int allow_single_character,
+    char *text,
+    size_t text_size) {
+    size_t used = 0;
+    if (!text || !text_size) return 0;
+    text[0] = 0;
+    if (!binding->count) {
+        if (text_size < sizeof("none")) return 0;
+        strcpy(text, "none");
+        return 1;
+    }
+    for (int i = 0; i < binding->count; i++) {
+        char single_character[2];
+        const char *name = binding_value_name(
+            names,
+            name_count,
+            binding->values[i],
+            single_character);
+        size_t length;
+        if (!name || (!allow_single_character && name == single_character))
+            return 0;
+        length = strlen(name);
+        if (used + (i ? 2u : 0u) + length + 1u > text_size) return 0;
+        if (i) {
+            memcpy(text + used, ", ", 2);
+            used += 2;
+        }
+        memcpy(text + used, name, length);
+        used += length;
+        text[used] = 0;
+    }
+    return 1;
+}
+
+int sr_input_config_format_gamepad_binding(
+    const SrInputConfig *config,
+    int action,
+    char *text,
+    size_t text_size) {
+    if (!config || action < 0 || action >= SR_INPUT_ACTIONS) return 0;
+    return format_binding(
+        &config->gamepad[action],
+        s_pad_names,
+        sizeof(s_pad_names) / sizeof(s_pad_names[0]),
+        0,
+        text,
+        text_size);
+}
+
+static int write_binding(
+    FILE *file,
+    const char *prefix,
+    const char *name,
+    const SrInputBinding *binding,
+    const NameValue *names,
+    size_t name_count,
+    int allow_single_character) {
+    char text[128];
+    if (!format_binding(
+            binding,
+            names,
+            name_count,
+            allow_single_character,
+            text,
+            sizeof(text))) {
+        return 0;
+    }
+    return fprintf(file, "%s.%s = %s\n", prefix, name, text) > 0;
+}
+
+static int write_config(FILE *file, const SrInputConfig *config) {
+    if (fprintf(file, "# KZL input config v4\n") <= 0) return 0;
+    for (int i = 0; i < SR_INPUT_ACTIONS; i++) {
+        if (!write_binding(
+                file,
+                "keyboard",
+                s_action_names[i],
+                &config->keyboard[i],
+                s_key_names,
+                sizeof(s_key_names) / sizeof(s_key_names[0]),
+                1)) {
+            return 0;
+        }
+    }
+    for (int i = 0; i < SR_INPUT_ANALOG_DIRECTIONS; i++) {
+        if (!write_binding(
+                file,
+                "keyboard",
+                s_analog_names[i],
+                &config->analog_keyboard[i],
+                s_key_names,
+                sizeof(s_key_names) / sizeof(s_key_names[0]),
+                1)) {
+            return 0;
+        }
+    }
+    for (int i = 0; i < SR_INPUT_ACTIONS; i++) {
+        if (!write_binding(
+                file,
+                "mouse",
+                s_action_names[i],
+                &config->mouse[i],
+                s_mouse_names,
+                sizeof(s_mouse_names) / sizeof(s_mouse_names[0]),
+                0)) {
+            return 0;
+        }
+    }
+    for (int i = 0; i < SR_INPUT_ACTIONS; i++) {
+        if (!write_binding(
+                file,
+                "gamepad",
+                s_action_names[i],
+                &config->gamepad[i],
+                s_pad_names,
+                sizeof(s_pad_names) / sizeof(s_pad_names[0]),
+                0)) {
+            return 0;
+        }
+    }
+    return fprintf(
+               file,
+               "analog.deadzone = %.6g\n"
+               "analog.curve = %.6g\n"
+               "analog.invert_y = %s\n"
+               "# Experimental gamepad-only twin-stick controls (default off)\n"
+               "twin_stick.enabled = %s\n"
+               "movement.deadzone = %.6g\n"
+               "movement.curve = %.6g\n"
+               "movement.invert_y = %s\n"
+               "aim.deadzone = %.6g\n"
+               "aim.curve = %.6g\n"
+               "aim.invert_x = %s\n"
+               "aim.invert_y = %s\n",
+               config->deadzone,
+               config->curve,
+               config->invert_y ? "true" : "false",
+               config->twin_stick_enabled ? "true" : "false",
+               config->movement_deadzone,
+               config->movement_curve,
+               config->movement_invert_y ? "true" : "false",
+               config->aim_deadzone,
+               config->aim_curve,
+               config->aim_invert_x ? "true" : "false",
+               config->aim_invert_y ? "true" : "false") > 0;
+}
+
 static int write_default_config(const char *path) {
+    SrInputConfig defaults;
     FILE *file = fopen(path, "wb");
+    int ok;
     if (!file) return 0;
-    static const char text[] =
-        "# KZL input config v2\n"
-        "keyboard.select = left_shift, right_shift\n"
-        "keyboard.start = enter\n"
-        "keyboard.up = up\n"
-        "keyboard.right = right\n"
-        "keyboard.down = down\n"
-        "keyboard.left = left\n"
-        "keyboard.l = Q\n"
-        "keyboard.r = E\n"
-        "keyboard.triangle = R\n"
-        "keyboard.circle = G\n"
-        "keyboard.cross = space\n"
-        "keyboard.square = F\n"
-        "keyboard.analog_up = W\n"
-        "keyboard.analog_right = D\n"
-        "keyboard.analog_down = S\n"
-        "keyboard.analog_left = A\n"
-        "mouse.l = x2\n"
-        "mouse.r = right\n"
-        "mouse.triangle = middle\n"
-        "mouse.circle = x1\n"
-        "mouse.cross = none\n"
-        "mouse.square = left\n"
-        "gamepad.select = back\n"
-        "gamepad.start = start\n"
-        "gamepad.up = dpad_up\n"
-        "gamepad.right = dpad_right\n"
-        "gamepad.down = dpad_down\n"
-        "gamepad.left = dpad_left\n"
-        "gamepad.l = left_shoulder, left_trigger\n"
-        "gamepad.r = right_shoulder, right_trigger\n"
-        "gamepad.triangle = north\n"
-        "gamepad.circle = east\n"
-        "gamepad.cross = south\n"
-        "gamepad.square = west\n"
-        "analog.deadzone = 0.24\n"
-        "analog.curve = 1.0\n"
-        "analog.invert_y = false\n";
-    int ok = fwrite(text, 1, sizeof(text) - 1, file) == sizeof(text) - 1;
+    sr_input_config_defaults(&defaults);
+    ok = write_config(file, &defaults);
     if (fclose(file) != 0) ok = 0;
     return ok;
 }
@@ -534,6 +846,22 @@ static char *read_config(const char *path, char *error, size_t error_size) {
     return text;
 }
 
+static int read_file_attributes(
+    const char *path, WIN32_FILE_ATTRIBUTE_DATA *attributes) {
+    return GetFileAttributesExA(
+        path, GetFileExInfoStandard, attributes) != 0;
+}
+
+static int same_file_version(
+    const WIN32_FILE_ATTRIBUTE_DATA *left,
+    const WIN32_FILE_ATTRIBUTE_DATA *right) {
+    return CompareFileTime(
+               &left->ftLastWriteTime,
+               &right->ftLastWriteTime) == 0 &&
+           left->nFileSizeHigh == right->nFileSizeHigh &&
+           left->nFileSizeLow == right->nFileSizeLow;
+}
+
 static int binding_equal(
     const SrInputBinding *left, const SrInputBinding *right) {
     if (left->count != right->count) return 0;
@@ -560,7 +888,45 @@ static int is_legacy_default_config(const SrInputConfig *config) {
     }
     return config->deadzone == legacy.deadzone &&
            config->curve == legacy.curve &&
-           config->invert_y == legacy.invert_y;
+           config->invert_y == legacy.invert_y &&
+           config->twin_stick_enabled == legacy.twin_stick_enabled &&
+           config->movement_deadzone == legacy.movement_deadzone &&
+           config->movement_curve == legacy.movement_curve &&
+           config->movement_invert_y == legacy.movement_invert_y &&
+           config->aim_deadzone == legacy.aim_deadzone &&
+           config->aim_curve == legacy.aim_curve &&
+           config->aim_invert_x == legacy.aim_invert_x &&
+           config->aim_invert_y == legacy.aim_invert_y;
+}
+
+static int is_default_config(const SrInputConfig *config) {
+    SrInputConfig defaults;
+    sr_input_config_defaults(&defaults);
+    for (int i = 0; i < SR_INPUT_ACTIONS; i++) {
+        if (!binding_equal(&config->keyboard[i], &defaults.keyboard[i]) ||
+            !binding_equal(&config->mouse[i], &defaults.mouse[i]) ||
+            !binding_equal(&config->gamepad[i], &defaults.gamepad[i])) {
+            return 0;
+        }
+    }
+    for (int i = 0; i < SR_INPUT_ANALOG_DIRECTIONS; i++) {
+        if (!binding_equal(
+                &config->analog_keyboard[i],
+                &defaults.analog_keyboard[i])) {
+            return 0;
+        }
+    }
+    return config->deadzone == defaults.deadzone &&
+           config->curve == defaults.curve &&
+           config->invert_y == defaults.invert_y &&
+           config->twin_stick_enabled == defaults.twin_stick_enabled &&
+           config->movement_deadzone == defaults.movement_deadzone &&
+           config->movement_curve == defaults.movement_curve &&
+           config->movement_invert_y == defaults.movement_invert_y &&
+           config->aim_deadzone == defaults.aim_deadzone &&
+           config->aim_curve == defaults.aim_curve &&
+           config->aim_invert_x == defaults.aim_invert_x &&
+           config->aim_invert_y == defaults.aim_invert_y;
 }
 
 int sr_input_init(void) {
@@ -612,15 +978,19 @@ int sr_input_init(void) {
     }
     SrInputConfig parsed;
     sr_input_config_defaults(&parsed);
-    int legacy_version =
-        strstr(text, "# KZL input config v1") != NULL;
+    int legacy_version = strstr(text, "# KZL input config v1") != NULL;
+    int previous_version = strstr(text, "# KZL input config v2") != NULL;
+    int version_three = strstr(text, "# KZL input config v3") != NULL;
     int ok = sr_input_config_parse(&parsed, text, error, sizeof(error));
     free(text);
     if (!ok) {
         fprintf(stderr, "input: invalid %s: %s\n", s_config_path, error);
         return 0;
     }
-    if (!required && legacy_version && is_legacy_default_config(&parsed)) {
+    if (!required &&
+        ((legacy_version && is_legacy_default_config(&parsed)) ||
+         ((previous_version || version_three) &&
+          is_default_config(&parsed)))) {
         sr_input_config_defaults(&parsed);
         if (!write_default_config(s_config_path)) {
             fprintf(
@@ -629,15 +999,21 @@ int sr_input_init(void) {
                 s_config_path);
         } else {
             fprintf(
-                stderr, "input: migrated default config to v2 %s\n",
+                stderr, "input: migrated default config to v4 %s\n",
                 s_config_path);
         }
     }
     s_config = parsed;
     s_initialized = 1;
     fprintf(
-        stderr, "input: loaded %s (deadzone %.3f, curve %.3f, invert_y %d)\n",
-        s_config_path, s_config.deadzone, s_config.curve, s_config.invert_y);
+        stderr,
+        "input: loaded %s (deadzone %.3f, curve %.3f, invert_y %d, "
+        "twin_stick %d)\n",
+        s_config_path,
+        s_config.deadzone,
+        s_config.curve,
+        s_config.invert_y,
+        s_config.twin_stick_enabled);
     return 1;
 }
 
@@ -657,6 +1033,264 @@ void sr_input_keyboard_axis(
 
 void sr_input_analog(int raw_x, int raw_y, uint8_t *lx, uint8_t *ly) {
     sr_input_config_analog(&s_config, raw_x, raw_y, lx, ly);
+}
+
+uint32_t sr_input_gamepad_sticks(
+    uint32_t buttons,
+    const SrInputSticks *sticks,
+    uint8_t *lx,
+    uint8_t *ly) {
+    uint8_t output_lx = 128;
+    uint8_t output_ly = 128;
+    uint32_t result = sr_input_config_gamepad_sticks(
+        &s_config,
+        &s_twin_stick_state,
+        buttons,
+        sticks,
+        &output_lx,
+        &output_ly);
+    if (lx) *lx = output_lx;
+    if (ly) *ly = output_ly;
+    return result;
+}
+
+void sr_input_gamepad_disconnected(void) {
+    memset(&s_twin_stick_state, 0, sizeof(s_twin_stick_state));
+}
+
+int sr_input_twin_stick_enabled(void) {
+    return s_config.twin_stick_enabled;
+}
+
+int sr_input_twin_stick_aim(float *x, float *y) {
+    if (!s_twin_stick_state.aim_active) return 0;
+    if (x) *x = s_twin_stick_state.aim_x;
+    if (y) *y = s_twin_stick_state.aim_y;
+    return 1;
+}
+
+const SrInputConfig *sr_input_config_get(void) {
+    return s_initialized ? &s_config : NULL;
+}
+
+int sr_input_config_save(
+    const SrInputConfig *config,
+    char *error,
+    size_t error_size) {
+    char temporary[1100];
+    FILE *file;
+    int length;
+    int ok;
+
+    if (error && error_size) error[0] = 0;
+    if (!s_initialized || !config || !s_config_path[0]) {
+        set_error(
+            error,
+            error_size,
+            0,
+            "input config cannot be saved",
+            NULL);
+        return 0;
+    }
+    length = snprintf(
+        temporary, sizeof(temporary), "%s.tmp", s_config_path);
+    if (length < 0 || (size_t)length >= sizeof(temporary)) {
+        set_error(
+            error,
+            error_size,
+            0,
+            "temporary input config path is too long",
+            NULL);
+        return 0;
+    }
+    file = fopen(temporary, "wb");
+    if (!file) {
+        set_error(
+            error,
+            error_size,
+            0,
+            "cannot create temporary input config",
+            temporary);
+        return 0;
+    }
+    ok = write_config(file, config) &&
+         fflush(file) == 0 &&
+         _commit(_fileno(file)) == 0;
+    if (fclose(file) != 0) ok = 0;
+    if (!ok) {
+        DeleteFileA(temporary);
+        set_error(
+            error,
+            error_size,
+            0,
+            "cannot write temporary input config",
+            temporary);
+        return 0;
+    }
+    if (!MoveFileExA(
+            temporary,
+            s_config_path,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        char detail[256];
+        snprintf(
+            detail,
+            sizeof(detail),
+            "%s (error %lu)",
+            s_config_path,
+            (unsigned long)GetLastError());
+        DeleteFileA(temporary);
+        set_error(
+            error,
+            error_size,
+            0,
+            "cannot publish input config",
+            detail);
+        return 0;
+    }
+    s_config = *config;
+    memset(&s_twin_stick_state, 0, sizeof(s_twin_stick_state));
+    fprintf(stderr, "input: saved %s\n", s_config_path);
+    return 1;
+}
+
+int sr_input_config_reload(char *error, size_t error_size) {
+    SrInputConfig parsed;
+    char *text;
+    int ok;
+
+    if (error && error_size) error[0] = 0;
+    if (!s_initialized || !s_config_path[0]) {
+        set_error(
+            error,
+            error_size,
+            0,
+            "input config cannot be reloaded",
+            NULL);
+        return 0;
+    }
+    text = read_config(s_config_path, error, error_size);
+    if (!text) return 0;
+    sr_input_config_defaults(&parsed);
+    ok = sr_input_config_parse(
+        &parsed, text, error, error_size);
+    free(text);
+    if (!ok) return 0;
+    s_config = parsed;
+    memset(&s_twin_stick_state, 0, sizeof(s_twin_stick_state));
+    return 1;
+}
+
+static DWORD WINAPI input_reload_thread(void *context) {
+    WIN32_FILE_ATTRIBUTE_DATA observed;
+    WIN32_FILE_ATTRIBUTE_DATA current;
+    int observed_valid;
+    (void)context;
+
+    observed_valid =
+        read_file_attributes(s_config_path, &observed);
+    for (;;) {
+        DWORD wait = WaitForSingleObject(
+            s_reload_stop_event, 250u);
+        int current_valid;
+        int changed;
+        if (wait == WAIT_OBJECT_0) return 0;
+        if (wait == WAIT_FAILED) {
+            fprintf(
+                stderr,
+                "input: hot reload watcher wait failed (error %lu)\n",
+                (unsigned long)GetLastError());
+            return 1;
+        }
+        current_valid =
+            read_file_attributes(s_config_path, &current);
+        changed =
+            current_valid != observed_valid ||
+            (current_valid &&
+             !same_file_version(&current, &observed));
+        if (!changed) continue;
+        observed_valid = current_valid;
+        if (current_valid) observed = current;
+        InterlockedExchange(&s_reload_requested, 1);
+    }
+}
+
+int sr_input_start_hot_reload(void) {
+    const char *override;
+    if (!s_initialized) {
+        fprintf(
+            stderr,
+            "input: hot reload requires initialized config\n");
+        return 0;
+    }
+    override = getenv("SR_INPUT_HOT_RELOAD");
+    if (override && strcmp(override, "0") == 0) {
+        fprintf(
+            stderr,
+            "input: hot reload disabled by SR_INPUT_HOT_RELOAD=0\n");
+        return 1;
+    }
+    if (!s_config_path[0] || s_reload_thread) return 1;
+    s_reload_stop_event = CreateEventA(
+        NULL, TRUE, FALSE, NULL);
+    if (!s_reload_stop_event) {
+        fprintf(
+            stderr,
+            "input: cannot create hot reload stop event (error %lu)\n",
+            (unsigned long)GetLastError());
+        return 0;
+    }
+    s_reload_thread = CreateThread(
+        NULL, 0, input_reload_thread, NULL, 0, NULL);
+    if (!s_reload_thread) {
+        fprintf(
+            stderr,
+            "input: cannot start hot reload watcher (error %lu)\n",
+            (unsigned long)GetLastError());
+        CloseHandle(s_reload_stop_event);
+        s_reload_stop_event = NULL;
+        return 0;
+    }
+    atexit(sr_input_stop_hot_reload);
+    fprintf(stderr, "input: hot reload watcher active\n");
+    return 1;
+}
+
+void sr_input_stop_hot_reload(void) {
+    if (!s_reload_thread) return;
+    SetEvent(s_reload_stop_event);
+    WaitForSingleObject(s_reload_thread, INFINITE);
+    CloseHandle(s_reload_thread);
+    CloseHandle(s_reload_stop_event);
+    s_reload_thread = NULL;
+    s_reload_stop_event = NULL;
+    InterlockedExchange(&s_reload_requested, 0);
+}
+
+void sr_input_poll_reload(void) {
+    char error[512];
+
+    if (!s_initialized ||
+        !s_config_path[0] ||
+        InterlockedExchange(&s_reload_requested, 0) == 0) {
+        return;
+    }
+    if (!sr_input_config_reload(error, sizeof(error))) {
+        fprintf(
+            stderr,
+            "input: hot reload rejected %s: %s "
+            "(keeping previous settings)\n",
+            s_config_path,
+            error);
+        return;
+    }
+    fprintf(
+        stderr,
+        "input: hot reloaded %s "
+        "(twin_stick %d, aim invert_x %d, invert_y %d)\n",
+        s_config_path,
+        s_config.twin_stick_enabled,
+        s_config.aim_invert_x,
+        s_config.aim_invert_y);
 }
 
 const char *sr_input_config_path(void) {

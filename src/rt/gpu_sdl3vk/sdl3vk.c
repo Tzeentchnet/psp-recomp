@@ -299,10 +299,19 @@ static void poll_input(int *quit) {
         s_pad ? SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTX) : 0;
     int pad_y =
         s_pad ? SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTY) : 0;
-    sr_input_analog(
-        key_x || key_y ? key_x : pad_x,
-        key_x || key_y ? key_y : pad_y,
-        &s_lx, &s_ly);
+    if (s_pad) {
+        SrInputSticks sticks = {
+            key_x || key_y ? key_x : pad_x,
+            key_x || key_y ? key_y : pad_y,
+            SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHTX),
+            SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHTY),
+        };
+        s_buttons =
+            sr_input_gamepad_sticks(s_buttons, &sticks, &s_lx, &s_ly);
+    } else {
+        sr_input_gamepad_disconnected();
+        sr_input_analog(key_x, key_y, &s_lx, &s_ly);
+    }
 }
 
 int sdl3vk_get_vk(Sdl3VkInfo *out) {

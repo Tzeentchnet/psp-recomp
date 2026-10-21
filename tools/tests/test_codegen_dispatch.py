@@ -76,12 +76,35 @@ class DispatchGenerationTests(unittest.TestCase):
                     "at = 0x089baac8\n"
                     'handler = "sr_kzl_downloads_unavailable"\n'
                 )
-            gotos, jal_next, host_functions = codegen.cx.load_overrides(path)
+            gotos, jal_next, host_functions, instruction_hooks = (
+                codegen.cx.load_overrides(path)
+            )
             self.assertEqual(gotos, {})
             self.assertEqual(jal_next, set())
+            self.assertEqual(instruction_hooks, {})
             self.assertEqual(
                 host_functions,
                 {0x089BAAC8: "sr_kzl_downloads_unavailable"},
+            )
+
+    def test_loads_instruction_hook_override(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(temporary, "overrides.toml")
+            with open(path, "w", encoding="ascii") as stream:
+                stream.write(
+                    "[[instruction_hook]]\n"
+                    "at = 0x08900688\n"
+                    'handler = "sr_kzl_twinstick_apply_aim"\n'
+                )
+            gotos, jal_next, host_functions, instruction_hooks = (
+                codegen.cx.load_overrides(path)
+            )
+            self.assertEqual(gotos, {})
+            self.assertEqual(jal_next, set())
+            self.assertEqual(host_functions, {})
+            self.assertEqual(
+                instruction_hooks,
+                {0x08900688: "sr_kzl_twinstick_apply_aim"},
             )
 
     def test_rejects_invalid_host_function_handler(self):
@@ -136,6 +159,34 @@ class DispatchGenerationTests(unittest.TestCase):
             output,
         )
         self.assertIn("r25=s->r[25];", output)
+
+    def test_instruction_hook_synchronizes_cached_gprs(self):
+        words = {
+            0x1000: i_type(0x09, 4, 4, 1),
+            0x1004: r_type(31, 0, 0, 0x08),
+            0x1008: 0,
+        }
+        used = set()
+        output = "\n".join(
+            codegen.emit_function(
+                FakeElf(words),
+                0x1000,
+                [(0x1000, 0x100C)],
+                {0x1000},
+                instruction_hooks={0x1000: "host_hook"},
+                used_instruction_hooks=used,
+            )
+        )
+        self.assertEqual(used, {0x1000})
+        flush = output.index("s->r[4]=r4;")
+        hook = output.index("host_hook(s);")
+        reload = output.index("r4=s->r[4];", hook)
+        instruction = output.index(
+            "SR_GPR(s, 4) = (SR_GPR(s, 4) + 0x00000001u);"
+        )
+        self.assertLess(flush, hook)
+        self.assertLess(hook, reload)
+        self.assertLess(reload, instruction)
 
     def test_does_not_fold_jalr_across_control_flow_merge(self):
         words = {

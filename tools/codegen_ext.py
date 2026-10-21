@@ -281,7 +281,7 @@ def switch_labels(table, known):
 
 
 def load_overrides(path):
-    """Load computed gotos, jal-next sites, and guest functions replaced by host handlers."""
+    """Load control-flow hints plus whole-function and instruction host hooks."""
     import re
     import tomllib
     with open(path, "rb") as f:
@@ -298,7 +298,23 @@ def load_overrides(path):
         if address in host_functions:
             raise ValueError(f"duplicate host_function at 0x{address:08x}")
         host_functions[address] = handler
-    return gotos, {j["at"] for j in cfg.get("jal_next", [])}, host_functions
+    instruction_hooks = {}
+    for entry in cfg.get("instruction_hook", []):
+        address = entry.get("at")
+        handler = entry.get("handler")
+        if not isinstance(address, int):
+            raise ValueError("instruction_hook.at must be an integer address")
+        if not isinstance(handler, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", handler):
+            raise ValueError(f"instruction_hook at 0x{address:08x} has an invalid C handler")
+        if address in instruction_hooks:
+            raise ValueError(f"duplicate instruction_hook at 0x{address:08x}")
+        instruction_hooks[address] = handler
+    return (
+        gotos,
+        {j["at"] for j in cfg.get("jal_next", [])},
+        host_functions,
+        instruction_hooks,
+    )
 
 
 def emit_jal_next(pc, w, delay_line, local_gprs=False):

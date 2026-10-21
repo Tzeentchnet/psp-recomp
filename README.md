@@ -158,7 +158,44 @@ gamepad.l = left_shoulder, left_trigger
 analog.deadzone = 0.24
 analog.curve = 1.0
 analog.invert_y = false
+twin_stick.enabled = false
+movement.deadzone = 0.24
+movement.curve = 1.0
+movement.invert_y = false
+aim.deadzone = 0.24
+aim.curve = 1.0
+aim.invert_x = false
+aim.invert_y = false
 ```
+
+`twin_stick.enabled = true` enables the experimental gamepad-only scheme.
+While a controller is connected, the movement stick is converted to PSP D-pad
+directions with hysteresis. The aim stick is carried through a native side
+channel and replaces the base on-foot facing vector before the game's original
+target and auto-aim correction. The runtime temporarily overlays the hidden
+D-pad movement profile without marking it dirty and restores the original
+mappings when the controller disconnects. This experiment has not yet passed
+the full gameplay validation matrix, so back up saves before testing it.
+
+Run `kzl.exe --configure-input` to edit all twelve gamepad action bindings and
+the twin-stick/reversal options in the native controller dialog. Each action
+accepts the same comma-separated names as `input.ini`, including combinations
+such as `west, right_trigger` for Square/fire. `kzl.exe --configure` opens the
+graphics dialog followed by controller settings.
+Turning twin-stick on from an unchecked state loads the tested default preset:
+`left_shoulder` for PSP L/strafe, `left_trigger` for PSP R/aim,
+`west, right_trigger` for Square/fire, and vertical aim reversal. It does not
+change the built-in controls while twin-stick remains disabled.
+
+The running game checks `input.ini` four times per second. Saving from a second
+`kzl.exe --configure-input` process hot-reloads bindings, twin-stick enablement,
+response settings, and aim reversal without restarting. Invalid edits are
+reported in the runtime log and the last valid configuration remains active
+until a corrected file is saved. The remapper remains open after saving so
+multiple adjustments can be tested; select **Close** when finished.
+Filesystem checks run on a sleeping watcher thread; the presentation path only
+checks an atomic reload notification and performs no periodic file I/O.
+Set `SR_INPUT_HOT_RELOAD=0` to disable the watcher for diagnostics.
 
 Bindings accept up to four comma-separated inputs or `none`. Keyboard inputs
 are `A`-`Z`, `0`-`9`, `enter`, `left_shift`, `right_shift`, `up`, `right`,
@@ -169,9 +206,10 @@ Gamepad inputs are `south`, `east`, `west`, `north`, `start`, `back`,
 `dpad_*` names, `left_stick`, and `right_stick`. Invalid settings stop startup
 with a line-specific error instead of silently falling back. Set
 `SR_INPUT_CONFIG=<path>` to use another file, or `SR_INPUT_CONFIG=0` to use
-built-in defaults without reading or writing a file. An untouched generated v1
-config is migrated automatically to the v2 PC defaults; customized v1 files
-retain their keyboard/gamepad choices and inherit the new mouse defaults.
+built-in defaults without reading or writing a file. An untouched generated
+v1, v2, or v3 config is migrated automatically to the v4 PC defaults;
+customized older files retain their bindings and inherit the disabled
+twin-stick defaults.
 Set `SR_GRAPHICS_CONFIG=<path>` or `SR_SETTINGS_DIR=<directory>` for isolated
 automation. `SR_GRAPHICS_CONFIG=0` uses the built-in graphics defaults without
 opening the first-run launcher or reading/writing a file.

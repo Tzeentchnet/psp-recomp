@@ -57,6 +57,8 @@ src/ref/interp.cpp \
               src/rt/graphics_config.c \
               src/rt/graphics_settings.c \
               src/rt/input_config.c \
+              src/rt/input_settings.c \
+              src/rt/kzl_twinstick.c \
               src/rt/startup_check.c \
               src/rt/audio_mixer.c \
               src/rt/sas_reverb.c \

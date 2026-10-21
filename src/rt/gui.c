@@ -7,6 +7,7 @@
 #include "graphics_config.h"
 #include "graphics_settings.h"
 #include "input_config.h"
+#include "input_settings.h"
 #ifdef SR_SDL3VK
 #include "gpu_sdl3vk/sdl3vk.h"
 #include "gpu_sdl3vk/ge_gpu.h"
@@ -84,7 +85,7 @@ static int win_mouse_down(void *context, int button) {
  * Generic controller support without external deps. XInput (loaded dynamically) covers Xbox pads
  * and the many third-party / PS-style pads that present an XInput interface (incl. PS4 via Steam
  * Input or DS4Windows). DirectInput covers a DualShock 4 / generic HID gamepad connected directly.
- * Both feed the same PSP pad mask plus the analog left stick (Lx/Ly, 0..255, 128=centre). */
+ * Both feed the same PSP pad mask plus movement and aim sticks. */
 static uint8_t s_lx = 128, s_ly = 128;     /* live left-stick, latched each present */
 static int s_pad_present = 0;               /* a controller is currently connected */
 
@@ -96,11 +97,14 @@ static PFN_XInputGetState s_xiGetState;
 
 static IDirectInput8A     *s_di;
 static IDirectInputDevice8A *s_dijoy;
+static int s_di_aim_axes;
 
 typedef struct PadState {
     uint8_t down[SR_PAD_RIGHT_STICK + 1];
-    int x, y;
-    int has_stick;
+    int movement_x, movement_y;
+    int aim_x, aim_y;
+    int has_movement_stick;
+    int has_aim_stick;
     int present;
 } PadState;
 
@@ -116,6 +120,20 @@ static BOOL CALLBACK di_enum_cb(const DIDEVICEINSTANCEA *inst, void *ctx) {
     return DIENUM_STOP;   /* take the first attached game controller */
 }
 
+static int di_set_axis_range(DWORD offset) {
+    DIPROPRANGE range;
+    memset(&range, 0, sizeof(range));
+    range.diph.dwSize = sizeof(range);
+    range.diph.dwHeaderSize = sizeof(range.diph);
+    range.diph.dwObj = offset;
+    range.diph.dwHow = DIPH_BYOFFSET;
+    range.lMin = 0;
+    range.lMax = 65535;
+    return SUCCEEDED(
+        IDirectInputDevice8_SetProperty(
+            s_dijoy, DIPROP_RANGE, &range.diph));
+}
+
 static void pad_init(void) {
     const char *dll[3] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
     for (int i = 0; i < 3 && !s_xiGetState; i++) {
@@ -128,13 +146,14 @@ static void pad_init(void) {
         if (s_dijoy) {
             IDirectInputDevice8_SetDataFormat(s_dijoy, &c_dfDIJoystick2);
             IDirectInputDevice8_SetCooperativeLevel(s_dijoy, s_hwnd, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE);
-            /* Normalise the main axes to 0..65535 so centre is ~32767. */
-            for (int axis = 0; axis < 2; axis++) {
-                DIPROPRANGE pr; pr.diph.dwSize = sizeof(pr); pr.diph.dwHeaderSize = sizeof(pr.diph);
-                pr.diph.dwObj = (DWORD)(axis == 0 ? DIJOFS_X : DIJOFS_Y); pr.diph.dwHow = DIPH_BYOFFSET;
-                pr.lMin = 0; pr.lMax = 65535;
-                IDirectInputDevice8_SetProperty(s_dijoy, DIPROP_RANGE, &pr.diph);
-            }
+            di_set_axis_range(DIJOFS_X);
+            di_set_axis_range(DIJOFS_Y);
+            int has_z = di_set_axis_range(DIJOFS_Z);
+            int has_rz = di_set_axis_range(DIJOFS_RZ);
+            int has_rx = di_set_axis_range(DIJOFS_RX);
+            int has_ry = di_set_axis_range(DIJOFS_RY);
+            s_di_aim_axes =
+                has_z && has_rz ? 1 : has_rx && has_ry ? 2 : 0;
             IDirectInputDevice8_Acquire(s_dijoy);
         }
     }
@@ -163,9 +182,18 @@ static void read_pad(PadState *state) {
             state->down[SR_PAD_DPAD_DOWN] = (w & 0x0002) != 0;
             state->down[SR_PAD_DPAD_LEFT] = (w & 0x0004) != 0;
             state->down[SR_PAD_DPAD_RIGHT] = (w & 0x0008) != 0;
-            state->x = st.Gamepad.sThumbLX;
-            state->y = -st.Gamepad.sThumbLY;
-            state->has_stick = 1;
+            state->movement_x = st.Gamepad.sThumbLX;
+            state->movement_y =
+                st.Gamepad.sThumbLY == -32768
+                    ? 32767
+                    : -(int)st.Gamepad.sThumbLY;
+            state->aim_x = st.Gamepad.sThumbRX;
+            state->aim_y =
+                st.Gamepad.sThumbRY == -32768
+                    ? 32767
+                    : -(int)st.Gamepad.sThumbRY;
+            state->has_movement_stick = 1;
+            state->has_aim_stick = 1;
         }
     }
     if (s_dijoy) {
@@ -192,10 +220,20 @@ static void read_pad(PadState *state) {
                 state->down[SR_PAD_DPAD_DOWN] |= pov >= 13500 && pov <= 22500;
                 state->down[SR_PAD_DPAD_LEFT] |= pov >= 22500 && pov <= 31500;
             }
-            if (!state->has_stick) {          /* prefer XInput stick if both present */
-                state->x = (int)js.lX - 32768;
-                state->y = (int)js.lY - 32768;
-                state->has_stick = 1;
+            if (!state->has_movement_stick) {
+                state->movement_x = (int)js.lX - 32768;
+                state->movement_y = (int)js.lY - 32768;
+                state->has_movement_stick = 1;
+            }
+            if (!state->has_aim_stick && s_di_aim_axes) {
+                if (s_di_aim_axes == 1) {
+                    state->aim_x = (int)js.lZ - 32768;
+                    state->aim_y = (int)js.lRz - 32768;
+                } else {
+                    state->aim_x = (int)js.lRx - 32768;
+                    state->aim_y = (int)js.lRy - 32768;
+                }
+                state->has_aim_stick = 1;
             }
         }
     }
@@ -217,6 +255,10 @@ int gui_init(const char *title) {
         fprintf(stderr, "gui_init: graphics configuration failed\n");
         return 0;
     }
+    if (!sr_input_init()) {
+        fprintf(stderr, "gui_init: input configuration failed\n");
+        return 0;
+    }
     if (sr_graphics_config_first_run()) {
         int result = sr_graphics_settings_show(
             "Killzone: Liberation Graphics");
@@ -225,9 +267,18 @@ int gui_init(const char *title) {
                 fprintf(stderr, "gui_init: first-run graphics setup cancelled\n");
             return 0;
         }
+        result = sr_input_settings_show(
+            "Killzone: Liberation Controller");
+        if (result <= 0) {
+            if (!result)
+                fprintf(
+                    stderr,
+                    "gui_init: first-run controller setup cancelled\n");
+            return 0;
+        }
     }
-    if (!sr_input_init()) {
-        fprintf(stderr, "gui_init: input configuration failed\n");
+    if (!sr_input_start_hot_reload()) {
+        fprintf(stderr, "gui_init: input hot reload watcher failed\n");
         return 0;
     }
     graphics = sr_graphics_config_get();
@@ -445,6 +496,7 @@ static void convert_fb(uint32_t fbaddr, int fmt, uint32_t stride) {
 
 void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
     if (!s_on) return;
+    sr_input_poll_reload();
     if (stride == 0) stride = 512;
 
 #ifdef SR_D3D12
@@ -515,9 +567,27 @@ void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
         pad.present ? pad_down : NULL, &pad);
     int key_x = 0, key_y = 0;
     sr_input_keyboard_axis(win_key_down, NULL, &key_x, &key_y);
-    int raw_x = key_x || key_y ? key_x : pad.has_stick ? pad.x : 0;
-    int raw_y = key_x || key_y ? key_y : pad.has_stick ? pad.y : 0;
-    sr_input_analog(raw_x, raw_y, &s_lx, &s_ly);
+    int raw_x =
+        key_x || key_y
+            ? key_x
+            : pad.has_movement_stick ? pad.movement_x : 0;
+    int raw_y =
+        key_x || key_y
+            ? key_y
+            : pad.has_movement_stick ? pad.movement_y : 0;
+    if (pad.present) {
+        SrInputSticks sticks = {
+            raw_x,
+            raw_y,
+            pad.has_aim_stick ? pad.aim_x : 0,
+            pad.has_aim_stick ? pad.aim_y : 0,
+        };
+        s_buttons =
+            sr_input_gamepad_sticks(s_buttons, &sticks, &s_lx, &s_ly);
+    } else {
+        sr_input_gamepad_disconnected();
+        sr_input_analog(raw_x, raw_y, &s_lx, &s_ly);
+    }
 
     convert_fb(fbaddr, fmt, stride);
     HDC dc = GetDC(s_hwnd);

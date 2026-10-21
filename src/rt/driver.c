@@ -12,6 +12,8 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "graphics_config.h"
 #include "graphics_settings.h"
+#include "input_config.h"
+#include "input_settings.h"
 #include "recomp.h"
 #include "startup_check.h"
 
@@ -143,11 +145,21 @@ int main(int argc, char **argv) {
     SetUnhandledExceptionFilter(sr_crash_filter);
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--configure-input") == 0) {
+            int result;
+            if (!sr_input_init()) return 2;
+            result = sr_input_settings_show(
+                "Killzone: Liberation Controller");
+            return result < 0 ? 2 : 0;
+        }
         if (strcmp(argv[i], "--configure") == 0) {
             int result;
-            if (!sr_graphics_config_init()) return 2;
+            if (!sr_graphics_config_init() || !sr_input_init()) return 2;
             result = sr_graphics_settings_show(
                 "Killzone: Liberation Graphics");
+            if (result <= 0) return result < 0 ? 2 : 0;
+            result = sr_input_settings_show(
+                "Killzone: Liberation Controller");
             return result < 0 ? 2 : 0;
         }
     }

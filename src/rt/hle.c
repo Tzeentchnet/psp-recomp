@@ -17,7 +17,9 @@
 #include "recomp.h"
 #include "audio.h"
 #include "atrac_decode.h"
+#include "input_config.h"
 #include "iso.h"
+#include "kzl_twinstick.h"
 #include "pgf.h"
 #include "sas_reverb.h"
 #include "nid_names.h"   /* sr_nid_name(): names unknown NIDs in the trap below */
@@ -2716,6 +2718,8 @@ static uint32_t h_CtrlButtons(void) {
 /* Latch one controller sample per frame into the ring (called from sr_vblank_tick). */
 void sr_ctrl_sample(void) {
     uint8_t lx = 128, ly = 128;
+    sr_kzl_twinstick_update(
+        sr_input_twin_stick_enabled() && gui_on() && gui_pad_present());
     if (gui_on()) gui_analog(&lx, &ly);
     {
         static int initialized;
