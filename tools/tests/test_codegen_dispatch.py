@@ -44,6 +44,25 @@ class DispatchGenerationTests(unittest.TestCase):
         self.assertIn("sr_set_dispatch_table(", output)
         self.assertNotIn("sr_register(", output)
 
+    def test_emits_runtime_import_patches(self):
+        lines = codegen.emit_dispatch_table(
+            [0x08804000],
+            {0x08926760: ("kjfs", 0x93E9297F)},
+        )
+        output = "\n".join(lines)
+        self.assertIn(
+            'sr_module_patch_import(0x08926760u, 0x93e9297fu, "kjfs");',
+            output,
+        )
+
+    def test_emits_vfpu7_integer_pack_operations(self):
+        unsigned_char, _, _ = codegen.vfpu_effect(0x08885E54, 0xD03C8484)
+        signed_short, _, _ = codegen.vfpu_effect(0x08886D6C, 0xD03F88CC)
+        self.assertIn("_v>>23", unsigned_char)
+        self.assertIn(">>16", signed_short)
+        self.assertIn("sr_vwrite", unsigned_char)
+        self.assertIn("sr_vwrite", signed_short)
+
     def test_loads_hot_addresses_from_audit_report(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = os.path.join(temporary, "hot.txt")
