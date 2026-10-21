@@ -251,6 +251,8 @@ typedef uint32_t (*HleFn)(CpuState *s);
 void     sr_hle_register(uint32_t nid, const char *name, HleFn fn);
 void     sr_hle_init(void);     /* registers all built-in handlers (idempotent) */
 void     sr_net_register(void);  /* offline networking HLE (src/rt/net.c) */
+void     sr_syscall_lib(
+             CpuState *s, const char *library, uint32_t nid);
 void     sr_syscall(CpuState *s, uint32_t nid);
 extern uint32_t sr_last_nid;
 enum {
@@ -361,10 +363,26 @@ uint32_t sr_module_start(
              uint32_t status_address, uint32_t option_address);
 uint32_t sr_module_unload(uint32_t uid);
 int      sr_module_find_export(
-             uint32_t nid, uint32_t *address, const char **library);
+             const char *library, uint32_t nid,
+             uint32_t *address, const char **resolved_library);
+int      sr_module_syscall_binding(
+             uint32_t code, const char **library, uint32_t *nid);
 int      sr_module_syscall_nid(uint32_t code, uint32_t *nid);
 int      sr_module_patch_import(
              uint32_t stub, uint32_t nid, const char *library);
+typedef enum SrModulePolicyMode {
+    SR_MODULE_GUEST = 1,
+    SR_MODULE_HLE = 2,
+    SR_MODULE_REJECT = 3,
+} SrModulePolicyMode;
+typedef struct SrModulePolicyEntry {
+    const char *path;
+    const char *module;
+    const char *sha1;
+    SrModulePolicyMode mode;
+} SrModulePolicyEntry;
+void     sr_module_set_policy(
+             const SrModulePolicyEntry *entries, uint32_t count);
 
 /* A function the static recompiler could not translate (an unimplemented instruction). The
  * body traps loudly with the guest address and reason rather than silently doing nothing, so

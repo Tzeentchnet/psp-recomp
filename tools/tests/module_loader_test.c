@@ -54,7 +54,8 @@ struct SrBlockAlloc {
 
 static SrBlockAlloc test_allocator;
 static uint32_t next_uid;
-static uint32_t last_unregistered_uid;
+static uint32_t unregistered_uids[16];
+static uint32_t unregistered_count;
 static uint32_t scheduler_thread;
 static uint32_t scheduler_entry;
 static int scheduler_priority;
@@ -91,16 +92,21 @@ SrBlockAlloc *sr_kmem_user(void) {
     return &test_allocator;
 }
 
+uint32_t sr_alloc_uid(void) {
+    return next_uid++;
+}
+
 uint32_t sr_alloc_uid_type(uint32_t type) {
     if (type != SR_TMID_MODULE) {
         fprintf(stderr, "unexpected UID type %u\n", type);
         abort();
     }
-    return next_uid++;
+    return sr_alloc_uid();
 }
 
 void sr_unregister_uid(uint32_t uid) {
-    last_unregistered_uid = uid;
+    if (unregistered_count < 16)
+        unregistered_uids[unregistered_count++] = uid;
 }
 
 uint32_t sched_create_thread(
@@ -345,12 +351,14 @@ static void reset_runtime(void) {
     memset(s_syscalls, 0, sizeof(s_syscalls));
     s_export_count = 0;
     s_syscall_count = 0;
+    sr_module_set_policy(NULL, 0);
     test_allocator.base = TEST_BASE;
     test_allocator.size = TEST_REGION_SIZE;
     test_allocator.allocated_size = 0;
     test_allocator.allocated = 0;
     next_uid = 0x110;
-    last_unregistered_uid = 0;
+    memset(unregistered_uids, 0, sizeof(unregistered_uids));
+    unregistered_count = 0;
     scheduler_thread = 0;
     scheduler_entry = 0;
     scheduler_priority = 0;
@@ -432,15 +440,20 @@ static void test_load_start_unload(void) {
     uint32_t export_address = 0;
     const char *library = NULL;
     CHECK(sr_module_find_export(
-        TEST_EXPORT_NID, &export_address, &library));
+        "testlib", TEST_EXPORT_NID, &export_address, &library));
     CHECK(export_address == TEST_BASE + 0x30);
     CHECK(strcmp(library, "testlib") == 0);
+    CHECK(!sr_module_find_export(
+        "otherlib", TEST_EXPORT_NID, &export_address, &library));
 
     CHECK(MEM_R32(TEST_BASE + 0x1a0) == 0x03e00008u);
     CHECK(MEM_R32(TEST_BASE + 0x1a4) == 0x0000004cu);
     uint32_t import_nid = 0;
-    CHECK(sr_module_syscall_nid(1, &import_nid));
+    const char *import_library = NULL;
+    CHECK(sr_module_syscall_binding(
+        1, &import_library, &import_nid));
     CHECK(import_nid == TEST_IMPORT_NID);
+    CHECK(strcmp(import_library, "dependency") == 0);
 
     uint32_t status = TEST_BASE + 0x270;
     CHECK(sr_module_start(uid, 7, TEST_BASE + 0x200, status, 0) == uid);
@@ -458,9 +471,10 @@ static void test_load_start_unload(void) {
 
     CHECK(sr_module_unload(uid) == uid);
     CHECK(!test_allocator.allocated);
-    CHECK(last_unregistered_uid == uid);
+    CHECK(unregistered_count == 1);
+    CHECK(unregistered_uids[0] == uid);
     CHECK(!sr_module_find_export(
-        TEST_EXPORT_NID, &export_address, &library));
+        "testlib", TEST_EXPORT_NID, &export_address, &library));
 
     memset(SR_HOST(TEST_BASE), 0xcc, TEST_REGION_SIZE);
     uint32_t reloaded =
@@ -499,13 +513,29 @@ static void test_malformed_cleanup(void) {
         bad_import, sizeof(bad_import), "bad-import.prx");
     CHECK(result == SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE);
     CHECK(!test_allocator.allocated);
-    CHECK(last_unregistered_uid == 0x110u);
+    CHECK(unregistered_count == 1);
+    CHECK(unregistered_uids[0] == 0x110u);
 
     uint32_t uid =
         sr_module_load_image(fixture, sizeof(fixture), "test/testmod.prx");
     CHECK(uid == 0x111u);
     CHECK(s_modules[0].base == TEST_BASE);
     CHECK(sr_module_unload(uid) == uid);
+}
+
+static void test_variable_import_rejection(void) {
+    uint8_t fixture[FIXTURE_SIZE];
+    build_fixture(fixture);
+    fixture[SEG0_OFFSET + 0x120 + 9] = 1;
+    reset_runtime();
+
+    uint32_t result = sr_module_load_image(
+        fixture, sizeof(fixture), "variable-import.prx");
+
+    CHECK(result == SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE);
+    CHECK(!test_allocator.allocated);
+    CHECK(unregistered_count == 1);
+    CHECK(unregistered_uids[0] == 0x110u);
 }
 
 static void test_hle_only_module(void) {
@@ -523,6 +553,71 @@ static void test_hle_only_module(void) {
     CHECK(sr_module_unload(uid) == uid);
 }
 
+static void test_explicit_module_policy(void) {
+    uint8_t fixture[FIXTURE_SIZE];
+    char sha1[41];
+    build_fixture(fixture);
+    module_sha1(fixture, sizeof(fixture), sha1);
+    SrModulePolicyEntry policy = {
+        "test/testmod.prx",
+        "testmod",
+        sha1,
+        SR_MODULE_HLE,
+    };
+    reset_runtime();
+    sr_module_set_policy(&policy, 1);
+
+    uint32_t uid =
+        sr_module_load_image(fixture, sizeof(fixture), "test/testmod.prx");
+
+    CHECK(uid == 0x110u);
+    CHECK(s_modules[0].hle_replaced);
+    CHECK(sr_module_start(uid, 0, 0, 0, 0) == uid);
+    CHECK(scheduler_thread == 0);
+    CHECK(sr_module_unload(uid) == uid);
+
+    policy.module = "wrong-name";
+    reset_runtime();
+    sr_module_set_policy(&policy, 1);
+    CHECK(
+        sr_module_load_image(
+            fixture, sizeof(fixture), "test/testmod.prx") ==
+        SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE);
+    CHECK(!test_allocator.allocated);
+}
+
+static void test_encrypted_module_requires_policy(void) {
+    uint8_t encrypted[52] = {0};
+    char sha1[41];
+    memcpy(encrypted, "~PSP", 4);
+    module_sha1(encrypted, sizeof(encrypted), sha1);
+    SrModulePolicyEntry unrelated = {
+        "other.prx",
+        "*",
+        sha1,
+        SR_MODULE_HLE,
+    };
+    reset_runtime();
+    sr_module_set_policy(&unrelated, 1);
+    CHECK(
+        sr_module_load_image(
+            encrypted, sizeof(encrypted), "sceCodec.prx") ==
+        SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE);
+
+    SrModulePolicyEntry matching = {
+        "sceCodec.prx",
+        "*",
+        sha1,
+        SR_MODULE_HLE,
+    };
+    reset_runtime();
+    sr_module_set_policy(&matching, 1);
+    uint32_t uid = sr_module_load_image(
+        encrypted, sizeof(encrypted), "sceCodec.prx");
+    CHECK(uid == 0x110u);
+    CHECK(sr_module_unload(uid) == uid);
+}
+
 int main(void) {
     uint8_t *memory = (uint8_t *)calloc(0x02000000u, 1);
     if (!memory) return 2;
@@ -531,7 +626,10 @@ int main(void) {
     test_relocations();
     test_load_start_unload();
     test_malformed_cleanup();
+    test_variable_import_rejection();
     test_hle_only_module();
+    test_explicit_module_policy();
+    test_encrypted_module_requires_policy();
 
     free(memory);
     if (failures) {

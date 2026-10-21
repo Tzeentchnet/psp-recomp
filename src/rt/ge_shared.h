@@ -92,6 +92,9 @@ typedef struct {
      * PPSSPP's accessor masks. The GPU backend reads these on flush("xfersrc") to know
      * which guest range is about to be read. */
     uint32_t xf_src, xf_srcw, xf_dst, xf_dstw, xf_spos, xf_dpos, xf_size;
+    /* Immediate vertex state, GE 0xF0-0xF9 (VSCX..VSCV). VAP (index 7) submits a vertex;
+     * the current runtime records state and reports nonzero VAP drawing explicitly. */
+    uint32_t imm[10];
 } GeState;
 
 /* A rasterized vertex: screen position, reciprocal clip-w (for persp-correct interp), UV,

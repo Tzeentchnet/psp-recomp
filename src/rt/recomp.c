@@ -439,7 +439,9 @@ void dispatch(CpuState *s, uint32_t target) {
         if (stop.reason == SR_INTERP_SYSCALL) {
             uint32_t code = (stop.op >> 6) & 0xfffffu;
             uint32_t nid;
-            if (!sr_module_syscall_nid(code, &nid)) {
+            const char *library;
+            if (!sr_module_syscall_binding(
+                    code, &library, &nid)) {
                 fprintf(
                     stderr,
                     "dispatch: unknown runtime PRX syscall code 0x%x "
@@ -447,7 +449,7 @@ void dispatch(CpuState *s, uint32_t target) {
                     code, stop.pc);
                 break;
             }
-            sr_syscall(s, nid);
+            sr_syscall_lib(s, library, nid);
             if (!remaining) {
                 stop.reason = SR_INTERP_STEP_LIMIT;
                 break;

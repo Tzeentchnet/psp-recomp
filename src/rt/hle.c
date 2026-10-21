@@ -1,7 +1,7 @@
 /* High-level emulation (Phase 6): NID -> handler dispatch for the recompiled game's imports.
  *
  * The PRX import table maps each .sceStub.text stub to a (library, NID); tools/imports.py
- * resolves it and the codegen emits sr_syscall(s, NID) in each stub. A handler reads its
+ * resolves it and the codegen emits sr_syscall_lib(s, library, NID) in each stub. A handler reads its
  * arguments from $a0-$a3 (and the stack for further args) and returns the $v0 value.
  *
  * Kernel object UIDs come from one counter, like PPSSPP's KernelObjectPool, and the driver
@@ -80,7 +80,12 @@ typedef struct { uint32_t uid, type; } UidObject;
 static UidObject *s_uid_objects;
 static uint32_t s_uid_object_count, s_uid_object_capacity;
 
-uint32_t sr_alloc_uid(void) { return s_uid++; }
+uint32_t sr_alloc_uid(void) {
+    uint32_t uid = s_uid++;
+    if (getenv("SR_UIDLOG"))
+        fprintf(stderr, "kernel uid 0x%x allocated\n", uid);
+    return uid;
+}
 void sr_register_uid_type(uint32_t uid, uint32_t type) {
     if (getenv("SR_UIDLOG"))
         fprintf(stderr, "kernel uid 0x%x type=%u\n", uid, type);
@@ -1606,6 +1611,7 @@ typedef enum {
 
 typedef struct {
     int used;
+    uint32_t uid;
     uint32_t lba, size, off;
     FILE *host;
     char path[256];
@@ -1641,6 +1647,7 @@ static void io_release_fd(uint32_t fd) {
     Fd *f = &s_fds[fd];
     if (f->host) fclose(f->host);
     if (f->async_thread) sched_delete_hle_thread(f->async_thread);
+    if (f->uid) sr_unregister_uid(f->uid);
     memset(f, 0, sizeof(*f));
 }
 
@@ -1804,6 +1811,7 @@ static uint32_t h_IoOpen(CpuState *s) {
         Fd *f = &s_fds[slot];
         memset(f, 0, sizeof(*f));
         f->used = 1; f->host = fp; f->lba = 0;
+        f->uid = sr_alloc_uid();
         f->size = (uint32_t)(sz < 0 ? 0 : sz); f->off = 0;
         f->async_priority = s_async_default_priority;
         snprintf(f->path, sizeof(f->path), "%s", path);
@@ -1812,6 +1820,7 @@ static uint32_t h_IoOpen(CpuState *s) {
 from_iso:
     memset(&s_fds[slot], 0, sizeof(s_fds[slot]));
     s_fds[slot].used = 1; s_fds[slot].host = NULL;
+    s_fds[slot].uid = sr_alloc_uid();
     s_fds[slot].lba = lba; s_fds[slot].size = size; s_fds[slot].off = 0;
     s_fds[slot].async_priority = s_async_default_priority;
     snprintf(s_fds[slot].path, sizeof(s_fds[slot].path), "%s", path);
@@ -2725,14 +2734,16 @@ static uint32_t h_CtrlButtons(void) {
      * three-column scripts and v2 continue to use runtime vblanks. */
     {
         static int scr_n = -1;
+        static int scr_active;
         static int scr_present_timing;
         static struct { uint32_t f, mask; uint32_t w; } scr[256];
         if (scr_n < 0) {
             scr_n = 0;
             const char *sp = getenv("SR_PADSCRIPT");
-            if (sp) {
+            if (sp && sp[0]) {
                 FILE *fp = fopen(sp, "r");
                 if (fp) {
+                    scr_active = 1;
                     char line[160];
                     while (scr_n < 256 && fgets(line, sizeof(line), fp)) {
                         uint32_t pf, rf, mask, pw, rw;
@@ -2771,7 +2782,7 @@ static uint32_t h_CtrlButtons(void) {
                 }
             }
         }
-        if (scr_n > 0) {
+        if (scr_active) {
             uint32_t frame =
                 scr_present_timing ? s_present_count : s_vcount_fwd;
             for (int i = 0; i < scr_n; i++)
@@ -3178,6 +3189,9 @@ static void present_perf_finish(
     s_present_perf.previous_backend_ms = backend_ms;
     if (s_present_perf.exit_after &&
         present >= s_present_perf.exit_after) {
+        fprintf(
+            stderr, "presentation limit reached at present %u\n",
+            present);
         sr_audio_shutdown();
         sr_trace_close();
         fflush(stderr);
@@ -4315,24 +4329,31 @@ void sr_hle_init(void) {
 
 /* ---- dispatch ---- */
 
-void sr_syscall(CpuState *s, uint32_t nid) {
+void sr_syscall_lib(CpuState *s, const char *library, uint32_t nid) {
     sr_hle_init();
     sr_last_nid = nid;
     if (getenv("SR_NIDLOG")) {
         static FILE *nf = NULL; static unsigned long nc = 0;
         if (!nf) nf = fopen("nidseq_mine.txt", "w");
-        if (nf) { fprintf(nf, "0x%08x %x\n", nid, sched_current_uid()); fflush(nf); nc++; }
+        if (nf) {
+            fprintf(
+                nf, "0x%08x %x %s\n", nid, sched_current_uid(),
+                library && library[0] ? library : "-");
+            fflush(nf);
+            nc++;
+        }
     }
     HleEntry *e = hle_find(nid);
     if (!e) {
         uint32_t target;
-        const char *library;
-        if (sr_module_find_export(nid, &target, &library)) {
+        const char *resolved_library;
+        if (sr_module_find_export(
+                library, nid, &target, &resolved_library)) {
             if (getenv("SR_SYSLOG"))
                 fprintf(
                     stderr,
                     "thr 0x%x : guest %s/0x%08x -> 0x%08x\n",
-                    sched_current_uid(), library, nid, target);
+                    sched_current_uid(), resolved_library, nid, target);
             dispatch(s, target);
             return;
         }
@@ -4347,7 +4368,9 @@ void sr_syscall(CpuState *s, uint32_t nid) {
             for (int i = 0; i < nwarned; i++) if (warned[i] == nid) { known = 1; break; }
             if (!known && nwarned < 1024) { warned[nwarned++] = nid;
                 const char *nm = sr_nid_name(nid);
-                fprintf(stderr, "HLE: permissive no-op nid 0x%08x (%s) (thread uid 0x%x)\n",
+                fprintf(stderr, "HLE: permissive no-op %s%s0x%08x (%s) (thread uid 0x%x)\n",
+                        library && library[0] ? library : "",
+                        library && library[0] ? "/" : "",
                         nid, nm ? nm : "unknown", sched_current_uid()); }
             s->r[1] = 0xDEADBEEFu;
             for (int i = 4; i <= 15; i++) s->r[i] = 0xDEADBEEFu;
@@ -4357,8 +4380,10 @@ void sr_syscall(CpuState *s, uint32_t nid) {
         }
         {
             const char *nm = sr_nid_name(nid);
-            fprintf(stderr, "HLE: unimplemented nid 0x%08x (%s) (thread uid 0x%x)\n"
+            fprintf(stderr, "HLE: unimplemented %s%s0x%08x (%s) (thread uid 0x%x)\n"
                             "     -> add a handler in src/rt/hle.c: sr_hle_register(0x%08xu, \"%s\", h_...);\n",
+                    library && library[0] ? library : "",
+                    library && library[0] ? "/" : "",
                     nid, nm ? nm : "unknown", sched_current_uid(), nid, nm ? nm : "sceUnknown");
         }
         sr_hit_hle = 1;
@@ -4391,4 +4416,8 @@ void sr_syscall(CpuState *s, uint32_t nid) {
         s->hi = 0xDEADBEEFu; s->lo = 0xDEADBEEFu;
     }
     s->r[2] = ret;
+}
+
+void sr_syscall(CpuState *s, uint32_t nid) {
+    sr_syscall_lib(s, NULL, nid);
 }

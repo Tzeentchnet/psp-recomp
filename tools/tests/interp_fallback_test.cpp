@@ -20,32 +20,48 @@ static uint32_t guest_export_address;
 static int hle_calls;
 static int guest_export_calls;
 
-extern "C" int sr_module_syscall_nid(uint32_t code, uint32_t *nid) {
+extern "C" int sr_module_syscall_binding(
+    uint32_t code, const char **library, uint32_t *nid) {
     if (!nid) return 0;
     if (code == 1) {
+        if (library) *library = "TestHLE";
         *nid = TEST_HLE_NID;
         return 1;
     }
     if (code == 2) {
+        if (library) *library = "testlib";
         *nid = TEST_GUEST_NID;
         return 1;
     }
     return 0;
 }
 
-extern "C" void sr_syscall(CpuState *state, uint32_t nid) {
+extern "C" int sr_module_syscall_nid(uint32_t code, uint32_t *nid) {
+    return sr_module_syscall_binding(code, nullptr, nid);
+}
+
+extern "C" void sr_syscall_lib(
+    CpuState *state, const char *library, uint32_t nid) {
     if (nid == TEST_HLE_NID) {
+        if (!library || std::strcmp(library, "TestHLE") != 0)
+            std::abort();
         hle_calls++;
         state->r[2] = 0x20u;
         return;
     }
     if (nid == TEST_GUEST_NID) {
+        if (!library || std::strcmp(library, "testlib") != 0)
+            std::abort();
         guest_export_calls++;
         dispatch(state, guest_export_address);
         return;
     }
     std::fprintf(stderr, "unexpected test NID 0x%08x\n", nid);
     std::abort();
+}
+
+extern "C" void sr_syscall(CpuState *state, uint32_t nid) {
+    sr_syscall_lib(state, nullptr, nid);
 }
 
 #define CHECK(condition) \

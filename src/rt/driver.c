@@ -33,6 +33,9 @@
 #endif
 
 void sr_register_all(void);
+#ifdef SR_MODULE_POLICY_INIT
+void SR_MODULE_POLICY_INIT(void);
+#endif
 
 /* Last-resort crash reporter: a silent host fault (access violation etc.) otherwise kills
  * the process with nothing in the log. Maps a faulting address inside the guest arena back
@@ -243,6 +246,9 @@ have_image:;
     }
     s.pc = entry;
 
+#ifdef SR_MODULE_POLICY_INIT
+    SR_MODULE_POLICY_INIT();
+#endif
     sr_register_all();
     /* "none" as the out path disables tracing -- much faster for HLE bring-up, where the goal
      * is to reach the next unimplemented import rather than diff a trace. */

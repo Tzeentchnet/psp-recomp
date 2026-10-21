@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../../third_party/ppsspp_savedata/SHA1.h"
+
 #define SR_MAX_MODULES 128
 #define SR_MAX_GUEST_EXPORTS 4096
 #define SR_MAX_MODULE_SYSCALLS 4096
@@ -66,6 +68,67 @@ static SrGuestExport s_exports[SR_MAX_GUEST_EXPORTS];
 static uint32_t s_export_count;
 static SrModuleSyscall s_syscalls[SR_MAX_MODULE_SYSCALLS];
 static uint32_t s_syscall_count;
+static const SrModulePolicyEntry *s_policy;
+static uint32_t s_policy_count;
+
+void sr_module_set_policy(
+    const SrModulePolicyEntry *entries, uint32_t count) {
+    if (count && !entries) {
+        fprintf(stderr, "module policy: null table with %u entries\n", count);
+        abort();
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (!entries[i].path || !entries[i].path[0] ||
+            !entries[i].sha1 || strlen(entries[i].sha1) != 40 ||
+            entries[i].mode < SR_MODULE_GUEST ||
+            entries[i].mode > SR_MODULE_REJECT) {
+            fprintf(stderr, "module policy: invalid entry %u\n", i);
+            abort();
+        }
+    }
+    s_policy = entries;
+    s_policy_count = count;
+}
+
+static int ascii_equal(const char *left, const char *right) {
+    if (!left || !right) return left == right;
+    while (*left && *right) {
+        unsigned char a = (unsigned char)*left++;
+        unsigned char b = (unsigned char)*right++;
+        if (a >= 'A' && a <= 'Z')
+            a = (unsigned char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z')
+            b = (unsigned char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return *left == *right;
+}
+
+static void module_sha1(
+    const uint8_t *data, uint32_t size, char output[41]) {
+    static const char digits[] = "0123456789abcdef";
+    uint8_t digest[20];
+    SHA_CTX context;
+    SHAInit(&context);
+    SHAUpdate(&context, data, (int)size);
+    SHAFinal(digest, &context);
+    for (int i = 0; i < 20; i++) {
+        output[i * 2] = digits[digest[i] >> 4];
+        output[i * 2 + 1] = digits[digest[i] & 15];
+    }
+    output[40] = 0;
+}
+
+static const SrModulePolicyEntry *module_policy(
+    const char *path, const char *sha1) {
+    for (uint32_t i = 0; i < s_policy_count; i++) {
+        const SrModulePolicyEntry *entry = &s_policy[i];
+        if (ascii_equal(entry->path, path) &&
+            ascii_equal(entry->sha1, sha1))
+            return entry;
+    }
+    return NULL;
+}
 
 static uint16_t file_r16(const uint8_t *data, uint32_t offset) {
     uint16_t value;
@@ -129,10 +192,6 @@ static int module_active(uint32_t uid) {
     return module_by_uid(uid) != NULL;
 }
 
-static int is_hle_replaced_module(const char *name) {
-    return name && name[0] == 's' && name[1] == 'c' && name[2] == 'e';
-}
-
 static uint32_t bind_module_syscall(uint32_t nid, const char *library) {
     const char *name = library ? library : "";
     for (uint32_t i = 0; i < s_syscall_count; i++) {
@@ -150,10 +209,17 @@ static uint32_t bind_module_syscall(uint32_t nid, const char *library) {
     return s_syscall_count;
 }
 
-int sr_module_syscall_nid(uint32_t code, uint32_t *nid) {
+int sr_module_syscall_binding(
+    uint32_t code, const char **library, uint32_t *nid) {
     if (!code || code > s_syscall_count || !nid) return 0;
-    *nid = s_syscalls[code - 1].nid;
+    SrModuleSyscall *binding = &s_syscalls[code - 1];
+    if (library) *library = binding->library;
+    *nid = binding->nid;
     return 1;
+}
+
+int sr_module_syscall_nid(uint32_t code, uint32_t *nid) {
+    return sr_module_syscall_binding(code, NULL, nid);
 }
 
 int sr_module_patch_import(
@@ -194,14 +260,18 @@ static int register_guest_export(
 }
 
 int sr_module_find_export(
-    uint32_t nid, uint32_t *address, const char **library) {
+    const char *library, uint32_t nid,
+    uint32_t *address, const char **resolved_library) {
     for (uint32_t i = s_export_count; i != 0; i--) {
         SrGuestExport *entry = &s_exports[i - 1];
         if (!entry->active || entry->nid != nid ||
             !module_active(entry->module_uid))
             continue;
+        if (library && library[0] &&
+            strcmp(entry->library, library) != 0)
+            continue;
         if (address) *address = entry->address;
-        if (library) *library = entry->library;
+        if (resolved_library) *resolved_library = entry->library;
         return 1;
     }
     return 0;
@@ -328,6 +398,14 @@ static int parse_imports(SrModule *module, uint32_t start, uint32_t end) {
         if (words < 5 || words > (end - position) / 4) return 0;
         char library[48];
         guest_string(name_address, library, sizeof(library));
+        if (variable_count != 0) {
+            fprintf(
+                stderr,
+                "module loader: unsupported variable imports from %s "
+                "in %s (count=%u)\n",
+                library, module->name, variable_count);
+            return 0;
+        }
         if (function_count > 1024 ||
             !guest_range(nid_table, function_count * 4) ||
             !guest_range(first_stub, function_count * 8))
@@ -412,8 +490,30 @@ uint32_t sr_module_load_image(
     const uint8_t *data, uint32_t data_size, const char *path) {
     if (!data || data_size < 52)
         return SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE;
-    if (memcmp(data, "~PSP", 4) == 0)
+    char sha1[41] = {0};
+    const SrModulePolicyEntry *policy = NULL;
+    if (s_policy_count) {
+        module_sha1(data, data_size, sha1);
+        policy = module_policy(path, sha1);
+    }
+    if (memcmp(data, "~PSP", 4) == 0) {
+        if (s_policy_count &&
+            (!policy || policy->mode != SR_MODULE_HLE)) {
+            fprintf(
+                stderr,
+                "module loader: encrypted module %s (%s) "
+                "has no HLE policy\n",
+                path ? path : "(unknown)", sha1);
+            return SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE;
+        }
         return create_fake_module(path);
+    }
+    if (policy && policy->mode == SR_MODULE_REJECT) {
+        fprintf(
+            stderr, "module loader: policy rejects %s (%s)\n",
+            path ? path : "(unknown)", sha1);
+        return SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE;
+    }
     if (memcmp(data, "\x7f" "ELF", 4) != 0 ||
         data[4] != 1 || data[5] != 1 ||
         file_r16(data, 16) != 0xffa0u)
@@ -538,7 +638,20 @@ uint32_t sr_module_load_image(
     module->start_priority = 0x20;
     module->start_stack_size = 0x40000;
     module->start_attr = module->attr;
-    module->hle_replaced = is_hle_replaced_module(module->name);
+    if (policy && policy->module && policy->module[0] &&
+        strcmp(policy->module, "*") != 0 &&
+        strcmp(policy->module, module->name) != 0) {
+        fprintf(
+            stderr,
+            "module loader: policy expected module %s at %s, got %s\n",
+            policy->module, path ? path : "(unknown)", module->name);
+        sr_unregister_uid(module->uid);
+        sr_ba_free(sr_kmem_user(), base);
+        memset(module, 0, sizeof(*module));
+        return SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE;
+    }
+    module->hle_replaced =
+        policy && policy->mode == SR_MODULE_HLE;
     snprintf(module->path, sizeof(module->path), "%s", path ? path : "");
 
     if (!parse_imports(module, import_start, import_end) ||

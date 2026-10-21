@@ -3663,6 +3663,11 @@ static const char *ge_cmd_name(uint32_t cmd) {
         case 0xDA: return "COLORTESTMASK";    case 0xE6: return "LOGICOP";
         case 0xEA: return "TRANSFERSTART";    case 0xEB: return "TRANSFERSRCPOS";
         case 0xEC: return "TRANSFERDSTPOS";   case 0xEE: return "TRANSFERSIZE";
+        case 0xF0: return "VSCX";             case 0xF1: return "VSCY";
+        case 0xF2: return "VSCZ";             case 0xF3: return "VTCS";
+        case 0xF4: return "VTCT";             case 0xF5: return "VTCQ";
+        case 0xF6: return "VCV";              case 0xF7: return "VAP";
+        case 0xF8: return "VFC";              case 0xF9: return "VSCV";
         default: return NULL;
     }
 }
@@ -3761,6 +3766,16 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
             case GE_OFFSETADDR: ge.offset=data<<8; break;
             case GE_ORIGIN:   ge.offset=pc; break;
             case GE_VERTEXTYPE: ge.vtype=data; break;
+
+            case 0xF0: case 0xF1: case 0xF2: case 0xF3: case 0xF4:
+            case 0xF5: case 0xF6: case 0xF8: case 0xF9:
+                ge.imm[cmd - 0xF0] = data;
+                break;
+            case 0xF7:
+                ge.imm[7] = data;
+                if (data != 0)
+                    ge_note_unhandled_cmd(cmd, op);
+                break;
 
             case GE_FRAMEBUFPTR:   ge.fbp=(ge.fbp&0xFF000000)|data;
                 if (s_gelog>0) fprintf(stderr,"GE FRAMEBUFPTR data=0x%06x -> fbp=0x%08x\n",data,ge.fbp);

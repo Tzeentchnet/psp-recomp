@@ -224,7 +224,8 @@ check-shaders-d3d12:
 test-module-loader:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
-		tools/tests/module_loader_test.c -o build/tests/module_loader_test.exe
+		tools/tests/module_loader_test.c third_party/ppsspp_savedata/SHA1.c \
+		-o build/tests/module_loader_test.exe
 	./build/tests/module_loader_test.exe
 
 test-interpreter:

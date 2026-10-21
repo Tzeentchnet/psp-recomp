@@ -945,7 +945,12 @@ void sched_run(uint32_t entry, uint32_t arglen, uint32_t argp, int create_start_
         memcpy(&t0->saved, s_cpu, sizeof(CpuState));
     } else {
         uint32_t size = SR_MODULE_START_STACK_SIZE;
+#ifdef SR_MODULE_START_UID
+        t0->uid = SR_MODULE_START_UID;
+        sr_register_uid_type(t0->uid, SR_TMID_THREAD);
+#else
         t0->uid = sr_alloc_uid_type(SR_TMID_THREAD);
+#endif
         uint32_t start = sr_ba_alloc(sr_kmem_user(), &size, 1, "stack/module_start");
         if (start == SR_BA_FAIL) {
             fprintf(stderr, "sched_run: no memory for module_start stack\n");
