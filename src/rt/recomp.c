@@ -1,6 +1,7 @@
 /* Runtime implementation. See recomp.h. */
 
 #include "recomp.h"
+#include "settings_path.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -101,7 +102,17 @@ static int sr_vfpu_loaded = 0;
 static void *sr_load_raw(const char *name, size_t expected) {
     char path[512];
     const char *base = getenv("PSP_VFPU_TABLES");
-    snprintf(path, sizeof(path), "%s/%s.dat", base ? base : "assets/vfpu", name);
+    if (base) {
+        snprintf(path, sizeof(path), "%s/%s.dat", base, name);
+    } else {
+        char relative[256], error[256];
+        snprintf(relative, sizeof(relative), "assets\\vfpu\\%s.dat", name);
+        if (!sr_settings_path(
+                relative, path, sizeof(path), error, sizeof(error))) {
+            fprintf(stderr, "sr_vfpu: %s\n", error);
+            abort();
+        }
+    }
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "sr_vfpu: cannot open %s\n", path); abort(); }
     void *t = malloc(expected);
@@ -335,7 +346,10 @@ static uint64_t sr_interp_step_limit(void) {
     if (limit != 0) return limit;
     const char *setting = getenv("SR_INTERP_MAX_STEPS");
     if (!setting || !setting[0]) {
-        limit = 1000000;
+#ifndef SR_INTERP_DEFAULT_MAX_STEPS
+#define SR_INTERP_DEFAULT_MAX_STEPS 1000000ULL
+#endif
+        limit = SR_INTERP_DEFAULT_MAX_STEPS;
         return limit;
     }
     char *end = NULL;
@@ -411,9 +425,37 @@ void dispatch(CpuState *s, uint32_t target) {
     }
     sr_log_interp_miss(target, s);
     SrInterpStop stop;
-    if (sr_interpret_fallback(
-            s, target, s->r[31], sr_interp_step_limit(), &stop)) {
-        return;
+    uint64_t remaining = sr_interp_step_limit();
+    uint32_t return_pc = s->r[31];
+    for (;;) {
+        if (sr_interpret_fallback(
+                s, target, return_pc, remaining, &stop)) {
+            return;
+        }
+        if (stop.steps >= remaining)
+            remaining = 0;
+        else
+            remaining -= stop.steps;
+        if (stop.reason == SR_INTERP_SYSCALL) {
+            uint32_t code = (stop.op >> 6) & 0xfffffu;
+            uint32_t nid;
+            if (!sr_module_syscall_nid(code, &nid)) {
+                fprintf(
+                    stderr,
+                    "dispatch: unknown runtime PRX syscall code 0x%x "
+                    "at 0x%08x\n",
+                    code, stop.pc);
+                break;
+            }
+            sr_syscall(s, nid);
+            if (!remaining) {
+                stop.reason = SR_INTERP_STEP_LIMIT;
+                break;
+            }
+            target = s->pc;
+            continue;
+        }
+        break;
     }
     fprintf(
         stderr,

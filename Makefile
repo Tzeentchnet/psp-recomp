@@ -40,6 +40,7 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/fpu_mode.c \
 src/rt/interp_runtime.cpp \
 src/ref/interp.cpp \
+              src/rt/module.c \
               src/rt/vfpu_interp.c \
               src/rt/vfpu_asin.c \
               src/rt/hle.c \
@@ -81,7 +82,8 @@ AT3_OBJS   := $(addprefix $(BUILD_DIR)/at3_,$(addsuffix .o,$(AT3_NAMES))) \
 
 DXC        ?= dxc
 
-.PHONY: all pipeline compile clean run shaders-d3d12 check-shaders-d3d12 test-d3d12-vertex
+.PHONY: all pipeline compile clean run shaders-d3d12 check-shaders-d3d12 \
+        test-d3d12-vertex test-module-loader test-interpreter test-runtime
 
 all: pipeline compile
 
@@ -218,6 +220,33 @@ shaders-d3d12:
 
 check-shaders-d3d12:
 	$(PYTHON) tools/compile_d3d12_shaders.py --dxc "$(DXC)" --check
+
+test-module-loader:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
+		tools/tests/module_loader_test.c -o build/tests/module_loader_test.exe
+	./build/tests/module_loader_test.exe
+
+test-interpreter:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/recomp.c -o build/tests/interp_recomp.o
+	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/dispatch_table.c -o build/tests/interp_dispatch.o
+	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/fpu_mode.c -o build/tests/interp_fpu.o
+	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/settings_path.c -o build/tests/interp_settings.o
+	$(CXX) -std=c++17 -O0 -Isrc/rt -Isrc/ref -c \
+		src/rt/interp_runtime.cpp -o build/tests/interp_runtime.o
+	$(CXX) -std=c++17 -O0 -Isrc/rt -Isrc/ref -c \
+		src/ref/interp.cpp -o build/tests/interp_ref.o
+	$(CXX) -std=c++17 -O0 -Isrc/rt -Isrc/ref -c \
+		tools/tests/interp_fallback_test.cpp -o build/tests/interp_test.o
+	$(CXX) -o build/tests/interp_fallback_test.exe \
+		build/tests/interp_test.o build/tests/interp_recomp.o \
+		build/tests/interp_dispatch.o build/tests/interp_fpu.o \
+		build/tests/interp_settings.o build/tests/interp_runtime.o \
+		build/tests/interp_ref.o -lm
+	./build/tests/interp_fallback_test.exe
+
+test-runtime: test-module-loader test-interpreter
 
 # Generated C code gets huge. Cache the compiled object to avoid rebuilding it on runtime changes.
 $(BUILD_DIR)/$(GAME_NAME)_recomp.o: $(BUILD_DIR)/$(GAME_NAME)_recomp.c src/rt/recomp.h

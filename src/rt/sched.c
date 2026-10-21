@@ -17,6 +17,16 @@
 #include "recomp.h"
 
 #include <windows.h>
+
+#ifndef SR_MODULE_START_PRIORITY
+#define SR_MODULE_START_PRIORITY 32u
+#endif
+#ifndef SR_MODULE_START_STACK_SIZE
+#define SR_MODULE_START_STACK_SIZE 0x400u
+#endif
+#ifndef SR_MODULE_START_ATTR
+#define SR_MODULE_START_ATTR 0x80000000u
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +57,7 @@ typedef struct {
     uint64_t vbl_seen;           /* s_vbl_count this thread last consumed (vblank latch) */
     char     name[32];
     uint32_t attr;
+    uint32_t gp;
     uint32_t stack_start, stack_size;   /* block in the user partition (kmem.c); 0 = none */
     int      deleted;            /* slot free for reuse once its fiber is gone */
     int      delete_on_exit;     /* the module start thread: deleted when its entry returns */
@@ -395,7 +406,7 @@ static void start_reset(TCB *t, uint32_t arglen, uint32_t argp) {
     CpuState *c = &t->saved;
     context_reset(c);
     c->pc = t->entry;
-    c->r[28] = s_gp;
+    c->r[28] = t->gp;
     if (!(t->attr & THREAD_ATTR_NO_FILLSTACK))
         for (uint32_t i = 0; i < t->stack_size; i++) MEM_W8(t->stack_start + i, 0xFF);
     uint32_t sp = t->stack_start + t->stack_size - 256;
@@ -461,6 +472,7 @@ uint32_t sched_create_thread(const char *name, uint32_t entry, int priority, uin
     t->uid = uid;
     snprintf(t->name, sizeof(t->name), "%s", name);
     t->attr = attr;
+    t->gp = (s_cur >= 0 && s_cpu) ? s_cpu->r[28] : s_gp;
     t->state = TH_DORMANT;
     t->priority = priority;
     t->initial_priority = priority;
@@ -471,6 +483,18 @@ uint32_t sched_create_thread(const char *name, uint32_t entry, int priority, uin
     if (getenv("SR_THLOG")) fprintf(stderr, "create thread uid=0x%x %s entry=0x%08x pri=%d stack=%08x-%08x\n",
                                     uid, t->name, entry, priority, start, start + size);
     return uid;
+}
+
+void sched_set_thread_gp(uint32_t uid, uint32_t gp) {
+    TCB *t = tcb_by_uid(uid);
+    if (!t || t->state != TH_DORMANT) {
+        fprintf(
+            stderr,
+            "sched_set_thread_gp: thread 0x%x is missing or already running\n",
+            uid);
+        abort();
+    }
+    t->gp = gp;
 }
 
 uint32_t sched_create_hle_thread(const char *name, int priority, uint32_t stack_size,
@@ -810,7 +834,7 @@ int sched_thread_status(uint32_t uid, SrThreadStatus *out) {
     out->entry = t->entry;
     out->stack = t->stack_start;
     out->stackSize = t->stack_size;
-    out->gpReg = s_gp;
+    out->gpReg = t->gp;
     out->initialPriority = t->initial_priority;
     out->currentPriority = t->priority;
     out->waitType = psp_wait_type(t);
@@ -894,10 +918,11 @@ void sched_run(uint32_t entry, uint32_t arglen, uint32_t argp, int create_start_
     TCB *t0 = tcb_slot();
     memset(t0, 0, sizeof(*t0));
     snprintf(t0->name, sizeof(t0->name), "module_start");
-    t0->priority = 32;
-    t0->initial_priority = 32;
+    t0->priority = SR_MODULE_START_PRIORITY;
+    t0->initial_priority = SR_MODULE_START_PRIORITY;
     t0->exit_status = (int32_t)0x800201a4u;
-    t0->attr = 0x80000000u;
+    t0->attr = SR_MODULE_START_ATTR;
+    t0->gp = s_gp;
     t0->entry = entry;
     t0->delete_on_exit = 1;
     uint32_t k0 = s_cpu->r[26];
@@ -919,7 +944,7 @@ void sched_run(uint32_t entry, uint32_t arglen, uint32_t argp, int create_start_
         t0->stack_size = stack_size;
         memcpy(&t0->saved, s_cpu, sizeof(CpuState));
     } else {
-        uint32_t size = 0x400;
+        uint32_t size = SR_MODULE_START_STACK_SIZE;
         t0->uid = sr_alloc_uid_type(SR_TMID_THREAD);
         uint32_t start = sr_ba_alloc(sr_kmem_user(), &size, 1, "stack/module_start");
         if (start == SR_BA_FAIL) {

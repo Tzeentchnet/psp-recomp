@@ -22,6 +22,7 @@
 #include "kzl_twinstick.h"
 #include "pgf.h"
 #include "sas_reverb.h"
+#include "settings_path.h"
 #include "nid_names.h"   /* sr_nid_name(): names unknown NIDs in the trap below */
 
 #include <stdio.h>
@@ -81,6 +82,8 @@ static uint32_t s_uid_object_count, s_uid_object_capacity;
 
 uint32_t sr_alloc_uid(void) { return s_uid++; }
 void sr_register_uid_type(uint32_t uid, uint32_t type) {
+    if (getenv("SR_UIDLOG"))
+        fprintf(stderr, "kernel uid 0x%x type=%u\n", uid, type);
     for (uint32_t i = 0; i < s_uid_object_count; i++) {
         if (s_uid_objects[i].uid == uid) {
             s_uid_objects[i].type = type;
@@ -405,9 +408,21 @@ static void font_load(void) {
     char path[600];
     const char *dir = getenv("SR_FONTDIR");
     if (dir) { snprintf(path, sizeof path, "%s/ltn0.pgf", dir); s_pgf_ltn = pgf_open(path); }
+    if (!s_pgf_ltn) {
+        char error[256];
+        if (sr_settings_path(
+                "font\\ltn0.pgf", path, sizeof(path), error, sizeof(error)))
+            s_pgf_ltn = pgf_open(path);
+    }
     if (!s_pgf_ltn) s_pgf_ltn = pgf_open("font/ltn0.pgf");
     if (!s_pgf_ltn) s_pgf_ltn = pgf_open("third_party/ppsspp/assets/flash0/font/ltn0.pgf");
     if (dir) { snprintf(path, sizeof path, "%s/jpn0.pgf", dir); s_pgf_jpn = pgf_open(path); }
+    if (!s_pgf_jpn) {
+        char error[256];
+        if (sr_settings_path(
+                "font\\jpn0.pgf", path, sizeof(path), error, sizeof(error)))
+            s_pgf_jpn = pgf_open(path);
+    }
     if (!s_pgf_jpn) s_pgf_jpn = pgf_open("font/jpn0.pgf");
     if (!s_pgf_jpn) s_pgf_jpn = pgf_open("third_party/ppsspp/assets/flash0/font/jpn0.pgf");
     if (getenv("SR_FONTLOG"))
@@ -1540,13 +1555,37 @@ static void guest_cstr(uint32_t addr, char *out, int max) {
     out[i] = 0;
 }
 
-/* sceKernelLoadModule(path, flags, opt): the module's code is NOT loaded or run (static
- * recompilation covers only the main EBOOT). Log the path loudly so any feature that
- * depends on a runtime-loaded module (e.g. a cutscene player) is identifiable. */
+static uint32_t h_IoAssign(CpuState *s) {
+    char alias[64], physical[64], filesystem[64];
+    guest_cstr(A0, alias, sizeof(alias));
+    guest_cstr(A1, physical, sizeof(physical));
+    guest_cstr(A2, filesystem, sizeof(filesystem));
+    if (getenv("SR_IOLOG")) {
+        fprintf(
+            stderr,
+            "sceIoAssign(\"%s\", \"%s\", \"%s\", %u, %08x, %u)\n",
+            alias, physical, filesystem, A3, s->r[8], s->r[9]);
+    }
+    return 0;
+}
+
 static uint32_t h_LoadModule(CpuState *s) {
-    char path[256]; guest_cstr(A0, path, sizeof(path));
-    fprintf(stderr, "sceKernelLoadModule(\"%s\") -> fake uid (module code not loaded)\n", path);
-    return sr_alloc_uid();
+    char path[256];
+    uint32_t lba, size;
+    guest_cstr(A0, path, sizeof(path));
+    if (iso_lookup(path, &lba, &size) != 0)
+        return 0x80010002u;
+    if (!size || size > 64u * 1024u * 1024u)
+        return 0x80020148u;
+    uint8_t *data = (uint8_t *)malloc(size);
+    if (!data) return 0x80020190u;
+    if (iso_read(lba, 0, data, size) != (int)size) {
+        free(data);
+        return 0x80010005u;
+    }
+    uint32_t result = sr_module_load_image(data, size, path);
+    free(data);
+    return result;
 }
 
 /* sceKernelPrintf: surface the game's own debug output (format string only; the engine's
@@ -1569,6 +1608,7 @@ typedef struct {
     int used;
     uint32_t lba, size, off;
     FILE *host;
+    char path[256];
     IoAsyncOp async_op;
     uint32_t async_addr, async_size;
     int64_t async_offset;
@@ -1766,6 +1806,7 @@ static uint32_t h_IoOpen(CpuState *s) {
         f->used = 1; f->host = fp; f->lba = 0;
         f->size = (uint32_t)(sz < 0 ? 0 : sz); f->off = 0;
         f->async_priority = s_async_default_priority;
+        snprintf(f->path, sizeof(f->path), "%s", path);
         return (uint32_t)slot;
     }
 from_iso:
@@ -1773,6 +1814,7 @@ from_iso:
     s_fds[slot].used = 1; s_fds[slot].host = NULL;
     s_fds[slot].lba = lba; s_fds[slot].size = size; s_fds[slot].off = 0;
     s_fds[slot].async_priority = s_async_default_priority;
+    snprintf(s_fds[slot].path, sizeof(s_fds[slot].path), "%s", path);
     return (uint32_t)slot;
 }
 static uint32_t h_IoWrite(CpuState *s) {
@@ -1807,7 +1849,9 @@ static uint32_t io_read(uint32_t fd, uint32_t dst, uint32_t count) {
         uint32_t n = count - done; if (n > sizeof(tmp)) n = sizeof(tmp);
         if (f->host) { size_t got = fread(tmp, 1, n, f->host); if (got < n) n = (uint32_t)got; }
         else iso_read(f->lba, f->off + done, tmp, n);
+#ifdef SR_KZL_PATCHES
         sr_kzl_patch_offline_menu(tmp, n);
+#endif
         for (uint32_t k = 0; k < n; k++) MEM_W8(dst + done + k, tmp[k]);
         done += n;
         if (n == 0) break;
@@ -1827,6 +1871,48 @@ static uint32_t h_IoRead(CpuState *s) {
     if (fd >= 64 || !s_fds[fd].used) return 0x80010009;
     if (io_async_busy(&s_fds[fd])) return SCE_KERNEL_ERROR_ASYNC_BUSY;
     return io_read(fd, A1, A2);
+}
+
+static uint32_t h_LoadModuleByID(CpuState *s) {
+    uint32_t fd = A0;
+    if (fd >= 64 || !s_fds[fd].used)
+        return SCE_KERNEL_ERROR_BADF;
+    Fd *file = &s_fds[fd];
+    if (!file->size || file->size > 64u * 1024u * 1024u)
+        return 0x80020148u;
+    uint8_t *data = (uint8_t *)malloc(file->size);
+    if (!data) return 0x80020190u;
+    int read_ok = 1;
+    if (file->host) {
+        if (fseek(file->host, 0, SEEK_SET) != 0 ||
+            fread(data, 1, file->size, file->host) != file->size)
+            read_ok = 0;
+        fseek(file->host, (long)file->off, SEEK_SET);
+    } else if (
+        iso_read(file->lba, 0, data, file->size) !=
+        (int)file->size) {
+        read_ok = 0;
+    }
+    if (!read_ok) {
+        free(data);
+        return 0x80010005u;
+    }
+    uint32_t result =
+        sr_module_load_image(data, file->size, file->path);
+    free(data);
+    if (getenv("SR_MODULE_LOG") || (int32_t)result < 0)
+        fprintf(
+            stderr, "sceKernelLoadModuleByID(%u, \"%s\") -> 0x%08x\n",
+            fd, file->path, result);
+    return result;
+}
+
+static uint32_t h_StartModule(CpuState *s) {
+    return sr_module_start(A0, A1, A2, A3, s->r[8]);
+}
+
+static uint32_t h_UnloadModule(CpuState *s) {
+    return sr_module_unload(A0);
 }
 
 static int64_t io_seek(Fd *f, int64_t off, uint32_t whence) {
@@ -3222,6 +3308,9 @@ static void dump_fb(const char *path, uint32_t fbaddr) { dump_fb_fmt(path, fbadd
  * render loop wake while worker threads were still runnable and redraw the same frame dozens of
  * times per vblank -- the loading screen burned ~50s/60 frames in the rasterizer that way. */
 static uint32_t h_DisplayWaitVblank(CpuState *s) { (void)s; sched_wait_vblank(); return 0; }
+static uint32_t h_DisplayWaitVblankCB(CpuState *s) {
+    return with_callbacks(s, h_DisplayWaitVblank);
+}
 
 /* Called once per delivered VBLANK by the scheduler. Counts frames and, with SR_FBDUMP=<n>,
  * snapshots the framebuffer the game has drawn (the display buffer, else the GE target, else
@@ -3243,6 +3332,19 @@ void sr_vblank_tick(void) {
                 s_vcount - s_last_flip_vcount, (s_vcount - s_last_flip_vcount) / 60,
                 g_mpeg_put, g_mpeg_getavc, g_mpeg_avcdec, g_mpeg_nodata);
         { extern void sched_dump_threads(void); sched_dump_threads(); }
+        if (getenv("SR_WATCHDOG_RAM")) {
+            static int dumped;
+            if (!dumped++) {
+                FILE *ram = fopen("watchdog_ram.bin", "wb");
+                if (!ram) {
+                    fprintf(stderr, "WATCHDOG: cannot create watchdog_ram.bin\n");
+                } else {
+                    fwrite(SR_HOST(0x08800000u), 1, 0x01800000u, ram);
+                    fclose(ram);
+                    fprintf(stderr, "WATCHDOG: wrote watchdog_ram.bin\n");
+                }
+            }
+        }
         fflush(stderr);
     }
     /* Frame capture happens at sceDisplaySetFrameBuf (the instant a finished frame is presented),
@@ -3850,6 +3952,13 @@ static uint32_t h_CreateEventFlag(CpuState *s) {
     /* a0=name, a1=attr, a2=initPattern, a3=opt. */
     Sync *m = sync_new(SR_TMID_EVENT_FLAG); if (!m) return 0x80020000;
     m->pattern = A2;
+    if (getenv("SR_EVENTLOG")) {
+        char name[64];
+        guest_cstr(A0, name, sizeof(name));
+        fprintf(
+            stderr, "CreateEventFlag uid=0x%x name=%s attr=0x%x pattern=0x%x\n",
+            m->uid, name, A1, m->pattern);
+    }
     return m->uid;
 }
 static uint32_t h_DeleteEventFlag(CpuState *s) {
@@ -3859,6 +3968,10 @@ static uint32_t h_DeleteEventFlag(CpuState *s) {
 }
 static uint32_t h_SetEventFlag(CpuState *s) {
     Sync *m = sync_find(A0); if (!m) return 0x80020000;
+    if (getenv("SR_EVENTLOG"))
+        fprintf(
+            stderr, "SetEventFlag uid=0x%x bits=0x%x pattern=0x%x->0x%x\n",
+            A0, A1, m->pattern, m->pattern | A1);
     m->pattern |= A1; sched_wake(A0); sched_preempt(); return 0;
 }
 static uint32_t h_ClearEventFlag(CpuState *s) {
@@ -3872,6 +3985,11 @@ static uint32_t h_WaitEventFlag(CpuState *s) {
     /* a0=uid, a1=bits, a2=mode, a3=outBits, [sp+16]=timeout. */
     uint32_t uid = A0, bits = A1, mode = A2, outp = A3, toptr = stack_arg(s, 0);
     Sync *m = sync_find(uid); if (!m) return 0x80020000;
+    if (getenv("SR_EVENTLOG"))
+        fprintf(
+            stderr,
+            "WaitEventFlag uid=0x%x bits=0x%x mode=0x%x pattern=0x%x timeout=0x%x\n",
+            uid, bits, mode, m->pattern, toptr);
     while (!evf_match(m, bits, mode)) {
         if (toptr) {
             uint32_t usec = MEM_R32(toptr);
@@ -4048,10 +4166,11 @@ void sr_hle_init(void) {
     sr_hle_register(0x56202973, "sceUmdWaitDriveStatWithTimer", h_ok);
     sr_hle_register(0xc629af26, "sceUtilityLoadAvModule", h_ok);
     sr_hle_register(0x977de386, "sceKernelLoadModule", h_LoadModule);
-    sr_hle_register(0x50f0c1ec, "sceKernelStartModule", h_ok);
+    sr_hle_register(0xb7f46618, "sceKernelLoadModuleByID", h_LoadModuleByID);
+    sr_hle_register(0x50f0c1ec, "sceKernelStartModule", h_StartModule);
     sr_hle_register(0xf0a26395, "sceKernelGetModuleId", h_GetModuleId);
     sr_hle_register(0xd1ff982a, "sceKernelStopModule", h_ok);
-    sr_hle_register(0x2e0911aa, "sceKernelUnloadModule", h_ok);
+    sr_hle_register(0x2e0911aa, "sceKernelUnloadModule", h_UnloadModule);
     sr_hle_register(0x8f2df740, "sceKernelStopUnloadSelfModuleWithStatus", h_ok);
     sr_hle_register(0xf919f628, "SysMemUserForUser_f919f628", h_F919F628);
     /* IoFileMgrForUser: file IO from the ISO. */
@@ -4077,6 +4196,7 @@ void sr_hle_init(void) {
     sr_hle_register(0xff5940b6, "sceIoCloseAsync", h_IoCloseAsync);
     sr_hle_register(0x54f5fb11, "sceIoDevctl", h_IoDevctl);
     sr_hle_register(0xb293727f, "sceIoChangeAsyncPriority", h_IoChangeAsyncPriority);
+    sr_hle_register(0xb2a628c1, "sceIoAssign", h_IoAssign);
     /* sceAudio */
     sr_hle_register(0x5ec81c55, "sceAudioChReserve", h_AudioChReserve);
     sr_hle_register(0x6fc46853, "sceAudioChRelease", h_AudioChRelease);
@@ -4109,6 +4229,7 @@ void sr_hle_init(void) {
     sr_hle_register(0x289d82fe, "sceDisplaySetFrameBuf", h_DisplaySetFrameBuf);
     sr_hle_register(0xeeda2e54, "sceDisplayGetFrameBuf", h_DisplayGetFrameBuf);
     sr_hle_register(0x984c27e7, "sceDisplayWaitVblankStart", h_DisplayWaitVblank);
+    sr_hle_register(0x46f186c3, "sceDisplayWaitVblankStartCB", h_DisplayWaitVblankCB);
     sr_hle_register(0x9c6eaad7, "sceDisplayGetVcount", h_DisplayGetVcount);
     sr_hle_register(0x773dd3a3, "sceDisplayGetCurrentHcount", h_DisplayGetCurrentHcount);
     sr_hle_register(0x210eab3a, "sceDisplayGetAccumulatedHcount", h_DisplayGetAccumulatedHcount);
@@ -4203,6 +4324,19 @@ void sr_syscall(CpuState *s, uint32_t nid) {
         if (nf) { fprintf(nf, "0x%08x %x\n", nid, sched_current_uid()); fflush(nf); nc++; }
     }
     HleEntry *e = hle_find(nid);
+    if (!e) {
+        uint32_t target;
+        const char *library;
+        if (sr_module_find_export(nid, &target, &library)) {
+            if (getenv("SR_SYSLOG"))
+                fprintf(
+                    stderr,
+                    "thr 0x%x : guest %s/0x%08x -> 0x%08x\n",
+                    sched_current_uid(), library, nid, target);
+            dispatch(s, target);
+            return;
+        }
+    }
     if (!e) {
         /* Permissive mode (SR_PERMISSIVE): unimplemented NIDs log once and return 0 instead of
          * trapping the thread. This is for bring-up exploration -- it lets audio/video (sceMpeg,

@@ -11,6 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef SR_GAME_TITLE
+#define SR_GAME_TITLE "PSP Recomp"
+#endif
+
 #ifndef SR_EXPECTED_ISO_SIZE
 
 int sr_startup_validate(void) {
@@ -111,8 +115,9 @@ int sr_startup_validate(void) {
     if (!path || !path[0]) {
         fprintf(
             stderr,
-            "KZL startup: PSP_ISO is not set. Point it at your own supported "
-            "Killzone: Liberation v1.20 US disc image.\n");
+            "%s startup: PSP_ISO is not set. Point it at your supported "
+            "disc image.\n",
+            SR_GAME_TITLE);
         return 0;
     }
 
@@ -121,24 +126,24 @@ int sr_startup_validate(void) {
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (file == INVALID_HANDLE_VALUE) {
         fprintf(
-            stderr, "KZL startup: cannot open PSP_ISO \"%s\" (error %lu).\n",
-            path, (unsigned long)GetLastError());
+            stderr, "%s startup: cannot open PSP_ISO \"%s\" (error %lu).\n",
+            SR_GAME_TITLE, path, (unsigned long)GetLastError());
         return 0;
     }
 
     LARGE_INTEGER size;
     if (!GetFileSizeEx(file, &size)) {
         fprintf(
-            stderr, "KZL startup: cannot read PSP_ISO size (error %lu).\n",
-            (unsigned long)GetLastError());
+            stderr, "%s startup: cannot read PSP_ISO size (error %lu).\n",
+            SR_GAME_TITLE, (unsigned long)GetLastError());
         CloseHandle(file);
         return 0;
     }
     if ((uint64_t)size.QuadPart != (uint64_t)SR_EXPECTED_ISO_SIZE) {
         fprintf(
             stderr,
-            "KZL startup: unsupported ISO size %llu bytes; expected %llu "
-            "for Killzone: Liberation v1.20 US.\n",
+            "%s startup: unsupported ISO size %llu bytes; expected %llu.\n",
+            SR_GAME_TITLE,
             (unsigned long long)size.QuadPart,
             (unsigned long long)SR_EXPECTED_ISO_SIZE);
         CloseHandle(file);
@@ -148,7 +153,9 @@ int sr_startup_validate(void) {
     uint8_t hash[20];
     char error[256];
     if (!hash_file_sha1(file, hash, error, sizeof(error))) {
-        fprintf(stderr, "KZL startup: cannot hash PSP_ISO: %s.\n", error);
+        fprintf(
+            stderr, "%s startup: cannot hash PSP_ISO: %s.\n",
+            SR_GAME_TITLE, error);
         CloseHandle(file);
         return 0;
     }
@@ -161,12 +168,13 @@ int sr_startup_validate(void) {
     if (_stricmp(actual, SR_EXPECTED_ISO_SHA1) != 0) {
         fprintf(
             stderr,
-            "KZL startup: unsupported ISO SHA-1 %s; expected %s "
-            "(Killzone: Liberation v1.20 US).\n",
-            actual, SR_EXPECTED_ISO_SHA1);
+            "%s startup: unsupported ISO SHA-1 %s; expected %s.\n",
+            SR_GAME_TITLE, actual, SR_EXPECTED_ISO_SHA1);
         return 0;
     }
-    fprintf(stderr, "KZL startup: verified PSP_ISO (%s).\n", actual);
+    fprintf(
+        stderr, "%s startup: verified PSP_ISO (%s).\n",
+        SR_GAME_TITLE, actual);
     return 1;
 }
 

@@ -22,6 +22,16 @@
 #include <string.h>
 #include <windows.h>
 
+#ifndef SR_GAME_TITLE
+#define SR_GAME_TITLE "PSP Recomp"
+#endif
+#ifndef SR_BOOT_ARG
+#define SR_BOOT_ARG "modulename"
+#endif
+#ifndef SR_BOOT_NEXT_UID
+#define SR_BOOT_NEXT_UID 0x11cu
+#endif
+
 void sr_register_all(void);
 
 /* Last-resort crash reporter: a silent host fault (access violation etc.) otherwise kills
@@ -149,23 +159,22 @@ int main(int argc, char **argv) {
             int result;
             if (!sr_input_init()) return 2;
             result = sr_input_settings_show(
-                "Killzone: Liberation Controller");
+                SR_GAME_TITLE " Controller");
             return result < 0 ? 2 : 0;
         }
         if (strcmp(argv[i], "--configure") == 0) {
             int result;
             if (!sr_graphics_config_init() || !sr_input_init()) return 2;
             result = sr_graphics_settings_show(
-                "Killzone: Liberation Graphics");
+                SR_GAME_TITLE " Graphics");
             if (result <= 0) return result < 0 ? 2 : 0;
             result = sr_input_settings_show(
-                "Killzone: Liberation Controller");
+                SR_GAME_TITLE " Controller");
             return result < 0 ? 2 : 0;
         }
     }
 
-    /* Normal runtime path: the generated image is already rebased and relocated by prxload.py.
-     * The KZL bootloader passes module_start one argument block: "modulename\0". */
+    /* Normal runtime path: the generated image is already rebased and relocated by prxload.py. */
     if (argc >= 6 && strcmp(argv[1], "--boot") == 0) {
         if (!sr_startup_validate()) return 2;
         long len;
@@ -216,12 +225,11 @@ have_image:;
     s.vfpuCtrl[1] = 0xe4;  /* TPREFIX = identity */
     s.vfpuCtrl[2] = 0;     /* DPREFIX = none */
     if (standalone) {
-        static const char boot_arg[] = "modulename";
+        static const char boot_arg[] = SR_BOOT_ARG;
         boot_arglen = (uint32_t)sizeof(boot_arg);
         boot_argp = 0x08800000u;  /* reserved usersystemlib range; copied before guest code runs */
         for (uint32_t i = 0; i < boot_arglen; i++) sr_w8(boot_argp + i, (uint8_t)boot_arg[i]);
-        /* BOOT.BIN and the kernel consumed 0x110..0x11b before creating module_start (F-050). */
-        sr_set_next_uid(0x11cu);
+        sr_set_next_uid(SR_BOOT_NEXT_UID);
 #ifdef SR_INITIAL_GE_LIST_ID
         sr_ge_set_next_list_id(SR_INITIAL_GE_LIST_ID);
 #endif
@@ -257,7 +265,7 @@ have_image:;
         sr_set_boot_uid_gap(SR_BOOT_UID_GAP_COUNT);
 #endif
     for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--gui") == 0) {
-        if (!gui_init("PSP Recomp")) return 2;
+        if (!gui_init(SR_GAME_TITLE)) return 2;
         use_sched = 1;
     }
 

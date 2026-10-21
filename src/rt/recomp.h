@@ -258,6 +258,7 @@ enum {
     SR_TMID_SEMAPHORE = 2,
     SR_TMID_EVENT_FLAG = 3,
     SR_TMID_FPL = 6,
+    SR_TMID_MODULE = 7,
     SR_TMID_CALLBACK = 8,
 };
 uint32_t sr_alloc_uid(void);
@@ -283,6 +284,7 @@ uint32_t sched_create_thread(const char *name, uint32_t entry, int priority, uin
                              uint32_t attr);                /* uid, or a kernel error (bit 31) */
 uint32_t sched_create_hle_thread(const char *name, int priority, uint32_t stack_size,
                                  SrHleThreadFn entry, uint32_t arg);
+void     sched_set_thread_gp(uint32_t uid, uint32_t gp);
 int      sched_delete_hle_thread(uint32_t uid);
 int      sched_delete_thread(uint32_t uid);         /* sceKernelDeleteThread: 0 or a kernel error */
 void     sched_exit_delete_current(int32_t status); /* sceKernelExitDeleteThread */
@@ -350,6 +352,19 @@ int      sched_current_priority(void);
 int      sched_is_dormant(uint32_t uid);
 uint32_t sched_current_uid(void);
 void     sched_run(uint32_t entry, uint32_t arglen, uint32_t argp, int create_start_thread);
+
+/* Runtime-loaded user PRXs (src/rt/module.c). */
+uint32_t sr_module_load_image(
+             const uint8_t *data, uint32_t size, const char *path);
+uint32_t sr_module_start(
+             uint32_t uid, uint32_t arg_size, uint32_t arg_address,
+             uint32_t status_address, uint32_t option_address);
+uint32_t sr_module_unload(uint32_t uid);
+int      sr_module_find_export(
+             uint32_t nid, uint32_t *address, const char **library);
+int      sr_module_syscall_nid(uint32_t code, uint32_t *nid);
+int      sr_module_patch_import(
+             uint32_t stub, uint32_t nid, const char *library);
 
 /* A function the static recompiler could not translate (an unimplemented instruction). The
  * body traps loudly with the guest address and reason rather than silently doing nothing, so
