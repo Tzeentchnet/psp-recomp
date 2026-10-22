@@ -374,6 +374,130 @@ typedef struct SrInterpMiss {
     const char *module;
 } SrInterpMiss;
 
+typedef struct SrInterpProfile {
+    uint32_t target;
+    const char *module;
+    uint64_t calls;
+    uint64_t instructions;
+    uint64_t syscalls;
+    uint64_t native_handoffs;
+    uint64_t step_limits;
+    uint64_t returns;
+    uint64_t failures;
+} SrInterpProfile;
+
+static SrInterpProfile *s_interp_profiles;
+static size_t s_interp_profile_count;
+static size_t s_interp_profile_capacity;
+static int s_interp_profile_enabled = -1;
+static char s_interp_profile_path[1024];
+
+static size_t sr_interp_profile_begin(
+    uint32_t target, const char *module) {
+    const char *label = module && module[0] ? module : "unknown";
+    if (s_interp_profile_enabled < 0) {
+        const char *path = getenv("SR_INTERP_PROFILE");
+        s_interp_profile_enabled = path && path[0] ? 1 : 0;
+        if (s_interp_profile_enabled) {
+            size_t length = strlen(path);
+            if (length >= sizeof(s_interp_profile_path)) {
+                fprintf(
+                    stderr,
+                    "SR_INTERP_PROFILE path is too long\n");
+                abort();
+            }
+            memcpy(s_interp_profile_path, path, length + 1u);
+        }
+    }
+    if (!s_interp_profile_enabled) return SIZE_MAX;
+    for (size_t i = 0; i < s_interp_profile_count; i++) {
+        if (s_interp_profiles[i].target == target &&
+            strcmp(s_interp_profiles[i].module, label) == 0) {
+            s_interp_profiles[i].calls++;
+            return i;
+        }
+    }
+    if (s_interp_profile_count == s_interp_profile_capacity) {
+        size_t capacity =
+            s_interp_profile_capacity
+                ? s_interp_profile_capacity * 2u : 32u;
+        SrInterpProfile *grown = (SrInterpProfile *)realloc(
+            s_interp_profiles, capacity * sizeof(*grown));
+        if (!grown) {
+            fprintf(
+                stderr,
+                "dispatch: cannot grow interpreter profile\n");
+            abort();
+        }
+        s_interp_profiles = grown;
+        s_interp_profile_capacity = capacity;
+    }
+    size_t index = s_interp_profile_count++;
+    memset(&s_interp_profiles[index], 0, sizeof(s_interp_profiles[index]));
+    s_interp_profiles[index].target = target;
+    s_interp_profiles[index].module = label;
+    s_interp_profiles[index].calls = 1;
+    return index;
+}
+
+static SrInterpProfile *sr_interp_profile_at(size_t index) {
+    return index < s_interp_profile_count
+        ? &s_interp_profiles[index] : NULL;
+}
+
+int sr_interp_profile_write(void) {
+    if (s_interp_profile_enabled <= 0) return 1;
+    FILE *file = fopen(s_interp_profile_path, "wb");
+    if (!file) {
+        fprintf(
+            stderr,
+            "dispatch: cannot create interpreter profile %s\n",
+            s_interp_profile_path);
+        return 0;
+    }
+    int failed =
+        fprintf(
+            file,
+            "# psp-recomp interpreter profile v1\n"
+            "module\ttarget\tcalls\tinstructions\tsyscalls\t"
+            "native_handoffs\tstep_limits\treturns\tfailures\n") < 0;
+    uint64_t calls = 0;
+    uint64_t instructions = 0;
+    for (size_t i = 0; i < s_interp_profile_count && !failed; i++) {
+        const SrInterpProfile *profile = &s_interp_profiles[i];
+        calls += profile->calls;
+        instructions += profile->instructions;
+        failed = fprintf(
+            file,
+            "%s\t0x%08x\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
+            profile->module, profile->target,
+            (unsigned long long)profile->calls,
+            (unsigned long long)profile->instructions,
+            (unsigned long long)profile->syscalls,
+            (unsigned long long)profile->native_handoffs,
+            (unsigned long long)profile->step_limits,
+            (unsigned long long)profile->returns,
+            (unsigned long long)profile->failures) < 0;
+    }
+    if (fclose(file) != 0) failed = 1;
+    if (failed) {
+        fprintf(
+            stderr,
+            "dispatch: cannot write interpreter profile %s\n",
+            s_interp_profile_path);
+        return 0;
+    }
+    fprintf(
+        stderr,
+        "dispatch: interpreter profile targets=%llu calls=%llu "
+        "instructions=%llu -> %s\n",
+        (unsigned long long)s_interp_profile_count,
+        (unsigned long long)calls,
+        (unsigned long long)instructions,
+        s_interp_profile_path);
+    return 1;
+}
+
 static void sr_log_interp_miss(
     uint32_t target, const CpuState *s, const char *module) {
     static SrInterpMiss *seen;
@@ -458,11 +582,22 @@ void sr_interpret_direct_module(
 static int sr_interpret_segment(
     CpuState *s, uint32_t target, uint32_t return_pc,
     uint64_t *remaining, int allow_native_handoff,
+    size_t profile_index,
     SrInterpStop *stop) {
     for (;;) {
-        if (sr_interpret_fallback(
+        int returned = sr_interpret_fallback(
                 s, target, return_pc, *remaining,
-                allow_native_handoff, stop)) {
+                allow_native_handoff, stop);
+        SrInterpProfile *profile =
+            sr_interp_profile_at(profile_index);
+        if (profile) {
+            profile->instructions += stop->steps;
+            if (stop->reason == SR_INTERP_SYSCALL)
+                profile->syscalls++;
+            else if (stop->reason == SR_INTERP_STEP_LIMIT)
+                profile->step_limits++;
+        }
+        if (returned) {
             return 1;
         }
         if (stop->steps >= *remaining)
@@ -496,11 +631,13 @@ static int sr_interpret_segment(
 
 static int sr_interpret_deep_callee(
     CpuState *s, uint32_t target, uint32_t return_pc,
+    size_t profile_index,
     SrInterpStop *stop) {
     uint64_t remaining = sr_interp_step_limit();
     for (;;) {
         if (sr_interpret_segment(
-                s, target, return_pc, &remaining, 0, stop))
+                s, target, return_pc, &remaining, 0,
+                profile_index, stop))
             return 1;
         if (stop->reason != SR_INTERP_STEP_LIMIT)
             return 0;
@@ -513,23 +650,33 @@ void sr_interpret_entry(CpuState *s) {
     uint32_t target = s->pc;
     const char *module = s->interp_module;
     sr_log_interp_miss(target, s, module);
+    size_t profile_index =
+        sr_interp_profile_begin(target, module);
     SrInterpStop stop;
     uint64_t remaining = sr_interp_step_limit();
     uint32_t return_pc = s->r[31];
     s->interp_depth++;
     for (;;) {
         if (sr_interpret_segment(
-                s, target, return_pc, &remaining, 1, &stop)) {
+                s, target, return_pc, &remaining, 1,
+                profile_index, &stop)) {
+            SrInterpProfile *profile =
+                sr_interp_profile_at(profile_index);
+            if (profile) profile->returns++;
             s->interp_depth--;
             return;
         }
         if (stop.reason == SR_INTERP_NATIVE_TARGET) {
+            SrInterpProfile *profile =
+                sr_interp_profile_at(profile_index);
+            if (profile) profile->native_handoffs++;
             RecompFn nested = sr_lookup(stop.pc);
             if (!nested) {
                 stop.reason = SR_INTERP_UNIMPLEMENTED;
                 break;
             }
             if (s->r[31] == return_pc) {
+                if (profile) profile->returns++;
                 s->interp_depth--;
 #if defined(__clang__)
                 [[clang::musttail]] return nested(s);
@@ -554,6 +701,7 @@ void sr_interpret_entry(CpuState *s) {
                 SrInterpStop callee_stop;
                 if (!sr_interpret_deep_callee(
                         s, stop.pc, callee_return_pc,
+                        profile_index,
                         &callee_stop)) {
                     stop = callee_stop;
                     break;
@@ -592,6 +740,11 @@ void sr_interpret_entry(CpuState *s) {
         "dispatch: interpreter stopped at 0x%08x op=0x%08x after %llu steps: %s\n",
         stop.pc, stop.op, (unsigned long long)stop.steps,
         sr_interp_reason_name(stop.reason));
+    {
+        SrInterpProfile *profile =
+            sr_interp_profile_at(profile_index);
+        if (profile) profile->failures++;
+    }
     if (stop.reason == SR_INTERP_MEMORY_FAULT)
         fprintf(stderr, "dispatch: memory fault at 0x%08x\n", stop.memory_address);
     /* Bring-up-only escape hatch retained for diagnosing unsupported dynamic code. */

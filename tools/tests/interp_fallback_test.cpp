@@ -175,11 +175,15 @@ int main() {
     CHECK(state.v[0] == 3.75f);
 
     const char *miss_log = "interp_fallback_test.misses";
+    const char *profile_log = "interp_fallback_test.profile";
     std::remove(miss_log);
+    std::remove(profile_log);
 #if defined(_WIN32)
     _putenv_s("SR_INTERP_MISS_LOG", miss_log);
+    _putenv_s("SR_INTERP_PROFILE", profile_log);
 #else
     setenv("SR_INTERP_MISS_LOG", miss_log, 1);
+    setenv("SR_INTERP_PROFILE", profile_log, 1);
 #endif
     sr_set_dispatch_table(nullptr, 0);
     std::memset(&state, 0, sizeof(state));
@@ -476,6 +480,29 @@ int main() {
     CHECK(((stop.op >> 6) & 0xfffffu) == 63u);
     uint32_t unknown_nid = 0;
     CHECK(!sr_module_syscall_nid(63, &unknown_nid));
+
+    CHECK(sr_interp_profile_write());
+    log = std::fopen(profile_log, "r");
+    CHECK(log != nullptr);
+    bool found_profile = false;
+    while (std::fgets(line, sizeof(line), log)) {
+        char module[32];
+        unsigned target;
+        unsigned long long calls;
+        unsigned long long instructions;
+        if (std::sscanf(
+                line, "%31s\t0x%x\t%llu\t%llu",
+                module, &target, &calls, &instructions) == 4 &&
+            std::strcmp(module, "unknown") == 0 &&
+            target == function) {
+            CHECK(calls == 2);
+            CHECK(instructions == 8);
+            found_profile = true;
+        }
+    }
+    CHECK(std::fclose(log) == 0);
+    CHECK(found_profile);
+    CHECK(std::remove(profile_log) == 0);
 
     std::puts("interpreter fallback tests passed");
     return 0;

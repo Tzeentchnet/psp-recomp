@@ -158,6 +158,18 @@ static void test_present_viewports(void) {
     check_float("pillarbox height", layout.viewport.Height, 1080.0f);
     check_u32("pillarbox scissor left", (uint32_t)layout.scissor.left, 7);
     check_u32("pillarbox scissor right", (uint32_t)layout.scissor.right, 1913);
+
+    GeD3D12CaptureLayout capture;
+    ged3d12_present_capture_layout(3, false, &capture);
+    check_u32("logical capture width", capture.width, 480);
+    check_u32("logical capture height", capture.height, 272);
+    check_u32("logical capture step", capture.source_step, 3);
+    check_u32("logical capture offset", capture.sample_offset, 1);
+    ged3d12_present_capture_layout(3, true, &capture);
+    check_u32("internal capture width", capture.width, 1440);
+    check_u32("internal capture height", capture.height, 816);
+    check_u32("internal capture step", capture.source_step, 1);
+    check_u32("internal capture offset", capture.sample_offset, 0);
 }
 
 static void test_shader_constants(void) {

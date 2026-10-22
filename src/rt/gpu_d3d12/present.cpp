@@ -5,6 +5,8 @@
 
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define PSP_WIDTH 480u
 #define PSP_HEIGHT 272u
@@ -318,6 +320,16 @@ bool ged3d12_present_capture_record(void) {
 
 bool ged3d12_present_capture_write(const char *path) {
     if (!path || !path[0] || !s_capture_readback) return false;
+    const char *internal_setting =
+        getenv("SR_D3D12_CAPTURE_INTERNAL");
+    const bool internal_resolution =
+        internal_setting && internal_setting[0] &&
+        strcmp(internal_setting, "0") != 0;
+    GeD3D12CaptureLayout layout = {};
+    ged3d12_present_capture_layout(
+        s_render_scale, internal_resolution, &layout);
+    if (!layout.width || !layout.height || !layout.source_step)
+        return false;
     D3D12_RANGE read_range = {0, (SIZE_T)s_capture_bytes};
     uint8_t *data = nullptr;
     if (!check_hr(s_capture_readback->Map(
@@ -328,16 +340,17 @@ bool ged3d12_present_capture_write(const char *path) {
 
     FILE *file = fopen(path, "wb");
     bool failed = !file ||
-        fprintf(file, "P6\n%u %u\n255\n", PSP_WIDTH, PSP_HEIGHT) < 0;
-    const UINT sample_offset = s_render_scale / 2u;
-    for (UINT y = 0; y < PSP_HEIGHT && !failed; y++) {
+        fprintf(
+            file, "P6\n%u %u\n255\n",
+            layout.width, layout.height) < 0;
+    for (UINT y = 0; y < layout.height && !failed; y++) {
+        const UINT source_y =
+            y * layout.source_step + layout.sample_offset;
         const uint8_t *row =
-            data +
-            (UINT64)(y * s_render_scale + sample_offset) *
-                s_capture_row_pitch;
-        for (UINT x = 0; x < PSP_WIDTH; x++) {
+            data + (UINT64)source_y * s_capture_row_pitch;
+        for (UINT x = 0; x < layout.width; x++) {
             const UINT source_x =
-                x * s_render_scale + sample_offset;
+                x * layout.source_step + layout.sample_offset;
             const uint8_t rgb[3] = {
                 row[source_x * 4 + 2],
                 row[source_x * 4 + 1],
@@ -355,6 +368,12 @@ bool ged3d12_present_capture_write(const char *path) {
     if (failed) {
         fprintf(stderr, "ged3d12: cannot write present capture %s\n", path);
         return false;
+    }
+    if (internal_resolution) {
+        fprintf(
+            stderr,
+            "ged3d12: internal-resolution capture %ux%u\n",
+            layout.width, layout.height);
     }
     return true;
 }

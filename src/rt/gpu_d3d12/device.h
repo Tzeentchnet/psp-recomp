@@ -19,6 +19,7 @@ uint32_t ged3d12_buttons(void);
 void     ged3d12_analog(uint8_t *lx, uint8_t *ly);
 int      ged3d12_pad_present(void);
 int ged3d12_capture_next(const char *path);
+double ged3d12_last_gpu_ms(void);
 
 #ifdef __cplusplus
 }

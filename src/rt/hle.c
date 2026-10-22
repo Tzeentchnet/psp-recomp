@@ -2954,6 +2954,7 @@ static FrameCaptureRequest s_frame_capture[FRAME_CAPTURE_COUNT];
 static int s_frame_capture_initialized;
 static int s_frame_capture_next;
 static char s_frame_capture_dir[768];
+static void runtime_exit_cleanly(int code);
 
 static void frame_capture_fail(const char *message, const char *detail) {
     fprintf(stderr, "golden-frame capture: %s%s%s\n",
@@ -3076,10 +3077,7 @@ static void frame_capture_complete(
     if (!done || fprintf(done, "%d\n", FRAME_CAPTURE_COUNT) < 0 || fclose(done) != 0)
         frame_capture_fail("cannot write completion marker", complete_path);
     fprintf(stderr, "golden-frame capture: completed %d frames\n", FRAME_CAPTURE_COUNT);
-    sr_audio_shutdown();
-    sr_trace_close();
-    fflush(stderr);
-    _Exit(0);
+    runtime_exit_cleanly(0);
 }
 
 #define PRESENT_PERF_MAX_SAMPLES 600
@@ -3091,10 +3089,14 @@ typedef struct PresentPerf {
     double frame_ms[PRESENT_PERF_MAX_SAMPLES];
     double frontend_ms[PRESENT_PERF_MAX_SAMPLES];
     double backend_ms[PRESENT_PERF_MAX_SAMPLES];
+    double gpu_ms[PRESENT_PERF_MAX_SAMPLES];
+    FILE *file;
     uint32_t start;
     uint32_t window;
     uint32_t samples;
+    uint32_t over_budget;
     uint32_t exit_after;
+    double frame_budget_ms;
     double minimum_fps;
     int initialized;
     int enabled;
@@ -3177,11 +3179,31 @@ static uint32_t env_present_value(
 static void present_perf_init(void) {
     if (s_present_perf.initialized) return;
     s_present_perf.initialized = 1;
-    s_present_perf.enabled = getenv("SR_PERF_LOG") ? 1 : 0;
+    const char *file_path = getenv("SR_PERF_FILE");
+    s_present_perf.enabled =
+        getenv("SR_PERF_LOG") ||
+        (file_path && file_path[0]) ? 1 : 0;
     s_present_perf.start = env_present_value("SR_PERF_START", 1);
     s_present_perf.window = env_present_value("SR_PERF_WINDOW", 120);
     s_present_perf.exit_after =
         env_present_value("SR_EXIT_AFTER_PRESENT", 0);
+    s_present_perf.frame_budget_ms = 1000.0 / 60.0;
+    const char *frame_budget = getenv("SR_PERF_FRAME_BUDGET_MS");
+    if (frame_budget && frame_budget[0]) {
+        char *end = NULL;
+        s_present_perf.frame_budget_ms =
+            strtod(frame_budget, &end);
+        if (!end || *end ||
+            s_present_perf.frame_budget_ms <= 0.0 ||
+            s_present_perf.frame_budget_ms > 1000.0) {
+            fprintf(
+                stderr,
+                "SR_PERF_FRAME_BUDGET_MS: expected a number in "
+                "(0, 1000], got %s\n",
+                frame_budget);
+            _Exit(2);
+        }
+    }
     const char *minimum_fps = getenv("SR_PERF_MIN_FPS");
     if (minimum_fps && minimum_fps[0]) {
         char *end = NULL;
@@ -3200,6 +3222,24 @@ static void present_perf_init(void) {
             PRESENT_PERF_MAX_SAMPLES, s_present_perf.window);
         _Exit(2);
     }
+    if (file_path && file_path[0]) {
+        s_present_perf.file = fopen(file_path, "wb");
+        if (!s_present_perf.file ||
+            fprintf(
+                s_present_perf.file,
+                "# psp-recomp present performance v1\n"
+                "present,frame_ms,frontend_ms,backend_ms,gpu_ms,"
+                "over_budget\n") < 0) {
+            if (s_present_perf.file)
+                fclose(s_present_perf.file);
+            s_present_perf.file = NULL;
+            fprintf(
+                stderr,
+                "SR_PERF_FILE: cannot create %s\n",
+                file_path);
+            _Exit(2);
+        }
+    }
     QueryPerformanceFrequency(&s_present_perf.frequency);
 }
 
@@ -3215,6 +3255,7 @@ static void present_perf_finish(
     double ticks_per_ms =
         (double)s_present_perf.frequency.QuadPart / 1000.0;
     double backend_ms = (double)(exit - entry) / ticks_per_ms;
+    double gpu_ms = gui_last_gpu_ms();
     if (s_present_perf.enabled &&
         present > s_present_perf.start &&
         s_present_perf.previous_entry) {
@@ -3226,13 +3267,30 @@ static void present_perf_finish(
             frame_ms > s_present_perf.previous_backend_ms
                 ? frame_ms - s_present_perf.previous_backend_ms : 0.0;
         s_present_perf.backend_ms[index] = backend_ms;
+        s_present_perf.gpu_ms[index] = gpu_ms;
+        int over_budget =
+            frame_ms > s_present_perf.frame_budget_ms;
+        if (over_budget) s_present_perf.over_budget++;
+        if (s_present_perf.file &&
+            fprintf(
+                s_present_perf.file,
+                "%u,%.6f,%.6f,%.6f,%.6f,%d\n",
+                present, frame_ms,
+                s_present_perf.frontend_ms[index],
+                backend_ms, gpu_ms, over_budget) < 0) {
+            fprintf(stderr, "SR_PERF_FILE: write failed\n");
+            runtime_exit_cleanly(2);
+        }
         if (s_present_perf.samples == s_present_perf.window) {
             double sorted[PRESENT_PERF_MAX_SAMPLES];
             double frame_sum = 0.0;
             double frontend_sum = 0.0;
             double backend_sum = 0.0;
+            double gpu_sum = 0.0;
             double frame_max = 0.0;
             double backend_max = 0.0;
+            double gpu_max = 0.0;
+            uint32_t gpu_samples = 0;
             for (uint32_t i = 0; i < s_present_perf.samples; i++) {
                 sorted[i] = s_present_perf.frame_ms[i];
                 frame_sum += s_present_perf.frame_ms[i];
@@ -3242,36 +3300,56 @@ static void present_perf_finish(
                     frame_max = s_present_perf.frame_ms[i];
                 if (s_present_perf.backend_ms[i] > backend_max)
                     backend_max = s_present_perf.backend_ms[i];
+                if (s_present_perf.gpu_ms[i] >= 0.0) {
+                    gpu_sum += s_present_perf.gpu_ms[i];
+                    gpu_samples++;
+                    if (s_present_perf.gpu_ms[i] > gpu_max)
+                        gpu_max = s_present_perf.gpu_ms[i];
+                }
             }
             qsort(
                 sorted, s_present_perf.samples,
                 sizeof(sorted[0]), compare_double);
+            uint32_t p50_index =
+                (s_present_perf.samples * 50u + 99u) / 100u - 1u;
             uint32_t p95_index =
                 (s_present_perf.samples * 95u + 99u) / 100u - 1u;
+            uint32_t p99_index =
+                (s_present_perf.samples * 99u + 99u) / 100u - 1u;
             double average = frame_sum / s_present_perf.samples;
             double fps = 1000.0 / average;
             fprintf(
                 stderr,
                 "PERF presents=%u-%u samples=%u fps=%.2f "
-                "frame_ms avg=%.2f p95=%.2f max=%.2f "
-                "frontend_ms avg=%.2f backend_ms avg=%.2f max=%.2f\n",
+                "frame_ms avg=%.2f p50=%.2f p95=%.2f p99=%.2f "
+                "max=%.2f over_budget=%u "
+                "frontend_ms avg=%.2f backend_ms avg=%.2f max=%.2f "
+                "gpu_ms avg=%.2f max=%.2f samples=%u\n",
                 present - s_present_perf.samples + 1u, present,
                 s_present_perf.samples, fps,
-                average, sorted[p95_index], frame_max,
+                average, sorted[p50_index], sorted[p95_index],
+                sorted[p99_index], frame_max,
+                s_present_perf.over_budget,
                 frontend_sum / s_present_perf.samples,
-                backend_sum / s_present_perf.samples, backend_max);
+                backend_sum / s_present_perf.samples, backend_max,
+                gpu_samples ? gpu_sum / gpu_samples : -1.0,
+                gpu_samples ? gpu_max : -1.0,
+                gpu_samples);
+            if (s_present_perf.file &&
+                fflush(s_present_perf.file) != 0) {
+                fprintf(stderr, "SR_PERF_FILE: flush failed\n");
+                runtime_exit_cleanly(2);
+            }
             if (s_present_perf.minimum_fps > 0.0 &&
                 fps < s_present_perf.minimum_fps) {
                 fprintf(
                     stderr,
                     "PERF FAILED: %.2f FPS is below the %.2f FPS minimum\n",
                     fps, s_present_perf.minimum_fps);
-                sr_audio_shutdown();
-                sr_trace_close();
-                fflush(stderr);
-                _Exit(3);
+                runtime_exit_cleanly(3);
             }
             s_present_perf.samples = 0;
+            s_present_perf.over_budget = 0;
         }
     }
     s_present_perf.previous_entry = entry;
@@ -3281,11 +3359,26 @@ static void present_perf_finish(
         fprintf(
             stderr, "presentation limit reached at present %u\n",
             present);
-        sr_audio_shutdown();
-        sr_trace_close();
-        fflush(stderr);
-        _Exit(0);
+        runtime_exit_cleanly(0);
     }
+}
+
+static void present_perf_shutdown(void) {
+    if (!s_present_perf.file) return;
+    if (fclose(s_present_perf.file) != 0)
+        fprintf(stderr, "SR_PERF_FILE: close failed\n");
+    s_present_perf.file = NULL;
+}
+
+static void runtime_exit_cleanly(int code) {
+    present_perf_shutdown();
+    if (!sr_interp_profile_write() && code == 0)
+        code = 2;
+    sr_audio_shutdown();
+    gui_shutdown();
+    sr_trace_close();
+    fflush(stderr);
+    _Exit(code);
 }
 
 static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
@@ -3398,7 +3491,7 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
                   g_mpeg_put, g_mpeg_getavc, g_mpeg_avcdec, g_mpeg_nodata); }
         sr_dump_calls();
         extern void sched_dump_threads(void); sched_dump_threads();
-        _Exit(0);
+        runtime_exit_cleanly(0);
     }
     return 0;
 }

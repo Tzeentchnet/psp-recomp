@@ -486,6 +486,52 @@ int gui_init(const char *title) {
     return 1;
 }
 
+void gui_shutdown(void) {
+    sr_input_stop_hot_reload();
+#ifdef SR_D3D12
+    if (s_d3d12) {
+        ge_set_backend(NULL);
+        if (s_ge_backend && s_ge_backend->shutdown)
+            s_ge_backend->shutdown();
+        else
+            ged3d12_window_shutdown();
+        s_ge_backend = NULL;
+        s_d3d12 = 0;
+    }
+#endif
+#ifdef SR_SDL3VK
+    if (s_sdl3) {
+        ge_set_backend(NULL);
+        if (s_ge_backend && s_ge_backend->shutdown)
+            s_ge_backend->shutdown();
+        s_ge_backend = NULL;
+        sdl3vk_shutdown();
+        s_sdl3 = 0;
+    }
+#endif
+    if (s_dijoy) {
+        IDirectInputDevice8_Unacquire(s_dijoy);
+        IDirectInputDevice8_Release(s_dijoy);
+        s_dijoy = NULL;
+    }
+    if (s_di) {
+        IDirectInput8_Release(s_di);
+        s_di = NULL;
+    }
+    if (s_hwnd) {
+        DestroyWindow(s_hwnd);
+        s_hwnd = NULL;
+    }
+    free(s_px);
+    s_px = NULL;
+    s_buttons = 0;
+    s_lx = s_ly = 128;
+    s_pad_present = 0;
+    s_on = 0;
+    s_fps_counter_enabled = -1;
+    sr_fps_counter_reset(&s_fps_counter);
+}
+
 int gui_on(void) { return s_on; }
 uint32_t gui_buttons(void) { return s_buttons; }
 void gui_analog(uint8_t *lx, uint8_t *ly) { if (lx) *lx = s_lx; if (ly) *ly = s_ly; }
@@ -514,6 +560,12 @@ int gui_capture_next(const char *path) {
     (void)path;
 #endif
     return 0;
+}
+double gui_last_gpu_ms(void) {
+#ifdef SR_D3D12
+    if (s_on && s_d3d12) return ged3d12_last_gpu_ms();
+#endif
+    return -1.0;
 }
 
 /* Present a framebuffer at guest address fbaddr. fmt: 0=5650, 1=5551, 2=4444, 3=8888.

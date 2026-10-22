@@ -59,6 +59,7 @@ struct UploadSlab {
 struct FrameContext {
     ID3D12CommandAllocator *allocator;
     UINT64 fence_value;
+    bool timestamp_valid;
     UINT64 upload_begin;
     UINT64 upload_cursor;
     UINT64 upload_end;
@@ -106,6 +107,11 @@ static uint8_t s_dsv_used[DSV_DESCRIPTOR_COUNT];
 static FrameContext s_frames[FRAME_COUNT];
 static ID3D12GraphicsCommandList *s_command_list;
 static ID3D12GraphicsCommandList5 *s_command_list5;
+static ID3D12QueryHeap *s_timestamp_heap;
+static ID3D12Resource *s_timestamp_readback;
+static uint64_t *s_timestamp_map;
+static UINT64 s_timestamp_frequency;
+static double s_last_gpu_ms = -1.0;
 static UINT s_active_frame = UINT32_MAX;
 static D3D12_SHADING_RATE s_direct_shading_rate =
     D3D12_SHADING_RATE_1X1;
@@ -301,6 +307,16 @@ static void release_device(void) {
     ged3d12_framebuffer_cache_shutdown();
     ged3d12_present_shutdown();
     ged3d12_vertex_capture_shutdown();
+
+    if (s_timestamp_readback && s_timestamp_map) {
+        D3D12_RANGE written = {0, 0};
+        s_timestamp_readback->Unmap(0, &written);
+    }
+    s_timestamp_map = nullptr;
+    RELEASE_COM(s_timestamp_readback);
+    RELEASE_COM(s_timestamp_heap);
+    s_timestamp_frequency = 0;
+    s_last_gpu_ms = -1.0;
 
     if (s_upload && s_upload_map) {
         D3D12_RANGE written = {0, 0};
@@ -707,6 +723,32 @@ static int create_frame_resources(void) {
             "map upload ring")) {
         return 0;
     }
+
+    D3D12_QUERY_HEAP_DESC query = {};
+    query.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query.Count = FRAME_COUNT * 2u;
+    if (!check_hr(s_device->CreateQueryHeap(
+            &query, IID_PPV_ARGS(&s_timestamp_heap)),
+            "create timestamp query heap") ||
+        !check_hr(s_graphics_queue->GetTimestampFrequency(
+            &s_timestamp_frequency),
+            "get graphics timestamp frequency") ||
+        !s_timestamp_frequency) {
+        return 0;
+    }
+
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    resource.Width = FRAME_COUNT * 2u * sizeof(uint64_t);
+    if (!check_hr(s_device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &resource,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&s_timestamp_readback)),
+            "create timestamp readback") ||
+        !check_hr(s_timestamp_readback->Map(
+            0, nullptr, reinterpret_cast<void **>(&s_timestamp_map)),
+            "map timestamp readback")) {
+        return 0;
+    }
     return 1;
 }
 
@@ -1032,6 +1074,18 @@ static int begin_frame(UINT *frame_index) {
                         "wait for frame fence")) {
         return 0;
     }
+    if (frame->timestamp_valid && s_timestamp_map &&
+        s_timestamp_frequency) {
+        const UINT query = index * 2u;
+        const uint64_t begin = s_timestamp_map[query];
+        const uint64_t end = s_timestamp_map[query + 1u];
+        if (end >= begin) {
+            s_last_gpu_ms =
+                (double)(end - begin) * 1000.0 /
+                (double)s_timestamp_frequency;
+        }
+        frame->timestamp_valid = false;
+    }
     release_upload_overflow(frame);
     frame->upload_cursor = frame->upload_begin;
     frame->srv_cursor = frame->srv_begin;
@@ -1045,6 +1099,9 @@ static int begin_frame(UINT *frame_index) {
     s_command_list->SetDescriptorHeaps(
         (UINT)(sizeof(heaps) / sizeof(heaps[0])), heaps);
     s_command_list->SetGraphicsRootSignature(s_root_signature);
+    s_command_list->EndQuery(
+        s_timestamp_heap, D3D12_QUERY_TYPE_TIMESTAMP,
+        index * 2u);
     s_current_shading_rate = D3D12_SHADING_RATE_1X1;
     s_active_frame = index;
     if (!bind_default_root_state()) {
@@ -1591,6 +1648,13 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     }
     const bool capture_requested = s_capture_path[0] != '\0';
     if (capture_requested && !ged3d12_present_capture_record()) return -2;
+    s_command_list->EndQuery(
+        s_timestamp_heap, D3D12_QUERY_TYPE_TIMESTAMP,
+        frame_index * 2u + 1u);
+    s_command_list->ResolveQueryData(
+        s_timestamp_heap, D3D12_QUERY_TYPE_TIMESTAMP,
+        frame_index * 2u, 2u, s_timestamp_readback,
+        frame_index * 2u * sizeof(uint64_t));
     if (!check_hr(s_command_list->Close(), "close graphics command list"))
         return -2;
     LONGLONG stage_present_done = stage_counter();
@@ -1604,6 +1668,7 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     s_frames[frame_index].fence_value = fence_value;
     s_active_frame = UINT32_MAX;
     if (!check_hr(signal_hr, "signal frame fence")) return -2;
+    s_frames[frame_index].timestamp_valid = true;
     if (FAILED(present_hr)) {
         check_hr(present_hr, "present swapchain");
         HRESULT removed = s_device->GetDeviceRemovedReason();
@@ -1714,6 +1779,9 @@ extern "C" void ged3d12_analog(uint8_t *lx, uint8_t *ly) {
     if (ly) *ly = s_ly;
 }
 extern "C" int ged3d12_pad_present(void) { return s_pad_present; }
+extern "C" double ged3d12_last_gpu_ms(void) {
+    return s_last_gpu_ms;
+}
 extern "C" int ged3d12_capture_next(const char *path) {
     if (!path || !path[0] || s_capture_path[0]) return 0;
     size_t length = strlen(path);

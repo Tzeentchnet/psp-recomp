@@ -63,6 +63,7 @@ static GeD3D12PipelineStats s_stats;
 static GeD3D12PipelineKey s_uber_key;
 static ID3D12PipelineState *s_uber_pipeline;
 static ID3D12PipelineLibrary *s_library;
+static int s_library_loaded_from_disk;
 static CRITICAL_SECTION s_lock;
 static HANDLE s_worker;
 static HANDLE s_worker_event;
@@ -156,6 +157,14 @@ static bool configure_cache_path(void) {
                     "ged3d12: PSO disk cache disabled; set "
                     "SR_D3D12_PSO_CACHE to opt in\n");
         }
+        return false;
+    }
+    if (!env_enabled("SR_D3D12_UNSAFE_PSO_CACHE")) {
+        fprintf(
+            stderr,
+            "ged3d12: PSO disk cache disabled because serialized "
+            "pipeline libraries are not stable across process launches; "
+            "SR_D3D12_UNSAFE_PSO_CACHE=1 is required for diagnostics\n");
         return false;
     }
 
@@ -280,6 +289,7 @@ static void initialize_pipeline_library(void) {
     void *blob = read_library_blob(&blob_size);
     hr = device->CreatePipelineLibrary(
         blob, blob_size, IID_PPV_ARGS(&s_library));
+    bool loaded_from_disk = SUCCEEDED(hr) && blob != nullptr;
     if (FAILED(hr) && blob) {
         fprintf(stderr,
                 "ged3d12: cached pipeline library was rejected "
@@ -300,11 +310,42 @@ static void initialize_pipeline_library(void) {
         s_cache_path[0] = '\0';
         return;
     }
+    s_library_loaded_from_disk = loaded_from_disk;
     if (s_log && blob_size) {
         fprintf(stderr,
                 "ged3d12: loaded %llu-byte PSO disk cache %s\n",
                 (unsigned long long)blob_size, s_cache_path);
     }
+}
+
+static bool reset_pipeline_library(void) {
+    ID3D12Device1 *device = nullptr;
+    HRESULT hr =
+        ged3d12_device()->QueryInterface(IID_PPV_ARGS(&device));
+    ID3D12PipelineLibrary *replacement = nullptr;
+    if (SUCCEEDED(hr)) {
+        hr = device->CreatePipelineLibrary(
+            nullptr, 0, IID_PPV_ARGS(&replacement));
+        device->Release();
+    }
+    if (FAILED(hr)) {
+        fprintf(
+            stderr,
+            "ged3d12: rebuild empty pipeline library failed "
+            "(HRESULT 0x%08lx); disabling disk persistence\n",
+            (unsigned long)hr);
+        if (s_library) s_library->Release();
+        s_library = nullptr;
+        s_cache_path[0] = '\0';
+        s_library_dirty = 0;
+        s_library_loaded_from_disk = 0;
+        return false;
+    }
+    if (s_library) s_library->Release();
+    s_library = replacement;
+    s_library_dirty = 0;
+    s_library_loaded_from_disk = 0;
+    return true;
 }
 
 static void pipeline_name(
@@ -536,9 +577,19 @@ static PipelineBuildResult load_or_create_pipeline(
         HRESULT hr = s_library->LoadGraphicsPipeline(
             name, &desc, IID_PPV_ARGS(&result.pipeline));
         if (SUCCEEDED(hr)) {
+            s_library_loaded_from_disk = 0;
             result.library_hit = true;
             return result;
         }
+        if (s_library_loaded_from_disk && hr != E_INVALIDARG) {
+            fprintf(
+                stderr,
+                "ged3d12: cached pipeline library failed validation "
+                "(HRESULT 0x%08lx); rebuilding it\n",
+                (unsigned long)hr);
+            reset_pipeline_library();
+        }
+        s_library_loaded_from_disk = 0;
         if (hr != E_INVALIDARG && s_log) {
             fprintf(stderr,
                     "ged3d12: load PSO from pipeline library missed "
@@ -667,6 +718,7 @@ bool ged3d12_pipeline_cache_init(void) {
     s_queue_count = 0;
     s_stopping = 0;
     s_library_dirty = 0;
+    s_library_loaded_from_disk = 0;
     s_log = env_enabled("SR_D3D12_PSO_LOG");
     s_cache_path[0] = '\0';
     configure_cache_path();
@@ -808,6 +860,7 @@ void ged3d12_pipeline_cache_shutdown(void) {
     s_queue_count = 0;
     s_stopping = 0;
     s_library_dirty = 0;
+    s_library_loaded_from_disk = 0;
     s_ready = 0;
     s_log = 0;
     s_cache_path[0] = '\0';

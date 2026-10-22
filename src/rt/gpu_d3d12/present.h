@@ -9,8 +9,18 @@ struct GeD3D12PresentViewport {
     D3D12_RECT scissor;
 };
 
+struct GeD3D12CaptureLayout {
+    UINT width;
+    UINT height;
+    UINT source_step;
+    UINT sample_offset;
+};
+
 void ged3d12_present_viewport(
     UINT output_width, UINT output_height, GeD3D12PresentViewport *out);
+void ged3d12_present_capture_layout(
+    UINT render_scale, bool internal_resolution,
+    GeD3D12CaptureLayout *out);
 
 bool ged3d12_present_init(void);
 void ged3d12_present_shutdown(void);

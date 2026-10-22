@@ -260,9 +260,11 @@ Set these environment variables before running the game to control runtime featu
   vertex upload, framebuffer and texture preparation, draw recording,
   presentation, and submission.
 - `SR_D3D12_PSO_LOG=1`: Print ubershader, asynchronous GE PSO, pipeline-library, and final cache statistics.
-- `SR_D3D12_PSO_CACHE=<path>`: Opt into pipeline-library disk persistence at the specified path.
-  Disk persistence is disabled by default because some drivers reject a library they previously serialized;
-  the exact ubershader fallback and asynchronous in-memory cache remain active.
+- `SR_D3D12_PSO_CACHE=<path>`: Request experimental pipeline-library disk persistence.
+  Serialized libraries remove the device on at least one validated driver, so
+  the additional `SR_D3D12_UNSAFE_PSO_CACHE=1` acknowledgement is required.
+  The exact ubershader fallback and asynchronous in-memory cache remain active
+  without disk persistence.
 - `SR_D3D12_WARP=1`: Select Microsoft WARP instead of a hardware adapter.
 - **F10** (D3D12 window): Write a complete textual GE state dump in the working directory.
   PIX for Windows can display nested list/draw events embedded in each D3D12 command list;
@@ -272,6 +274,8 @@ Set these environment variables before running the game to control runtime featu
   scaled GPU display texture after presentation conversion and center-sample it back to
   480x272; other presenters use the
   authoritative guest framebuffer. A successful sequence writes `capture.complete`.
+- `SR_D3D12_CAPTURE_INTERNAL=1`: Keep D3D12 captures at the selected
+  full internal resolution instead of center-sampling them to 480x272.
 - `SR_PADSCRIPT=<path>`: Inject deterministic controller pulses. Golden pad-script v3 entries
   contain a PPSSPP vblank index, a runtime presentation index, a shared PSP button mask, and
   backend-specific widths; the runtime consumes presentation-timed values so turbo scheduler
@@ -297,7 +301,9 @@ Set these environment variables before running the game to control runtime featu
   `SR_PERF_WINDOW=<1..600>` selects the reporting window. `SR_PERF_MIN_FPS=<fps>` terminates with
   failure when a completed window falls below the required average, while
   `SR_EXIT_AFTER_PRESENT=<present>` makes unattended benchmarks exit cleanly with final audio
-  synchronization statistics.
+  synchronization statistics. `SR_PERF_FILE=<path>` additionally writes
+  per-presentation CSV with host, backend, and fenced D3D12 GPU time;
+  `SR_PERF_FRAME_BUDGET_MS=<milliseconds>` overrides its over-budget threshold.
 - `PSP_VFPU_TABLES=<directory>`: Override the `assets/vfpu` lookup-table directory. The golden
   harness sets this explicitly so runtime execution does not depend on its working directory.
 - `SR_INTERP_MISS_LOG=<path>`: Write each distinct guest target that missed the generated
@@ -306,6 +312,9 @@ Set these environment variables before running the game to control runtime featu
   supported misses through the reference interpreter, hands nested targets
   back to generated code when they enter the active native table, and reuses
   the tested VFPU instruction engine for supported interpreted VFPU operations.
+- `SR_INTERP_PROFILE=<path>`: Write aggregate calls, guest instructions,
+  syscalls, native handoffs, chunk limits, returns, and failures for every
+  module-qualified fallback target. This does not change the v2 miss log.
 - `SR_INTERP_MAX_STEPS=<1..100000000>`: Bound one interpreter fallback invocation; the default
   is 1,000,000 instructions. A syscall, unsupported instruction, memory fault, or exhausted
   bound is a fatal error unless the diagnostic-only `SR_DISPATCH_PERMISSIVE=1` escape hatch is set.

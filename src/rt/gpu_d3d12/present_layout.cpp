@@ -36,3 +36,20 @@ void ged3d12_present_viewport(
     out->scissor.right = (LONG)ceilf(x + width);
     out->scissor.bottom = (LONG)ceilf(y + height);
 }
+
+void ged3d12_present_capture_layout(
+    UINT render_scale, bool internal_resolution,
+    GeD3D12CaptureLayout *out) {
+    memset(out, 0, sizeof(*out));
+    if (!render_scale) return;
+    if (internal_resolution) {
+        out->width = 480u * render_scale;
+        out->height = 272u * render_scale;
+        out->source_step = 1;
+        return;
+    }
+    out->width = 480u;
+    out->height = 272u;
+    out->source_step = render_scale;
+    out->sample_offset = render_scale / 2u;
+}

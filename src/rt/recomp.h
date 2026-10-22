@@ -170,6 +170,7 @@ void     sr_interpret_direct(CpuState *s, uint32_t target);
 void     sr_interpret_direct_module(
              CpuState *s, uint32_t target, const char *module);
 void     sr_interpret_entry(CpuState *s);
+int      sr_interp_profile_write(void);
 void     dispatch(CpuState *s, uint32_t target);
 
 #if defined(__clang__)
@@ -268,6 +269,7 @@ extern uint32_t g_sdk_version;          /* sceKernelSetCompiledSdkVersion (hle.c
  * called from sceDisplaySetFrameBuf to show a frame, pump messages, and sample the keyboard;
  * gui_buttons returns the live PSP pad state; gui_on reports whether the window is active. */
 int      gui_init(const char *title);
+void     gui_shutdown(void);
 int      gui_on(void);
 uint32_t gui_buttons(void);
 void     gui_analog(uint8_t *lx, uint8_t *ly);   /* live left-stick (0..255, 128=centre) */
@@ -276,6 +278,7 @@ int      gui_message(
              const char *text, int yes_no, int allow_cancel, int default_no);
 void     gui_present(uint32_t fbaddr, int fmt, uint32_t stride);
 int gui_capture_next(const char *path);
+double gui_last_gpu_ms(void);
 int sr_kzl_patch_offline_menu(uint8_t *data, uint32_t size);
 void sr_kzl_killzone_com_disabled(CpuState *s);
 void sr_kzl_downloads_unavailable(CpuState *s);
