@@ -27,32 +27,39 @@ typedef struct CpuState {
         uint32_t vi[128];
     };
     uint32_t vfpuCtrl[16];  /* VFPU control: prefixes (S/T/D), cc, etc. */
+    const char *interp_module;  /* host-only identity for generated interpreter tail entries */
+    uint32_t interp_depth;      /* active interpreter/native handoffs on this guest thread */
 } CpuState;
 
-/* Guest memory: a single host region. g_mem points at guest 0x08000000, and the underlying
- * allocation also extends 0x04000000 bytes *below* g_mem so the same arena covers VRAM/eDRAM
- * (0x04000000..0x041fffff). SR_HOST maps a VRAM address to g_mem minus an offset that still
- * lands inside the allocation. Keeping SR_RAM_BASE at 0x08000000 means the recompiled code's
- * MEM_* macros are unchanged (no rebuild of the big object). */
+/* Guest memory: g_mem points at guest 0x08000000, and the underlying allocation extends below
+ * it for VRAM/eDRAM. The PSP's separate 16 KiB scratchpad is mapped at 0x00010000. */
 extern uint8_t *g_mem;
+extern uint8_t g_scratchpad[0x4000];
 extern int g_sr_gpu_vram_read_watch;
 extern int g_sr_gpu_vram_write_watch;
 void sr_gpu_vram_read(uint32_t addr, uint32_t bytes);
 void sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes);
 void sr_gpu_vram_prepare_write(uint32_t addr, uint32_t bytes);
 #define SR_RAM_BASE 0x08000000u
+#define SR_SCRATCHPAD_BASE 0x00010000u
+#define SR_SCRATCHPAD_SIZE 0x00004000u
 #define SR_PHYS(a)  ((a) & 0x1FFFFFFFu)
-/* Signed offset so addresses below SR_RAM_BASE (VRAM/eDRAM at 0x04000000) map below g_mem,
- * into the part of the arena reserved for them, instead of wrapping to a huge positive offset. */
-#define SR_HOST(a)  (g_mem + (int32_t)(SR_PHYS(a) - SR_RAM_BASE))
+static inline uint8_t *sr_host(uint32_t a) {
+    uint32_t physical = SR_PHYS(a);
+    if ((uint32_t)(physical - SR_SCRATCHPAD_BASE) <
+        SR_SCRATCHPAD_SIZE)
+        return g_scratchpad + (physical - SR_SCRATCHPAD_BASE);
+    return g_mem + (int32_t)(physical - SR_RAM_BASE);
+}
+#define SR_HOST(a) sr_host(a)
 
-/* The arena covers guest physical [0x04000000, 0x0c000000): VRAM/eDRAM at 0x04000000 and user
- * RAM at 0x08000000. A guest pointer outside that window is wild (would fault on real hardware
- * too). During bring-up some not-yet-faithful subsystems compute such pointers; rather than
- * segfault the host, out-of-range reads return 0 and writes are dropped. Valid accesses are
- * unaffected, so differential/bit-exact checks still hold. */
+/* Valid guest memory is scratchpad, VRAM/eDRAM, or user RAM. */
 static inline int sr_inrange(uint32_t a) {
-    return (uint32_t)(SR_PHYS(a) - 0x04000000u) < 0x08000000u;
+    uint32_t physical = SR_PHYS(a);
+    return
+        (uint32_t)(physical - SR_SCRATCHPAD_BASE) <
+            SR_SCRATCHPAD_SIZE ||
+        (uint32_t)(physical - 0x04000000u) < 0x08000000u;
 }
 extern void sr_oor(uint32_t a, uint32_t v, int store);   /* records out-of-range access (diag) */
 static inline void sr_prepare_read(uint32_t a, uint32_t bytes) {
@@ -128,13 +135,19 @@ typedef struct SrDispatchEntry {
     uint32_t address;
     RecompFn function;
 } SrDispatchEntry;
+typedef struct SrDispatchTable {
+    const char *name;
+    const SrDispatchEntry *entries;
+    uint32_t count;
+} SrDispatchTable;
 typedef enum SrInterpStopReason {
     SR_INTERP_RETURNED = 0,
     SR_INTERP_SYSCALL,
     SR_INTERP_UNIMPLEMENTED,
     SR_INTERP_MEMORY_FAULT,
     SR_INTERP_STEP_LIMIT,
-    SR_INTERP_BREAK
+    SR_INTERP_BREAK,
+    SR_INTERP_NATIVE_TARGET
 } SrInterpStopReason;
 typedef struct SrInterpStop {
     SrInterpStopReason reason;
@@ -144,11 +157,35 @@ typedef struct SrInterpStop {
     uint64_t steps;
 } SrInterpStop;
 void     sr_set_dispatch_table(const SrDispatchEntry *entries, uint32_t count);
+int      sr_activate_dispatch_table(const SrDispatchTable *table);
+int      sr_deactivate_dispatch_table(const SrDispatchTable *table);
+void     sr_disable_native_function(RecompFn function);
 RecompFn sr_lookup(uint32_t addr);
+const char *sr_interpreter_module(uint32_t addr);
 int      sr_interpret_fallback(
              CpuState *s, uint32_t target, uint32_t return_pc,
-             uint64_t max_steps, SrInterpStop *stop);
+             uint64_t max_steps, int allow_native_handoff,
+             SrInterpStop *stop);
+void     sr_interpret_direct(CpuState *s, uint32_t target);
+void     sr_interpret_direct_module(
+             CpuState *s, uint32_t target, const char *module);
+void     sr_interpret_entry(CpuState *s);
 void     dispatch(CpuState *s, uint32_t target);
+
+#if defined(__clang__)
+#define SR_INTERPRET_TAIL(s, target, module) do { \
+    (s)->pc = (target); \
+    (s)->interp_module = (module); \
+    [[clang::musttail]] return sr_interpret_entry(s); \
+} while (0)
+#else
+#define SR_INTERPRET_TAIL(s, target, module) do { \
+    (s)->pc = (target); \
+    (s)->interp_module = (module); \
+    sr_interpret_entry(s); \
+    return; \
+} while (0)
+#endif
 
 /* Tracing. When a trace file is open, the generated code reports each instruction. sr_begin
  * snapshots the register file and records pc/op; sr_end diffs and emits the line, with an
@@ -306,6 +343,7 @@ void     sched_cb_wait(int on);                     /* current thread enters/lea
 void     sched_cb_notify_thread(uint32_t uid);      /* a callback of uid was notified */
 /* Kernel callbacks (src/rt/callback.c). */
 void     sr_cb_register(void);                      /* callback and scePower callback HLE */
+int      sr_cb_valid(uint32_t uid);
 int      sr_cb_notify(uint32_t uid, uint32_t arg);  /* 1 if uid is a callback */
 int      sr_cb_run_pending(CpuState *s, uint32_t thread_uid);
 void     sched_thread_sleep(void);                  /* sceKernelSleepThread[CB] (wakeup-count) */
@@ -380,6 +418,8 @@ typedef struct SrModulePolicyEntry {
     const char *module;
     const char *sha1;
     SrModulePolicyMode mode;
+    uint32_t native_base;
+    const SrDispatchTable *native_dispatch;
 } SrModulePolicyEntry;
 void     sr_module_set_policy(
              const SrModulePolicyEntry *entries, uint32_t count);

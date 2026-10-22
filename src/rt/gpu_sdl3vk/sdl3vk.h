@@ -19,6 +19,7 @@ extern "C" {
 /* Create the SDL3 window and the Vulkan device/swapchain. Returns 1 on success, 0 on any
  * failure (caller falls back to the GDI path). */
 int  sdl3vk_init(const char *title);
+void sdl3vk_set_title(const char *title);
 
 /* Present one 480x272 frame. px points to 480*272 little-endian BGRA words (the same
  * packing gui.c already produces for StretchDIBits: (r<<16)|(g<<8)|b). Pumps the SDL

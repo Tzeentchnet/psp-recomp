@@ -46,6 +46,7 @@ typedef struct SrModule {
     uint32_t start_priority;
     uint32_t start_stack_size;
     uint32_t start_attr;
+    const SrDispatchTable *native_dispatch;
     char name[32];
     char path[256];
 } SrModule;
@@ -81,7 +82,10 @@ void sr_module_set_policy(
         if (!entries[i].path || !entries[i].path[0] ||
             !entries[i].sha1 || strlen(entries[i].sha1) != 40 ||
             entries[i].mode < SR_MODULE_GUEST ||
-            entries[i].mode > SR_MODULE_REJECT) {
+            entries[i].mode > SR_MODULE_REJECT ||
+            (entries[i].native_dispatch &&
+             (entries[i].mode != SR_MODULE_GUEST ||
+              !entries[i].native_base))) {
             fprintf(stderr, "module policy: invalid entry %u\n", i);
             abort();
         }
@@ -102,6 +106,23 @@ static int ascii_equal(const char *left, const char *right) {
         if (a != b) return 0;
     }
     return *left == *right;
+}
+
+static int native_dispatch_disabled(const SrDispatchTable *table) {
+    const char *setting = getenv("SR_DISABLE_NATIVE_MODULES");
+    if (!setting || !setting[0] || !table) return 0;
+    if (strcmp(setting, "1") == 0 || strcmp(setting, "*") == 0)
+        return 1;
+    const char *cursor = setting;
+    while (cursor[0]) {
+        const char *end = strchr(cursor, ',');
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        if (strlen(table->name) == length &&
+            strncmp(cursor, table->name, length) == 0)
+            return 1;
+        cursor = end ? end + 1 : cursor + length;
+    }
+    return 0;
 }
 
 static void module_sha1(
@@ -653,6 +674,40 @@ uint32_t sr_module_load_image(
     module->hle_replaced =
         policy && policy->mode == SR_MODULE_HLE;
     snprintf(module->path, sizeof(module->path), "%s", path ? path : "");
+    int native_disabled =
+        policy && native_dispatch_disabled(policy->native_dispatch);
+    if (policy && policy->native_dispatch && !native_disabled) {
+        uint32_t end = base + allocation_size;
+        if (base != policy->native_base ||
+            !policy->native_dispatch->count) {
+            fprintf(
+                stderr,
+                "module loader: native policy for %s expected base "
+                "0x%08x, got 0x%08x\n",
+                module->name, policy->native_base, base);
+            sr_unregister_uid(module->uid);
+            sr_ba_free(sr_kmem_user(), base);
+            memset(module, 0, sizeof(*module));
+            return SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE;
+        }
+        for (uint32_t i = 0;
+             i < policy->native_dispatch->count; i++) {
+            uint32_t address =
+                policy->native_dispatch->entries[i].address;
+            if (address < base || address >= end) {
+                fprintf(
+                    stderr,
+                    "module loader: native table %s address 0x%08x "
+                    "is outside %s at 0x%08x-0x%08x\n",
+                    policy->native_dispatch->name, address,
+                    module->name, base, end);
+                sr_unregister_uid(module->uid);
+                sr_ba_free(sr_kmem_user(), base);
+                memset(module, 0, sizeof(*module));
+                return SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE;
+            }
+        }
+    }
 
     if (!parse_imports(module, import_start, import_end) ||
         !parse_exports(module, export_start, export_end)) {
@@ -670,16 +725,37 @@ uint32_t sr_module_load_image(
         memset(module, 0, sizeof(*module));
         return SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE;
     }
+    if (policy && policy->native_dispatch && !native_disabled) {
+        if (!sr_activate_dispatch_table(policy->native_dispatch)) {
+            fprintf(
+                stderr,
+                "module loader: cannot activate native table %s for %s\n",
+                policy->native_dispatch->name, module->name);
+            for (uint32_t i = 0; i < s_export_count; i++)
+                if (s_exports[i].module_uid == module->uid)
+                    s_exports[i].active = 0;
+            sr_unregister_uid(module->uid);
+            sr_ba_free(sr_kmem_user(), base);
+            memset(module, 0, sizeof(*module));
+            return SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE;
+        }
+        module->native_dispatch = policy->native_dispatch;
+    } else if (native_disabled && getenv("SR_MODULE_LOG")) {
+        fprintf(
+            stderr, "module loader: native table %s disabled for %s\n",
+            policy->native_dispatch->name, module->name);
+    }
     if (module->module_start)
         module->entry = module->module_start;
     if (getenv("SR_MODULE_LOG") || !module->hle_replaced)
         fprintf(
             stderr,
             "module loader: %s uid=0x%x base=%08x size=%x "
-            "entry=%08x gp=%08x%s\n",
+            "entry=%08x gp=%08x%s%s\n",
             module->name, module->uid, module->base, module->size,
             module->entry, module->gp,
-            module->hle_replaced ? " (HLE replaced)" : "");
+            module->hle_replaced ? " (HLE replaced)" : "",
+            module->native_dispatch ? " (native)" : "");
     return module->uid;
 }
 
@@ -738,6 +814,13 @@ uint32_t sr_module_unload(uint32_t uid) {
     for (uint32_t i = 0; i < s_export_count; i++)
         if (s_exports[i].module_uid == uid)
             s_exports[i].active = 0;
+    if (module->native_dispatch &&
+        !sr_deactivate_dispatch_table(module->native_dispatch)) {
+        fprintf(
+            stderr, "module loader: native table %s is not active for %s\n",
+            module->native_dispatch->name, module->name);
+        return SCE_KERNEL_ERROR_ERROR;
+    }
     if (module->base && !sr_ba_free(sr_kmem_user(), module->base)) {
         fprintf(
             stderr,

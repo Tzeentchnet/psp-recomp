@@ -20,6 +20,7 @@
 #define TEST_EXIT_STATUS 0x000055aau
 
 uint8_t *g_mem;
+uint8_t g_scratchpad[SR_SCRATCHPAD_SIZE];
 int g_sr_gpu_vram_read_watch;
 int g_sr_gpu_vram_write_watch;
 
@@ -158,6 +159,7 @@ int sched_delete_thread(uint32_t uid) {
     return 0;
 }
 
+#include "../../src/rt/dispatch_table.c"
 #include "../../src/rt/module.c"
 
 static int failures;
@@ -352,6 +354,7 @@ static void reset_runtime(void) {
     s_export_count = 0;
     s_syscall_count = 0;
     sr_module_set_policy(NULL, 0);
+    sr_set_dispatch_table(NULL, 0);
     test_allocator.base = TEST_BASE;
     test_allocator.size = TEST_REGION_SIZE;
     test_allocator.allocated_size = 0;
@@ -563,6 +566,8 @@ static void test_explicit_module_policy(void) {
         "testmod",
         sha1,
         SR_MODULE_HLE,
+        0,
+        NULL,
     };
     reset_runtime();
     sr_module_set_policy(&policy, 1);
@@ -596,6 +601,8 @@ static void test_encrypted_module_requires_policy(void) {
         "*",
         sha1,
         SR_MODULE_HLE,
+        0,
+        NULL,
     };
     reset_runtime();
     sr_module_set_policy(&unrelated, 1);
@@ -609,6 +616,8 @@ static void test_encrypted_module_requires_policy(void) {
         "*",
         sha1,
         SR_MODULE_HLE,
+        0,
+        NULL,
     };
     reset_runtime();
     sr_module_set_policy(&matching, 1);
@@ -616,6 +625,54 @@ static void test_encrypted_module_requires_policy(void) {
         encrypted, sizeof(encrypted), "sceCodec.prx");
     CHECK(uid == 0x110u);
     CHECK(sr_module_unload(uid) == uid);
+}
+
+static void native_module_entry(CpuState *state) {
+    state->r[2] = 0x1234u;
+}
+
+static void test_native_module_policy(void) {
+    uint8_t fixture[FIXTURE_SIZE];
+    char sha1[41];
+    build_fixture(fixture);
+    module_sha1(fixture, sizeof(fixture), sha1);
+    static const SrDispatchEntry native_entries[] = {
+        {TEST_BASE, native_module_entry},
+    };
+    static const SrDispatchTable native_table = {
+        "test-native",
+        native_entries,
+        1,
+    };
+    SrModulePolicyEntry policy = {
+        "test/testmod.prx",
+        "testmod",
+        sha1,
+        SR_MODULE_GUEST,
+        TEST_BASE,
+        &native_table,
+    };
+    reset_runtime();
+    sr_module_set_policy(&policy, 1);
+
+    uint32_t uid =
+        sr_module_load_image(fixture, sizeof(fixture), "test/testmod.prx");
+
+    CHECK(uid == 0x110u);
+    CHECK(s_modules[0].native_dispatch == &native_table);
+    CHECK(sr_lookup(TEST_BASE) == native_module_entry);
+    CHECK(sr_module_unload(uid) == uid);
+    CHECK(sr_lookup(TEST_BASE) == NULL);
+
+    policy.native_base = TEST_BASE + 0x100u;
+    reset_runtime();
+    sr_module_set_policy(&policy, 1);
+    CHECK(
+        sr_module_load_image(
+            fixture, sizeof(fixture), "test/testmod.prx") ==
+        SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE);
+    CHECK(!test_allocator.allocated);
+    CHECK(sr_lookup(TEST_BASE) == NULL);
 }
 
 int main(void) {
@@ -630,6 +687,7 @@ int main(void) {
     test_hle_only_module();
     test_explicit_module_policy();
     test_encrypted_module_requires_policy();
+    test_native_module_policy();
 
     free(memory);
     if (failures) {

@@ -233,6 +233,9 @@ Set these environment variables before running the game to control runtime featu
 - `SR_SAVEDATA_MIGRATE=1`: After loading a legacy plaintext save produced by an
   older runtime build, rewrite it in PSP/PPSSPP-compatible secure format using
   the game's live key.
+- `SR_MEMSTICK_STATE=inserted|removed`: Select the initial Memory Stick state.
+  The default is `inserted`; `removed` matches PPSSPP's `--no-memstick`
+  driver, device, FAT, callback, capacity, and write-protection responses.
 - When `SR_GPU` is unset, the renderer comes from `graphics.ini`; `auto` uses
   D3D12 in a D3D12-enabled build and otherwise retains the build's default.
 - `SR_GPU=vk`: Use the Vulkan GE backend (SDL3/Vulkan build).
@@ -274,6 +277,17 @@ Set these environment variables before running the game to control runtime featu
   backend-specific widths; the runtime consumes presentation-timed values so turbo scheduler
   variance cannot consume inputs before a menu appears. Legacy three-column and v2 scripts retain
   runtime-vblank timing.
+- `SR_PADLOG=1`: Print scripted button-mask edges with both presentation and
+  vblank counters.
+- `SR_INPUT_LOG=1`: Print live logical button/analog edges and whether a
+  gamepad is connected.
+- `SR_FPS_COUNTER=1`: Update the GDI, Vulkan, or D3D12 window title every
+  500 ms with rolling presentation FPS and average frame time.
+- `SR_FBSNAP_PRESENT=<interval>`: Write an eight-file rotating set of software
+  framebuffer snapshots at the requested presentation interval.
+- `SR_FBCAPTURE_PRESENTS=<p1,p2,...>`: Write software framebuffer snapshots at
+  up to 32 exact positive presentation numbers. Duplicate or malformed values
+  fail startup.
 - `SR_FAST_FORWARD_PRESENT=<present>`: Run scheduler and presentation pacing as fast as the host
   allows until the requested presentation, keep host audio dormant during that phase, then align
   virtual time to the host clock and start real-time XAudio2 playback. This is intended for
@@ -287,10 +301,20 @@ Set these environment variables before running the game to control runtime featu
 - `PSP_VFPU_TABLES=<directory>`: Override the `assets/vfpu` lookup-table directory. The golden
   harness sets this explicitly so runtime execution does not depend on its working directory.
 - `SR_INTERP_MISS_LOG=<path>`: Write each distinct guest target that missed the generated
-  dispatch table once. The runtime executes supported misses through the reference interpreter.
+  dispatch table once. Version 2 entries retain the generated module prefix so
+  overlapping overlay addresses remain distinct. The runtime executes
+  supported misses through the reference interpreter, hands nested targets
+  back to generated code when they enter the active native table, and reuses
+  the tested VFPU instruction engine for supported interpreted VFPU operations.
 - `SR_INTERP_MAX_STEPS=<1..100000000>`: Bound one interpreter fallback invocation; the default
   is 1,000,000 instructions. A syscall, unsupported instruction, memory fault, or exhausted
   bound is a fatal error unless the diagnostic-only `SR_DISPATCH_PERMISSIVE=1` escape hatch is set.
+- `SR_DISABLE_NATIVE_MODULES=*` or a comma-separated generated-table name
+  list: Keep matching policy-selected modules interpreted for differential
+  diagnostics. Normal validation must leave this unset.
+- `SR_TRACE_RAM=<path>`: With bounded instruction tracing, write the
+  `0x08800000..0x09ffffff` RAM snapshot when the trace reaches its step limit.
+  The snapshot is game-derived and must not be committed.
 - `SR_GPU_GE` / `SR_VIDEO=gdi`: Legacy Vulkan/software and presenter overrides.
 - `SR_GPU_LOG=1`: Print GPU cache flushes and batch information to the console. D3D12
   includes list/draw identity, command PC/opcode, per-draw batch/vertex counts, presents,

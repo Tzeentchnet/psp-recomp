@@ -10,6 +10,12 @@ namespace {
 
 bool valid_span(uint32_t address, std::size_t size) {
     uint32_t physical = SR_PHYS(address);
+    if (physical >= SR_SCRATCHPAD_BASE &&
+        physical < SR_SCRATCHPAD_BASE + SR_SCRATCHPAD_SIZE) {
+        return size <= SR_SCRATCHPAD_SIZE &&
+               physical - SR_SCRATCHPAD_BASE <=
+                   SR_SCRATCHPAD_SIZE - size;
+    }
     if (physical < 0x04000000u || physical >= 0x0c000000u)
         return false;
     return size <= 0x08000000u &&
@@ -68,6 +74,25 @@ bool write_runtime(
     }
 }
 
+bool has_native_target(void *context, uint32_t address) {
+    const uint32_t initial = *(const uint32_t *)context;
+    return address != initial && sr_lookup(address) != nullptr;
+}
+
+bool execute_vfpu_fallback(
+    void *, ref::CpuState *state, uint32_t instruction) {
+    CpuState runtime = {};
+    std::memcpy(runtime.vi, state->vi, sizeof(runtime.vi));
+    std::memcpy(
+        runtime.vfpuCtrl, state->vfpuCtrl, sizeof(runtime.vfpuCtrl));
+    if (sr_vfpu_interp(&runtime, instruction) == SR_VFPU_OTHER)
+        return false;
+    std::memcpy(state->vi, runtime.vi, sizeof(state->vi));
+    std::memcpy(
+        state->vfpuCtrl, runtime.vfpuCtrl, sizeof(state->vfpuCtrl));
+    return true;
+}
+
 void import_state(ref::CpuState *destination, const CpuState *source, uint32_t pc) {
     std::memcpy(destination->r, source->r, sizeof(destination->r));
     destination->hi = source->hi;
@@ -98,6 +123,18 @@ void export_state(CpuState *destination, const ref::CpuState *source) {
         sizeof(destination->vfpuCtrl));
 }
 
+void yield_runtime(
+    void *context, ref::CpuState *state, uint32_t steps) {
+    CpuState *runtime = static_cast<CpuState *>(context);
+    export_state(runtime, state);
+    if (sr_sched_on) {
+        sr_timeslice -= (int32_t)steps;
+        if (sr_timeslice <= 0)
+            sr_yield(runtime);
+    }
+    import_state(state, runtime, runtime->pc);
+}
+
 SrInterpStopReason convert_reason(ref::StopReason reason) {
     switch (reason) {
         case ref::StopReason::kTargetReached:
@@ -112,6 +149,8 @@ SrInterpStopReason convert_reason(ref::StopReason reason) {
             return SR_INTERP_STEP_LIMIT;
         case ref::StopReason::kBreak:
             return SR_INTERP_BREAK;
+        case ref::StopReason::kNativeTarget:
+            return SR_INTERP_NATIVE_TARGET;
         case ref::StopReason::kRunning:
             break;
     }
@@ -122,12 +161,17 @@ SrInterpStopReason convert_reason(ref::StopReason reason) {
 
 extern "C" int sr_interpret_fallback(
     CpuState *state, uint32_t target, uint32_t return_pc,
-    uint64_t max_steps, SrInterpStop *stop) {
+    uint64_t max_steps, int allow_native_handoff, SrInterpStop *stop) {
     ref::CpuState interpreted;
     import_state(&interpreted, state, target);
     ref::Memory memory(nullptr, read_runtime, write_runtime);
+    uint32_t initial_target = target;
     ref::StepResult result = ref::Run(
-        &interpreted, &memory, max_steps, nullptr, true, return_pc);
+        &interpreted, &memory, max_steps, nullptr, true, return_pc,
+        allow_native_handoff ? has_native_target : nullptr,
+        allow_native_handoff ? &initial_target : nullptr,
+        execute_vfpu_fallback, nullptr,
+        yield_runtime, state);
     export_state(state, &interpreted);
     if (stop) {
         stop->reason = convert_reason(result.reason);

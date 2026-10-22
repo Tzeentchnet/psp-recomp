@@ -13,6 +13,7 @@
 
 static uint8_t s_ram[TEST_RAM_SIZE];
 uint8_t *g_mem = s_ram;
+uint8_t g_scratchpad[SR_SCRATCHPAD_SIZE];
 int g_sr_gpu_vram_read_watch;
 int g_sr_gpu_vram_write_watch;
 

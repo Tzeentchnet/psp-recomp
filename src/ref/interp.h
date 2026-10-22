@@ -19,6 +19,7 @@ enum class StopReason {
 	kBreak,            // break instruction
 	kStepLimit,        // reached the caller's instruction budget
 	kTargetReached,    // reached the caller's requested return PC
+	kNativeTarget,     // reached a target available in the native dispatch table
 };
 
 struct StepResult {
@@ -46,8 +47,18 @@ private:
 // Execute up to max_steps instructions starting from s->pc. Stops on the first non-running
 // condition (syscall, unimplemented op, fault, break) or when the budget is exhausted.
 // When sink is non-null, every executed instruction is traced.
+using NativeTargetPredicate = bool (*)(void *, uint32_t);
+using InstructionFallback = bool (*)(void *, CpuState *, uint32_t);
+using ExecutionHook = void (*)(void *, CpuState *, uint32_t);
+
 StepResult Run(
 	CpuState *s, Memory *mem, unsigned long long max_steps, TraceSink *sink,
-	bool stop_at_pc = false, uint32_t stop_pc = 0);
+	bool stop_at_pc = false, uint32_t stop_pc = 0,
+	NativeTargetPredicate native_target = nullptr,
+	void *native_target_context = nullptr,
+	InstructionFallback instruction_fallback = nullptr,
+	void *instruction_fallback_context = nullptr,
+	ExecutionHook execution_hook = nullptr,
+	void *execution_hook_context = nullptr);
 
 }  // namespace ref

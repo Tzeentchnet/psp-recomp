@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Allegrex -> C codegen (Phase 3). Reads an ELF and a function list (TOML from analyze.py,
 # or all discovered functions) and emits one C function per guest function:
-#   void f_<hexaddr>(CpuState *s);
+#   void [<symbol_prefix>_]f_<hexaddr>(CpuState *s);
 # per ARCHITECTURE.md section 6. Each instruction becomes one C statement, with branch
 # delay-slot reordering, intra-function branches as labels + goto, direct calls for known
 # targets, jr $ra as return, and computed transfers through dispatch(). Every emitted
@@ -29,9 +29,15 @@ F = lambda i: f"s->f[{i}]"
 FI = lambda i: f"s->fi[{i}]"
 
 
-def emit_dispatch_table(addresses, imports=None):
+def function_symbol(address, symbol_prefix=""):
+    prefix = f"{symbol_prefix}_" if symbol_prefix else ""
+    return f"{prefix}f_{address:08x}"
+
+
+def emit_dispatch_table(addresses, imports=None, symbol_prefix=""):
     entries = [
-        f"    {{0x{address:08x}u, f_{address:08x}}},"
+        f"    {{0x{address:08x}u, "
+        f"{function_symbol(address, symbol_prefix)}}},"
         for address in sorted(addresses)
     ]
     import_patches = []
@@ -41,6 +47,27 @@ def emit_dispatch_table(addresses, imports=None):
             f'    sr_module_patch_import(0x{address:08x}u, '
             f'0x{nid:08x}u, "{escaped_library}");'
         )
+    if symbol_prefix:
+        entries_name = f"s_{symbol_prefix}_dispatch_entries"
+        table_name = f"{symbol_prefix}_dispatch_table"
+        return [
+            f"static const SrDispatchEntry {entries_name}[] = {{",
+            *entries,
+            "};",
+            "",
+            f"const SrDispatchTable {table_name} = {{",
+            f'    "{symbol_prefix}",',
+            f"    {entries_name},",
+            f"    (uint32_t)(sizeof({entries_name}) / "
+            f"sizeof({entries_name}[0])),",
+            "};",
+            "",
+            f"int {symbol_prefix}_register(void) {{",
+            *import_patches,
+            f"    return sr_activate_dispatch_table(&{table_name});",
+            "}",
+            "",
+        ]
     return [
         "static const SrDispatchEntry s_recomp_dispatch[] = {",
         *entries,
@@ -1089,6 +1116,9 @@ def emit_function(
     stats=None,
     instruction_hooks=None,
     used_instruction_hooks=None,
+    symbol_prefix="",
+    runtime_jal=False,
+    verify_runtime_code=False,
 ):
     if instruction_hooks is None:
         instruction_hooks = {}
@@ -1099,9 +1129,31 @@ def emit_function(
     if stats is not None:
         stats["constant_jalr"] = stats.get("constant_jalr", 0) + len(direct_jalr)
     out = []
-    out.append(f"void f_{start:08x}(CpuState *s) {{")
+    out.append(
+        f"void {function_symbol(start, symbol_prefix)}(CpuState *s) {{"
+    )
     out.append("    SR_YIELD(s);")   # preemption point (no-op unless the scheduler is active)
     out.append("    SR_GPR_LOCAL_DECLS(s);")
+    if verify_runtime_code:
+        out.append("    static int _code_matches = -1;")
+        out.append("    if (_code_matches < 0) {")
+        out.append("        _code_matches = 1;")
+        for address in sorted(insns):
+            instruction = read32(elf, address)
+            if instruction is None:
+                continue
+            out.append(
+                f"        if (MEM_R32(0x{address:08x}u) != "
+                f"0x{instruction:08x}u) _code_matches = 0;"
+            )
+        out.append("    }")
+        out.append(
+            f"    if (!_code_matches) {{ SR_GPR_FLUSH(s); "
+            f"sr_disable_native_function("
+            f"{function_symbol(start, symbol_prefix)}); "
+            f'SR_INTERPRET_TAIL(s, 0x{start:08x}u, '
+            f'"{symbol_prefix}"); }}'
+        )
     # Instructions are emitted in address order, but execution must begin at the entry. When the
     # entry is not the lowest address (the function contains code reached via a back-edge to a
     # lower address), jump to the entry's label first; otherwise control would start mid-body.
@@ -1145,18 +1197,40 @@ def emit_function(
             continue
         if op == 3:  # jal
             target = jump_target(addr, w)
-            out.append(
-                f"    SR_TRACE_BEGIN(s, 0x{addr:08x}u, 0x{w:08x}u); "
-                f"SR_GPR(s, 31) = 0x{(addr + 8) & 0xFFFFFFFF:08x}u; "
-                "SR_TRACE_END(s, 0u, 0);"
-            )
-            out.append(normal_line(ds, dsw))
-            out.append("    SR_GPR_FLUSH(s);")
-            if target in known:
-                out.append(f"    f_{target:08x}(s);")
+            if runtime_jal:
+                out.append(
+                    f"    {{ uint32_t _jw = MEM_R32(0x{addr:08x}u); "
+                    f"uint32_t _t = (0x{(addr + 4) & 0xF0000000:08x}u | "
+                    "((_jw & 0x03ffffffu) << 2));"
+                )
+                out.append(
+                    f"    SR_TRACE_BEGIN(s, 0x{addr:08x}u, _jw); "
+                    f"SR_GPR(s, 31) = "
+                    f"0x{(addr + 8) & 0xFFFFFFFF:08x}u; "
+                    "SR_TRACE_END(s, 0u, 0);"
+                )
+                out.append(normal_line(ds, dsw))
+                out.append(
+                    "    SR_GPR_FLUSH(s); dispatch(s, _t); "
+                    "SR_GPR_RELOAD(s); }"
+                )
             else:
-                out.append(f"    dispatch(s, 0x{target:08x}u);")
-            out.append("    SR_GPR_RELOAD(s);")
+                out.append(
+                    f"    SR_TRACE_BEGIN(s, 0x{addr:08x}u, "
+                    f"0x{w:08x}u); "
+                    f"SR_GPR(s, 31) = "
+                    f"0x{(addr + 8) & 0xFFFFFFFF:08x}u; "
+                    "SR_TRACE_END(s, 0u, 0);"
+                )
+                out.append(normal_line(ds, dsw))
+                out.append("    SR_GPR_FLUSH(s);")
+                if target in known:
+                    out.append(
+                        f"    {function_symbol(target, symbol_prefix)}(s);"
+                    )
+                else:
+                    out.append(f"    dispatch(s, 0x{target:08x}u);")
+                out.append("    SR_GPR_RELOAD(s);")
             continue
         if op == 0 and fn == 0x09:  # jalr rd, rs
             # The target is read before the link and the delay slot, either of which may
@@ -1173,7 +1247,8 @@ def emit_function(
             if addr in direct_jalr:
                 target = direct_jalr[addr]
                 out.append(
-                    f"    if (_t == 0x{target:08x}u) f_{target:08x}(s); "
+                    f"    if (_t == 0x{target:08x}u) "
+                    f"{function_symbol(target, symbol_prefix)}(s); "
                     "else dispatch(s, _t);"
                 )
             else:
@@ -1217,7 +1292,10 @@ def emit_function(
             )
             out.append(normal_line(ds, dsw))
             if target in known and target != start:
-                out.append(f"    SR_GPR_FLUSH(s); f_{target:08x}(s); return;")
+                out.append(
+                    f"    SR_GPR_FLUSH(s); "
+                    f"{function_symbol(target, symbol_prefix)}(s); return;"
+                )
             else:
                 y = (
                     "SR_GPR_YIELD(s, SR_GPR_FLUSH(s), SR_GPR_RELOAD(s)); "
@@ -1268,11 +1346,17 @@ def main(argv):
     if len(args) < 2:
         sys.stderr.write(
             "usage: codegen.py <elf> <out.c> [--base=HEX] [--jumptables=TOML] "
-            "[--overrides=TOML] [--hot-functions=TXT]\n"
+            "[--overrides=TOML] [--function-entry=HEX] "
+            "[--symbol-prefix=IDENTIFIER] [--runtime-jal] "
+            "[--verify-runtime-code] [--hot-functions=TXT]\n"
         )
         return 2
     base = None
     hot_path = None
+    symbol_prefix = ""
+    runtime_jal = False
+    verify_runtime_code = False
+    function_entries = set()
     for o in opts:
         if o.startswith("--base="):
             base = int(o.split("=", 1)[1], 16)
@@ -1286,12 +1370,39 @@ def main(argv):
             JAL_NEXT.update(jal_next)
             HOST_FUNCTIONS.update(host_functions)
             INSTRUCTION_HOOKS.update(instruction_hooks)
+        elif o.startswith("--function-entry="):
+            function_entries.add(int(o.split("=", 1)[1], 16))
+        elif o.startswith("--symbol-prefix="):
+            symbol_prefix = o.split("=", 1)[1]
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", symbol_prefix):
+                raise ValueError(
+                    f"invalid C symbol prefix {symbol_prefix!r}"
+                )
+        elif o == "--runtime-jal":
+            runtime_jal = True
+        elif o == "--verify-runtime-code":
+            verify_runtime_code = True
         elif o.startswith("--hot-functions="):
             hot_path = o.split("=", 1)[1]
     elf = Elf(args[0], base=base)
     ranges = exec_ranges(elf)
     known, _ = analyze(elf)
     known = set(a for a in known if in_ranges(a, ranges))
+    invalid_function_entries = {
+        address
+        for address in function_entries
+        if address & 3 or not in_ranges(address, ranges)
+    }
+    if invalid_function_entries:
+        addresses = ", ".join(
+            f"0x{address:08x}"
+            for address in sorted(invalid_function_entries)
+        )
+        raise ValueError(
+            f"function entries are unaligned or outside executable ranges: "
+            f"{addresses}"
+        )
+    known.update(function_entries)
     # A jal .+8 target is the rest of the same function, not an entry point.
     known -= {a + 8 for a in JAL_NEXT}
     unknown_host_functions = set(HOST_FUNCTIONS) - known
@@ -1310,11 +1421,15 @@ def main(argv):
         raise ValueError(
             f"instruction hooks are outside executable ranges: {addresses}"
         )
-    if JUMPTABLES or JAL_NEXT or HOST_FUNCTIONS or INSTRUCTION_HOOKS:
+    if (
+        JUMPTABLES or JAL_NEXT or HOST_FUNCTIONS or INSTRUCTION_HOOKS
+        or function_entries
+    ):
         print(
             f"hints: {len(JUMPTABLES)} jump tables / computed gotos, "
             f"{len(JAL_NEXT)} jal .+8 sites, {len(HOST_FUNCTIONS)} host functions, "
-            f"{len(INSTRUCTION_HOOKS)} instruction hooks"
+            f"{len(INSTRUCTION_HOOKS)} instruction hooks, "
+            f"{len(function_entries)} function entries"
         )
 
     # Import stubs live in .sceStub.text. In the file each is "jr $ra; <placeholder>"; the
@@ -1337,7 +1452,10 @@ def main(argv):
 
     includes = ['#include "recomp.h"', "#include <math.h>", "#include <string.h>"]
     helpers = [SR_TO_W, "", GPR_CACHE_PREAMBLE, "", cx.PREAMBLE, ""]
-    protos = [f"void f_{a:08x}(CpuState *s);" for a in sorted(known)]
+    protos = [
+        f"void {function_symbol(a, symbol_prefix)}(CpuState *s);"
+        for a in sorted(known)
+    ]
     funcs = []     # one list of lines per guest function, in address order
     emitted = []
     stubbed = []
@@ -1347,7 +1465,10 @@ def main(argv):
         out = []
         funcs.append(out)
         if a in HOST_FUNCTIONS:
-            out.append(f"void f_{a:08x}(CpuState *s) {{  /* host function override */")
+            out.append(
+                f"void {function_symbol(a, symbol_prefix)}"
+                "(CpuState *s) {  /* host function override */"
+            )
             out.append(f"    {HOST_FUNCTIONS[a]}(s);")
             out.append("}")
             out.append("")
@@ -1360,7 +1481,11 @@ def main(argv):
             if lib_nid is not None:
                 lib, nid = lib_nid
                 escaped_lib = lib.replace("\\", "\\\\").replace('"', '\\"')
-                out.append(f"void f_{a:08x}(CpuState *s) {{  /* import: {lib} nid 0x{nid:08x} */")
+                out.append(
+                    f"void {function_symbol(a, symbol_prefix)}"
+                    f"(CpuState *s) {{  /* import: {lib} "
+                    f"nid 0x{nid:08x} */"
+                )
                 out.append(
                     f"    SR_DIRECT_TRACE_BEGIN(s, 0x{a:08x}u, 0x{w0:08x}u); "
                     "SR_DIRECT_TRACE_END(s, 0u, 0);"
@@ -1374,7 +1499,10 @@ def main(argv):
                 out.append("}")
             else:
                 # No import-table entry (or non-PRX): keep the old HLE-boundary behavior.
-                out.append(f"void f_{a:08x}(CpuState *s) {{  /* import stub -> HLE boundary */")
+                out.append(
+                    f"void {function_symbol(a, symbol_prefix)}"
+                    "(CpuState *s) {  /* import stub -> HLE boundary */"
+                )
                 out.append(
                     f"    SR_DIRECT_TRACE_BEGIN(s, 0x{a:08x}u, 0x{w0:08x}u); "
                     "SR_DIRECT_TRACE_END(s, 0u, 0);"
@@ -1394,6 +1522,9 @@ def main(argv):
                     stats,
                     INSTRUCTION_HOOKS,
                     used_instruction_hooks,
+                    symbol_prefix,
+                    runtime_jal,
+                    verify_runtime_code,
                 )
             )
             emitted.append(a)
@@ -1402,7 +1533,10 @@ def main(argv):
             # function at run time aborts with its address and reason (recorded in STUBS.md),
             # rather than silently dropping it.
             reason = str(e).replace('"', "'")
-            out.append(f"void f_{a:08x}(CpuState *s) {{  /* untranslatable: {reason} */")
+            out.append(
+                f"void {function_symbol(a, symbol_prefix)}"
+                f"(CpuState *s) {{  /* untranslatable: {reason} */"
+            )
             out.append(f'    sr_unimplemented(0x{a:08x}u, "{reason}");')
             out.append("}")
             out.append("")
@@ -1417,7 +1551,7 @@ def main(argv):
         raise ValueError(
             f"instruction hooks are not translated instruction starts: {addresses}"
         )
-    register = emit_dispatch_table(emitted, impmap)
+    register = emit_dispatch_table(emitted, impmap, symbol_prefix)
     banner = "/* Generated by tools/codegen.py. Do not edit by hand. */"
     split = next((o for o in opts if o == "--split" or o.startswith("--split=")), None)
     import os
@@ -1436,8 +1570,20 @@ def main(argv):
         guard = f"{stem.upper()}_H"
         with open(os.path.join(out_dir, f"{stem}.h"), "w", encoding="ascii", newline="\n") as f:
             # The static inline helpers live in the header, so TUs that do not use them stay quiet.
-            f.write("\n".join([banner, f"#ifndef {guard}", f"#define {guard}"] + includes + [""] + helpers
-                              + protos + ["void sr_register_all(void);", "#endif", ""]))
+            registration = (
+                [
+                    f"extern const SrDispatchTable "
+                    f"{symbol_prefix}_dispatch_table;",
+                    f"int {symbol_prefix}_register(void);",
+                ]
+                if symbol_prefix
+                else ["void sr_register_all(void);"]
+            )
+            f.write("\n".join(
+                [banner, f"#ifndef {guard}", f"#define {guard}"]
+                + includes + [""] + helpers + protos
+                + registration + ["#endif", ""]
+            ))
         tu_head = [banner, f'#include "{stem}.h"', ""]
         if hot_path:
             hot_addresses = load_hot_functions(hot_path)

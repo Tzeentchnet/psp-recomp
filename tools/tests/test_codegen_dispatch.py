@@ -55,6 +55,27 @@ class DispatchGenerationTests(unittest.TestCase):
             output,
         )
 
+    def test_prefixes_module_symbols_and_registration(self):
+        output = "\n".join(
+            codegen.emit_dispatch_table(
+                [0x09AF5800, 0x09AF6000],
+                symbol_prefix="mga_kjfs",
+            )
+        )
+
+        self.assertIn(
+            "{0x09af5800u, mga_kjfs_f_09af5800}", output
+        )
+        self.assertIn(
+            "const SrDispatchTable mga_kjfs_dispatch_table", output
+        )
+        self.assertIn("int mga_kjfs_register(void)", output)
+        self.assertIn(
+            "sr_activate_dispatch_table(&mga_kjfs_dispatch_table)",
+            output,
+        )
+        self.assertNotIn("sr_register_all", output)
+
     def test_emits_vfpu7_integer_pack_operations(self):
         unsigned_char, _, _ = codegen.vfpu_effect(0x08885E54, 0xD03C8484)
         signed_short, _, _ = codegen.vfpu_effect(0x08886D6C, 0xD03F88CC)
@@ -178,6 +199,85 @@ class DispatchGenerationTests(unittest.TestCase):
             output,
         )
         self.assertIn("r25=s->r[25];", output)
+
+    def test_prefixes_direct_function_calls(self):
+        words = {
+            0x1000: (0x03 << 26) | (0x2000 >> 2),
+            0x1004: 0,
+            0x1008: r_type(31, 0, 0, 0x08),
+            0x100C: 0,
+            0x2000: r_type(31, 0, 0, 0x08),
+            0x2004: 0,
+        }
+        output = "\n".join(
+            codegen.emit_function(
+                FakeElf(words),
+                0x1000,
+                [(0x1000, 0x100C), (0x2000, 0x2008)],
+                {0x1000, 0x2000},
+                symbol_prefix="mga_test",
+            )
+        )
+
+        self.assertIn("void mga_test_f_00001000", output)
+        self.assertIn("mga_test_f_00002000(s);", output)
+        self.assertNotIn(" f_00002000(s);", output)
+
+    def test_runtime_jal_reads_patched_guest_instruction(self):
+        words = {
+            0x1000: (0x03 << 26) | (0x2000 >> 2),
+            0x1004: 0,
+            0x1008: r_type(31, 0, 0, 0x08),
+            0x100C: 0,
+            0x2000: r_type(31, 0, 0, 0x08),
+            0x2004: 0,
+        }
+        output = "\n".join(
+            codegen.emit_function(
+                FakeElf(words),
+                0x1000,
+                [(0x1000, 0x100C), (0x2000, 0x2008)],
+                {0x1000, 0x2000},
+                symbol_prefix="mga_test",
+                runtime_jal=True,
+            )
+        )
+
+        self.assertIn(
+            "uint32_t _jw = MEM_R32(0x00001000u)", output
+        )
+        self.assertIn("dispatch(s, _t)", output)
+        self.assertNotIn("mga_test_f_00002000(s);", output)
+
+    def test_runtime_code_verification_falls_back_explicitly(self):
+        words = {
+            0x1000: i_type(0x09, 4, 4, 1),
+            0x1004: r_type(31, 0, 0, 0x08),
+            0x1008: 0,
+        }
+        output = "\n".join(
+            codegen.emit_function(
+                FakeElf(words),
+                0x1000,
+                [(0x1000, 0x100C)],
+                {0x1000},
+                symbol_prefix="mga_test",
+                verify_runtime_code=True,
+            )
+        )
+
+        self.assertIn("static int _code_matches = -1", output)
+        self.assertIn(
+            "MEM_R32(0x00001000u) != 0x24840001u", output
+        )
+        self.assertIn(
+            'SR_INTERPRET_TAIL(s, 0x00001000u, "mga_test")',
+            output,
+        )
+        self.assertIn(
+            "sr_disable_native_function(mga_test_f_00001000)",
+            output,
+        )
 
     def test_instruction_hook_synchronizes_cached_gprs(self):
         words = {

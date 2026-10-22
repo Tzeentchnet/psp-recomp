@@ -1029,6 +1029,52 @@ static void sample_tex(int tu, int tv, int *r, int *g, int *b, int *a) {
     sample_tex_level(0, tu, tv, r, g, b, a);
 }
 
+#define TEXEL_CACHE_SIZE 1024
+typedef struct GeTexelCacheEntry {
+    int u;
+    int v;
+    uint32_t rgba;
+    uint32_t generation;
+} GeTexelCacheEntry;
+
+static GeTexelCacheEntry s_texel_cache[TEXEL_CACHE_SIZE];
+static uint32_t s_texel_cache_generation = 1;
+
+static void texel_cache_begin(void) {
+    s_texel_cache_generation++;
+    if (!s_texel_cache_generation) {
+        memset(s_texel_cache, 0, sizeof(s_texel_cache));
+        s_texel_cache_generation = 1;
+    }
+}
+
+static void sample_tex_cached(
+    int tu, int tv, int *r, int *g, int *b, int *a) {
+    uint32_t slot =
+        ((uint32_t)tu * 73856093u ^ (uint32_t)tv * 19349663u) &
+        (TEXEL_CACHE_SIZE - 1u);
+    GeTexelCacheEntry *entry = &s_texel_cache[slot];
+    if (entry->generation == s_texel_cache_generation &&
+        entry->u == tu && entry->v == tv) {
+        uint32_t color = entry->rgba;
+        *r = color & 0xff;
+        *g = (color >> 8) & 0xff;
+        *b = (color >> 16) & 0xff;
+        *a = color >> 24;
+        g_tex_samples++;
+        if (*r | *g | *b) g_tex_nonzero++;
+        if (s_stat_on > 0 && *a == 0) s_stat.texa0++;
+        return;
+    }
+    sample_tex(tu, tv, r, g, b, a);
+    entry->u = tu;
+    entry->v = tv;
+    entry->rgba =
+        (uint32_t)*r | ((uint32_t)*g << 8) |
+        ((uint32_t)*b << 16) | ((uint32_t)*a << 24);
+    entry->generation = s_texel_cache_generation;
+}
+
 static void sample_tex_f(float fu, float fv_coord, int *r, int *g, int *b, int *a) {
     static int nobil = -1; if (nobil < 0) nobil = getenv("SR_NOBILINEAR") ? 1 : 0;
     int use_linear = !nobil && ((ge.tex_filter & 1) || ((ge.tex_filter >> 8) & 1));
@@ -1040,11 +1086,35 @@ static void sample_tex_f(float fu, float fv_coord, int *r, int *g, int *b, int *
     if (fx > 256) fx = 256;
     if (fy < 0) fy = 0;
     if (fy > 256) fy = 256;
+    if (fx == 0 && fy == 0) {
+        sample_tex_cached(u0, v0, r, g, b, a);
+        return;
+    }
+    if (fx == 0) {
+        int r0,g0,b0,a0, r1,g1,b1,a1;
+        sample_tex_cached(u0, v0,   &r0,&g0,&b0,&a0);
+        sample_tex_cached(u0, v0+1, &r1,&g1,&b1,&a1);
+#define LERP_VERTICAL(c0,c1) ((c0) + (((c1)-(c0))*fy>>8))
+        *r=LERP_VERTICAL(r0,r1); *g=LERP_VERTICAL(g0,g1);
+        *b=LERP_VERTICAL(b0,b1); *a=LERP_VERTICAL(a0,a1);
+#undef LERP_VERTICAL
+        return;
+    }
+    if (fy == 0) {
+        int r0,g0,b0,a0, r1,g1,b1,a1;
+        sample_tex_cached(u0,   v0, &r0,&g0,&b0,&a0);
+        sample_tex_cached(u0+1, v0, &r1,&g1,&b1,&a1);
+#define LERP_HORIZONTAL(c0,c1) ((c0) + (((c1)-(c0))*fx>>8))
+        *r=LERP_HORIZONTAL(r0,r1); *g=LERP_HORIZONTAL(g0,g1);
+        *b=LERP_HORIZONTAL(b0,b1); *a=LERP_HORIZONTAL(a0,a1);
+#undef LERP_HORIZONTAL
+        return;
+    }
     int r0,g0,b0,a0, r1,g1,b1,a1, r2,g2,b2,a2, r3,g3,b3,a3;
-    sample_tex(u0,   v0,   &r0,&g0,&b0,&a0);
-    sample_tex(u0+1, v0,   &r1,&g1,&b1,&a1);
-    sample_tex(u0,   v0+1, &r2,&g2,&b2,&a2);
-    sample_tex(u0+1, v0+1, &r3,&g3,&b3,&a3);
+    sample_tex_cached(u0,   v0,   &r0,&g0,&b0,&a0);
+    sample_tex_cached(u0+1, v0,   &r1,&g1,&b1,&a1);
+    sample_tex_cached(u0,   v0+1, &r2,&g2,&b2,&a2);
+    sample_tex_cached(u0+1, v0+1, &r3,&g3,&b3,&a3);
 #define LERP1(c0,c1,f) ((c0) + (((c1)-(c0))*(f)>>8))
     int tr=LERP1(r0,r1,fx), tg=LERP1(g0,g1,fx), tb=LERP1(b0,b1,fx), ta=LERP1(a0,a1,fx);
     int br=LERP1(r2,r3,fx), bg=LERP1(g2,g3,fx), bb=LERP1(b2,b3,fx), ba=LERP1(a2,a3,fx);
@@ -1693,6 +1763,7 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
      * depth, shading, blending on the GPU); if it declines it has already flushed, so the
      * software path below stays correctly ordered against prior GPU work. */
     if (s_backend && s_backend->tri && s_backend->tri(A, B, C, persp)) return;
+    texel_cache_begin();
 
     float area=(B->x-A->x)*(C->y-A->y)-(C->x-A->x)*(B->y-A->y);
     if (area == 0.0f) { if (persp) s_stat.deg3d++; return; }
@@ -1750,7 +1821,7 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
      * recomputed per covered pixel from the integer weights, so identical geometry always
      * produces identical z/uv (no incremental float drift between passes). */
 #define AT_SETUP(n, f) float n##_ac=(VA->f)-(VC->f), n##_bc=(VB->f)-(VC->f)
-#define AT_PIX(n, f)   float n=(VC->f)+w0f*n##_ac+w1f*n##_bc
+#define AT_EVAL(n, f)  ((VC->f)+w0f*n##_ac+w1f*n##_bc)
     AT_SETUP(iu, u); AT_SETUP(iv, v); AT_SETUP(irw, rw); AT_SETUP(iz, z); AT_SETUP(ifog, fog);
     AT_SETUP(ir, r); AT_SETUP(ig, g); AT_SETUP(ib, b); AT_SETUP(ia, a);
 
@@ -1773,8 +1844,20 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
         for (int x=minx; x<=maxx; x++, e0-=dy0*16, e1-=dy1*16, e2-=dy2*16) {
             if ((e0+bias0) < 0 || (e1+bias1) < 0 || (e2+bias2) < 0) continue;
             float w0f = (float)e1*inv, w1f = (float)e2*inv;
-            AT_PIX(irw, rw); AT_PIX(iz, z); AT_PIX(ifog, fog);
-            if (!zrange_ok(iz, persp)) { if (s_stat_on > 0) s_stat.zrange++; continue; }
+            float irw = VC->rw;
+            float iz = VC->z;
+            float ifog = VC->fog;
+            if (persp) {
+                irw = AT_EVAL(irw, rw);
+                iz = AT_EVAL(iz, z);
+                ifog = AT_EVAL(ifog, fog);
+                if (!zrange_ok(iz, 1)) {
+                    if (s_stat_on > 0) s_stat.zrange++;
+                    continue;
+                }
+            } else if (use_z) {
+                iz = AT_EVAL(iz, z);
+            }
 
             /* Clear-mode triangles: depth (bit 10) writes unconditionally, no z-test — the
              * normal path below only touches the z-buffer when z-test is enabled, so a game
@@ -1798,7 +1881,8 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
 
             float u = 0, fv = 0;
             if (textured) {
-                AT_PIX(iu, u); AT_PIX(iv, v);
+                float iu = AT_EVAL(iu, u);
+                float iv = AT_EVAL(iv, v);
                 if (persp) {
                     float inv_rw = (irw != 0.0f) ? 1.0f / irw : 1.0f;
                     u = iu * inv_rw; fv = iv * inv_rw;
@@ -1806,7 +1890,10 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
             }
             int r, g, b, a;
             if (gouraud) {
-                AT_PIX(ir, r); AT_PIX(ig, g); AT_PIX(ib, b); AT_PIX(ia, a);
+                float ir = AT_EVAL(ir, r);
+                float ig = AT_EVAL(ig, g);
+                float ib = AT_EVAL(ib, b);
+                float ia = AT_EVAL(ia, a);
                 r=(int)ir; g=(int)ig; b=(int)ib; a=(int)ia;
             }
             else         { r=C->r; g=C->g; b=C->b; a=C->a; }
@@ -1855,12 +1942,13 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
         }
     }
 #undef AT_SETUP
-#undef AT_PIX
+#undef AT_EVAL
 }
 
 /* Line rasterizer (DDA), used for prim types 1/2 in both modes. */
 static void draw_line_vtx(const Vtx *A, const Vtx *B, int persp) {
     if (s_backend && s_backend->line && s_backend->line(A, B, persp)) return;
+    texel_cache_begin();
     float dx=B->x-A->x, dy=B->y-A->y;
     float len=fmaxf(fabsf(dx),fabsf(dy));
     int steps=(int)len;
@@ -1897,6 +1985,7 @@ static void draw_line_vtx(const Vtx *A, const Vtx *B, int persp) {
 
 static void draw_point_vtx(const Vtx *A, int persp) {
     if (s_backend && s_backend->point && s_backend->point(A, persp)) return;
+    texel_cache_begin();
     if (!zrange_ok(A->z, persp)) { if (s_stat_on > 0) s_stat.zrange++; return; }
     int textured = ge.tex_enable && !ge.clear && ge.tex_addr;
     float u=0, fv=0;
@@ -2365,6 +2454,7 @@ static void fill_rect_clear_fast(int xa, int ya, int xb, int yb, int r, int g, i
  * persp=1 recovers UV from the over-w storage and depth-tests with the second vertex's z. */
 static void fill_sprite(const Vtx *p0, const Vtx *p1, int persp) {
     if (s_backend && s_backend->sprite && s_backend->sprite(p0, p1, persp)) return;
+    texel_cache_begin();
 
     int xa=(int)fminf(p0->x,p1->x), xb=(int)fmaxf(p0->x,p1->x);
     int ya=(int)fminf(p0->y,p1->y), yb=(int)fmaxf(p0->y,p1->y);

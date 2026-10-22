@@ -11,6 +11,7 @@ extern "C" {
 /* Creates the SDL3 window whose Win32 HWND is consumed by backend->init(). */
 int  ged3d12_window_init(const char *title);
 void ged3d12_window_shutdown(void);
+void ged3d12_set_title(const char *title);
 
 const GeBackend *ged3d12_backend(void);
 

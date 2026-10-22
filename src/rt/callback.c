@@ -33,6 +33,10 @@ static Callback *cb_find(uint32_t uid) {
     return NULL;
 }
 
+int sr_cb_valid(uint32_t uid) {
+    return cb_find(uid) != NULL;
+}
+
 static int s_log = -1;
 static int cblog(void) { if (s_log < 0) s_log = getenv("SR_CBLOG") ? 1 : 0; return s_log; }
 

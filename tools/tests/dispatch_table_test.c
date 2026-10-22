@@ -16,6 +16,14 @@ static void last(CpuState *state) {
     state->r[2] = 3;
 }
 
+static void interpreted(CpuState *state) {
+    state->r[2] = 4;
+}
+
+static void replacement(CpuState *state) {
+    state->r[2] = 5;
+}
+
 #define CHECK(condition) \
     do { \
         if (!(condition)) { \
@@ -43,8 +51,94 @@ int main(void) {
     sr_lookup(0x08812000u)(&state);
     CHECK(state.r[2] == 2);
 
+    static const SrDispatchEntry module_entries[] = {
+        {0x09af5800u, middle},
+        {0x09af6000u, last},
+    };
+    static const SrDispatchTable module_table = {
+        "module",
+        module_entries,
+        2,
+    };
+    CHECK(sr_activate_dispatch_table(&module_table));
+    CHECK(sr_activate_dispatch_table(&module_table));
+    CHECK(sr_lookup(0x08804000u) == first);
+    CHECK(sr_lookup(0x09af5800u) == middle);
+
+    static const SrDispatchEntry collision_entries[] = {
+        {0x08812000u, last},
+    };
+    static const SrDispatchTable collision_table = {
+        "collision",
+        collision_entries,
+        1,
+    };
+    CHECK(!sr_activate_dispatch_table(&collision_table));
+    CHECK(sr_lookup(0x08812000u) == middle);
+
+    CHECK(sr_deactivate_dispatch_table(&module_table));
+    CHECK(!sr_deactivate_dispatch_table(&module_table));
+    CHECK(sr_lookup(0x09af5800u) == NULL);
+    CHECK(sr_lookup(0x08804000u) == first);
+
+    static const SrDispatchEntry overlay_a_entries[] = {
+        {0x09b43c00u, first},
+    };
+    static const SrDispatchEntry overlay_b_entries[] = {
+        {0x09b43c00u, last},
+    };
+    static const SrDispatchTable overlay_a = {
+        "overlay-a",
+        overlay_a_entries,
+        1,
+    };
+    static const SrDispatchTable overlay_b = {
+        "overlay-b",
+        overlay_b_entries,
+        1,
+    };
+    CHECK(sr_activate_dispatch_table(&overlay_a));
+    CHECK(!sr_activate_dispatch_table(&overlay_b));
+    CHECK(sr_lookup(0x09b43c00u) == first);
+    CHECK(sr_deactivate_dispatch_table(&overlay_a));
+    CHECK(sr_activate_dispatch_table(&overlay_b));
+    CHECK(sr_lookup(0x09b43c00u) == last);
+    CHECK(sr_deactivate_dispatch_table(&overlay_b));
+
     sr_set_dispatch_table(NULL, 0);
     CHECK(sr_lookup(0x08804000u) == NULL);
+
+    static const SrDispatchEntry interpreted_entries[] = {
+        {0x09b43c00u, interpreted},
+    };
+    static const SrDispatchEntry replacement_entries[] = {
+        {0x09b43c00u, replacement},
+    };
+    static const SrDispatchTable interpreted_table = {
+        "interpreted",
+        interpreted_entries,
+        1,
+    };
+    static const SrDispatchTable replacement_table = {
+        "replacement",
+        replacement_entries,
+        1,
+    };
+    CHECK(sr_activate_dispatch_table(&interpreted_table));
+    CHECK(sr_lookup(0x09b43c00u) == interpreted);
+    CHECK(sr_interpreter_module(0x09b43c00u) == NULL);
+    sr_disable_native_function(interpreted);
+    sr_disable_native_function(interpreted);
+    CHECK(sr_lookup(0x09b43c00u) == NULL);
+    CHECK(
+        strcmp(
+            sr_interpreter_module(0x09b43c00u),
+            "interpreted") == 0);
+    CHECK(sr_deactivate_dispatch_table(&interpreted_table));
+    CHECK(sr_activate_dispatch_table(&replacement_table));
+    CHECK(sr_lookup(0x09b43c00u) == replacement);
+    CHECK(sr_interpreter_module(0x09b43c00u) == NULL);
+    CHECK(sr_deactivate_dispatch_table(&replacement_table));
 
     const uint32_t large_count = 42600;
     SrDispatchEntry *large = malloc(sizeof(*large) * large_count);

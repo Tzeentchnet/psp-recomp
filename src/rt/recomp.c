@@ -9,6 +9,7 @@
 #include <string.h>
 
 uint8_t *g_mem = NULL;
+uint8_t g_scratchpad[SR_SCRATCHPAD_SIZE];
 int sr_hit_hle = 0;
 
 /* Out-of-range (wild guest pointer) access recorder. Bounds-safe MEM_* drops these; with
@@ -337,6 +338,7 @@ static const char *sr_interp_reason_name(SrInterpStopReason reason) {
         case SR_INTERP_MEMORY_FAULT: return "memory fault";
         case SR_INTERP_STEP_LIMIT: return "step limit";
         case SR_INTERP_BREAK: return "break";
+        case SR_INTERP_NATIVE_TARGET: return "native target";
     }
     return "unknown";
 }
@@ -367,16 +369,27 @@ static uint64_t sr_interp_step_limit(void) {
     return limit;
 }
 
-static void sr_log_interp_miss(uint32_t target, const CpuState *s) {
-    static uint32_t *seen;
+typedef struct SrInterpMiss {
+    uint32_t target;
+    const char *module;
+} SrInterpMiss;
+
+static void sr_log_interp_miss(
+    uint32_t target, const CpuState *s, const char *module) {
+    static SrInterpMiss *seen;
     static size_t seen_count;
     static size_t seen_capacity;
     static FILE *log_file;
-    for (size_t i = 0; i < seen_count; i++)
-        if (seen[i] == target) return;
+    const char *label = module && module[0] ? module : "unknown";
+    for (size_t i = 0; i < seen_count; i++) {
+        if (seen[i].target == target &&
+            strcmp(seen[i].module, label) == 0)
+            return;
+    }
     if (seen_count == seen_capacity) {
         size_t capacity = seen_capacity ? seen_capacity * 2 : 32;
-        uint32_t *grown = (uint32_t *)realloc(seen, capacity * sizeof(*seen));
+        SrInterpMiss *grown =
+            (SrInterpMiss *)realloc(seen, capacity * sizeof(*seen));
         if (!grown) {
             fprintf(stderr, "dispatch: cannot grow interpreter miss log\n");
             abort();
@@ -384,23 +397,27 @@ static void sr_log_interp_miss(uint32_t target, const CpuState *s) {
         seen = grown;
         seen_capacity = capacity;
     }
-    seen[seen_count++] = target;
+    seen[seen_count].target = target;
+    seen[seen_count].module = label;
+    seen_count++;
     fprintf(
         stderr,
-        "dispatch: interpreter fallback at 0x%08x (pc=0x%08x ra=0x%08x)\n",
-        target, s->pc, s->r[31]);
+        "dispatch: interpreter fallback [%s] at 0x%08x "
+        "(pc=0x%08x ra=0x%08x)\n",
+        label, target, s->pc, s->r[31]);
 
     const char *path = getenv("SR_INTERP_MISS_LOG");
     if (!path || !path[0]) return;
     if (!log_file) {
         log_file = fopen(path, "w");
         if (!log_file ||
-            fprintf(log_file, "# psp-recomp interpreter misses v1\n") < 0) {
+            fprintf(log_file, "# psp-recomp interpreter misses v2\n") < 0) {
             fprintf(stderr, "dispatch: cannot create miss log %s\n", path);
             abort();
         }
     }
-    if (fprintf(log_file, "0x%08x\n", target) < 0 || fflush(log_file) != 0) {
+    if (fprintf(log_file, "%s 0x%08x\n", label, target) < 0 ||
+        fflush(log_file) != 0) {
         fprintf(stderr, "dispatch: cannot write miss log %s\n", path);
         abort();
     }
@@ -423,38 +440,149 @@ void dispatch(CpuState *s, uint32_t target) {
         fn(s);
         return;
     }
-    sr_log_interp_miss(target, s);
+    sr_interpret_direct_module(
+        s, target, sr_interpreter_module(target));
+}
+
+void sr_interpret_direct(CpuState *s, uint32_t target) {
+    sr_interpret_direct_module(s, target, NULL);
+}
+
+void sr_interpret_direct_module(
+    CpuState *s, uint32_t target, const char *module) {
+    s->pc = target;
+    s->interp_module = module;
+    sr_interpret_entry(s);
+}
+
+static int sr_interpret_segment(
+    CpuState *s, uint32_t target, uint32_t return_pc,
+    uint64_t *remaining, int allow_native_handoff,
+    SrInterpStop *stop) {
+    for (;;) {
+        if (sr_interpret_fallback(
+                s, target, return_pc, *remaining,
+                allow_native_handoff, stop)) {
+            return 1;
+        }
+        if (stop->steps >= *remaining)
+            *remaining = 0;
+        else
+            *remaining -= stop->steps;
+        if (stop->reason != SR_INTERP_SYSCALL)
+            return 0;
+
+        uint32_t code = (stop->op >> 6) & 0xfffffu;
+        uint32_t nid;
+        const char *library;
+        if (!sr_module_syscall_binding(code, &library, &nid)) {
+            fprintf(
+                stderr,
+                "dispatch: unknown runtime PRX syscall code 0x%x "
+                "at 0x%08x\n",
+                code, stop->pc);
+            return 0;
+        }
+        sr_syscall_lib(s, library, nid);
+        if (!*remaining) {
+            stop->reason = SR_INTERP_STEP_LIMIT;
+            return 0;
+        }
+        target = s->pc;
+    }
+}
+
+#define SR_INTERP_MAX_NATIVE_HANDOFF_DEPTH 256u
+
+static int sr_interpret_deep_callee(
+    CpuState *s, uint32_t target, uint32_t return_pc,
+    SrInterpStop *stop) {
+    uint64_t remaining = sr_interp_step_limit();
+    for (;;) {
+        if (sr_interpret_segment(
+                s, target, return_pc, &remaining, 0, stop))
+            return 1;
+        if (stop->reason != SR_INTERP_STEP_LIMIT)
+            return 0;
+        target = s->pc;
+        remaining = sr_interp_step_limit();
+    }
+}
+
+void sr_interpret_entry(CpuState *s) {
+    uint32_t target = s->pc;
+    const char *module = s->interp_module;
+    sr_log_interp_miss(target, s, module);
     SrInterpStop stop;
     uint64_t remaining = sr_interp_step_limit();
     uint32_t return_pc = s->r[31];
+    s->interp_depth++;
     for (;;) {
-        if (sr_interpret_fallback(
-                s, target, return_pc, remaining, &stop)) {
+        if (sr_interpret_segment(
+                s, target, return_pc, &remaining, 1, &stop)) {
+            s->interp_depth--;
             return;
         }
-        if (stop.steps >= remaining)
-            remaining = 0;
-        else
-            remaining -= stop.steps;
-        if (stop.reason == SR_INTERP_SYSCALL) {
-            uint32_t code = (stop.op >> 6) & 0xfffffu;
-            uint32_t nid;
-            const char *library;
-            if (!sr_module_syscall_binding(
-                    code, &library, &nid)) {
-                fprintf(
-                    stderr,
-                    "dispatch: unknown runtime PRX syscall code 0x%x "
-                    "at 0x%08x\n",
-                    code, stop.pc);
+        if (stop.reason == SR_INTERP_NATIVE_TARGET) {
+            RecompFn nested = sr_lookup(stop.pc);
+            if (!nested) {
+                stop.reason = SR_INTERP_UNIMPLEMENTED;
                 break;
             }
-            sr_syscall_lib(s, library, nid);
+            if (s->r[31] == return_pc) {
+                s->interp_depth--;
+#if defined(__clang__)
+                [[clang::musttail]] return nested(s);
+#else
+                nested(s);
+                return;
+#endif
+            }
+            if (s->interp_depth >=
+                SR_INTERP_MAX_NATIVE_HANDOFF_DEPTH) {
+                static int warned;
+                if (!warned) {
+                    warned = 1;
+                    fprintf(
+                        stderr,
+                        "dispatch: native handoff depth limited to %u; "
+                        "continuing deeper calls in the scheduler-aware "
+                        "interpreter\n",
+                        SR_INTERP_MAX_NATIVE_HANDOFF_DEPTH);
+                }
+                uint32_t callee_return_pc = s->r[31];
+                SrInterpStop callee_stop;
+                if (!sr_interpret_deep_callee(
+                        s, stop.pc, callee_return_pc,
+                        &callee_stop)) {
+                    stop = callee_stop;
+                    break;
+                }
+                target = callee_return_pc;
+                s->pc = target;
+                if (target == return_pc) {
+                    s->interp_depth--;
+                    return;
+                }
+                continue;
+            }
+            nested(s);
+            target = s->r[31];
+            s->pc = target;
+            if (target == return_pc) {
+                s->interp_depth--;
+                return;
+            }
             if (!remaining) {
                 stop.reason = SR_INTERP_STEP_LIMIT;
                 break;
             }
+            continue;
+        }
+        if (stop.reason == SR_INTERP_STEP_LIMIT &&
+            sr_sched_on) {
             target = s->pc;
+            remaining = sr_interp_step_limit();
             continue;
         }
         break;
@@ -474,6 +602,7 @@ void dispatch(CpuState *s, uint32_t target) {
         if (permissive) {
             fprintf(stderr, "dispatch: permissive no-op return after interpreter failure\n");
             s->r[2] = 0;
+            s->interp_depth--;
             return;
         }
     }
@@ -589,6 +718,12 @@ void sr_begin(const CpuState *s, uint32_t pc, uint32_t op) {
         if (pc != s_trace_start_pc) return;
         s_trace_active = 1;
         fprintf(stderr, "trace: started at 0x%08x\n", pc);
+        fprintf(s_fp, "# init pc=0x%08x", pc);
+        for (int i = 1; i < 32; i++)
+            fprintf(s_fp, " r%d=0x%08x", i, s->r[i]);
+        fprintf(
+            s_fp, " hi=0x%08x lo=0x%08x fcr31=0x%08x\n",
+            s->hi, s->lo, s->fcr31);
     }
     s_trace_step_active = 1;
     memcpy(s_r, s->r, sizeof(s_r));
@@ -636,6 +771,21 @@ void sr_end(const CpuState *s, uint32_t mem_addr, int mem_size) {
             abort();
         }
         fprintf(stderr, "trace: completed %llu steps\n", s_trace_limit);
+        const char *ram_path = getenv("SR_TRACE_RAM");
+        if (ram_path && ram_path[0]) {
+            FILE *ram = fopen(ram_path, "wb");
+            if (!ram ||
+                fwrite(
+                    SR_HOST(0x08800000u), 1, 0x01800000u, ram) !=
+                    0x01800000u ||
+                fclose(ram) != 0) {
+                fprintf(
+                    stderr, "trace: cannot write RAM snapshot %s\n",
+                    ram_path);
+                abort();
+            }
+            fprintf(stderr, "trace: wrote RAM snapshot %s\n", ram_path);
+        }
         fflush(stderr);
         _Exit(0);
     }

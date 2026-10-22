@@ -396,6 +396,10 @@ int ged3d12_window_init(const char *title) {
     return 1;
 }
 
+void ged3d12_set_title(const char *title) {
+    if (s_window && title) SDL_SetWindowTitle(s_window, title);
+}
+
 static int enable_debug_layer(UINT *factory_flags) {
     if (!env_enabled("SR_D3D12_DEBUG")) return 1;
 

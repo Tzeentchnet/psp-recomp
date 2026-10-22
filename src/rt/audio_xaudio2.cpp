@@ -17,6 +17,9 @@ extern "C" int sched_fast_forwarding(void);
 #define SAMPLE_RATE 44100
 #define BLOCK_FRAMES 256
 #define BUFFER_COUNT 8
+#define PADDING_FADE_FRAMES 64
+#define RESUME_PREBUFFER_FRAMES (BUFFER_COUNT * BLOCK_FRAMES * 2)
+#define RESUME_MAX_WAIT_MS 500
 
 static SrAudioMixer s_mixer;
 static CRITICAL_SECTION s_lock;
@@ -28,6 +31,7 @@ static HANDLE s_event;
 static HANDLE s_thread;
 static volatile LONG s_run;
 static volatile LONG s_voice_error;
+static volatile LONG s_real_device_buffers;
 static int16_t s_blocks[BUFFER_COUNT][BLOCK_FRAMES * 2];
 static int s_next_block;
 static int s_inited;
@@ -36,6 +40,12 @@ static int s_log;
 static UINT32 s_min_device_buffers = BUFFER_COUNT;
 static UINT32 s_max_device_buffers;
 static uint64_t s_last_log_frames;
+static uint64_t s_padding_blocks;
+static uint64_t s_padding_transitions;
+static int s_padding_active;
+static int16_t s_last_left;
+static int16_t s_last_right;
+static LARGE_INTEGER s_pending_audio_qpc;
 static LARGE_INTEGER s_start_qpc;
 static LARGE_INTEGER s_qpc_frequency;
 static int s_playback_started;
@@ -49,8 +59,9 @@ public:
     void STDMETHODCALLTYPE OnBufferStart(void *) noexcept override {}
     void STDMETHODCALLTYPE OnLoopEnd(void *) noexcept override {}
 
-    void STDMETHODCALLTYPE OnBufferEnd(void *) noexcept override {
-        if (s_lock_initialized) {
+    void STDMETHODCALLTYPE OnBufferEnd(void *context) noexcept override {
+        if (context && s_lock_initialized) {
+            InterlockedDecrement(&s_real_device_buffers);
             EnterCriticalSection(&s_lock);
             sr_audio_mixer_complete(&s_mixer, BLOCK_FRAMES);
             LeaveCriticalSection(&s_lock);
@@ -66,25 +77,86 @@ public:
 
 static VoiceCallback s_callback;
 
-static int submit_block(void) {
+static int submit_block(int guest_audio) {
     int index = s_next_block;
-    EnterCriticalSection(&s_lock);
-    sr_audio_mixer_render(&s_mixer, s_blocks[index], BLOCK_FRAMES);
-    LeaveCriticalSection(&s_lock);
+    if (guest_audio) {
+        EnterCriticalSection(&s_lock);
+        sr_audio_mixer_render(
+            &s_mixer, s_blocks[index], BLOCK_FRAMES);
+        LeaveCriticalSection(&s_lock);
+        if (s_padding_active) {
+            for (int i = 0; i < PADDING_FADE_FRAMES; i++) {
+                s_blocks[index][i * 2] =
+                    (int16_t)(
+                        (int32_t)s_blocks[index][i * 2] *
+                        (i + 1) / PADDING_FADE_FRAMES);
+                s_blocks[index][i * 2 + 1] =
+                    (int16_t)(
+                        (int32_t)s_blocks[index][i * 2 + 1] *
+                        (i + 1) / PADDING_FADE_FRAMES);
+            }
+            s_padding_active = 0;
+            s_pending_audio_qpc.QuadPart = 0;
+        }
+        s_last_left =
+            s_blocks[index][(BLOCK_FRAMES - 1) * 2];
+        s_last_right =
+            s_blocks[index][(BLOCK_FRAMES - 1) * 2 + 1];
+    } else {
+        memset(s_blocks[index], 0, sizeof(s_blocks[index]));
+        if (!s_padding_active) {
+            for (int i = 0; i < PADDING_FADE_FRAMES; i++) {
+                int scale = PADDING_FADE_FRAMES - i - 1;
+                s_blocks[index][i * 2] =
+                    (int16_t)(
+                        (int32_t)s_last_left * scale /
+                        PADDING_FADE_FRAMES);
+                s_blocks[index][i * 2 + 1] =
+                    (int16_t)(
+                        (int32_t)s_last_right * scale /
+                        PADDING_FADE_FRAMES);
+            }
+            s_padding_active = 1;
+            s_padding_transitions++;
+        }
+    }
 
     XAUDIO2_BUFFER buffer = {};
     buffer.AudioBytes = sizeof(s_blocks[index]);
     buffer.pAudioData = (const BYTE *)s_blocks[index];
-    buffer.pContext = (void *)(uintptr_t)index;
+    buffer.pContext =
+        guest_audio ? (void *)(uintptr_t)(index + 1) : nullptr;
+    if (guest_audio)
+        InterlockedIncrement(&s_real_device_buffers);
     HRESULT result = s_source->SubmitSourceBuffer(&buffer);
     if (FAILED(result)) {
+        if (guest_audio)
+            InterlockedDecrement(&s_real_device_buffers);
         fprintf(stderr, "audio: SubmitSourceBuffer failed (0x%08lx)\n",
                 (unsigned long)result);
         InterlockedExchange(&s_voice_error, (LONG)result);
         return 0;
     }
+    if (!guest_audio) s_padding_blocks++;
     s_next_block = (s_next_block + 1) % BUFFER_COUNT;
     return 1;
+}
+
+static int guest_audio_ready(int available) {
+    if (available < BLOCK_FRAMES) return 0;
+    if (!s_padding_active) {
+        s_pending_audio_qpc.QuadPart = 0;
+        return 1;
+    }
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    if (!s_pending_audio_qpc.QuadPart)
+        s_pending_audio_qpc = now;
+    if (available >= RESUME_PREBUFFER_FRAMES)
+        return 1;
+    return
+        now.QuadPart - s_pending_audio_qpc.QuadPart >=
+        s_qpc_frequency.QuadPart * RESUME_MAX_WAIT_MS / 1000;
 }
 
 static void fill_device_queue(void) {
@@ -112,8 +184,9 @@ static void fill_device_queue(void) {
         EnterCriticalSection(&s_lock);
         int available = sr_audio_mixer_available(&s_mixer);
         LeaveCriticalSection(&s_lock);
-        if (available < BLOCK_FRAMES) break;
-        if (!submit_block()) break;
+        int guest_audio = guest_audio_ready(available);
+        if (!guest_audio && !s_playback_started) break;
+        if (!submit_block(guest_audio)) break;
         s_playback_started = 1;
         state.BuffersQueued++;
         if (state.BuffersQueued > s_max_device_buffers)
@@ -143,7 +216,9 @@ static void log_progress(void) {
         stderr,
         "audio: XAudio2 played=%llu device=%u blocks/%u frames (%.2f ms) "
         "clock_drift=%.2f ms max_guest_queue=%llu dropped=%llu "
-        "resynced=%llu silent_blocks=%llu underruns=%llu\n",
+        "resynced=%llu silent_blocks=%llu underruns=%llu "
+        "padding_blocks=%llu padding_transitions=%llu "
+        "real_buffers=%ld\n",
         (unsigned long long)stats.completed_frames,
         state.BuffersQueued,
         state.BuffersQueued * BLOCK_FRAMES,
@@ -153,7 +228,11 @@ static void log_progress(void) {
         (unsigned long long)stats.dropped_frames,
         (unsigned long long)stats.resynced_frames,
         (unsigned long long)stats.silent_blocks,
-        (unsigned long long)s_underruns);
+        (unsigned long long)s_underruns,
+        (unsigned long long)s_padding_blocks,
+        (unsigned long long)s_padding_transitions,
+        (long)InterlockedCompareExchange(
+            &s_real_device_buffers, 0, 0));
 }
 
 static DWORD WINAPI feeder(void *) {
@@ -199,10 +278,17 @@ extern "C" int sr_audio_init(void) {
     if (getenv("SR_NOAUDIO")) return 0;
 
     InterlockedExchange(&s_voice_error, 0);
+    InterlockedExchange(&s_real_device_buffers, 0);
     s_next_block = 0;
     s_min_device_buffers = BUFFER_COUNT;
     s_max_device_buffers = 0;
     s_last_log_frames = 0;
+    s_padding_blocks = 0;
+    s_padding_transitions = 0;
+    s_padding_active = 0;
+    s_last_left = 0;
+    s_last_right = 0;
+    s_pending_audio_qpc.QuadPart = 0;
     s_playback_started = 0;
     s_underruns = 0;
     sr_audio_mixer_init(&s_mixer);
@@ -316,7 +402,8 @@ extern "C" void sr_audio_shutdown(void) {
             "audio: XAudio2 shutdown played=%llu frames (%.2f ms), "
             "clock_drift=%.2f ms, device_buffers=%u..%u, "
             "max_guest_queue=%llu, dropped=%llu, resynced=%llu, silent_blocks=%llu, "
-            "underruns=%llu%s\n",
+            "underruns=%llu, padding_blocks=%llu, "
+            "padding_transitions=%llu%s\n",
             (unsigned long long)stats.completed_frames,
             played_ms, played_ms - elapsed_ms,
             s_playback_started ? s_min_device_buffers : 0u,
@@ -326,6 +413,8 @@ extern "C" void sr_audio_shutdown(void) {
             (unsigned long long)stats.resynced_frames,
             (unsigned long long)stats.silent_blocks,
             (unsigned long long)s_underruns,
+            (unsigned long long)s_padding_blocks,
+            (unsigned long long)s_padding_transitions,
             s_voice_error ? ", voice_error" : "");
     }
 

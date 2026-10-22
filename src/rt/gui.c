@@ -8,6 +8,7 @@
 #include "graphics_settings.h"
 #include "input_config.h"
 #include "input_settings.h"
+#include "fps_counter.h"
 #ifdef SR_SDL3VK
 #include "gpu_sdl3vk/sdl3vk.h"
 #include "gpu_sdl3vk/ge_gpu.h"
@@ -26,6 +27,10 @@
 #define PSP_W 480
 #define PSP_H 272
 
+#ifndef SR_GAME_TITLE
+#define SR_GAME_TITLE "PSP Recomp"
+#endif
+
 static int      s_on = 0;
 #ifdef SR_SDL3VK
 static int      s_sdl3 = 0;            /* SDL3+Vulkan presenter active (src/rt/gpu_sdl3vk) */
@@ -41,6 +46,44 @@ static uint32_t *s_px;                 /* PSP_W*PSP_H BGRA for StretchDIBits */
 static BITMAPINFO s_bmi;
 static uint32_t s_buttons = 0;
 static LARGE_INTEGER s_freq, s_last;   /* frame pacing to ~60 Hz */
+static SrFpsCounter s_fps_counter;
+static int s_fps_counter_enabled = -1;
+static char s_window_title[128] = "PSP Recomp";
+
+static void set_window_title(const char *title) {
+#ifdef SR_D3D12
+    if (s_d3d12) {
+        ged3d12_set_title(title);
+        return;
+    }
+#endif
+#ifdef SR_SDL3VK
+    if (s_sdl3) {
+        sdl3vk_set_title(title);
+        return;
+    }
+#endif
+    if (s_hwnd) SetWindowTextA(s_hwnd, title);
+}
+
+static void update_fps_counter(void) {
+    if (s_fps_counter_enabled < 0)
+        s_fps_counter_enabled = getenv("SR_FPS_COUNTER") ? 1 : 0;
+    if (!s_fps_counter_enabled || !s_freq.QuadPart) return;
+    LARGE_INTEGER now;
+    double fps;
+    double frame_ms;
+    QueryPerformanceCounter(&now);
+    if (!sr_fps_counter_tick(
+            &s_fps_counter, (uint64_t)now.QuadPart,
+            (uint64_t)s_freq.QuadPart, 0.5, &fps, &frame_ms))
+        return;
+    char title[256];
+    snprintf(
+        title, sizeof(title), "%s | %.1f FPS | %.2f ms",
+        s_window_title, fps, frame_ms);
+    set_window_title(title);
+}
 
 static int win_key_code(int key) {
     if ((key >= 'A' && key <= 'Z') || (key >= '0' && key <= '9')) return key;
@@ -251,6 +294,11 @@ int gui_init(const char *title) {
     const char *environment;
     const char *requested;
     int explicit_gpu;
+    snprintf(
+        s_window_title, sizeof(s_window_title), "%s",
+        title && title[0] ? title : "PSP Recomp");
+    sr_fps_counter_reset(&s_fps_counter);
+    s_fps_counter_enabled = -1;
     if (!sr_graphics_config_init()) {
         fprintf(stderr, "gui_init: graphics configuration failed\n");
         return 0;
@@ -261,14 +309,14 @@ int gui_init(const char *title) {
     }
     if (sr_graphics_config_first_run()) {
         int result = sr_graphics_settings_show(
-            "Killzone: Liberation Graphics");
+            SR_GAME_TITLE " Graphics");
         if (result <= 0) {
             if (!result)
                 fprintf(stderr, "gui_init: first-run graphics setup cancelled\n");
             return 0;
         }
         result = sr_input_settings_show(
-            "Killzone: Liberation Controller");
+            SR_GAME_TITLE " Controller");
         if (result <= 0) {
             if (!result)
                 fprintf(
@@ -453,8 +501,8 @@ int gui_message(
         flags |= MB_OK;
     if (yes_no && default_no) flags |= MB_DEFBUTTON2;
     int result = MessageBoxA(
-        s_hwnd, text && text[0] ? text : "Killzone: Liberation",
-        "Killzone: Liberation", flags);
+        s_hwnd, text && text[0] ? text : SR_GAME_TITLE,
+        SR_GAME_TITLE, flags);
     if (result == IDNO) return 2;
     if (result == IDCANCEL) return 3;
     return 1;
@@ -588,6 +636,17 @@ void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
         sr_input_gamepad_disconnected();
         sr_input_analog(raw_x, raw_y, &s_lx, &s_ly);
     }
+    if (getenv("SR_INPUT_LOG")) {
+        static uint32_t previous = UINT32_MAX;
+        if (s_buttons != previous) {
+            fprintf(
+                stderr,
+                "INPUT present=%u buttons=0x%04x pad=%s analog=%u,%u\n",
+                sr_present_count(), s_buttons,
+                s_pad_present ? "connected" : "none", s_lx, s_ly);
+            previous = s_buttons;
+        }
+    }
 
     convert_fb(fbaddr, fmt, stride);
     HDC dc = GetDC(s_hwnd);
@@ -599,6 +658,7 @@ void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
 #if defined(SR_SDL3VK) || defined(SR_D3D12)
 pace:
 #endif
+    update_fps_counter();
     /* Pace to ~60 Hz so the intro/menus play at a watchable speed. Skipped when the scheduler
      * already paces vblanks to real time (the default): pacing twice on unaligned grids makes
      * frames miss their vblank and costs a whole extra period (30/20 fps quantization). */

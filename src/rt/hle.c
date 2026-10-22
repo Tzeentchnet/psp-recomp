@@ -20,6 +20,7 @@
 #include "input_config.h"
 #include "iso.h"
 #include "kzl_twinstick.h"
+#include "memstick_state.h"
 #include "pgf.h"
 #include "sas_reverb.h"
 #include "settings_path.h"
@@ -2399,8 +2400,8 @@ static uint32_t h_IoRmdir(CpuState *s) {
 }
 
 /* sceIoDevctl, after PPSSPP sceIo.cpp: the UMD commands, and the memory stick ones for
- * mscmhc0:/ms0:/memstick: and fatms0:. The memory stick is always inserted and its FAT assigned,
- * and a registered insert/eject callback is notified with that state at once, as PPSSPP does.
+ * mscmhc0:/ms0:/memstick: and fatms0:. SR_MEMSTICK_STATE=removed exposes the same initial
+ * removed-card state as PPSSPP's --no-memstick option.
  * a0=device, a1=cmd, a2=arg, a3=arglen, t0=out, t1=outlen. */
 #define MS_FAKE_FREE_SPACE ((1024u + 512u) * 1024u * 1024u)
 static uint32_t s_ms_callbacks[32], s_ms_fat_callbacks[32];
@@ -2437,13 +2438,20 @@ static uint32_t h_IoDevctl(CpuState *s) {
     }
     if (!strcmp(name, "mscmhc0:") || !strcmp(name, "ms0:") || !strcmp(name, "memstick:")) {
         switch (cmd) {
-        case 0x02025801:   /* driver status: device inserted */
-            if (sr_inrange(outPtr) && outLen >= 4) { MEM_W32(outPtr, 4); return 0; }
+        case 0x02025801:   /* driver status: ready or device inserted */
+            if (sr_inrange(outPtr) && outLen >= 4) {
+                MEM_W32(outPtr, sr_memstick_driver_state());
+                return 0;
+            }
             return BAD_PARAMS;
-        case 0x02015804:   /* register insert/eject callback; notified at once with "inserted" */
+        case 0x02015804:   /* register insert/eject callback */
             if (sr_inrange(argAddr) && outPtr == 0 && argLen >= 4) {
                 uint32_t cb = MEM_R32(argAddr);
-                if (s_ms_ncb < 32 && sr_cb_notify(cb, 1)) { s_ms_callbacks[s_ms_ncb++] = cb; return 0; }
+                if (s_ms_ncb < 32 && sr_cb_valid(cb)) {
+                    s_ms_callbacks[s_ms_ncb++] = cb;
+                    if (sr_memstick_inserted()) sr_cb_notify(cb, 1);
+                    return 0;
+                }
                 return ERR_EINVAL;
             }
             return BAD_PARAMS;
@@ -2451,13 +2459,18 @@ static uint32_t h_IoDevctl(CpuState *s) {
             if (sr_inrange(argAddr) && argLen >= 4)
                 return cb_list_remove(s_ms_callbacks, &s_ms_ncb, MEM_R32(argAddr)) ? 0 : ERR_EINVAL;
             return BAD_PARAMS;
-        case 0x02025806:   /* inserted */
-            if (sr_inrange(outPtr) && outLen >= 4) { MEM_W32(outPtr, 1); return 0; }
+        case 0x02025806:   /* inserted or removed */
+            if (sr_inrange(outPtr) && outLen >= 4) {
+                MEM_W32(outPtr, sr_memstick_device_state());
+                return 0;
+            }
             return BAD_PARAMS;
         case 0x02425818:   /* capacity */
+            if (!sr_memstick_inserted()) return 0x80010013u;
             if (sr_inrange(argAddr) && argLen >= 4) { ms_write_device_size(argAddr); return 0; }
             return BAD_PARAMS;
         case 0x02425824:   /* write protected: no */
+            if (!sr_memstick_inserted()) return 0x80010013u;
             if (sr_inrange(outPtr) && outLen == 4) { MEM_W32(outPtr, 0); return 0; }
             return 0xFFFFFFFFu;
         }
@@ -2465,10 +2478,14 @@ static uint32_t h_IoDevctl(CpuState *s) {
     if (!strcmp(name, "fatms0:")) {
         switch (cmd) {
         case 0x0240d81e: break;   /* invalidate the driver's file table cache: falls to UNSUP */
-        case 0x02415821:   /* register insert/eject callback; notified at once with FAT assigned */
+        case 0x02415821:   /* register insert/eject callback */
             if (sr_inrange(argAddr) && argLen >= 4) {
                 uint32_t cb = MEM_R32(argAddr);
-                if (s_ms_nfatcb < 32 && sr_cb_notify(cb, 1)) { s_ms_fat_callbacks[s_ms_nfatcb++] = cb; return 0; }
+                if (s_ms_nfatcb < 32 && sr_cb_valid(cb)) {
+                    s_ms_fat_callbacks[s_ms_nfatcb++] = cb;
+                    if (sr_memstick_inserted()) sr_cb_notify(cb, 1);
+                    return 0;
+                }
             }
             return ERR_EINVAL;
         case 0x02415822:
@@ -2477,15 +2494,17 @@ static uint32_t h_IoDevctl(CpuState *s) {
             break;
         case 0x02415823:   /* set FAT state */
             return (sr_inrange(argAddr) && argLen == 4) ? 0 : 0xFFFFFFFFu;
-        case 0x02425823:   /* FAT enabled: 1 */
+        case 0x02425823:   /* FAT assigned or unassigned */
             if ((int32_t)(outPtr + outLen) < (int32_t)outPtr) return 0x800200d3u;
             if (!sr_inrange(outPtr)) return ERR_EINVAL;
-            MEM_W32(outPtr, 1);
+            MEM_W32(outPtr, sr_memstick_fat_state());
             return 0;
         case 0x02425824:
+            if (!sr_memstick_inserted()) return 0x80010013u;
             if (sr_inrange(outPtr) && outLen == 4) { MEM_W32(outPtr, 0); return 0; }
             return 0xFFFFFFFFu;
         case 0x02425818:
+            if (!sr_memstick_inserted()) return 0x80010013u;
             if (sr_inrange(argAddr) && argLen >= 4) { ms_write_device_size(argAddr); return 0; }
             return BAD_PARAMS;
         }
@@ -2535,11 +2554,12 @@ static uint32_t h_AudioSetChannelDataLen(CpuState *s) {
     return 0;
 }
 /* Read a guest sample buffer, expand mono to stereo, hand to the backend, then block until
- * the host queue is back down to ~one buffer of lead (real sceAudio blocking semantics).
+ * the host queue is back down to three guest buffers or two device queues of lead.
  * Pacing against the queue self-corrects: a late thread returns immediately and catches up,
  * an early one sleeps the difference. The old open-loop sleep of the buffer's duration ran
  * slightly slower than the device every iteration (sleep + decode time), so streams drifted
- * behind (voice lagging subtitles) and underran (crackle). */
+ * behind (voice lagging subtitles) and underran (crackle). Waiting for an empty queue has the
+ * same underrun: the producer only wakes after XAudio2 consumes the final submitted block. */
 
 static uint32_t audio_output(CpuState *s, uint32_t ch, uint32_t buf, int voll, int volr) {
     uint32_t n = ch < 9 ? s_audio_len[ch] : 1024;
@@ -2557,7 +2577,10 @@ static uint32_t audio_output(CpuState *s, uint32_t ch, uint32_t buf, int voll, i
         sched_delay_current(n ? (n * 1000000u / 44100u) : 1000u);
         return n;
     }
-    int queue_target = ch == AUDIO_SRC_CH ? (int)n : 0;
+    int queue_target = (int)n * 3;
+    int device_target = sr_audio_device_latency_frames() * 2;
+    if (device_target > queue_target)
+        queue_target = device_target;
     while ((q = sr_audio_queued((int)ch)) > queue_target)
         sched_delay_current(
             (uint32_t)(q - queue_target) * 1000000u / 44100u);
@@ -2785,10 +2808,23 @@ static uint32_t h_CtrlButtons(void) {
         if (scr_active) {
             uint32_t frame =
                 scr_present_timing ? s_present_count : s_vcount_fwd;
+            uint32_t scripted = 0;
             for (int i = 0; i < scr_n; i++)
                 if (frame >= scr[i].f && frame < scr[i].f + scr[i].w)
-                    keys |= scr[i].mask;
-            return keys;
+                    scripted |= scr[i].mask;
+            if (getenv("SR_PADLOG")) {
+                static uint32_t last_scripted = UINT32_MAX;
+                if (scripted != last_scripted) {
+                    fprintf(
+                        stderr,
+                        "PADSCRIPT clock=%s frame=%u present=%u vblank=%u "
+                        "mask=0x%04x\n",
+                        scr_present_timing ? "present" : "vblank",
+                        frame, s_present_count, s_vcount_fwd, scripted);
+                    last_scripted = scripted;
+                }
+            }
+            return keys | scripted;
         }
     }
     /* The auto-START pulse below only exists to advance the intro/attract in headless or no-input
@@ -3066,6 +3102,59 @@ typedef struct PresentPerf {
 
 static PresentPerf s_present_perf;
 
+static int present_capture_requested(uint32_t present) {
+    enum { MAX_PRESENT_CAPTURES = 32 };
+    static int initialized;
+    static uint32_t values[MAX_PRESENT_CAPTURES];
+    static int count;
+    if (!initialized) {
+        initialized = 1;
+        const char *setting = getenv("SR_FBCAPTURE_PRESENTS");
+        const char *cursor = setting;
+        while (cursor && cursor[0]) {
+            char *end = NULL;
+            unsigned long parsed = strtoul(cursor, &end, 10);
+            if (end == cursor || parsed == 0 || parsed > UINT32_MAX ||
+                (*end != '\0' && *end != ',')) {
+                fprintf(
+                    stderr,
+                    "SR_FBCAPTURE_PRESENTS: expected comma-separated positive "
+                    "integers, got %s\n",
+                    setting);
+                _Exit(2);
+            }
+            if (count == MAX_PRESENT_CAPTURES) {
+                fprintf(
+                    stderr,
+                    "SR_FBCAPTURE_PRESENTS: at most %d captures are supported\n",
+                    MAX_PRESENT_CAPTURES);
+                _Exit(2);
+            }
+            for (int i = 0; i < count; i++) {
+                if (values[i] == (uint32_t)parsed) {
+                    fprintf(
+                        stderr,
+                        "SR_FBCAPTURE_PRESENTS: duplicate presentation %lu\n",
+                        parsed);
+                    _Exit(2);
+                }
+            }
+            values[count++] = (uint32_t)parsed;
+            cursor = *end == ',' ? end + 1 : end;
+            if (cursor[0] == '\0' && end[0] == ',') {
+                fprintf(
+                    stderr,
+                    "SR_FBCAPTURE_PRESENTS: trailing comma in %s\n",
+                    setting);
+                _Exit(2);
+            }
+        }
+    }
+    for (int i = 0; i < count; i++)
+        if (values[i] == present) return 1;
+    return 0;
+}
+
 static int compare_double(const void *left, const void *right) {
     double a = *(const double *)left;
     double b = *(const double *)right;
@@ -3201,8 +3290,11 @@ static void present_perf_finish(
 
 static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
     char capture_path[1024];
+    char exact_capture_path[64];
     int capture_requested = 0;
     int captured_by_d3d12 = 0;
+    int exact_capture_requested = 0;
+    int exact_captured_by_d3d12 = 0;
 
     s_framebuf = A0;
     s_last_flip_vcount = s_vcount;
@@ -3214,6 +3306,16 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
             capture_path, sizeof(capture_path));
         if (capture_requested && gui_on())
             captured_by_d3d12 = gui_capture_next(capture_path);
+        exact_capture_requested =
+            present_capture_requested(s_present_count);
+        if (exact_capture_requested) {
+            snprintf(
+                exact_capture_path, sizeof(exact_capture_path),
+                "capture_present_%u.ppm", s_present_count);
+            if (gui_on())
+                exact_captured_by_d3d12 =
+                    gui_capture_next(exact_capture_path);
+        }
     }
     /* SR_GEWATCH: interleave presents with GELIST lines to expose draw-vs-present ordering. */
     {
@@ -3226,6 +3328,18 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
     /* Interactive window: show this finished frame and sample the keyboard (A1=bufferwidth,
      * A2=pixelformat 0=5650/1=5551/2=4444/3=8888). */
     if (gui_on() && s_framebuf) gui_present(s_framebuf, (int)A2, A1);
+    if (exact_capture_requested) {
+        if (!exact_captured_by_d3d12)
+            dump_fb_fmt(
+                exact_capture_path, A0, (int)A2,
+                A1 ? A1 : 512);
+        fprintf(
+            stderr,
+            "FBCAPTURE_PRESENT present=%u vblank=%u backend=%s -> %s\n",
+            s_present_count, s_vcount,
+            exact_captured_by_d3d12 ? "gpu" : "guest",
+            exact_capture_path);
+    }
     if (s_framebuf) {
         LONGLONG perf_exit = present_perf_entry();
         present_perf_finish(s_present_count, perf_entry, perf_exit);
@@ -3245,6 +3359,23 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
             snprintf(p, sizeof p, "snap_%u.ppm", (s_vcount / (uint32_t)fs) % 8u);
             dump_fb_fmt(p, A0, (int)A2, A1 ? A1 : 512);
             fprintf(stderr, "FBSNAP f=%u -> %s\n", s_vcount, p);
+        }
+    }
+    {
+        static int fs = -2;
+        if (fs == -2) {
+            const char *value = getenv("SR_FBSNAP_PRESENT");
+            fs = value ? atoi(value) : 0;
+        }
+        if (fs > 0 && s_present_count % (uint32_t)fs == 0) {
+            char path[64];
+            snprintf(
+                path, sizeof(path), "snap_present_%u.ppm",
+                (s_present_count / (uint32_t)fs) % 8u);
+            dump_fb_fmt(path, A0, (int)A2, A1 ? A1 : 512);
+            fprintf(
+                stderr, "FBSNAP_PRESENT present=%u vblank=%u -> %s\n",
+                s_present_count, s_vcount, path);
         }
     }
     /* The buffer handed to SetFrameBuf is a freshly-completed frame. With SR_FBDUMP=<N>, once N

@@ -62,6 +62,34 @@ inline uint32_t Funct(uint32_t op) { return op & 0x3F; }
 inline int32_t SImm(uint32_t op) { return (int32_t)(int16_t)(op & 0xFFFF); }
 inline uint32_t ZImm(uint32_t op) { return op & 0xFFFF; }
 
+inline int VfpuVectorIndices(uint32_t reg, int size, uint8_t *out) {
+	int matrix = (reg >> 2) & 7;
+	int column = reg & 3;
+	int transpose = (reg >> 5) & 1;
+	int row;
+	if (size == 1) {
+		transpose = 0;
+		row = (reg >> 5) & 3;
+	} else if (size == 2) {
+		row = (reg >> 5) & 2;
+	} else if (size == 3) {
+		row = (reg >> 6) & 1;
+	} else {
+		row = (reg >> 5) & 2;
+	}
+	for (int i = 0; i < size; i++) {
+		out[i] = transpose
+			? (uint8_t)(matrix * 16 + ((row + i) & 3) * 4 + column)
+			: (uint8_t)(matrix * 16 + column * 4 + ((row + i) & 3));
+	}
+	return size;
+}
+
+inline uint32_t VfpuMemoryAddress(const CpuState *s, uint32_t op) {
+	int32_t offset = (int32_t)(int16_t)(op & 0xFFFC);
+	return s->r[Rs(op)] + (uint32_t)offset;
+}
+
 inline void SetR(CpuState *s, uint32_t idx, uint32_t val) {
 	if (idx != 0) s->r[idx] = val;
 }
@@ -104,9 +132,12 @@ void StoreInfo(const CpuState *s, uint32_t op, uint32_t *addr, int *size) {
 		case 0x2A: *size = 4; break;   // swl (records the touched word)
 		case 0x2E: *size = 4; break;   // swr
 		case 0x39: *size = 4; break;   // swc1
+		case 0x3A: *size = 4; break;   // sv.s
+		case 0x3E: *size = 16; break;  // sv.q
 		default: return;
 	}
-	*addr = s->r[Rs(op)] + SImm(op);
+	*addr = opcode == 0x3A || opcode == 0x3E
+		? VfpuMemoryAddress(s, op) : s->r[Rs(op)] + SImm(op);
 }
 
 }  // namespace
@@ -284,6 +315,41 @@ static StopReason Execute(CpuState *s, Memory *mem, uint32_t op) {
 		case 0x28: mem->Write8(s->r[Rs(op)] + SImm(op), (uint8_t)s->r[Rt(op)]); return StopReason::kRunning;   // sb
 		case 0x29: mem->Write16(s->r[Rs(op)] + SImm(op), (uint16_t)s->r[Rt(op)]); return StopReason::kRunning; // sh
 		case 0x2B: mem->Write32(s->r[Rs(op)] + SImm(op), s->r[Rt(op)]); return StopReason::kRunning;  // sw
+		case 0x12: {  // COP2 transfers between GPRs and VFPU data/control registers
+			uint32_t sub = Rs(op);
+			if (sub == 8) {  // bvf/bvt/bvfl/bvtl
+				uint32_t condition = (op >> 18) & 7;
+				uint32_t expected = (op >> 16) & 1;
+				bool taken =
+					((s->vfpuCtrl[3] >> condition) & 1u) ==
+					expected;
+				if ((op >> 17) & 1)
+					skip_likely(taken);
+				else
+					take_branch(taken);
+				return StopReason::kRunning;
+			}
+			uint32_t imm = op & 0xFF;
+			uint32_t *value;
+			uint8_t index[1];
+			if (imm < 128) {
+				VfpuVectorIndices(imm, 1, index);
+				value = &s->vi[index[0]];
+			} else if (imm < 144) {
+				value = &s->vfpuCtrl[imm - 128];
+			} else {
+				return StopReason::kUnimplemented;
+			}
+			if (sub == 3) {
+				SetR(s, Rt(op), *value);
+				return StopReason::kRunning;
+			}
+			if (sub == 7) {
+				*value = s->r[Rt(op)];
+				return StopReason::kRunning;
+			}
+			return StopReason::kUnimplemented;
+		}
 		case 0x11: {  // COP1 (single-precision FPU)
 			const uint32_t fmt = Rs(op);  // sub-op selector in the rs field
 			const uint32_t ft = Rt(op);
@@ -375,17 +441,60 @@ static StopReason Execute(CpuState *s, Memory *mem, uint32_t op) {
 			return StopReason::kUnimplemented;
 		}
 		case 0x31: s->fi[Rt(op)] = mem->Read32(s->r[Rs(op)] + SImm(op)); return StopReason::kRunning; // lwc1
+		case 0x32: {  // lv.s
+			uint8_t index[1];
+			uint32_t vt = Rt(op) | ((op & 3) << 5);
+			VfpuVectorIndices(vt, 1, index);
+			s->vi[index[0]] = mem->Read32(VfpuMemoryAddress(s, op));
+			return StopReason::kRunning;
+		}
+		case 0x36: {  // lv.q
+			uint8_t indices[4];
+			uint32_t vt = Rt(op) | ((op & 1) << 5);
+			uint32_t address = VfpuMemoryAddress(s, op);
+			VfpuVectorIndices(vt, 4, indices);
+			for (int i = 0; i < 4; i++)
+				s->vi[indices[i]] = mem->Read32(address + i * 4);
+			return StopReason::kRunning;
+		}
 		case 0x39: mem->Write32(s->r[Rs(op)] + SImm(op), s->fi[Rt(op)]); return StopReason::kRunning; // swc1
+		case 0x3A: {  // sv.s
+			uint8_t index[1];
+			uint32_t vt = Rt(op) | ((op & 3) << 5);
+			VfpuVectorIndices(vt, 1, index);
+			mem->Write32(VfpuMemoryAddress(s, op), s->vi[index[0]]);
+			return StopReason::kRunning;
+		}
+		case 0x3E: {  // sv.q
+			uint8_t indices[4];
+			uint32_t vt = Rt(op) | ((op & 1) << 5);
+			uint32_t address = VfpuMemoryAddress(s, op);
+			VfpuVectorIndices(vt, 4, indices);
+			for (int i = 0; i < 4; i++)
+				mem->Write32(address + i * 4, s->vi[indices[i]]);
+			return StopReason::kRunning;
+		}
 		default: return StopReason::kUnimplemented;
 	}
 }
 
 StepResult Run(
 	CpuState *s, Memory *mem, unsigned long long max_steps, TraceSink *sink,
-	bool stop_at_pc, uint32_t stop_pc) {
+	bool stop_at_pc, uint32_t stop_pc,
+	NativeTargetPredicate native_target, void *native_target_context,
+	InstructionFallback instruction_fallback,
+	void *instruction_fallback_context,
+	ExecutionHook execution_hook,
+	void *execution_hook_context) {
 	for (unsigned long long i = 0; i < max_steps; i++) {
+		if (execution_hook && i != 0 && (i & 0xffu) == 0 &&
+			!s->in_delay_slot)
+			execution_hook(execution_hook_context, s, 256);
 		if (stop_at_pc && i != 0 && !s->in_delay_slot && s->pc == stop_pc)
 			return {StopReason::kTargetReached, s->pc, 0, i};
+		if (native_target && !s->in_delay_slot &&
+			native_target(native_target_context, s->pc))
+			return {StopReason::kNativeTarget, s->pc, 0, i};
 		uint32_t pc = s->pc;
 		uint32_t op = mem->Read32(pc);
 		if (mem->last_fault())
@@ -398,6 +507,10 @@ StepResult Run(
 		if (sink) sink->BeginStep(s, pc, op);
 		bool was_in_delay_slot = s->in_delay_slot;
 		StopReason reason = Execute(s, mem, op);
+		if (reason == StopReason::kUnimplemented &&
+			instruction_fallback &&
+			instruction_fallback(instruction_fallback_context, s, op))
+			reason = StopReason::kRunning;
 		if (s->in_delay_slot && was_in_delay_slot) {
 			s->pc = s->next_pc;
 			s->in_delay_slot = false;

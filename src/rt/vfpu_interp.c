@@ -46,6 +46,33 @@ static void eat_prefix(CpuState *s) {
     s->vfpuCtrl[2] = 0u;
 }
 
+static int32_t sr_vf2i(float x, float multiplier, int mode) {
+    if (isnan(x)) return 0x7fffffff;
+    double scaled = (double)(x * multiplier);
+    if (scaled > 2147483647.0) return 0x7fffffff;
+    if (scaled <= -2147483648.0)
+        return (int32_t)0x80000000u;
+    switch (mode) {
+        case 16: {
+            double rounded = floor(scaled);
+            double fraction = scaled - rounded;
+            if (fraction > 0.5 ||
+                (fraction == 0.5 &&
+                 fmod(rounded, 2.0) != 0.0))
+                rounded += 1.0;
+            return (int32_t)rounded;
+        }
+        case 17:
+            return x >= 0.0f
+                ? (int32_t)floor(scaled)
+                : (int32_t)ceil(scaled);
+        case 18:
+            return (int32_t)ceil(scaled);
+        default:
+            return (int32_t)floor(scaled);
+    }
+}
+
 /* vcst constant table, computed with the same float expressions as PPSSPP (MIPS.cpp). */
 static float sr_cst[32];
 static int sr_cst_init = 0;
@@ -80,6 +107,9 @@ static void sr_cst_load(void) {
 
 int sr_vfpu_interp(CpuState *s, uint32_t w) {
     uint32_t op = w >> 26;
+
+    if ((w & 0xffff0000u) == 0xffff0000u)
+        return SR_VFPU_STATE;  /* vnop */
 
     if (op == 0x37) {  /* (w>>24)&3: 0/1/2 = vpfxs/vpfxt/vpfxd, 3 = viim/vfim */
         int rn = (w >> 24) & 3;
@@ -183,6 +213,41 @@ int sr_vfpu_interp(CpuState *s, uint32_t w) {
             for (int i = 0; i < n; i++) d[i] = c;
             sr_vwrite(s, di, d, n, s->vfpuCtrl[2]); eat_prefix(s); return SR_VFPU_COMPUTE;
         }
+        if (sub21 >= 16 && sub21 <= 19) {
+            int imm = (w >> 16) & 0x1F;
+            float source[4], destination[4];
+            vreg_idx(vs, n, si);
+            vreg_idx(vd, n, di);
+            sr_vread(source, s, si, n, s->vfpuCtrl[0]);
+            for (int i = 0; i < n; i++) {
+                int32_t value = sr_vf2i(
+                    source[i], ldexpf(1.0f, imm), sub21);
+                memcpy(
+                    &destination[i], &value,
+                    sizeof(value));
+            }
+            sr_vwrite(
+                s, di, destination, n,
+                s->vfpuCtrl[2] & ~0xffu);
+            eat_prefix(s);
+            return SR_VFPU_COMPUTE;
+        }
+        if (sub21 == 20) {  /* vi2f: d = float(int bits of s) / 2^imm */
+            int imm = (w >> 16) & 0x1F;
+            float source[4], destination[4];
+            vreg_idx(vs, n, si);
+            vreg_idx(vd, n, di);
+            sr_vread(source, s, si, n, s->vfpuCtrl[0]);
+            for (int i = 0; i < n; i++) {
+                int32_t value;
+                memcpy(&value, &source[i], sizeof(value));
+                destination[i] = (float)value * ldexpf(1.0f, -imm);
+            }
+            sr_vwrite(
+                s, di, destination, n, s->vfpuCtrl[2]);
+            eat_prefix(s);
+            return SR_VFPU_COMPUTE;
+        }
         if (sub21 == 21) {  /* vcmov: conditional move on the VFPU CC register */
             int tf = (w >> 19) & 1, imm3 = (w >> 16) & 7;
             float sv[4], d[4];
@@ -198,6 +263,95 @@ int sr_vfpu_interp(CpuState *s, uint32_t w) {
                     if ((int)((cc >> i) & 1) == !tf) d[i] = sv[i];
             }
             sr_vwrite(s, di, d, n, s->vfpuCtrl[2]); eat_prefix(s); return SR_VFPU_COMPUTE;
+        }
+        if (sub21 == 1) {  /* VFPU7 packed integer conversions */
+            int op7 = (w >> 16) & 0x1F;
+            float source[4] = {0}, destination[4] = {0};
+            uint32_t input[4] = {0}, output[4] = {0};
+            vreg_idx(vs, n, si);
+            sr_vread(source, s, si, n, s->vfpuCtrl[0]);
+            memcpy(input, source, sizeof(input));
+            int output_size;
+            if (op7 == 24) {  /* vuc2i */
+                output_size = 4;
+                for (int i = 0; i < 4; i++)
+                    output[i] =
+                        (((input[0] >> (8 * i)) & 0xffu) *
+                         0x01010101u) >> 1;
+            } else if (op7 == 25) {  /* vc2i */
+                output_size = 4;
+                output[0] = (input[0] & 0x000000ffu) << 24;
+                output[1] = (input[0] & 0x0000ff00u) << 16;
+                output[2] = (input[0] & 0x00ff0000u) << 8;
+                output[3] = input[0] & 0xff000000u;
+            } else if (op7 == 26 || op7 == 27) {
+                int lanes = n == 1 ? 1 : 2;
+                output_size = n == 1 ? 2 : 4;
+                for (int i = 0; i < lanes; i++) {
+                    if (op7 == 26) {  /* vus2i */
+                        output[2 * i] =
+                            (input[i] & 0xffffu) << 15;
+                        output[2 * i + 1] =
+                            (input[i] & 0xffff0000u) >> 1;
+                    } else {  /* vs2i */
+                        output[2 * i] =
+                            (input[i] & 0xffffu) << 16;
+                        output[2 * i + 1] =
+                            input[i] & 0xffff0000u;
+                    }
+                }
+            } else if (op7 >= 28 && op7 <= 31) {
+                int32_t signed_input[4] = {0};
+                memcpy(
+                    signed_input, source,
+                    sizeof(signed_input));
+                output_size =
+                    op7 == 28 || op7 == 29
+                        ? 1
+                        : (n + 1) / 2;
+                if (op7 == 28) {  /* vi2uc */
+                    for (int i = 0; i < 4; i++) {
+                        int32_t value = signed_input[i];
+                        if (value < 0) value = 0;
+                        output[0] |=
+                            ((uint32_t)(value >> 23) & 0xffu)
+                            << (i * 8);
+                    }
+                } else if (op7 == 29) {  /* vi2c */
+                    for (int i = 0; i < 4; i++)
+                        output[0] |=
+                            ((uint32_t)signed_input[i] >> 24)
+                            << (i * 8);
+                } else {
+                    for (int i = 0; i < output_size; i++) {
+                        int32_t low = signed_input[i * 2];
+                        int32_t high =
+                            signed_input[i * 2 + 1];
+                        if (op7 == 30) {  /* vi2us */
+                            if (low < 0) low = 0;
+                            if (high < 0) high = 0;
+                            output[i] =
+                                ((uint32_t)(low >> 15) &
+                                 0xffffu) |
+                                (((uint32_t)(high >> 15) &
+                                  0xffffu) << 16);
+                        } else {  /* vi2s */
+                            output[i] =
+                                ((uint32_t)low >> 16) |
+                                (((uint32_t)high >> 16) << 16);
+                        }
+                    }
+                }
+            } else {
+                return SR_VFPU_OTHER;
+            }
+            memcpy(destination, output, sizeof(destination));
+            vreg_idx(vd, output_size, di);
+            sr_vwrite(
+                s, di, destination, output_size,
+                s->vfpuCtrl[2]);
+            eat_prefix(s);
+            return SR_VFPU_COMPUTE;
         }
         if (sub21 == 2) {  /* VFPU9 group */
             int op9 = (w >> 16) & 0x1F;

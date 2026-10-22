@@ -263,6 +263,10 @@ int sdl3vk_init(const char *title) {
     return 1;
 }
 
+void sdl3vk_set_title(const char *title) {
+    if (s_win && title) SDL_SetWindowTitle(s_win, title);
+}
+
 /* ---- input -------------------------------------------------------------------------- */
 
 static void poll_input(int *quit) {
