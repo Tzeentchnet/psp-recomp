@@ -170,6 +170,22 @@ static void test_present_viewports(void) {
     check_u32("internal capture height", capture.height, 816);
     check_u32("internal capture step", capture.source_step, 1);
     check_u32("internal capture offset", capture.sample_offset, 0);
+    check_u32(
+        "565 capture color",
+        ged3d12_present_capture_rgb(0x00ffffffu, 0),
+        0x00f8fcf8u);
+    check_u32(
+        "5551 capture color",
+        ged3d12_present_capture_rgb(0x00ffffffu, 1),
+        0x00f8f8f8u);
+    check_u32(
+        "4444 capture color",
+        ged3d12_present_capture_rgb(0x00ffffffu, 2),
+        0x00f0f0f0u);
+    check_u32(
+        "8888 capture color",
+        ged3d12_present_capture_rgb(0x00123456u, 3),
+        0x00123456u);
 }
 
 static void test_shader_constants(void) {

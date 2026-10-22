@@ -66,6 +66,54 @@ vec4 sample_texture_psp(vec2 uv, bool nearest, int flags) {
     return vec4(psp_lerp(upper, lower, weight.y));
 }
 
+ivec4 combine_texture_psp(
+    ivec4 vertex, ivec4 texture_color,
+    int texture_function, bool texture_rgba, bool color_double) {
+    ivec4 result = vertex;
+    int divisor = color_double ? 128 : 256;
+    if (texture_function == 1) {
+        if (texture_rgba) {
+            int inverse_alpha = 255 - texture_color.a;
+            result.rgb =
+                ((vertex.rgb + 1) * inverse_alpha +
+                 (texture_color.rgb + 1) * texture_color.a) /
+                divisor;
+        } else {
+            result.rgb = color_double
+                ? texture_color.rgb * 2 : texture_color.rgb;
+        }
+    } else if (texture_function == 2) {
+        ivec3 environment =
+            ivec3(pc.texenv.rgb * 255.0 + 0.5);
+        result.rgb =
+            ((255 - texture_color.rgb) * vertex.rgb +
+             texture_color.rgb * environment + 255) /
+            divisor;
+        result.a = texture_rgba
+            ? (vertex.a + 1) * texture_color.a / 256
+            : vertex.a;
+    } else if (texture_function == 3) {
+        result.rgb = color_double
+            ? texture_color.rgb * 2 : texture_color.rgb;
+        result.a = texture_rgba ? texture_color.a : vertex.a;
+    } else if (texture_function >= 4) {
+        result.rgb = vertex.rgb + texture_color.rgb;
+        if (color_double) result.rgb *= 2;
+        result.a = texture_rgba
+            ? (vertex.a + 1) * texture_color.a / 256
+            : vertex.a;
+    } else {
+        result.rgb =
+            (vertex.rgb + 1) *
+            (color_double ? texture_color.rgb * 2 : texture_color.rgb) /
+            256;
+        result.a = texture_rgba
+            ? (vertex.a + 1) * texture_color.a / 256
+            : vertex.a;
+    }
+    return clamp(result, ivec4(0), ivec4(255));
+}
+
 void main() {
     int flags = pc.cfg.x >> 8;
 
@@ -92,25 +140,45 @@ void main() {
             int  tf    = pc.cfg.x & 7;
             bool rgba  = (flags & 2) != 0;
             float dscl = ((flags & 4) != 0) ? 2.0 : 1.0;
-            vec3 rgb; float al;
-            if (tf == 1) {                       /* decal */
-                if (rgba) rgb = mix(v.rgb, t.rgb, t.a * (1.0 / 255.0)) * dscl;
-                else      rgb = t.rgb * dscl;
-                al = v.a;
-            } else if (tf == 2) {                /* blend against TEXENVCOLOR */
-                rgb = mix(v.rgb, pc.texenv.rgb * 255.0, t.rgb * (1.0 / 255.0)) * dscl;
-                al  = rgba ? v.a * t.a * (1.0 / 255.0) : v.a;
-            } else if (tf == 3) {                /* replace */
-                rgb = t.rgb * dscl;
-                al  = rgba ? t.a : v.a;
-            } else if (tf >= 4) {                /* add */
-                rgb = (v.rgb + t.rgb) * dscl;
-                al  = rgba ? v.a * t.a * (1.0 / 255.0) : v.a;
-            } else {                             /* modulate */
-                rgb = v.rgb * t.rgb * (1.0 / 255.0) * dscl;
-                al  = rgba ? v.a * t.a * (1.0 / 255.0) : v.a;
+            if ((flags & 512) != 0) {
+                col = vec4(combine_texture_psp(
+                    ivec4(v), ivec4(t), tf, rgba,
+                    (flags & 4) != 0));
+            } else {
+                vec3 rgb; float al;
+                if (tf == 1) {                   /* decal */
+                    if (rgba)
+                        rgb = mix(
+                            v.rgb, t.rgb,
+                            t.a * (1.0 / 255.0)) * dscl;
+                    else
+                        rgb = t.rgb * dscl;
+                    al = v.a;
+                } else if (tf == 2) {            /* blend */
+                    rgb = mix(
+                        v.rgb, pc.texenv.rgb * 255.0,
+                        t.rgb * (1.0 / 255.0)) * dscl;
+                    al = rgba
+                        ? v.a * t.a * (1.0 / 255.0)
+                        : v.a;
+                } else if (tf == 3) {            /* replace */
+                    rgb = t.rgb * dscl;
+                    al = rgba ? t.a : v.a;
+                } else if (tf >= 4) {            /* add */
+                    rgb = (v.rgb + t.rgb) * dscl;
+                    al = rgba
+                        ? v.a * t.a * (1.0 / 255.0)
+                        : v.a;
+                } else {                         /* modulate */
+                    rgb = v.rgb * t.rgb *
+                          (1.0 / 255.0) * dscl;
+                    al = rgba
+                        ? v.a * t.a * (1.0 / 255.0)
+                        : v.a;
+                }
+                col = vec4(
+                    min(rgb, vec3(255.0)), min(al, 255.0));
             }
-            col = vec4(min(rgb, vec3(255.0)), min(al, 255.0));
         }
 
         /* Alpha test (func order matches ge.c alpha_test). */
@@ -131,8 +199,17 @@ void main() {
         }
 
         if ((flags & 8) != 0) {
-            float f = clamp(v_fog, 0.0, 1.0);   /* 1 = no fog (PPSSPP convention) */
-            col.rgb = mix(pc.fogcol.rgb * 255.0, col.rgb, f);
+            if ((flags & 512) != 0) {
+                int fog = int(clamp(v_fog, 0.0, 1.0) * 256.0);
+                ivec3 fog_color =
+                    ivec3(pc.fogcol.rgb * 255.0 + 0.5);
+                ivec3 source = ivec3(col.rgb);
+                col.rgb = vec3(
+                    fog_color + (((source - fog_color) * fog) >> 8));
+            } else {
+                float f = clamp(v_fog, 0.0, 1.0);
+                col.rgb = mix(pc.fogcol.rgb * 255.0, col.rgb, f);
+            }
         }
 
         /* doubled-src-alpha blend factors folded into the source color */

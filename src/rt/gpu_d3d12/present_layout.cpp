@@ -53,3 +53,30 @@ void ged3d12_present_capture_layout(
     out->source_step = render_scale;
     out->sample_offset = render_scale / 2u;
 }
+
+uint32_t ged3d12_present_capture_rgb(
+    uint32_t rgb, uint32_t format) {
+    uint32_t red = (rgb >> 16) & 0xffu;
+    uint32_t green = (rgb >> 8) & 0xffu;
+    uint32_t blue = rgb & 0xffu;
+    switch (format & 3u) {
+        case 0:
+            red &= 0xf8u;
+            green &= 0xfcu;
+            blue &= 0xf8u;
+            break;
+        case 1:
+            red &= 0xf8u;
+            green &= 0xf8u;
+            blue &= 0xf8u;
+            break;
+        case 2:
+            red &= 0xf0u;
+            green &= 0xf0u;
+            blue &= 0xf0u;
+            break;
+        default:
+            break;
+    }
+    return (red << 16) | (green << 8) | blue;
+}

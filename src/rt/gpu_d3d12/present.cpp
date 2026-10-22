@@ -318,7 +318,8 @@ bool ged3d12_present_capture_record(void) {
     return true;
 }
 
-bool ged3d12_present_capture_write(const char *path) {
+bool ged3d12_present_capture_write(
+    const char *path, uint32_t format) {
     if (!path || !path[0] || !s_capture_readback) return false;
     const char *internal_setting =
         getenv("SR_D3D12_CAPTURE_INTERNAL");
@@ -351,10 +352,17 @@ bool ged3d12_present_capture_write(const char *path) {
         for (UINT x = 0; x < layout.width; x++) {
             const UINT source_x =
                 x * layout.source_step + layout.sample_offset;
+            uint32_t packed =
+                ((uint32_t)row[source_x * 4 + 2] << 16) |
+                ((uint32_t)row[source_x * 4 + 1] << 8) |
+                row[source_x * 4];
+            if (!internal_resolution)
+                packed = ged3d12_present_capture_rgb(
+                    packed, format);
             const uint8_t rgb[3] = {
-                row[source_x * 4 + 2],
-                row[source_x * 4 + 1],
-                row[source_x * 4],
+                (uint8_t)(packed >> 16),
+                (uint8_t)(packed >> 8),
+                (uint8_t)packed,
             };
             if (fwrite(rgb, 1, sizeof(rgb), file) != sizeof(rgb)) {
                 failed = true;

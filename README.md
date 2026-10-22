@@ -258,7 +258,10 @@ Set these environment variables before running the game to control runtime featu
   shader path and use host hardware filtering for A/B diagnostics.
   Non-mipmapped GPU textures otherwise use the software renderer's 8-bit
   bilinear weights, truncation order, and explicit wrap/clamp coordinates on
-  both D3D12 and Vulkan.
+  both D3D12 and Vulkan. The same path applies PSP integer texture-function
+  and fog math. Logical D3D12 captures are canonicalized through the active
+  PSP framebuffer format before golden comparison; full internal-resolution
+  captures remain raw.
 - `SR_D3D12_VRS=0`: Disable coarse shading for direct scaled draws. This keeps
   every fragment at the selected internal resolution at a substantial cost.
 - `SR_D3D12_STAGE_LOG=1`: Report 120-frame CPU averages for fence/begin,

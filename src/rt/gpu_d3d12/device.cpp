@@ -1678,7 +1678,8 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     if (capture_requested) {
         if (!wait_for_fence(s_graphics_fence, fence_value, s_graphics_event,
                             "wait for present capture") ||
-            !ged3d12_present_capture_write(s_capture_path)) {
+            !ged3d12_present_capture_write(
+                s_capture_path, (uint32_t)format)) {
             return -2;
         }
         fprintf(stderr, "ged3d12: captured presented frame -> %s\n", s_capture_path);

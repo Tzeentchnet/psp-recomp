@@ -312,6 +312,56 @@ int4 apply_write_mask(
         format);
 }
 
+int4 combine_texture_psp(
+    int4 vertex, int4 texture_color,
+    int texture_function, bool texture_rgba, bool color_double) {
+    int4 result = vertex;
+    int divisor = color_double ? 128 : 256;
+    if (texture_function == 1) {
+        if (texture_rgba) {
+            int inverse_alpha = 255 - texture_color.a;
+            result.rgb =
+                ((vertex.rgb + 1) * inverse_alpha +
+                 (texture_color.rgb + 1) * texture_color.a) /
+                divisor;
+        } else {
+            result.rgb = color_double
+                ? texture_color.rgb * 2 : texture_color.rgb;
+        }
+    } else if (texture_function == 2) {
+        int3 environment =
+            (int3)(texenv.rgb * 255.0 + 0.5);
+        result.rgb =
+            ((255 - texture_color.rgb) * vertex.rgb +
+             texture_color.rgb * environment + 255) /
+            divisor;
+        result.a = texture_rgba
+            ? (vertex.a + 1) * texture_color.a / 256
+            : vertex.a;
+    } else if (texture_function == 3) {
+        result.rgb = color_double
+            ? texture_color.rgb * 2 : texture_color.rgb;
+        result.a = texture_rgba ? texture_color.a : vertex.a;
+    } else if (texture_function >= 4) {
+        result.rgb = vertex.rgb + texture_color.rgb;
+        if (color_double) result.rgb *= 2;
+        result.a = texture_rgba
+            ? (vertex.a + 1) * texture_color.a / 256
+            : vertex.a;
+    } else {
+        result.rgb =
+            (vertex.rgb + 1) *
+            (color_double ? texture_color.rgb * 2 : texture_color.rgb) /
+            256;
+        result.a = texture_rgba
+            ? (vertex.a + 1) * texture_color.a / 256
+            : vertex.a;
+    }
+    return clamp(
+        result, int4(0, 0, 0, 0),
+        int4(255, 255, 255, 255));
+}
+
 int4 shade_source(
     PSInput input, bool front_facing,
     out int source_depth, out int flags) {
@@ -350,40 +400,56 @@ int4 shade_source(
             int texture_function = cfg.x & 7;
             bool texture_rgba = (flags & 2) != 0;
             float color_scale = (flags & 4) != 0 ? 2.0 : 1.0;
-            float3 rgb;
-            float alpha;
-
-            if (texture_function == 1) {
-                rgb = texture_rgba
-                    ? lerp(vertex.rgb, texture_color.rgb,
-                           texture_color.a * (1.0 / 255.0)) * color_scale
-                    : texture_color.rgb * color_scale;
-                alpha = vertex.a;
-            } else if (texture_function == 2) {
-                rgb = lerp(
-                    vertex.rgb, texenv.rgb * 255.0,
-                    texture_color.rgb * (1.0 / 255.0)) * color_scale;
-                alpha = texture_rgba
-                    ? vertex.a * texture_color.a * (1.0 / 255.0)
-                    : vertex.a;
-            } else if (texture_function == 3) {
-                rgb = texture_color.rgb * color_scale;
-                alpha = texture_rgba ? texture_color.a : vertex.a;
-            } else if (texture_function >= 4) {
-                rgb = (vertex.rgb + texture_color.rgb) * color_scale;
-                alpha = texture_rgba
-                    ? vertex.a * texture_color.a * (1.0 / 255.0)
-                    : vertex.a;
+            if (quantized_sampler) {
+                shaded = (float4)combine_texture_psp(
+                    (int4)vertex,
+                    (int4)texture_color,
+                    texture_function,
+                    texture_rgba,
+                    (flags & 4) != 0);
             } else {
-                rgb = vertex.rgb * texture_color.rgb *
-                      (1.0 / 255.0) * color_scale;
-                alpha = texture_rgba
-                    ? vertex.a * texture_color.a * (1.0 / 255.0)
-                    : vertex.a;
+                float3 rgb;
+                float alpha;
+                if (texture_function == 1) {
+                    rgb = texture_rgba
+                        ? lerp(vertex.rgb, texture_color.rgb,
+                               texture_color.a * (1.0 / 255.0)) *
+                              color_scale
+                        : texture_color.rgb * color_scale;
+                    alpha = vertex.a;
+                } else if (texture_function == 2) {
+                    rgb = lerp(
+                        vertex.rgb, texenv.rgb * 255.0,
+                        texture_color.rgb * (1.0 / 255.0)) *
+                        color_scale;
+                    alpha = texture_rgba
+                        ? vertex.a * texture_color.a *
+                              (1.0 / 255.0)
+                        : vertex.a;
+                } else if (texture_function == 3) {
+                    rgb = texture_color.rgb * color_scale;
+                    alpha = texture_rgba
+                        ? texture_color.a : vertex.a;
+                } else if (texture_function >= 4) {
+                    rgb =
+                        (vertex.rgb + texture_color.rgb) *
+                        color_scale;
+                    alpha = texture_rgba
+                        ? vertex.a * texture_color.a *
+                              (1.0 / 255.0)
+                        : vertex.a;
+                } else {
+                    rgb = vertex.rgb * texture_color.rgb *
+                          (1.0 / 255.0) * color_scale;
+                    alpha = texture_rgba
+                        ? vertex.a * texture_color.a *
+                              (1.0 / 255.0)
+                        : vertex.a;
+                }
+                shaded = float4(
+                    min(rgb, float3(255.0, 255.0, 255.0)),
+                    min(alpha, 255.0));
             }
-            shaded = float4(
-                min(rgb, float3(255.0, 255.0, 255.0)),
-                min(alpha, 255.0));
         }
 
         int alpha_test = cfg.y;
@@ -396,8 +462,19 @@ int4 shade_source(
         }
 
         if ((flags & 8) != 0) {
-            shaded.rgb = lerp(
-                fogcol.rgb * 255.0, shaded.rgb, saturate(input.fog));
+            if ((flags & 32768) != 0) {
+                int fog = (int)(saturate(input.fog) * 256.0);
+                int3 fog_color =
+                    (int3)(fogcol.rgb * 255.0 + 0.5);
+                int3 source = (int3)shaded.rgb;
+                shaded.rgb = (float3)(
+                    fog_color + (((source - fog_color) * fog) >> 8));
+            } else {
+                shaded.rgb = lerp(
+                    fogcol.rgb * 255.0,
+                    shaded.rgb,
+                    saturate(input.fog));
+            }
         }
 
         if ((flags & 512) != 0) {
