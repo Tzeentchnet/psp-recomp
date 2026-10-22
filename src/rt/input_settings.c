@@ -10,10 +10,28 @@
 #include <string.h>
 #include <windows.h>
 
+#ifndef SR_ENABLE_KZL_TWIN_STICK
+#define SR_ENABLE_KZL_TWIN_STICK 1
+#endif
+
 #define IDC_TWIN_STICK 1200
 #define IDC_AIM_INVERT_X 1201
 #define IDC_AIM_INVERT_Y 1202
 #define IDC_GAMEPAD_BINDING_BASE 1300
+
+#if SR_ENABLE_KZL_TWIN_STICK
+#define GAMEPAD_HEADER_Y 52
+#define GAMEPAD_ROW_Y 80
+#define GAMEPAD_EXAMPLES_Y 292
+#define INPUT_DIALOG_BUTTON_Y 334
+#define INPUT_DIALOG_HEIGHT 266
+#else
+#define GAMEPAD_HEADER_Y 16
+#define GAMEPAD_ROW_Y 44
+#define GAMEPAD_EXAMPLES_Y 256
+#define INPUT_DIALOG_BUTTON_Y 298
+#define INPUT_DIALOG_HEIGHT 242
+#endif
 
 typedef struct InputDialogContext {
     SrInputConfig config;
@@ -36,12 +54,21 @@ static const char *const s_action_labels[SR_INPUT_ACTIONS] = {
     "D-pad Right",
     "D-pad Down",
     "D-pad Left",
+#if SR_ENABLE_KZL_TWIN_STICK
     "PSP L / Strafe",
     "PSP R / Aim",
     "Triangle / Reload",
     "Circle / Grenade",
     "Cross / Interact",
     "Square / Fire",
+#else
+    "L button",
+    "R button",
+    "Triangle",
+    "Circle",
+    "Cross",
+    "Square",
+#endif
 };
 
 static void set_control_font(HWND control) {
@@ -112,6 +139,7 @@ static int append_text(
     return 1;
 }
 
+#if SR_ENABLE_KZL_TWIN_STICK
 static void set_binding_text(
     HWND dialog, const SrInputConfig *config, int action) {
     char binding[128];
@@ -121,6 +149,7 @@ static void set_binding_text(
             dialog, IDC_GAMEPAD_BINDING_BASE + action, binding);
     }
 }
+#endif
 
 static INT_PTR CALLBACK input_dialog_proc(
     HWND dialog, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -136,6 +165,7 @@ static INT_PTR CALLBACK input_dialog_proc(
                 ? context->title
                 : "Controller Settings");
 
+#if SR_ENABLE_KZL_TWIN_STICK
         add_control(
             dialog, 0, "BUTTON", "Enable experimental twin-stick controls",
             WS_TABSTOP | BS_AUTOCHECKBOX,
@@ -163,17 +193,18 @@ static INT_PTR CALLBACK input_dialog_proc(
             IDC_AIM_INVERT_Y,
             context->config.aim_invert_y
                 ? BST_CHECKED : BST_UNCHECKED);
+#endif
 
         add_control(
             dialog, 0, "STATIC",
             "Gamepad bindings (comma-separated; use none to clear):",
-            0, 16, 52, 420, 20, 0);
+            0, 16, GAMEPAD_HEADER_Y, 420, 20, 0);
         for (int action = 0; action < SR_INPUT_ACTIONS; action++) {
             int column = action / 6;
             int row = action % 6;
             int label_x = column ? 310 : 16;
             int edit_x = column ? 414 : 120;
-            int y = 80 + row * 34;
+            int y = GAMEPAD_ROW_Y + row * 34;
             char binding[128];
             if (!sr_input_config_format_gamepad_binding(
                     &context->config,
@@ -196,20 +227,21 @@ static INT_PTR CALLBACK input_dialog_proc(
             dialog, 0, "STATIC",
             "Examples: right_trigger, left_shoulder, west, south. "
             "All valid names remain documented in input.ini.",
-            0, 16, 292, 568, 34, 0);
+            0, 16, GAMEPAD_EXAMPLES_Y, 568, 34, 0);
         add_control(
             dialog, 0, "BUTTON", "Save",
             WS_TABSTOP | BS_DEFPUSHBUTTON,
-            414, 334, 80, 27, IDOK);
+            414, INPUT_DIALOG_BUTTON_Y, 80, 27, IDOK);
         add_control(
             dialog, 0, "BUTTON", "Close",
             WS_TABSTOP | BS_PUSHBUTTON,
-            504, 334, 80, 27, IDCANCEL);
+            504, INPUT_DIALOG_BUTTON_Y, 80, 27, IDCANCEL);
         center_dialog(dialog);
         return TRUE;
     }
     if (message == WM_COMMAND && context) {
         int command = LOWORD(wparam);
+#if SR_ENABLE_KZL_TWIN_STICK
         if (command == IDC_TWIN_STICK &&
             HIWORD(wparam) == BN_CLICKED &&
             IsDlgButtonChecked(dialog, IDC_TWIN_STICK) ==
@@ -234,6 +266,7 @@ static INT_PTR CALLBACK input_dialog_proc(
                 dialog, &context->config, SR_INPUT_SQUARE);
             return TRUE;
         }
+#endif
         if (command == IDOK) {
             SrInputConfig parsed = context->config;
             char settings[4096];
@@ -261,6 +294,7 @@ static INT_PTR CALLBACK input_dialog_proc(
                     return TRUE;
                 }
             }
+#if SR_ENABLE_KZL_TWIN_STICK
             if (!append_text(
                     settings,
                     sizeof(settings),
@@ -284,6 +318,7 @@ static INT_PTR CALLBACK input_dialog_proc(
                     MB_OK | MB_ICONERROR);
                 return TRUE;
             }
+#endif
             if (!sr_input_config_parse(
                     &parsed, settings, error, sizeof(error))) {
                 MessageBoxA(
@@ -336,7 +371,7 @@ int sr_input_settings_show(const char *title) {
         WS_POPUP | WS_CAPTION | WS_SYSMENU |
         DS_MODALFRAME | DS_CENTER;
     dialog_template.dialog.cx = 404;
-    dialog_template.dialog.cy = 266;
+    dialog_template.dialog.cy = INPUT_DIALOG_HEIGHT;
     result = DialogBoxIndirectParamW(
         GetModuleHandleW(NULL),
         &dialog_template.dialog,

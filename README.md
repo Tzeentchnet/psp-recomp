@@ -177,6 +177,12 @@ D-pad movement profile without marking it dirty and restores the original
 mappings when the controller disconnects. This experiment has not yet passed
 the full gameplay validation matrix, so back up saves before testing it.
 
+Title integrations without the Killzone-specific control extension can compile
+the runtime with `SR_ENABLE_KZL_TWIN_STICK=0`. That build keeps standard PSP
+button and analog input, omits twin-stick/reversal controls from the native
+dialog and generated `input.ini`, and ignores stale twin-stick settings in an
+existing configuration. The generic fork default remains enabled for Killzone.
+
 Run `kzl.exe --configure-input` to edit all twelve gamepad action bindings and
 the twin-stick/reversal options in the native controller dialog. Each action
 accepts the same comma-separated names as `input.ini`, including combinations

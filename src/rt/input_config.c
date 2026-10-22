@@ -13,6 +13,10 @@
 #include <string.h>
 #include <windows.h>
 
+#ifndef SR_ENABLE_KZL_TWIN_STICK
+#define SR_ENABLE_KZL_TWIN_STICK 1
+#endif
+
 static const char *const s_action_names[SR_INPUT_ACTIONS] = {
     "select", "start", "up", "right", "down", "left",
     "l", "r", "triangle", "circle", "cross", "square",
@@ -103,6 +107,16 @@ static char s_config_path[1024];
 static HANDLE s_reload_thread;
 static HANDLE s_reload_stop_event;
 static volatile LONG s_reload_requested;
+
+static void apply_build_features(SrInputConfig *config) {
+#if SR_ENABLE_KZL_TWIN_STICK
+    (void)config;
+#else
+    config->twin_stick_enabled = 0;
+    config->aim_invert_x = 0;
+    config->aim_invert_y = 0;
+#endif
+}
 
 static int text_equal(const char *left, const char *right) {
     while (*left && *right) {
@@ -585,7 +599,8 @@ uint32_t sr_input_config_gamepad_sticks(
     const SrInputSticks *sticks,
     uint8_t *lx,
     uint8_t *ly) {
-    if (!config->twin_stick_enabled) {
+    if (!SR_ENABLE_KZL_TWIN_STICK ||
+        !config->twin_stick_enabled) {
         memset(state, 0, sizeof(*state));
         sr_input_config_analog(
             config, sticks->movement_x, sticks->movement_y, lx, ly);
@@ -773,11 +788,19 @@ static int write_config(FILE *file, const SrInputConfig *config) {
             return 0;
         }
     }
+    if (fprintf(
+            file,
+            "analog.deadzone = %.6g\n"
+            "analog.curve = %.6g\n"
+            "analog.invert_y = %s\n",
+            config->deadzone,
+            config->curve,
+            config->invert_y ? "true" : "false") <= 0) {
+        return 0;
+    }
+#if SR_ENABLE_KZL_TWIN_STICK
     return fprintf(
                file,
-               "analog.deadzone = %.6g\n"
-               "analog.curve = %.6g\n"
-               "analog.invert_y = %s\n"
                "# Experimental gamepad-only twin-stick controls (default off)\n"
                "twin_stick.enabled = %s\n"
                "movement.deadzone = %.6g\n"
@@ -787,9 +810,6 @@ static int write_config(FILE *file, const SrInputConfig *config) {
                "aim.curve = %.6g\n"
                "aim.invert_x = %s\n"
                "aim.invert_y = %s\n",
-               config->deadzone,
-               config->curve,
-               config->invert_y ? "true" : "false",
                config->twin_stick_enabled ? "true" : "false",
                config->movement_deadzone,
                config->movement_curve,
@@ -798,6 +818,9 @@ static int write_config(FILE *file, const SrInputConfig *config) {
                config->aim_curve,
                config->aim_invert_x ? "true" : "false",
                config->aim_invert_y ? "true" : "false") > 0;
+#else
+    return 1;
+#endif
 }
 
 static int write_default_config(const char *path) {
@@ -1003,6 +1026,7 @@ int sr_input_init(void) {
                 s_config_path);
         }
     }
+    apply_build_features(&parsed);
     s_config = parsed;
     s_initialized = 1;
     fprintf(
@@ -1059,11 +1083,15 @@ void sr_input_gamepad_disconnected(void) {
 }
 
 int sr_input_twin_stick_enabled(void) {
-    return s_config.twin_stick_enabled;
+    return SR_ENABLE_KZL_TWIN_STICK &&
+           s_config.twin_stick_enabled;
 }
 
 int sr_input_twin_stick_aim(float *x, float *y) {
-    if (!s_twin_stick_state.aim_active) return 0;
+    if (!SR_ENABLE_KZL_TWIN_STICK ||
+        !s_twin_stick_state.aim_active) {
+        return 0;
+    }
     if (x) *x = s_twin_stick_state.aim_x;
     if (y) *y = s_twin_stick_state.aim_y;
     return 1;
@@ -1079,6 +1107,7 @@ int sr_input_config_save(
     size_t error_size) {
     char temporary[1100];
     FILE *file;
+    SrInputConfig saved;
     int length;
     int ok;
 
@@ -1092,6 +1121,8 @@ int sr_input_config_save(
             NULL);
         return 0;
     }
+    saved = *config;
+    apply_build_features(&saved);
     length = snprintf(
         temporary, sizeof(temporary), "%s.tmp", s_config_path);
     if (length < 0 || (size_t)length >= sizeof(temporary)) {
@@ -1113,7 +1144,7 @@ int sr_input_config_save(
             temporary);
         return 0;
     }
-    ok = write_config(file, config) &&
+    ok = write_config(file, &saved) &&
          fflush(file) == 0 &&
          _commit(_fileno(file)) == 0;
     if (fclose(file) != 0) ok = 0;
@@ -1147,7 +1178,7 @@ int sr_input_config_save(
             detail);
         return 0;
     }
-    s_config = *config;
+    s_config = saved;
     memset(&s_twin_stick_state, 0, sizeof(s_twin_stick_state));
     fprintf(stderr, "input: saved %s\n", s_config_path);
     return 1;
@@ -1175,6 +1206,7 @@ int sr_input_config_reload(char *error, size_t error_size) {
         &parsed, text, error, error_size);
     free(text);
     if (!ok) return 0;
+    apply_build_features(&parsed);
     s_config = parsed;
     memset(&s_twin_stick_state, 0, sizeof(s_twin_stick_state));
     return 1;
