@@ -240,11 +240,18 @@ class DispatchGenerationTests(unittest.TestCase):
                 {0x1000, 0x2000},
                 symbol_prefix="mga_test",
                 runtime_jal=True,
+                verify_runtime_code=True,
             )
         )
 
         self.assertIn(
             "uint32_t _jw = MEM_R32(0x00001000u)", output
+        )
+        self.assertIn(
+            "(MEM_R32(0x00001000u) >> 26) != 0x03u", output
+        )
+        self.assertNotIn(
+            "MEM_R32(0x00001000u) != 0x0c000800u", output
         )
         self.assertIn("dispatch(s, _t)", output)
         self.assertNotIn("mga_test_f_00002000(s);", output)
@@ -266,7 +273,9 @@ class DispatchGenerationTests(unittest.TestCase):
             )
         )
 
-        self.assertIn("static int _code_matches = -1", output)
+        self.assertIn("int _code_matches = 1", output)
+        self.assertNotIn("static int _code_matches", output)
+        self.assertNotIn("if (_code_matches < 0)", output)
         self.assertIn(
             "MEM_R32(0x00001000u) != 0x24840001u", output
         )

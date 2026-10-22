@@ -1135,18 +1135,25 @@ def emit_function(
     out.append("    SR_YIELD(s);")   # preemption point (no-op unless the scheduler is active)
     out.append("    SR_GPR_LOCAL_DECLS(s);")
     if verify_runtime_code:
-        out.append("    static int _code_matches = -1;")
-        out.append("    if (_code_matches < 0) {")
-        out.append("        _code_matches = 1;")
+        out.append("    int _code_matches = 1;")
         for address in sorted(insns):
             instruction = read32(elf, address)
             if instruction is None:
                 continue
-            out.append(
-                f"        if (MEM_R32(0x{address:08x}u) != "
-                f"0x{instruction:08x}u) _code_matches = 0;"
-            )
-        out.append("    }")
+            if (
+                runtime_jal
+                and instruction >> 26 == 3
+                and address not in JAL_NEXT
+            ):
+                out.append(
+                    f"    if ((MEM_R32(0x{address:08x}u) >> 26) "
+                    "!= 0x03u) _code_matches = 0;"
+                )
+            else:
+                out.append(
+                    f"    if (MEM_R32(0x{address:08x}u) != "
+                    f"0x{instruction:08x}u) _code_matches = 0;"
+                )
         out.append(
             f"    if (!_code_matches) {{ SR_GPR_FLUSH(s); "
             f"sr_disable_native_function("
