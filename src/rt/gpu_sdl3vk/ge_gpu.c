@@ -73,7 +73,8 @@ typedef struct { float x, y, z, rw, u, v, fog; uint32_t rgba; } GpuVert;
 /* fragment push constants (must match psp.frag PC block) */
 typedef struct { int32_t cfg[4]; float texenv[4]; float fogcol[4]; float texsize[4]; } PushPC;
 enum { F_TEX = 1, F_RGBA = 2, F_DBL = 4, F_FOG = 8, F_PERSP = 16, F_CLEAR = 32,
-       F_NEAREST = 64, F_SA2X = 128, F_SA2XI = 256 };
+       F_NEAREST = 64, F_SA2X = 128, F_SA2XI = 256, F_PSP_SAMPLER = 512,
+       F_CLAMP_U = 1024, F_CLAMP_V = 2048 };
 
 typedef struct {
     uint8_t blend_on, srcf, dstf, eq;      /* VkBlendFactor / VkBlendOp values */
@@ -941,6 +942,14 @@ static void build_state(int persp, int sprite, Batch *b) {
         if (g->tex_func & 0x10000) flags |= F_DBL;
         int linear = (g->tex_filter & 1) || ((g->tex_filter >> 8) & 1);
         if (!linear) flags |= F_NEAREST;
+        {
+            const char *setting = getenv("SR_GPU_PSP_SAMPLER");
+            if (!setting || !setting[0] || strcmp(setting, "0") != 0) {
+                flags |= F_PSP_SAMPLER;
+                if (g->tex_wrap & 1u) flags |= F_CLAMP_U;
+                if ((g->tex_wrap >> 8) & 1u) flags |= F_CLAMP_V;
+            }
+        }
         b->pc.texsize[0] = (float)g->tex_w;
         b->pc.texsize[1] = (float)g->tex_h;
     }

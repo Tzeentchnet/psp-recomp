@@ -19,6 +19,11 @@ static uint32_t clamp_scissor_end(int value, uint32_t limit) {
     return (uint32_t)value < limit ? (uint32_t)value + 1u : limit;
 }
 
+static bool psp_sampler_enabled(void) {
+    const char *setting = getenv("SR_GPU_PSP_SAMPLER");
+    return !setting || !setting[0] || strcmp(setting, "0") != 0;
+}
+
 static bool blend_factor_compatible(
     uint32_t factor, uint32_t fixed_color) {
     return factor <= 5u ||
@@ -99,6 +104,10 @@ void ged3d12_shader_constants_build(
         if (!(state->tex_filter & 1u) &&
             !((state->tex_filter >> 8) & 1u)) {
             flags |= GE_D3D12_SHADER_NEAREST;
+        }
+        if (psp_sampler_enabled() &&
+            (!texture || !texture->sampler.mip_enabled)) {
+            flags |= GE_D3D12_SHADER_PSP_SAMPLER;
         }
         if (texture &&
             (texture->flags &

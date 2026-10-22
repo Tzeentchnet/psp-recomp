@@ -18,7 +18,8 @@ layout(set = 0, binding = 0) uniform sampler2D u_tex;
 /* flags bits (pc.cfg.x >> 8): 1 textured, 2 texfunc-RGBA, 4 color-double, 8 fog,
  * 16 persp (apply minz/maxz), 32 clear mode, 64 nearest-filter (+0.5 texel shift),
  * 128 premultiply rgb by 2*alpha (PSP src blend factor DOUBLE_SRC_ALPHA with VK factor
- * ONE), 256 premultiply rgb by (1 - 2*alpha) (ONE_MINUS_DOUBLE_SRC_ALPHA). */
+ * ONE), 256 premultiply rgb by (1 - 2*alpha) (ONE_MINUS_DOUBLE_SRC_ALPHA),
+ * 512 PSP-quantized sampling, 1024 clamp U, 2048 clamp V. */
 layout(push_constant) uniform PC {
     ivec4 cfg;      /* x = texfunc | flags<<8, y = alpha test (func|ref<<8|mask<<16),
                        z = minz, w = maxz */
@@ -26,6 +27,44 @@ layout(push_constant) uniform PC {
     vec4  fogcol;   /* rgb = GE_FOGCOLOR / 255 */
     vec4  texsize;  /* xy = tex dimensions, zw = texel offset (render-target sub-rect) */
 } pc;
+
+int wrap_coordinate(int value, int size, bool clamp_value) {
+    if (clamp_value) return clamp(value, 0, size - 1);
+    int wrapped = value % size;
+    return wrapped < 0 ? wrapped + size : wrapped;
+}
+
+ivec4 texture_texel(ivec2 coordinate, int flags) {
+    ivec2 dimensions = max(ivec2(pc.texsize.xy), ivec2(1));
+    coordinate.x = wrap_coordinate(
+        coordinate.x, dimensions.x, (flags & 1024) != 0);
+    coordinate.y = wrap_coordinate(
+        coordinate.y, dimensions.y, (flags & 2048) != 0);
+    coordinate += ivec2(pc.texsize.zw);
+    return ivec4(texelFetch(u_tex, coordinate, 0) * 255.0 + 0.5);
+}
+
+ivec4 psp_lerp(ivec4 first, ivec4 second, int weight) {
+    return first + (((second - first) * weight) >> 8);
+}
+
+vec4 sample_texture_psp(vec2 uv, bool nearest, int flags) {
+    if (nearest) return vec4(texture_texel(ivec2(floor(uv)), flags));
+    vec2 position = uv - 0.5;
+    ivec2 base = ivec2(floor(position));
+    ivec2 weight = clamp(
+        ivec2((position - vec2(base)) * 256.0),
+        ivec2(0), ivec2(256));
+    ivec4 upper = psp_lerp(
+        texture_texel(base, flags),
+        texture_texel(base + ivec2(1, 0), flags),
+        weight.x);
+    ivec4 lower = psp_lerp(
+        texture_texel(base + ivec2(0, 1), flags),
+        texture_texel(base + ivec2(1, 1), flags),
+        weight.x);
+    return vec4(psp_lerp(upper, lower, weight.y));
+}
 
 void main() {
     int flags = pc.cfg.x >> 8;
@@ -46,8 +85,10 @@ void main() {
             float rw = max(abs(v_rw), 1e-20);
             vec2 uv = v_uv / rw;
             if ((flags & 64) != 0) uv += vec2(0.5);
-            uv += pc.texsize.zw;
-            vec4 t = texture(u_tex, uv / pc.texsize.xy) * 255.0;
+            vec2 shifted_uv = uv + pc.texsize.zw;
+            vec4 t = (flags & 512) != 0
+                ? sample_texture_psp(uv, (flags & 64) != 0, flags)
+                : texture(u_tex, shifted_uv / pc.texsize.xy) * 255.0;
             int  tf    = pc.cfg.x & 7;
             bool rgba  = (flags & 2) != 0;
             float dscl = ((flags & 4) != 0) ? 2.0 : 1.0;

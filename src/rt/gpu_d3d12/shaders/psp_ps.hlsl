@@ -124,6 +124,39 @@ int feedback_coordinate(int value, int size, bool clamp_value) {
     return wrapped < 0 ? wrapped + size : wrapped;
 }
 
+int4 psp_lerp(int4 first, int4 second, int weight) {
+    return first + (((second - first) * weight) >> 8);
+}
+
+int4 texture_texel(int2 coordinate) {
+    int2 dimensions = max((int2)texsize.xy, int2(1, 1));
+    uint clut_format = (uint)color_test_state.w;
+    coordinate.x = feedback_coordinate(
+        coordinate.x, dimensions.x, (clut_format & (1u << 30)) != 0);
+    coordinate.y = feedback_coordinate(
+        coordinate.y, dimensions.y, (clut_format & (1u << 31)) != 0);
+    coordinate += (int2)texsize.zw;
+    return (int4)(psp_texture.Load(int3(coordinate, 0)) * 255.0 + 0.5);
+}
+
+float4 sample_texture_psp(float2 uv, bool nearest) {
+    if (nearest) return (float4)texture_texel((int2)floor(uv));
+    float2 position = uv - 0.5;
+    int2 base = (int2)floor(position);
+    int2 weight = clamp(
+        (int2)((position - (float2)base) * 256.0),
+        int2(0, 0), int2(256, 256));
+    int4 upper = psp_lerp(
+        texture_texel(base),
+        texture_texel(base + int2(1, 0)),
+        weight.x);
+    int4 lower = psp_lerp(
+        texture_texel(base + int2(0, 1)),
+        texture_texel(base + int2(1, 1)),
+        weight.x);
+    return (float4)psp_lerp(upper, lower, weight.y);
+}
+
 float4 feedback_texel(int2 coordinate) {
     int2 dimensions = max((int2)texsize.xy, int2(1, 1));
     int render_scale = max((int)(texenv.w + 0.5), 1);
@@ -158,10 +191,24 @@ float4 feedback_texel(int2 coordinate) {
     return (float4)unpack_native(color, (int)format);
 }
 
-float4 sample_feedback(float2 uv, bool nearest) {
+float4 sample_feedback(float2 uv, bool nearest, bool psp_sampler) {
     if (nearest) return feedback_texel((int2)floor(uv));
     float2 position = uv - 0.5;
     int2 base = (int2)floor(position);
+    if (psp_sampler) {
+        int2 weight = clamp(
+            (int2)((position - (float2)base) * 256.0),
+            int2(0, 0), int2(256, 256));
+        int4 upper = psp_lerp(
+            (int4)feedback_texel(base),
+            (int4)feedback_texel(base + int2(1, 0)),
+            weight.x);
+        int4 lower = psp_lerp(
+            (int4)feedback_texel(base + int2(0, 1)),
+            (int4)feedback_texel(base + int2(1, 1)),
+            weight.x);
+        return (float4)psp_lerp(upper, lower, weight.y);
+    }
     float2 weight = position - (float2)base;
     float4 upper = lerp(
         feedback_texel(base),
@@ -287,13 +334,19 @@ int4 shade_source(
             float rw = max(abs(input.rw), 1e-20);
             float2 uv = input.uv / rw;
             if ((flags & 64) != 0) uv += float2(0.5, 0.5);
-            uv += texsize.zw;
+            float2 shifted_uv = uv + texsize.zw;
 
+            bool nearest = (flags & 64) != 0;
+            bool quantized_sampler = (flags & 32768) != 0;
             float4 texture_color =
                 (flags & 16384) != 0
-                    ? sample_feedback(uv, (flags & 64) != 0)
-                    : psp_texture.Sample(
-                          psp_sampler, uv / texsize.xy) * 255.0;
+                    ? sample_feedback(
+                          shifted_uv, nearest, quantized_sampler)
+                    : quantized_sampler
+                        ? sample_texture_psp(uv, nearest)
+                        : psp_texture.Sample(
+                              psp_sampler,
+                              shifted_uv / texsize.xy) * 255.0;
             int texture_function = cfg.x & 7;
             bool texture_rgba = (flags & 2) != 0;
             float color_scale = (flags & 4) != 0 ? 2.0 : 1.0;

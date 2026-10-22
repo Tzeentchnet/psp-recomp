@@ -254,6 +254,11 @@ Set these environment variables before running the game to control runtime featu
 - `SR_D3D12_FRAMEBUFFER_LOG=1`: Print persistent color/depth target allocation and cache statistics.
 - `SR_D3D12_FRAMEBUFFER_SAFE=1`: Read cached color targets back after presentation to validate GPU/CPU ownership.
 - `SR_D3D12_SCALE=1` through `8`: Override `graphics.ini` for one process.
+- `SR_GPU_PSP_SAMPLER=0`: Disable the default PSP-quantized nearest/bilinear
+  shader path and use host hardware filtering for A/B diagnostics.
+  Non-mipmapped GPU textures otherwise use the software renderer's 8-bit
+  bilinear weights, truncation order, and explicit wrap/clamp coordinates on
+  both D3D12 and Vulkan.
 - `SR_D3D12_VRS=0`: Disable coarse shading for direct scaled draws. This keeps
   every fragment at the selected internal resolution at a substantial cost.
 - `SR_D3D12_STAGE_LOG=1`: Report 120-frame CPU averages for fence/begin,

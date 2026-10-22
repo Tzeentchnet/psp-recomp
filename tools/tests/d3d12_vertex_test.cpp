@@ -274,7 +274,18 @@ static void test_shader_constants(void) {
         GE_D3D12_SHADER_NEAREST |
         GE_D3D12_SHADER_COLOR_TEST |
         GE_D3D12_SHADER_DITHER |
-        GE_D3D12_SHADER_STENCIL);
+        GE_D3D12_SHADER_STENCIL |
+        GE_D3D12_SHADER_PSP_SAMPLER);
+    _putenv_s("SR_GPU_PSP_SAMPLER", "0");
+    GeD3D12ShaderConstants hardware_sampler_constants = {};
+    ged3d12_shader_constants_build(
+        &state, 1, 0, 1, &texture, &hardware_sampler_constants);
+    check_u32(
+        "hardware sampler override",
+        ((uint32_t)hardware_sampler_constants.config[0] >> 8) &
+            GE_D3D12_SHADER_PSP_SAMPLER,
+        0);
+    _putenv_s("SR_GPU_PSP_SAMPLER", "");
     check_u32(
         "shader alpha test", (uint32_t)constants.config[1],
         state.atest);
