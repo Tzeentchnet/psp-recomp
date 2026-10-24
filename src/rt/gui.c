@@ -316,7 +316,7 @@ int gui_init(const char *title) {
             return 0;
         }
         result = sr_input_settings_show(
-            SR_GAME_TITLE " Controller");
+            SR_GAME_TITLE " Controller", 1);
         if (result <= 0) {
             if (!result)
                 fprintf(

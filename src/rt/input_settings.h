@@ -5,7 +5,14 @@
 extern "C" {
 #endif
 
-int sr_input_settings_show(const char *title);
+enum {
+    SR_INPUT_SETTINGS_ERROR = -1,
+    SR_INPUT_SETTINGS_CLOSED = 0,
+    SR_INPUT_SETTINGS_SAVED = 1,
+    SR_INPUT_SETTINGS_LAUNCH = 2,
+};
+
+int sr_input_settings_show(const char *title, int allow_launch);
 
 #ifdef __cplusplus
 }

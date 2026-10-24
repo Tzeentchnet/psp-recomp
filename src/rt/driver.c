@@ -31,6 +31,10 @@
 #ifndef SR_BOOT_NEXT_UID
 #define SR_BOOT_NEXT_UID 0x11cu
 #endif
+#if defined(SR_CONFIG_BOOT_IMAGE) && \
+    (!defined(SR_CONFIG_BOOT_BASE) || !defined(SR_CONFIG_BOOT_ENTRY))
+#error SR_CONFIG_BOOT_IMAGE requires SR_CONFIG_BOOT_BASE and SR_CONFIG_BOOT_ENTRY
+#endif
 
 void sr_register_all(void);
 #ifdef SR_MODULE_POLICY_INIT
@@ -149,11 +153,37 @@ static void seed_from_init(const char *trace_path, CpuState *s) {
     if (mem_lines) fprintf(stderr, "seed: %d memory lines from %s\n", mem_lines, trace_path);
 }
 
+#ifdef SR_CONFIG_BOOT_IMAGE
+static int executable_sibling_path(
+    const char *name, char *path, size_t path_size) {
+    DWORD length;
+    char *slash;
+    char *forward_slash;
+    size_t prefix_length;
+    size_t name_length;
+
+    if (!path_size || path_size > MAXDWORD) return 0;
+    length = GetModuleFileNameA(NULL, path, (DWORD)path_size);
+    if (!length || length >= path_size) return 0;
+    slash = strrchr(path, '\\');
+    forward_slash = strrchr(path, '/');
+    if (!slash || (forward_slash && forward_slash > slash))
+        slash = forward_slash;
+    if (!slash) return 0;
+    prefix_length = (size_t)(slash - path) + 1;
+    name_length = strlen(name);
+    if (prefix_length + name_length >= path_size) return 0;
+    memcpy(path + prefix_length, name, name_length + 1);
+    return 1;
+}
+#endif
+
 int main(int argc, char **argv) {
     uint32_t entry;
     uint32_t boot_arglen = 0, boot_argp = 0;
     const char *ref_trace = NULL, *out;
     int standalone = 0;
+    int launch_from_config = 0;
 
     SetUnhandledExceptionFilter(sr_crash_filter);
 
@@ -162,7 +192,7 @@ int main(int argc, char **argv) {
             int result;
             if (!sr_input_init()) return 2;
             result = sr_input_settings_show(
-                SR_GAME_TITLE " Controller");
+                SR_GAME_TITLE " Controller", 0);
             return result < 0 ? 2 : 0;
         }
         if (strcmp(argv[i], "--configure") == 0) {
@@ -172,8 +202,49 @@ int main(int argc, char **argv) {
                 SR_GAME_TITLE " Graphics");
             if (result <= 0) return result < 0 ? 2 : 0;
             result = sr_input_settings_show(
-                SR_GAME_TITLE " Controller");
-            return result < 0 ? 2 : 0;
+                SR_GAME_TITLE " Controller", 1);
+            if (result < 0) return 2;
+            if (result != SR_INPUT_SETTINGS_LAUNCH) return 0;
+#ifdef SR_CONFIG_BOOT_IMAGE
+            char image_path[MAX_PATH];
+            long len;
+            uint8_t *img;
+            if (!executable_sibling_path(
+                    SR_CONFIG_BOOT_IMAGE,
+                    image_path,
+                    sizeof(image_path))) {
+                MessageBoxA(
+                    NULL,
+                    "Cannot locate the game image beside the executable.",
+                    "Cannot Launch Game",
+                    MB_OK | MB_ICONERROR);
+                return 2;
+            }
+            if (!sr_startup_validate()) {
+                MessageBoxA(
+                    NULL,
+                    "The supported game ISO could not be validated. "
+                    "Set PSP_ISO to your disc image and try again.",
+                    "Cannot Launch Game",
+                    MB_OK | MB_ICONERROR);
+                return 2;
+            }
+            img = read_file(image_path, &len);
+            entry = SR_CONFIG_BOOT_ENTRY;
+            out = "none";
+            standalone = 1;
+            launch_from_config = 1;
+            sr_mem_init();
+            sr_load_segment(SR_CONFIG_BOOT_BASE, img, (uint32_t)len);
+            goto have_image;
+#else
+            MessageBoxA(
+                NULL,
+                "This build does not define a game image for the launcher.",
+                "Cannot Launch Game",
+                MB_OK | MB_ICONERROR);
+            return 2;
+#endif
         }
     }
 
@@ -270,6 +341,10 @@ have_image:;
     if (use_sched && entry == SR_BOOT_UID_GAP_ENTRY)
         sr_set_boot_uid_gap(SR_BOOT_UID_GAP_COUNT);
 #endif
+    if (launch_from_config) {
+        if (!gui_init(SR_GAME_TITLE)) return 2;
+        use_sched = 1;
+    }
     for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--gui") == 0) {
         if (!gui_init(SR_GAME_TITLE)) return 2;
         use_sched = 1;

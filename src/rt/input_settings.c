@@ -17,6 +17,7 @@
 #define IDC_TWIN_STICK 1200
 #define IDC_AIM_INVERT_X 1201
 #define IDC_AIM_INVERT_Y 1202
+#define IDC_LAUNCH_GAME 1203
 #define IDC_GAMEPAD_BINDING_BASE 1300
 
 #if SR_ENABLE_KZL_TWIN_STICK
@@ -36,6 +37,7 @@
 typedef struct InputDialogContext {
     SrInputConfig config;
     const char *title;
+    int allow_launch;
 } InputDialogContext;
 
 #pragma pack(push, 2)
@@ -231,11 +233,21 @@ static INT_PTR CALLBACK input_dialog_proc(
         add_control(
             dialog, 0, "BUTTON", "Save",
             WS_TABSTOP | BS_DEFPUSHBUTTON,
-            414, INPUT_DIALOG_BUTTON_Y, 80, 27, IDOK);
+            context->allow_launch ? 274 : 414,
+            INPUT_DIALOG_BUTTON_Y, 80, 27, IDOK);
+        if (context->allow_launch) {
+            add_control(
+                dialog, 0, "BUTTON", "Save && Launch Game",
+                WS_TABSTOP | BS_PUSHBUTTON,
+                364, INPUT_DIALOG_BUTTON_Y, 140, 27,
+                IDC_LAUNCH_GAME);
+        }
         add_control(
             dialog, 0, "BUTTON", "Close",
             WS_TABSTOP | BS_PUSHBUTTON,
-            504, INPUT_DIALOG_BUTTON_Y, 80, 27, IDCANCEL);
+            context->allow_launch ? 514 : 504,
+            INPUT_DIALOG_BUTTON_Y,
+            context->allow_launch ? 70 : 80, 27, IDCANCEL);
         center_dialog(dialog);
         return TRUE;
     }
@@ -267,7 +279,8 @@ static INT_PTR CALLBACK input_dialog_proc(
             return TRUE;
         }
 #endif
-        if (command == IDOK) {
+        if (command == IDOK ||
+            (command == IDC_LAUNCH_GAME && context->allow_launch)) {
             SrInputConfig parsed = context->config;
             char settings[4096];
             char value[128];
@@ -338,6 +351,8 @@ static INT_PTR CALLBACK input_dialog_proc(
                 return TRUE;
             }
             context->config = parsed;
+            if (command == IDC_LAUNCH_GAME)
+                EndDialog(dialog, IDC_LAUNCH_GAME);
             return TRUE;
         }
         if (command == IDCANCEL) {
@@ -352,7 +367,7 @@ static INT_PTR CALLBACK input_dialog_proc(
     return FALSE;
 }
 
-int sr_input_settings_show(const char *title) {
+int sr_input_settings_show(const char *title, int allow_launch) {
     const SrInputConfig *current = sr_input_config_get();
     InputDialogContext context;
     EmptyDialogTemplate dialog_template;
@@ -366,6 +381,7 @@ int sr_input_settings_show(const char *title) {
     }
     context.config = *current;
     context.title = title;
+    context.allow_launch = allow_launch;
     memset(&dialog_template, 0, sizeof(dialog_template));
     dialog_template.dialog.style =
         WS_POPUP | WS_CAPTION | WS_SYSMENU |
@@ -385,5 +401,8 @@ int sr_input_settings_show(const char *title) {
             (unsigned long)GetLastError());
         return -1;
     }
-    return result == IDOK ? 1 : 0;
+    if (result == IDC_LAUNCH_GAME) return SR_INPUT_SETTINGS_LAUNCH;
+    return result == IDOK
+        ? SR_INPUT_SETTINGS_SAVED
+        : SR_INPUT_SETTINGS_CLOSED;
 }
