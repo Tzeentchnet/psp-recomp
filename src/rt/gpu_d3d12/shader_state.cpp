@@ -90,6 +90,10 @@ void ged3d12_shader_constants_build(
     bool clear = state->clear != 0;
     bool textured =
         state->tex_enable && !clear && state->tex_addr != 0;
+    bool framebuffer_texture =
+        texture &&
+        texture->framebuffer.handle !=
+            GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
     if (clear) flags |= GE_D3D12_SHADER_CLEAR;
     if (perspective && !(clear && sprite_semantics))
         flags |= GE_D3D12_SHADER_DEPTH_RANGE;
@@ -115,6 +119,9 @@ void ged3d12_shader_constants_build(
             (texture->flags &
              GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT) != 0) {
             flags |= GE_D3D12_SHADER_FRAMEBUFFER_CLUT;
+        }
+        if (framebuffer_texture) {
+            flags |= GE_D3D12_SHADER_FRAMEBUFFER;
         }
     }
     if (!clear && state->color_test_enable)
@@ -145,9 +152,7 @@ void ged3d12_shader_constants_build(
         state->tex_w > 0 ? (float)state->tex_w : 1.0f;
     out->texture_size[1] =
         state->tex_h > 0 ? (float)state->tex_h : 1.0f;
-    if (texture &&
-        texture->framebuffer.handle !=
-            GE_D3D12_FRAMEBUFFER_HANDLE_NONE) {
+    if (framebuffer_texture) {
         out->texture_size[2] = (float)texture->framebuffer.x;
         out->texture_size[3] = (float)texture->framebuffer.y;
     }

@@ -291,7 +291,23 @@ static void test_shader_constants(void) {
         GE_D3D12_SHADER_COLOR_TEST |
         GE_D3D12_SHADER_DITHER |
         GE_D3D12_SHADER_STENCIL |
-        GE_D3D12_SHADER_PSP_SAMPLER);
+        GE_D3D12_SHADER_PSP_SAMPLER |
+        GE_D3D12_SHADER_FRAMEBUFFER);
+    check_u32(
+        "framebuffer texture shader flag",
+        flags & GE_D3D12_SHADER_FRAMEBUFFER,
+        GE_D3D12_SHADER_FRAMEBUFFER);
+    GeD3D12TextureBinding decoded_texture = texture;
+    decoded_texture.framebuffer.handle =
+        GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
+    GeD3D12ShaderConstants decoded_constants = {};
+    ged3d12_shader_constants_build(
+        &state, 1, 0, 1, &decoded_texture, &decoded_constants);
+    check_u32(
+        "decoded texture framebuffer flag",
+        ((uint32_t)decoded_constants.config[0] >> 8) &
+            GE_D3D12_SHADER_FRAMEBUFFER,
+        0);
     _putenv_s("SR_GPU_PSP_SAMPLER", "0");
     GeD3D12ShaderConstants hardware_sampler_constants = {};
     ged3d12_shader_constants_build(
@@ -366,9 +382,28 @@ static void test_shader_constants(void) {
     s_render_scale = 4;
     ged3d12_shader_constants_build(
         &state, 1, 0, 1, &texture, &constants);
+    uint32_t scaled_flags =
+        (uint32_t)constants.config[0] >> 8;
     check_float(
         "scaled shader render scale",
         constants.texture_environment[3], 4.0f);
+    check_u32(
+        "scaled framebuffer PSP sampler",
+        scaled_flags & GE_D3D12_SHADER_PSP_SAMPLER,
+        GE_D3D12_SHADER_PSP_SAMPLER);
+    check_u32(
+        "scaled framebuffer shader flag",
+        scaled_flags & GE_D3D12_SHADER_FRAMEBUFFER,
+        GE_D3D12_SHADER_FRAMEBUFFER);
+    GeD3D12ShaderConstants scaled_decoded_constants = {};
+    ged3d12_shader_constants_build(
+        &state, 1, 0, 1,
+        &decoded_texture, &scaled_decoded_constants);
+    check_u32(
+        "scaled decoded texture PSP sampler",
+        ((uint32_t)scaled_decoded_constants.config[0] >> 8) &
+            GE_D3D12_SHADER_PSP_SAMPLER,
+        GE_D3D12_SHADER_PSP_SAMPLER);
     check_u32(
         "scaled shader scissor left",
         (uint32_t)constants.scissor[0], 12);
