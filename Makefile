@@ -35,6 +35,8 @@ RT_D3D12_PRESENT_LAYOUT_O := $(BUILD_DIR)/gpu_d3d12_present_layout.o
 RT_D3D12_SHADER_STATE_O := $(BUILD_DIR)/gpu_d3d12_shader_state.o
 RT_D3D12_TEXTURE_O := $(BUILD_DIR)/gpu_d3d12_texture.o
 RT_D3D12_TEXTURE_KEY_O := $(BUILD_DIR)/gpu_d3d12_texture_key.o
+RT_TEXTURE_SCALER_O := $(BUILD_DIR)/texture_scaler.o
+RT_XBRZ_O := $(BUILD_DIR)/xbrz.o
 RT_SRCS    := src/rt/recomp.c \
               src/rt/dispatch_table.c \
               src/rt/fpu_mode.c \
@@ -87,7 +89,7 @@ DXC        ?= dxc
 .PHONY: all pipeline compile clean run shaders-d3d12 check-shaders-d3d12 \
         test-d3d12-vertex test-dispatch-table test-fps-counter \
         test-input-config test-module-loader test-memstick-state \
-        test-interpreter test-runtime
+        test-interpreter test-texture-scaler test-runtime
 
 all: pipeline compile
 
@@ -127,6 +129,7 @@ $(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h \
                src/rt/gpu_d3d12/framebuffer.h \
                src/rt/gpu_d3d12/vertex.h \
                src/rt/gpu_d3d12/texture.h \
+               src/rt/graphics_config.h \
                src/rt/gpu_d3d12/shaders/psp_vs.inc src/rt/gpu_d3d12/shaders/psp_ps.inc \
                src/rt/gpu_d3d12/shaders/psp_ps_direct.inc \
                src/rt/ge_shared.h src/rt/recomp.h
@@ -187,6 +190,7 @@ $(RT_D3D12_TEXTURE_O): src/rt/gpu_d3d12/texture.cpp \
                        src/rt/gpu_d3d12/texture.h \
                        src/rt/gpu_d3d12/framebuffer.h \
                        src/rt/gpu_d3d12/device.h \
+                       src/rt/graphics_config.h src/rt/texture_scaler.h \
                        src/rt/ge_shared.h src/rt/recomp.h
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/texture.cpp -o $@
@@ -195,6 +199,16 @@ $(RT_D3D12_TEXTURE_KEY_O): src/rt/gpu_d3d12/texture_key.cpp \
                            src/rt/gpu_d3d12/texture.h src/rt/ge_shared.h
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/texture_key.cpp -o $@
+
+$(RT_TEXTURE_SCALER_O): src/rt/texture_scaler.cpp src/rt/texture_scaler.h \
+                        third_party/xbrz/xbrz.h third_party/xbrz/config.h
+	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
+	$(CXX) $(CXXFLAGS) -c src/rt/texture_scaler.cpp -o $@
+
+$(RT_XBRZ_O): third_party/xbrz/xbrz.cpp third_party/xbrz/xbrz.h \
+              third_party/xbrz/config.h
+	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
+	$(CXX) $(CXXFLAGS) -c third_party/xbrz/xbrz.cpp -o $@
 
 $(BUILD_DIR)/d3d12_vertex_test.exe: tools/tests/d3d12_vertex_test.cpp \
                                    src/rt/gpu_d3d12/vertex.cpp \
@@ -282,8 +296,16 @@ test-interpreter:
 		build/tests/interp_ref.o -lm
 	./build/tests/interp_fallback_test.exe
 
+test-texture-scaler:
+	@$(PYTHON) -c "from pathlib import Path; Path(r'build/tests').mkdir(parents=True, exist_ok=True)"
+	$(CXX) -std=c++17 -O2 -Isrc/rt \
+		tools/tests/texture_scaler_test.cpp src/rt/texture_scaler.cpp \
+		third_party/xbrz/xbrz.cpp -o build/tests/texture_scaler_test.exe
+	./build/tests/texture_scaler_test.exe
+
 test-runtime: test-dispatch-table test-fps-counter test-input-config \
-	test-module-loader test-memstick-state test-interpreter
+	test-module-loader test-memstick-state test-interpreter \
+	test-texture-scaler
 
 # Generated C code gets huge. Cache the compiled object to avoid rebuilding it on runtime changes.
 $(BUILD_DIR)/$(GAME_NAME)_recomp.o: $(BUILD_DIR)/$(GAME_NAME)_recomp.c src/rt/recomp.h
@@ -294,7 +316,8 @@ compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_AUDIO_XAUDIO2_O) $(R
          $(RT_D3D12_VERTEX_O) $(RT_D3D12_PIPELINE_O) $(RT_D3D12_PIPELINE_KEY_O) \
          $(RT_D3D12_PRESENT_O) $(RT_D3D12_PRESENT_LAYOUT_O) \
          $(RT_D3D12_SHADER_STATE_O) \
-         $(RT_D3D12_TEXTURE_O) $(RT_D3D12_TEXTURE_KEY_O) $(AT3_OBJS)
+         $(RT_D3D12_TEXTURE_O) $(RT_D3D12_TEXTURE_KEY_O) \
+         $(RT_TEXTURE_SCALER_O) $(RT_XBRZ_O) $(AT3_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(GAME_NAME).exe \
 		$(BUILD_DIR)/$(GAME_NAME)_recomp.o \
 		$(RT_GE_O) \
@@ -310,6 +333,8 @@ compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_AUDIO_XAUDIO2_O) $(R
 		$(RT_D3D12_SHADER_STATE_O) \
 		$(RT_D3D12_TEXTURE_O) \
 		$(RT_D3D12_TEXTURE_KEY_O) \
+		$(RT_TEXTURE_SCALER_O) \
+		$(RT_XBRZ_O) \
 		$(AT3_OBJS) \
 		$(RT_SRCS) \
 		$(LIBS) -lstdc++ -lm

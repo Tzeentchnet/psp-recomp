@@ -1088,7 +1088,7 @@ static void test_storage_growth(void) {
                      1, 2, 3, 4);
     GeVtx b = a;
     GeVtx c = a;
-    for (uint32_t i = 0; i < 3000; i++) {
+    for (uint32_t i = 0; i < 80001; i++) {
         s_debug_context.draw_serial = i;
         ged3d12_vertex_capture_tri(&a, &b, &c, 1);
     }
@@ -1098,9 +1098,10 @@ static void test_storage_growth(void) {
         fail("grown storage upload failed");
         return;
     }
-    check_u32("grown vertex count", frame.vertex_count, 9000);
-    check_u32("grown batch count", frame.batch_count, 3000);
-    check_u32("grown upload size", frame.buffer.SizeInBytes, 9000 * 32);
+    check_u32("grown vertex count", frame.vertex_count, 240003);
+    check_u32("grown batch count", frame.batch_count, 80001);
+    check_u32(
+        "grown upload size", frame.buffer.SizeInBytes, 240003 * 32);
 }
 
 int main(void) {

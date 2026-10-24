@@ -38,6 +38,8 @@
  */
 #include "ge_gpu.h"
 #include "sdl3vk.h"
+#include "../graphics_config.h"
+#include "../texture_scaler.h"
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "../recomp.h"
@@ -182,6 +184,8 @@ static unsigned long s_cnt_readback = 0, s_cnt_upload = 0, s_cnt_dirty = 0;
 static unsigned long s_cnt_snap = 0, s_cnt_texup = 0, s_cnt_xferblit = 0;
 
 static uint32_t s_texscratch[512 * 512];
+static uint32_t *s_texscaled;
+static uint32_t s_texture_scale = 1u;
 static uint32_t s_pxscratch[FB_W * FB_H];
 
 #define VKC(expr) do { VkResult vr_ = (expr); if (vr_ != VK_SUCCESS) { \
@@ -745,6 +749,18 @@ static int tex_upload(VkImage img, const uint32_t *px, int w, int h) {
     return cmd_submit_wait();
 }
 
+static const uint32_t *tex_decode_scaled(int w, int h) {
+    ge_decode_tex_rgba(s_texscratch);
+    if (s_texture_scale == 1u) return s_texscratch;
+    if (!s_texscaled || !sr_texture_scale_rgba(
+            s_texscratch, (uint32_t)w, (uint32_t)h,
+            s_texture_scale, s_texscaled)) {
+        fprintf(stderr, "gegpu: xBRZ texture scaling failed\n");
+        return NULL;
+    }
+    return s_texscaled;
+}
+
 static int tex_make(const uint32_t *px, int w, int h, int linear, int clamp_u, int clamp_v,
                     VkImage *img, VkDeviceMemory *mem, VkImageView *view, VkSampler *smp) {
     if (!make_image((uint32_t)w, (uint32_t)h, VK_FORMAT_R8G8B8A8_UNORM,
@@ -783,8 +799,9 @@ static VkDescriptorSet tex_get(void) {
         if (e->hash == hash) { e->pending = 1; return e->set; }
         /* same texture state, new contents: update in place (cache stays bounded) */
         if (e->pending) submit_pending();
-        ge_decode_tex_rgba(s_texscratch);
-        if (!tex_upload(e->img, s_texscratch, e->w, e->h)) return s_white_set;
+        const uint32_t *pixels = tex_decode_scaled(w, h);
+        if (!pixels || !tex_upload(e->img, pixels, e->w, e->h))
+            return s_white_set;
         e->hash = hash;
         e->pending = 1;
         s_cnt_texup++;
@@ -795,15 +812,19 @@ static VkDescriptorSet tex_get(void) {
         submit_pending();   /* batches reference sets about to be freed */
         tex_evict_lru();
     }
-    ge_decode_tex_rgba(s_texscratch);
+    const uint32_t *pixels = tex_decode_scaled(w, h);
+    if (!pixels) return s_white_set;
     TexEnt *e = &s_tex[s_tex_n];
     memset(e, 0, sizeof(*e));
-    if (!tex_make(s_texscratch, w, h, linear, clamp_u, clamp_v, &e->img, &e->mem, &e->view, &e->smp))
+    int scaled_w = w * (int)s_texture_scale;
+    int scaled_h = h * (int)s_texture_scale;
+    if (!tex_make(pixels, scaled_w, scaled_h, linear, clamp_u, clamp_v,
+                  &e->img, &e->mem, &e->view, &e->smp))
         return s_white_set;
     e->set = make_descriptor(e->view, e->smp, s_dpool_tex);
     if (!e->set) return s_white_set;
     e->key = key; e->hash = hash;
-    e->w = w; e->h = h;
+    e->w = scaled_w; e->h = scaled_h;
     e->pending = 1;
     e->lru = s_texlru++;
     s_cnt_texup++;
@@ -944,7 +965,8 @@ static void build_state(int persp, int sprite, Batch *b) {
         if (!linear) flags |= F_NEAREST;
         {
             const char *setting = getenv("SR_GPU_PSP_SAMPLER");
-            if (!setting || !setting[0] || strcmp(setting, "0") != 0) {
+            if (s_texture_scale == 1u &&
+                (!setting || !setting[0] || strcmp(setting, "0") != 0)) {
                 flags |= F_PSP_SAMPLER;
                 if (g->tex_wrap & 1u) flags |= F_CLAMP_U;
                 if ((g->tex_wrap >> 8) & 1u) flags |= F_CLAMP_V;
@@ -1445,6 +1467,26 @@ static int gegpu_init(void) {
         const char *lg = getenv("SR_GPU_LOG");
         s_log = (lg && lg[0] && strcmp(lg, "0") != 0) ? 1 : 0;
     }
+    {
+        const SrGraphicsConfig *config = sr_graphics_config_get();
+        uint64_t pixels;
+        s_texture_scale = config ? config->texture_scale : 1u;
+        pixels =
+            (uint64_t)512u * 512u *
+            s_texture_scale * s_texture_scale;
+        if (pixels > SIZE_MAX / sizeof(uint32_t)) {
+            fprintf(stderr, "gegpu: texture scaler allocation is too large\n");
+            return 0;
+        }
+        if (s_texture_scale > 1u) {
+            s_texscaled = (uint32_t *)malloc(
+                (size_t)pixels * sizeof(uint32_t));
+            if (!s_texscaled) {
+                fprintf(stderr, "gegpu: cannot allocate texture scaler buffer\n");
+                return 0;
+            }
+        }
+    }
 
     VkCommandPoolCreateInfo cpi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1483,7 +1525,10 @@ static int gegpu_init(void) {
 
     if (!make_buffer(MAX_VERTS * sizeof(GpuVert), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                      &s_vbuf, &s_vbuf_m, (void **)&s_vmap)) return 0;
-    if (!make_buffer(1u << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    if (!make_buffer(
+            (VkDeviceSize)512u * 512u * 4u *
+                s_texture_scale * s_texture_scale,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      &s_xfer, &s_xfer_m, &s_xfer_map)) return 0;
 
     VkDescriptorSetLayoutBinding db = {0};
@@ -1550,7 +1595,11 @@ static int gegpu_init(void) {
     s_ready = 1;
     sr_gpu_vram_watch_reads(1);
     sr_gpu_vram_watch_writes(1);
-    fprintf(stderr, "gegpu: full GPU GE active (persistent targets, no software fallback)\n");
+    fprintf(
+        stderr,
+        "gegpu: full GPU GE active (persistent targets, no software fallback, "
+        "xBRZ scale %ux)\n",
+        s_texture_scale);
     return 1;
 }
 
@@ -1561,5 +1610,8 @@ static void gegpu_shutdown(void) {
     sr_gpu_vram_watch_reads(0);
     sr_gpu_vram_watch_writes(0);
     vkDeviceWaitIdle(s_dev);
+    free(s_texscaled);
+    s_texscaled = NULL;
+    s_texture_scale = 1u;
     /* process exit follows immediately; Vulkan objects die with the device */
 }

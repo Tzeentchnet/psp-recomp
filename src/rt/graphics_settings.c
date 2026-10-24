@@ -11,6 +11,8 @@
 
 #define IDC_RENDERER 1001
 #define IDC_RESOLUTION 1002
+#define IDC_TEXTURE_SCALE 1003
+#define IDC_D3D12_SHADING 1004
 
 typedef struct GraphicsDialogContext {
     SrGraphicsConfig config;
@@ -76,8 +78,12 @@ static INT_PTR CALLBACK graphics_dialog_proc(
     if (message == WM_INITDIALOG) {
         HWND renderer;
         HWND resolution;
+        HWND texture_scale;
+        HWND d3d12_shading;
         int selected_renderer = 0;
         int selected_resolution = 0;
+        int selected_texture_scale = 0;
+        int selected_d3d12_shading = 0;
         char label[64];
 
         context = (GraphicsDialogContext *)lparam;
@@ -140,17 +146,58 @@ static INT_PTR CALLBACK graphics_dialog_proc(
             (WPARAM)selected_resolution, 0);
 
         add_control(
+            dialog, 0, "STATIC", "Texture upscaling:", 0,
+            16, 93, 112, 20, 0);
+        texture_scale = add_control(
+            dialog, WS_EX_CLIENTEDGE, "COMBOBOX", "",
+            WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            132, 89, 210, 150, IDC_TEXTURE_SCALE);
+        add_combo_item(
+            texture_scale, "Off (native textures)", 1,
+            &selected_texture_scale, (int)context->config.texture_scale);
+        for (int scale = 2; scale <= 5; scale++) {
+            snprintf(label, sizeof(label), "%dx xBRZ", scale);
+            add_combo_item(
+                texture_scale, label, scale,
+                &selected_texture_scale,
+                (int)context->config.texture_scale);
+        }
+        SendMessage(
+            texture_scale, CB_SETCURSEL,
+            (WPARAM)selected_texture_scale, 0);
+
+        add_control(
+            dialog, 0, "STATIC", "D3D12 shading:", 0,
+            16, 131, 112, 20, 0);
+        d3d12_shading = add_control(
+            dialog, WS_EX_CLIENTEDGE, "COMBOBOX", "",
+            WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            132, 127, 210, 100, IDC_D3D12_SHADING);
+        add_combo_item(
+            d3d12_shading, "Balanced (variable rate)", 0,
+            &selected_d3d12_shading,
+            (int)context->config.d3d12_full_rate);
+        add_combo_item(
+            d3d12_shading, "Full resolution (best quality)", 1,
+            &selected_d3d12_shading,
+            (int)context->config.d3d12_full_rate);
+        SendMessage(
+            d3d12_shading, CB_SETCURSEL,
+            (WPARAM)selected_d3d12_shading, 0);
+
+        add_control(
             dialog, 0, "STATIC",
-            "Higher resolutions improve geometry and edge quality but use more GPU memory.",
-            0, 16, 88, 326, 34, 0);
+            "Internal resolution improves geometry and edges. xBRZ improves game textures "
+            "on hardware renderers. Both options increase GPU memory use.",
+            0, 16, 164, 326, 44, 0);
         add_control(
             dialog, 0, "BUTTON", "Save",
             WS_TABSTOP | BS_DEFPUSHBUTTON,
-            176, 128, 80, 27, IDOK);
+            176, 214, 80, 27, IDOK);
         add_control(
             dialog, 0, "BUTTON", "Cancel",
             WS_TABSTOP | BS_PUSHBUTTON,
-            262, 128, 80, 27, IDCANCEL);
+            262, 214, 80, 27, IDCANCEL);
         center_dialog(dialog);
         return TRUE;
     }
@@ -159,15 +206,24 @@ static INT_PTR CALLBACK graphics_dialog_proc(
         if (command == IDOK) {
             HWND renderer = GetDlgItem(dialog, IDC_RENDERER);
             HWND resolution = GetDlgItem(dialog, IDC_RESOLUTION);
+            HWND texture_scale = GetDlgItem(dialog, IDC_TEXTURE_SCALE);
+            HWND d3d12_shading =
+                GetDlgItem(dialog, IDC_D3D12_SHADING);
             LRESULT renderer_index =
                 SendMessage(renderer, CB_GETCURSEL, 0, 0);
             LRESULT resolution_index =
                 SendMessage(resolution, CB_GETCURSEL, 0, 0);
+            LRESULT texture_scale_index =
+                SendMessage(texture_scale, CB_GETCURSEL, 0, 0);
+            LRESULT d3d12_shading_index =
+                SendMessage(d3d12_shading, CB_GETCURSEL, 0, 0);
             char error[512];
             if (renderer_index == CB_ERR ||
-                resolution_index == CB_ERR) {
+                resolution_index == CB_ERR ||
+                texture_scale_index == CB_ERR ||
+                d3d12_shading_index == CB_ERR) {
                 MessageBoxA(
-                    dialog, "Select both graphics options.",
+                    dialog, "Select all graphics options.",
                     "Graphics Settings", MB_OK | MB_ICONERROR);
                 return TRUE;
             }
@@ -178,6 +234,14 @@ static INT_PTR CALLBACK graphics_dialog_proc(
                 (uint32_t)SendMessage(
                     resolution, CB_GETITEMDATA,
                     (WPARAM)resolution_index, 0);
+            context->config.texture_scale =
+                (uint32_t)SendMessage(
+                    texture_scale, CB_GETITEMDATA,
+                    (WPARAM)texture_scale_index, 0);
+            context->config.d3d12_full_rate =
+                (uint32_t)SendMessage(
+                    d3d12_shading, CB_GETITEMDATA,
+                    (WPARAM)d3d12_shading_index, 0);
             if (!sr_graphics_config_save(
                     &context->config, error, sizeof(error))) {
                 MessageBoxA(
@@ -216,7 +280,7 @@ int sr_graphics_settings_show(const char *title) {
     dialog_template.dialog.style =
         WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER;
     dialog_template.dialog.cx = 236;
-    dialog_template.dialog.cy = 112;
+    dialog_template.dialog.cy = 170;
     result = DialogBoxIndirectParamW(
         GetModuleHandleW(NULL), &dialog_template.dialog, NULL,
         graphics_dialog_proc, (LPARAM)&context);

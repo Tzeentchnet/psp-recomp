@@ -10,6 +10,8 @@ extern "C" {
 
 #define SR_GRAPHICS_SCALE_MIN 1u
 #define SR_GRAPHICS_SCALE_MAX 8u
+#define SR_TEXTURE_SCALE_MIN 1u
+#define SR_TEXTURE_SCALE_MAX 5u
 
 enum SrGraphicsRenderer {
     SR_GRAPHICS_RENDERER_AUTO,
@@ -21,6 +23,8 @@ enum SrGraphicsRenderer {
 typedef struct SrGraphicsConfig {
     int renderer;
     uint32_t internal_resolution;
+    uint32_t texture_scale;
+    uint32_t d3d12_full_rate;
 } SrGraphicsConfig;
 
 void sr_graphics_config_defaults(SrGraphicsConfig *config);

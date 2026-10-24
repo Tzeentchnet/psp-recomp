@@ -269,6 +269,16 @@ void sdl3vk_set_title(const char *title) {
 
 /* ---- input -------------------------------------------------------------------------- */
 
+static void toggle_fullscreen(void) {
+    int fullscreen =
+        (SDL_GetWindowFlags(s_win) & SDL_WINDOW_FULLSCREEN) != 0;
+    if (!SDL_SetWindowFullscreen(s_win, !fullscreen)) {
+        fprintf(
+            stderr, "sdl3vk: fullscreen toggle failed: %s\n",
+            SDL_GetError());
+    }
+}
+
 static void poll_input(int *quit) {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
@@ -276,6 +286,8 @@ static void poll_input(int *quit) {
         case SDL_EVENT_QUIT: *quit = 1; break;
         case SDL_EVENT_KEY_DOWN:
             if (ev.key.key == SDLK_ESCAPE) *quit = 1;
+            if (ev.key.key == SDLK_F11 && !ev.key.repeat)
+                toggle_fullscreen();
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
             if (!s_pad) s_pad = SDL_OpenGamepad(ev.gdevice.which);

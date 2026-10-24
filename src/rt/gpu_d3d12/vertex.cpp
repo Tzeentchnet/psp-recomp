@@ -9,9 +9,10 @@
 
 #define INITIAL_VERTEX_CAPACITY 4096u
 #define INITIAL_BATCH_CAPACITY 2048u
-/* Leaves over 24 MiB in each frame partition for textures and presentation. */
-#define MAX_FRAME_VERTICES 240000u
-#define MAX_FRAME_BATCHES (MAX_FRAME_VERTICES / 3u)
+/* Bound malformed display lists while allowing dense frames to spill into the
+ * upload allocator's fenced overflow slabs. */
+#define MAX_FRAME_VERTICES (1024u * 1024u)
+#define MAX_FRAME_BATCHES (256u * 1024u)
 
 static GeD3D12Vertex *s_vertices;
 static GeD3D12VertexBatch *s_batches;

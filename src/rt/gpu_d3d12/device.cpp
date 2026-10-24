@@ -754,7 +754,9 @@ static int create_frame_resources(void) {
 
 static void configure_variable_rate_shading(void) {
     const char *vrs = getenv("SR_D3D12_VRS");
-    if (vrs && strcmp(vrs, "0") == 0) {
+    const SrGraphicsConfig *config = sr_graphics_config_get();
+    if ((vrs && strcmp(vrs, "0") == 0) ||
+        ((!vrs || !vrs[0]) && config && config->d3d12_full_rate)) {
         s_direct_shading_rate = D3D12_SHADING_RATE_1X1;
         return;
     }
@@ -1291,6 +1293,16 @@ static void dump_ge_state_hotkey(void) {
         fprintf(stderr, "ged3d12: F10 GE state dump failed\n");
 }
 
+static void toggle_fullscreen(void) {
+    bool fullscreen =
+        (SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN) != 0;
+    if (!SDL_SetWindowFullscreen(s_window, !fullscreen)) {
+        fprintf(
+            stderr, "ged3d12: fullscreen toggle failed: %s\n",
+            SDL_GetError());
+    }
+}
+
 static void poll_input(int *quit) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -1302,6 +1314,8 @@ static void poll_input(int *quit) {
             if (event.key.key == SDLK_ESCAPE) *quit = 1;
             if (event.key.key == SDLK_F10 && !event.key.repeat)
                 dump_ge_state_hotkey();
+            if (event.key.key == SDLK_F11 && !event.key.repeat)
+                toggle_fullscreen();
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
             if (!s_pad) s_pad = SDL_OpenGamepad(event.gdevice.which);

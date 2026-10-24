@@ -35,18 +35,35 @@ int main(void) {
         "default renderer", (uint32_t)config.renderer,
         SR_GRAPHICS_RENDERER_D3D12);
     check_u32("default internal resolution", config.internal_resolution, 2);
+    check_u32("default texture scale", config.texture_scale, 1);
+    check_u32("default D3D12 full-rate", config.d3d12_full_rate, 0);
 
     check_true(
         "parse graphics config",
         sr_graphics_config_parse(
             &config,
             "renderer = software\n"
-            "internal_resolution = 8\n",
+            "internal_resolution = 8\n"
+            "texture_scale = 4\n"
+            "d3d12_full_rate = 1\n",
             error, sizeof(error)));
     check_u32(
         "parsed renderer", (uint32_t)config.renderer,
         SR_GRAPHICS_RENDERER_SOFTWARE);
     check_u32("parsed internal resolution", config.internal_resolution, 8);
+    check_u32("parsed texture scale", config.texture_scale, 4);
+    check_u32("parsed D3D12 full-rate", config.d3d12_full_rate, 1);
+
+    sr_graphics_config_defaults(&config);
+    check_true(
+        "parse v1 graphics config",
+        sr_graphics_config_parse(
+            &config,
+            "renderer = vk\n"
+            "internal_resolution = 3\n",
+            error, sizeof(error)));
+    check_u32("v1 texture scale default", config.texture_scale, 1);
+    check_u32("v1 D3D12 full-rate default", config.d3d12_full_rate, 0);
 
     sr_graphics_config_defaults(&config);
     check_true(
@@ -63,6 +80,18 @@ int main(void) {
         "reject invalid scale",
         !sr_graphics_config_parse(
             &config, "internal_resolution=9\n",
+            error, sizeof(error)));
+    sr_graphics_config_defaults(&config);
+    check_true(
+        "reject invalid texture scale",
+        !sr_graphics_config_parse(
+            &config, "texture_scale=6\n",
+            error, sizeof(error)));
+    sr_graphics_config_defaults(&config);
+    check_true(
+        "reject invalid D3D12 full-rate",
+        !sr_graphics_config_parse(
+            &config, "d3d12_full_rate=2\n",
             error, sizeof(error)));
     sr_graphics_config_defaults(&config);
     check_true(
@@ -91,6 +120,8 @@ int main(void) {
     config = *sr_graphics_config_get();
     config.renderer = SR_GRAPHICS_RENDERER_SOFTWARE;
     config.internal_resolution = 6;
+    config.texture_scale = 3;
+    config.d3d12_full_rate = 1;
     check_true(
         "save graphics config",
         sr_graphics_config_save(&config, error, sizeof(error)));
@@ -102,6 +133,12 @@ int main(void) {
     check_u32(
         "saved internal resolution",
         sr_graphics_config_get()->internal_resolution, 6);
+    check_u32(
+        "saved texture scale",
+        sr_graphics_config_get()->texture_scale, 3);
+    check_u32(
+        "saved D3D12 full-rate",
+        sr_graphics_config_get()->d3d12_full_rate, 1);
     {
         FILE *file = fopen(config_path, "rb");
         char text[256] = {0};
@@ -116,6 +153,12 @@ int main(void) {
             check_true(
                 "saved scale text",
                 strstr(text, "internal_resolution = 6") != NULL);
+            check_true(
+                "saved texture scale text",
+                strstr(text, "texture_scale = 3") != NULL);
+            check_true(
+                "saved D3D12 full-rate text",
+                strstr(text, "d3d12_full_rate = 1") != NULL);
         }
     }
     _putenv_s("SR_D3D12_SCALE", "7");

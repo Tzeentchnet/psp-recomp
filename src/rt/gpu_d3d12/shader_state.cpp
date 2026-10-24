@@ -106,6 +106,8 @@ void ged3d12_shader_constants_build(
             flags |= GE_D3D12_SHADER_NEAREST;
         }
         if (psp_sampler_enabled() &&
+            (!texture ||
+             !(texture->flags & GE_D3D12_TEXTURE_UPSCALED)) &&
             (!texture || !texture->sampler.mip_enabled)) {
             flags |= GE_D3D12_SHADER_PSP_SAMPLER;
         }
