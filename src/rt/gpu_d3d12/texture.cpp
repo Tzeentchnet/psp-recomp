@@ -175,6 +175,8 @@ static bool texture_memory(
                 level, address, (unsigned long long)*size);
         return false;
     }
+    /* Incompatible framebuffer reinterpretations fall back to guest VRAM. */
+    sr_prepare_read(address, (uint32_t)*size);
     *data = static_cast<const uint8_t *>(SR_HOST(address));
     return true;
 }

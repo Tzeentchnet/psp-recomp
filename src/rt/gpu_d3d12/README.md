@@ -107,6 +107,8 @@ VRAM: `texture.cpp` captures and deduplicates the draw's 2 KiB palette, binds it
 R32 buffer at `t1`, and the pixel shader reconstructs the packed 32-bit index before
 applying the PSP shift/mask/start lookup and nearest or linear filtering. Presentation
 copies only the scaled visible 480×272 rectangle from a compatible cached target.
+Incompatible framebuffer texture reinterpretations materialize an overlapping
+GPU-newer target into guest VRAM before the fallback texture is hashed and decoded.
 The shader derives logical pixel coordinates from `SV_Position / scale` so the
 PSP dither matrix remains stable while destination color/depth loads use physical
 scaled coordinates.
