@@ -930,15 +930,8 @@ static uint8_t dxt_alpha_lerp(uint8_t a1, uint8_t a2, int n, int denominator) {
     return (uint8_t)((v1 + v2 + 31) >> 8);
 }
 
-static uint32_t dxt_sample(uint32_t address, uint32_t stride, uint32_t format,
-                           uint32_t u, uint32_t v) {
-    uint32_t blocks_per_row = (stride + 3u) >> 2;
-    if (!blocks_per_row) blocks_per_row = 1;
-    uint32_t block_index = (v >> 2) * blocks_per_row + (u >> 2);
-    uint32_t block_size = format == 8 ? 8u : 16u;
-    uint8_t bytes[16] = {0};
-    for (uint32_t i = 0; i < block_size; i++)
-        bytes[i] = MEM_R8(address + block_index * block_size + i);
+static uint32_t dxt_decode(
+    const uint8_t *bytes, uint32_t format, uint32_t u, uint32_t v) {
     if (format == 8) {
         GeDxt1Block block;
         memcpy(&block, bytes, sizeof(block));
@@ -973,6 +966,18 @@ static uint32_t dxt_sample(uint32_t address, uint32_t stride, uint32_t format,
         alpha = dxt_alpha_lerp(
             block.alpha1, block.alpha2, (int)alpha_index - 1, 5);
     return color | ((uint32_t)alpha << 24);
+}
+
+static uint32_t dxt_sample(uint32_t address, uint32_t stride, uint32_t format,
+                           uint32_t u, uint32_t v) {
+    uint32_t blocks_per_row = (stride + 3u) >> 2;
+    if (!blocks_per_row) blocks_per_row = 1;
+    uint32_t block_index = (v >> 2) * blocks_per_row + (u >> 2);
+    uint32_t block_size = format == 8 ? 8u : 16u;
+    uint8_t bytes[16] = {0};
+    for (uint32_t i = 0; i < block_size; i++)
+        bytes[i] = MEM_R8(address + block_index * block_size + i);
+    return dxt_decode(bytes, format, u, v);
 }
 
 static void sample_tex_level(int level, int tu, int tv,
@@ -1159,26 +1164,126 @@ static void texdump_maybe(void) {
             s_ge_frame, path, ge.clut_addr, ge.clut_fmt, ge.tex_swizzle, ge.tex_bufw, ge.tex_filter);
 }
 
-/* GPU backend texture decode: current texture, through the exact sampler path above.
- * Linear (non-swizzled) direct-color formats take a row-wise fast path with the same
- * unpack_color expansion — render-to-texture sources are re-decoded every frame and the
- * per-texel sample_tex call (wrap + swizzle offset math) dominates otherwise. */
+static uint16_t prepared_r16(const uint8_t *data, uint32_t offset) {
+    uint16_t value;
+    memcpy(&value, data + offset, sizeof(value));
+    return value;
+}
+
+static uint32_t prepared_r32(const uint8_t *data, uint32_t offset) {
+    uint32_t value;
+    memcpy(&value, data + offset, sizeof(value));
+    return value;
+}
+
+static int prepare_texture_level(
+    int level, uint32_t address, const uint8_t **data) {
+    uint64_t size = ge_texture_level_byte_size(&ge, level);
+    if (!size || size > UINT32_MAX) return 0;
+    uint64_t last = (uint64_t)address + size - 1u;
+    if (last > UINT32_MAX ||
+        !sr_inrange(address) || !sr_inrange((uint32_t)last)) {
+        return 0;
+    }
+    sr_prepare_read(address, (uint32_t)size);
+    *data = (const uint8_t *)SR_HOST(address);
+    return 1;
+}
+
+static void decode_prepared_texel(
+    const uint8_t *data, uint32_t stride, int level,
+    uint32_t u, uint32_t v, int *r, int *g, int *b, int *a) {
+    g_tex_samples++;
+    switch (ge.tex_fmt) {
+        case 0: case 1: case 2:
+            unpack_color(
+                prepared_r16(
+                    data, texel_offset(
+                        stride, u, v, 16, ge.tex_swizzle)),
+                ge.tex_fmt, r, g, b, a);
+            break;
+        case 3:
+            unpack_color(
+                prepared_r32(
+                    data, texel_offset(
+                        stride, u, v, 32, ge.tex_swizzle)),
+                3, r, g, b, a);
+            break;
+        case 4: {
+            uint32_t offset =
+                texel_offset(stride, u, v, 4, ge.tex_swizzle);
+            uint8_t packed = data[offset];
+            uint32_t index =
+                (u & 1u) ? packed >> 4 : packed & 0x0fu;
+            clut_lookup_level(
+                index, level, ge.tex_fmt, r, g, b, a);
+            break;
+        }
+        case 5:
+            clut_lookup_level(
+                data[texel_offset(
+                    stride, u, v, 8, ge.tex_swizzle)],
+                level, ge.tex_fmt, r, g, b, a);
+            break;
+        case 6:
+            clut_lookup_level(
+                prepared_r16(
+                    data, texel_offset(
+                        stride, u, v, 16, ge.tex_swizzle)),
+                level, ge.tex_fmt, r, g, b, a);
+            break;
+        case 7:
+            clut_lookup_level(
+                prepared_r32(
+                    data, texel_offset(
+                        stride, u, v, 32, ge.tex_swizzle)),
+                level, ge.tex_fmt, r, g, b, a);
+            break;
+        case 8: case 9: case 10: {
+            uint32_t blocks_per_row = (stride + 3u) >> 2;
+            if (!blocks_per_row) blocks_per_row = 1;
+            uint32_t block_size = ge.tex_fmt == 8 ? 8u : 16u;
+            uint32_t block_index =
+                (v >> 2) * blocks_per_row + (u >> 2);
+            uint32_t color = dxt_decode(
+                data + block_index * block_size,
+                ge.tex_fmt, u, v);
+            *r = color & 0xff;
+            *g = (color >> 8) & 0xff;
+            *b = (color >> 16) & 0xff;
+            *a = color >> 24;
+            break;
+        }
+        default:
+            *r = *g = *b = *a = 255;
+            break;
+    }
+    if (*r | *g | *b) g_tex_nonzero++;
+    if (s_stat_on > 0 && *a == 0) s_stat.texa0++;
+}
+
+/* GPU backend texture decode: synchronize each level once, then decode its bounded
+ * host span without invoking the watched VRAM callback for every texel. */
 void ge_decode_tex_rgba_level(uint32_t *out, int level) {
     if (!out || level < 0 || level >= 8) return;
     uint32_t address, stride;
     int width, height;
     texture_level_info(level, &address, &stride, &width, &height);
     if (!address || width <= 0 || height <= 0) return;
+    const uint8_t *data;
+    if (!prepare_texture_level(level, address, &data)) return;
     if (!ge.tex_swizzle && ge.tex_fmt <= 3) {
         for (int v = 0; v < height; v++) {
             uint32_t *dst = out + (uint32_t)v * (uint32_t)width;
             if (ge.tex_fmt == 3) {
                 const uint32_t *src =
-                    (const uint32_t *)SR_HOST(address + (uint32_t)v * stride * 4);
+                    (const uint32_t *)(
+                        data + (uint32_t)v * stride * 4);
                 memcpy(dst, src, (size_t)width * 4);
             } else {
                 const uint16_t *src =
-                    (const uint16_t *)SR_HOST(address + (uint32_t)v * stride * 2);
+                    (const uint16_t *)(
+                        data + (uint32_t)v * stride * 2);
                 for (int u = 0; u < width; u++) {
                     int r, g, b, a;
                     unpack_color(src[u], (int)ge.tex_fmt, &r, &g, &b, &a);
@@ -1191,7 +1296,9 @@ void ge_decode_tex_rgba_level(uint32_t *out, int level) {
     for (int v = 0; v < height; v++)
         for (int u = 0; u < width; u++) {
             int r, g, b, a;
-            sample_tex_level(level, u, v, &r, &g, &b, &a);
+            decode_prepared_texel(
+                data, stride, level,
+                (uint32_t)u, (uint32_t)v, &r, &g, &b, &a);
             out[v * width + u] =
                 (uint32_t)(r & 0xFF) | ((uint32_t)(g & 0xFF) << 8) |
                 ((uint32_t)(b & 0xFF) << 16) | ((uint32_t)(a & 0xFF) << 24);

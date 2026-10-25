@@ -517,7 +517,8 @@ uint32_t sr_module_load_image(
         module_sha1(data, data_size, sha1);
         policy = module_policy(path, sha1);
     }
-    if (memcmp(data, "~PSP", 4) == 0) {
+    if (memcmp(data, "~PSP", 4) == 0 ||
+        memcmp(data, "~SCE", 4) == 0) {
         if (s_policy_count &&
             (!policy || policy->mode != SR_MODULE_HLE)) {
             fprintf(

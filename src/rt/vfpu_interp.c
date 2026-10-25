@@ -494,6 +494,45 @@ int sr_vfpu_interp(CpuState *s, uint32_t w) {
         int idx = (w >> 21) & 0x1F;
         if (idx == 28) {  /* VFPUMatrix1: vmidt (3) / vmzero (6) / vmone (7) */
             int which = (w >> 16) & 0xF;
+            if (which == 0) {  /* vmmov */
+                int side = n;
+                float matrix[16] = {0};
+                uint8_t indices[4];
+                for (int j = 0; j < side; j++) {
+                    if (j == side - 1) {
+                        for (int i = 0; i < side; i++)
+                            indices[i] = (uint8_t)mreg_idx(vs, side, j, i);
+                        sr_vread(
+                            &matrix[j * 4],
+                            s,
+                            indices,
+                            side,
+                            s->vfpuCtrl[0]);
+                    } else {
+                        for (int i = 0; i < side; i++)
+                            matrix[j * 4 + i] =
+                                s->v[mreg_idx(vs, side, j, i)];
+                    }
+                }
+                for (int j = 0; j < side; j++) {
+                    if (j == side - 1) {
+                        for (int i = 0; i < side; i++)
+                            indices[i] = (uint8_t)mreg_idx(vd, side, j, i);
+                        sr_vwrite(
+                            s,
+                            indices,
+                            &matrix[j * 4],
+                            side,
+                            s->vfpuCtrl[2]);
+                    } else {
+                        for (int i = 0; i < side; i++)
+                            s->v[mreg_idx(vd, side, j, i)] =
+                                matrix[j * 4 + i];
+                    }
+                }
+                eat_prefix(s);
+                return SR_VFPU_COMPUTE;
+            }
             if (which != 3 && which != 6 && which != 7) return SR_VFPU_OTHER;
             int side = n;
             for (int j = 0; j < side; j++)

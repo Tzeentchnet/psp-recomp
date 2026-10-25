@@ -357,6 +357,74 @@ def build(suite, rnd):
         out = [cx.mreg_index(vd, side, a, b) for a in range(side) for b in range(side)]
         suite.add(f"vmscl_{side}", setup, cx.effect(0, w)[0], out, [f2u(f32(x * sc)) for x in m])
 
+    # vmmov captures the complete source before writing an overlapping destination.
+    for side, vd in ((2, 0x01), (3, 0x01), (4, 0x04)):
+        vs = 0x00
+        source = [f32(float(i + 1)) for i in range(side * side)]
+        source_indices = [
+            cx.mreg_index(vs, side, j, i)
+            for j in range(side)
+            for i in range(side)
+        ]
+        dest_indices = [
+            cx.mreg_index(vd, side, j, i)
+            for j in range(side)
+            for i in range(side)
+        ]
+        setup = setv(source_indices, [f2u(value) for value in source])
+        word = (
+            (0x3C << 26)
+            | (28 << 21)
+            | size_bits(side)
+            | (vs << 8)
+            | vd
+        )
+        suite.add(
+            f"vmmov_{side}",
+            setup,
+            cg.vfpu_effect(0, word)[0],
+            dest_indices,
+            [f2u(value) for value in source],
+        )
+
+    # Matrix S/D prefixes affect only the final row, including saturation and masking.
+    side, vs, vd = 3, 0x00, 0x04
+    source = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, -2.0, 2.0, 0.5]
+    source_indices = [
+        cx.mreg_index(vs, side, j, i)
+        for j in range(side)
+        for i in range(side)
+    ]
+    dest_indices = [
+        cx.mreg_index(vd, side, j, i)
+        for j in range(side)
+        for i in range(side)
+    ]
+    word = (
+        (0x3C << 26)
+        | (28 << 21)
+        | size_bits(side)
+        | (vs << 8)
+        | vd
+    )
+    setup = (
+        setv(source_indices, [f2u(value) for value in source])
+        + setv(dest_indices, [f2u(-9.0)] * len(dest_indices))
+        + ["s->vfpuCtrl[0]=0xe1u;", "s->vfpuCtrl[2]=0x40du;"]
+    )
+    suite.add(
+        "vmmov_prefix",
+        setup,
+        cg.vfpu_effect(0, word)[0],
+        dest_indices,
+        [
+            *[f2u(value) for value in source[:6]],
+            f2u(1.0),
+            f2u(-1.0),
+            f2u(-9.0),
+        ],
+    )
+
     # vnop / vflush (opcode 0x3F): 0xFFFFxxxx keeps the S prefix, other encodings eat it
     for w, want in ((0xFFFF0000, 0x1B), (0xFFFF040D, 0x1B), (0xFC000000, 0xE4)):
         suite.add_cond(f"vflush_{w:08x}", ["s->vfpuCtrl[0]=0x1Bu;", cx.effect(0, w)[0]], "s->vfpuCtrl[0]", None)

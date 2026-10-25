@@ -17,6 +17,7 @@
 #include "recomp.h"
 #include "audio.h"
 #include "atrac_decode.h"
+#include "display_state.h"
 #include "input_config.h"
 #include "iso.h"
 #include "kzl_twinstick.h"
@@ -1607,6 +1608,7 @@ typedef enum {
     IO_ASYNC_OPEN,
     IO_ASYNC_READ,
     IO_ASYNC_SEEK,
+    IO_ASYNC_IOCTL,
     IO_ASYNC_CLOSE,
 } IoAsyncOp;
 
@@ -1618,6 +1620,7 @@ typedef struct {
     char path[256];
     IoAsyncOp async_op;
     uint32_t async_addr, async_size;
+    uint32_t async_cmd, async_out_addr, async_out_size;
     int64_t async_offset;
     uint32_t async_whence, async_delay;
     int64_t async_res;
@@ -1934,6 +1937,91 @@ static int64_t io_seek(Fd *f, int64_t off, uint32_t whence) {
     return pos;
 }
 
+static int io_guest_span(uint32_t address, uint32_t size) {
+    if (size == 0) return 1;
+    return
+        address <= UINT32_MAX - (size - 1u) &&
+        sr_inrange(address) &&
+        sr_inrange(address + size - 1u);
+}
+
+static uint32_t io_ioctl(
+    uint32_t fd, uint32_t cmd,
+    uint32_t in_addr, uint32_t in_size,
+    uint32_t out_addr, uint32_t out_size,
+    uint32_t *delay) {
+    const uint32_t invalid_argument = 0x80010016u;
+    const uint32_t io_error = 0x80010005u;
+    if (fd >= 64 || !s_fds[fd].used)
+        return SCE_KERNEL_ERROR_BADF;
+    Fd *f = &s_fds[fd];
+    if (delay) *delay += 100u;
+    switch (cmd) {
+        case 0x01020003u:
+            if (!io_guest_span(out_addr, 4) || out_size < 4)
+                return invalid_argument;
+            MEM_W32(out_addr, 2048u);
+            return 0;
+        case 0x01020004u:
+            if (!io_guest_span(out_addr, 4) || out_size < 4)
+                return invalid_argument;
+            MEM_W32(out_addr, f->off);
+            return 0;
+        case 0x01010005u: {
+            if (in_size < 4 || !io_guest_span(in_addr, 16))
+                return invalid_argument;
+            int64_t offset = (int64_t)(
+                ((uint64_t)MEM_R32(in_addr + 4) << 32) |
+                MEM_R32(in_addr));
+            uint32_t whence = MEM_R32(in_addr + 12);
+            if (whence > 2)
+                return invalid_argument;
+            int64_t base =
+                whence == 1 ? (int64_t)f->off :
+                (whence == 2 ? (int64_t)f->size : 0);
+            if ((offset > 0 && base > INT64_MAX - offset) ||
+                (offset < 0 && base < INT64_MIN - offset))
+                return io_error;
+            int64_t position = base + offset;
+            if (position < 0 || position > f->size)
+                return io_error;
+            f->off = (uint32_t)position;
+            return 0;
+        }
+        case 0x01020006u:
+            if (!io_guest_span(out_addr, 4) || out_size < 4)
+                return invalid_argument;
+            MEM_W32(out_addr, f->lba);
+            return 0;
+        case 0x01020007u:
+            if (!io_guest_span(out_addr, 8) || out_size < 8)
+                return invalid_argument;
+            MEM_W32(out_addr, f->size);
+            MEM_W32(out_addr + 4, 0);
+            return 0;
+        case 0x01030008u: {
+            if (!io_guest_span(in_addr, 4) || in_size < 4)
+                return invalid_argument;
+            uint32_t size = MEM_R32(in_addr);
+            if (size > out_size || !io_guest_span(out_addr, size))
+                return invalid_argument;
+            if (delay) *delay = 0;
+            return io_read(fd, out_addr, size);
+        }
+        case 0x01d20001u:
+            if (!io_guest_span(out_addr, 4) || out_size < 4)
+                return invalid_argument;
+            MEM_W32(out_addr, f->off);
+            return 0;
+        default:
+            fprintf(
+                stderr,
+                "HLE: unimplemented sceIoIoctl(%u, %08x, %08x, %u, %08x, %u)\n",
+                fd, cmd, in_addr, in_size, out_addr, out_size);
+            return 0x80020325u;
+    }
+}
+
 static uint32_t h_IoLseek32(CpuState *s) {
     /* a0=fd, a1=offset, a2=whence. Returns new position (32-bit). */
     uint32_t fd = A0; int32_t off = (int32_t)A1; uint32_t whence = A2;
@@ -1980,6 +2068,13 @@ static void io_async_execute(uint32_t fd, uint32_t *delay) {
         case IO_ASYNC_SEEK:
             f->async_res = io_seek(f, f->async_offset, f->async_whence);
             *delay = 100;
+            break;
+        case IO_ASYNC_IOCTL:
+            f->async_res = (int64_t)(int32_t)io_ioctl(
+                fd, f->async_cmd,
+                f->async_addr, f->async_size,
+                f->async_out_addr, f->async_out_size,
+                delay);
             break;
         case IO_ASYNC_CLOSE:
             f->async_res = 0;
@@ -2094,6 +2189,36 @@ static uint32_t h_IoLseekAsync(CpuState *s) {
     f->async_op = IO_ASYNC_SEEK;
     f->async_offset = offset;
     f->async_whence = whence;
+    return io_async_start(fd);
+}
+
+static uint32_t h_IoIoctl(CpuState *s) {
+    uint32_t fd = A0;
+    if (fd >= 64 || !s_fds[fd].used)
+        return SCE_KERNEL_ERROR_BADF;
+    if (io_async_busy(&s_fds[fd]))
+        return SCE_KERNEL_ERROR_ASYNC_BUSY;
+    uint32_t delay = 0;
+    uint32_t result = io_ioctl(
+        fd, A1, A2, A3, stack_arg(s, 0), stack_arg(s, 1), &delay);
+    if (delay) sched_delay_current(delay);
+    return result;
+}
+
+static uint32_t h_IoIoctlAsync(CpuState *s) {
+    uint32_t fd = A0;
+    if (fd >= 64 || !s_fds[fd].used)
+        return SCE_KERNEL_ERROR_BADF;
+    Fd *f = &s_fds[fd];
+    if (io_async_busy(f))
+        return SCE_KERNEL_ERROR_ASYNC_BUSY;
+    f->async_op = IO_ASYNC_IOCTL;
+    f->async_cmd = A1;
+    f->async_addr = A2;
+    f->async_size = A3;
+    f->async_out_addr = stack_arg(s, 0);
+    f->async_out_size = stack_arg(s, 1);
+    f->async_delay = 0;
     return io_async_start(fd);
 }
 
@@ -2941,7 +3066,10 @@ static uint32_t h_CtrlPeekBuffer(CpuState *s) { return ctrl_fill_n(A0, A1, 0, 1)
 
 /* sceDisplay: remember the framebuffer; vblank waits block until the next delivered vblank. */
 static int dump_fb_fmt(const char *path, uint32_t fbaddr, int fmt, uint32_t stride);
-static uint32_t s_framebuf = 0, s_vcount = 0;
+static SrDisplayState s_display;
+static uint32_t s_display_flip_count;
+static uint32_t s_last_display_flip_vcount;
+static uint32_t s_vcount;
 static uint32_t s_last_flip_vcount = 0;   /* hang watchdog (see sr_vblank_tick) */
 
 #define FRAME_CAPTURE_COUNT 50
@@ -3096,6 +3224,7 @@ typedef struct PresentPerf {
     uint32_t samples;
     uint32_t over_budget;
     uint32_t exit_after;
+    uint32_t window_first_present;
     double frame_budget_ms;
     double minimum_fps;
     int initialized;
@@ -3227,8 +3356,8 @@ static void present_perf_init(void) {
         if (!s_present_perf.file ||
             fprintf(
                 s_present_perf.file,
-                "# psp-recomp present performance v1\n"
-                "present,frame_ms,frontend_ms,backend_ms,gpu_ms,"
+                "# psp-recomp display performance v2\n"
+                "flip,present,frame_ms,frontend_ms,backend_ms,gpu_ms,"
                 "over_budget\n") < 0) {
             if (s_present_perf.file)
                 fclose(s_present_perf.file);
@@ -3250,7 +3379,7 @@ static LONGLONG present_perf_entry(void) {
 }
 
 static void present_perf_finish(
-    uint32_t present, LONGLONG entry, LONGLONG exit) {
+    uint32_t flip, uint32_t present, LONGLONG entry, LONGLONG exit) {
     present_perf_init();
     double ticks_per_ms =
         (double)s_present_perf.frequency.QuadPart / 1000.0;
@@ -3262,6 +3391,8 @@ static void present_perf_finish(
         double frame_ms =
             (double)(entry - s_present_perf.previous_entry) / ticks_per_ms;
         uint32_t index = s_present_perf.samples++;
+        if (index == 0)
+            s_present_perf.window_first_present = present;
         s_present_perf.frame_ms[index] = frame_ms;
         s_present_perf.frontend_ms[index] =
             frame_ms > s_present_perf.previous_backend_ms
@@ -3274,8 +3405,8 @@ static void present_perf_finish(
         if (s_present_perf.file &&
             fprintf(
                 s_present_perf.file,
-                "%u,%.6f,%.6f,%.6f,%.6f,%d\n",
-                present, frame_ms,
+                "%u,%u,%.6f,%.6f,%.6f,%.6f,%d\n",
+                flip, present, frame_ms,
                 s_present_perf.frontend_ms[index],
                 backend_ms, gpu_ms, over_budget) < 0) {
             fprintf(stderr, "SR_PERF_FILE: write failed\n");
@@ -3320,12 +3451,13 @@ static void present_perf_finish(
             double fps = 1000.0 / average;
             fprintf(
                 stderr,
-                "PERF presents=%u-%u samples=%u fps=%.2f "
+                "PERF flips=%u-%u presents=%u-%u samples=%u fps=%.2f "
                 "frame_ms avg=%.2f p50=%.2f p95=%.2f p99=%.2f "
                 "max=%.2f over_budget=%u "
                 "frontend_ms avg=%.2f backend_ms avg=%.2f max=%.2f "
                 "gpu_ms avg=%.2f max=%.2f samples=%u\n",
-                present - s_present_perf.samples + 1u, present,
+                flip - s_present_perf.samples + 1u, flip,
+                s_present_perf.window_first_present, present,
                 s_present_perf.samples, fps,
                 average, sorted[p50_index], sorted[p95_index],
                 sorted[p99_index], frame_max,
@@ -3354,6 +3486,10 @@ static void present_perf_finish(
     }
     s_present_perf.previous_entry = entry;
     s_present_perf.previous_backend_ms = backend_ms;
+}
+
+static void present_limit_check(uint32_t present) {
+    present_perf_init();
     if (s_present_perf.exit_after &&
         present >= s_present_perf.exit_after) {
         fprintf(
@@ -3381,19 +3517,73 @@ static void runtime_exit_cleanly(int code) {
     _Exit(code);
 }
 
+static void display_present(const SrDisplayFramebuffer *framebuffer) {
+    LONGLONG perf_entry;
+    LONGLONG perf_exit;
+    if (!gui_on() || !framebuffer->address) return;
+    if (s_display_flip_count &&
+        s_last_display_flip_vcount == s_vcount) {
+        return;
+    }
+    present_perf_init();
+    perf_entry = present_perf_entry();
+    gui_present(
+        framebuffer->address, (int)framebuffer->format,
+        framebuffer->stride);
+    perf_exit = present_perf_entry();
+    s_display_flip_count++;
+    s_last_display_flip_vcount = s_vcount;
+    if (getenv("SR_DISPLAY_LOG")) {
+        fprintf(
+            stderr,
+            "DISPLAY flip=%u present=%u vblank=%u "
+            "buf=0x%08x fmt=%u stride=%u\n",
+            s_display_flip_count, s_present_count, s_vcount,
+            framebuffer->address, framebuffer->format,
+            framebuffer->stride);
+    }
+    present_perf_finish(
+        s_display_flip_count, s_present_count, perf_entry, perf_exit);
+}
+
 static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
+    SrDisplayFramebuffer framebuffer = { A0, A1, A2 };
     char capture_path[1024];
     char exact_capture_path[64];
+    int display_action;
+    int displayed = 0;
     int capture_requested = 0;
     int captured_by_d3d12 = 0;
     int exact_capture_requested = 0;
     int exact_captured_by_d3d12 = 0;
 
-    s_framebuf = A0;
+    if (A3 != SR_DISPLAY_SETBUF_IMMEDIATE &&
+        A3 != SR_DISPLAY_SETBUF_NEXTFRAME) {
+        fprintf(
+            stderr, "sceDisplaySetFrameBuf: invalid sync mode %u\n", A3);
+        return 0x800200d2u;
+    }
+    if (A0 && (!sr_inrange(A0) || (A0 & 15u))) {
+        fprintf(
+            stderr, "sceDisplaySetFrameBuf: invalid address 0x%08x\n", A0);
+        return 0x800200d3u;
+    }
+    if ((A1 & 63u) || (!A1 && A0)) {
+        fprintf(
+            stderr, "sceDisplaySetFrameBuf: invalid stride %u\n", A1);
+        return 0x800200d2u;
+    }
+    if (A2 > 3u) {
+        fprintf(
+            stderr, "sceDisplaySetFrameBuf: invalid format %u\n", A2);
+        return 0x800200d2u;
+    }
+
+    display_action = sr_display_state_set_framebuffer(
+        &s_display, &framebuffer, (int)A3);
     s_last_flip_vcount = s_vcount;
     present_perf_init();
-    LONGLONG perf_entry = present_perf_entry();
-    if (s_framebuf) {
+    if (A0) {
         s_present_count++;
         capture_requested = frame_capture_path(
             capture_path, sizeof(capture_path));
@@ -3416,11 +3606,21 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
         if (gw < 0) { gw = getenv("SR_GEWATCH") ? 1 : 0;
                       const char *p = getenv("SR_GEWATCH_AFTER"); gwa = p ? atoi(p) : 0; }
         if (gw && s_vcount >= (uint32_t)gwa)
-            fprintf(stderr, "PRESENT f=%u buf=0x%08x fmt=%u stride=%u\n", s_vcount, A0, A2, A1);
+            fprintf(
+                stderr,
+                "SETFRAMEBUF f=%u present=%u buf=0x%08x "
+                "fmt=%u stride=%u sync=%u action=%d\n",
+                s_vcount, s_present_count, A0, A2, A1, A3,
+                display_action);
     }
-    /* Interactive window: show this finished frame and sample the keyboard (A1=bufferwidth,
-     * A2=pixelformat 0=5650/1=5551/2=4444/3=8888). */
-    if (gui_on() && s_framebuf) gui_present(s_framebuf, (int)A2, A1);
+    if (display_action == SR_DISPLAY_FLIP && A0) {
+        display_present(&s_display.current);
+        displayed = gui_on();
+    }
+    if (!displayed &&
+        (captured_by_d3d12 || exact_captured_by_d3d12)) {
+        gui_present(A0, (int)A2, A1);
+    }
     if (exact_capture_requested) {
         if (!exact_captured_by_d3d12)
             dump_fb_fmt(
@@ -3433,13 +3633,9 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
             exact_captured_by_d3d12 ? "gpu" : "guest",
             exact_capture_path);
     }
-    if (s_framebuf) {
-        LONGLONG perf_exit = present_perf_entry();
-        present_perf_finish(s_present_count, perf_entry, perf_exit);
-    }
     if (capture_requested)
         frame_capture_complete(
-            s_framebuf, (int)A2, A1 ? A1 : 512,
+            A0, (int)A2, A1 ? A1 : 512,
             capture_path, captured_by_d3d12);
     /* SR_FBSNAP=<N>: dump the presented framebuffer every N frames into a rotating set of
      * PPMs so an unattended run can be observed after the fact (8 most recent kept). */
@@ -3475,9 +3671,9 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
      * frames have elapsed, snapshot exactly this presented buffer (the right instant -- before the
      * game recycles it as the next back buffer) and stop. */
     const char *fd = getenv("SR_FBDUMP");
-    if (fd && s_framebuf && s_vcount >= (uint32_t)atoi(fd)) {
+    if (fd && A0 && s_vcount >= (uint32_t)atoi(fd)) {
         extern unsigned long g_ge_pixels;
-        dump_fb_fmt("fb_present.ppm", s_framebuf, (int)A2, A1 ? A1 : 512);
+        dump_fb_fmt("fb_present.ppm", A0, (int)A2, A1 ? A1 : 512);
         /* Also snapshot the whole 2MB eDRAM so any rendered region can be found regardless of which
          * buffer/stride/format the game settled on. */
         FILE *raw = fopen("edram.bin", "wb");
@@ -3485,7 +3681,7 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
         sr_trace_close();
         extern unsigned long g_tex_samples, g_tex_nonzero;
         fprintf(stderr, "presented frame %u: buf=0x%08x fmt=%u stride=%u ge_pixels=%lu tex_samples=%lu tex_nonzero=%lu\n",
-                s_vcount, s_framebuf, A2, A1 ? A1 : 512, g_ge_pixels, g_tex_samples, g_tex_nonzero);
+                s_vcount, A0, A2, A1 ? A1 : 512, g_ge_pixels, g_tex_samples, g_tex_nonzero);
         { extern unsigned long g_mpeg_put, g_mpeg_getavc, g_mpeg_avcdec, g_mpeg_nodata;
           fprintf(stderr, "mpeg: ringPut=%lu getAvcAu=%lu avcDecode=%lu noData=%lu\n",
                   g_mpeg_put, g_mpeg_getavc, g_mpeg_avcdec, g_mpeg_nodata); }
@@ -3493,10 +3689,16 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
         extern void sched_dump_threads(void); sched_dump_threads();
         runtime_exit_cleanly(0);
     }
+    if (A0) present_limit_check(s_present_count);
     return 0;
 }
 static uint32_t h_DisplayGetFrameBuf(CpuState *s) {
-    if (A0) MEM_W32(A0, s_framebuf);
+    const SrDisplayFramebuffer *framebuffer =
+        sr_display_state_get_framebuffer(
+            &s_display, A3 == SR_DISPLAY_SETBUF_NEXTFRAME);
+    if (A0) MEM_W32(A0, framebuffer->address);
+    if (A1) MEM_W32(A1, framebuffer->stride);
+    if (A2) MEM_W32(A2, framebuffer->format);
     return 0;
 }
 
@@ -3556,8 +3758,13 @@ static uint32_t h_DisplayWaitVblankCB(CpuState *s) {
 void sr_ctrl_sample(void);
 void ge_set_frame(uint32_t frame);
 void sr_vblank_tick(void) {
+    int display_action;
     s_vcount++; s_vcount_fwd = s_vcount;
     ge_set_frame(s_vcount);
+    display_action = sr_display_state_begin_vblank(&s_display);
+    if (display_action == SR_DISPLAY_FLIP)
+        display_present(&s_display.current);
+    sr_display_state_end_vblank(&s_display);
     sr_ctrl_sample();   /* latch one controller sample per frame (PPSSPP ring semantics) */
     /* Hang watchdog: vblanks keep being delivered even when every game thread is blocked,
      * so a stretch with no sceDisplaySetFrameBuf means the render loop is stuck (e.g. an
@@ -4269,6 +4476,7 @@ static uint32_t h_IoWaitAsyncCB(CpuState *s) { return with_callbacks(s, h_IoWait
 
 void sr_hle_init(void) {
     if (s_hle_n) return;
+    sr_display_state_init(&s_display);
     g_callcount = getenv("SR_CALLCOUNT") ? 1 : 0;
     /* NID audit 2026-06: every entry below verified against PPSSPP's HLE tables. A handler on
      * the wrong NID is worse than none -- handlers that fill out-params write through whatever
@@ -4428,6 +4636,8 @@ void sr_hle_init(void) {
     sr_hle_register(0x89aa9906, "sceIoOpenAsync", h_IoOpenAsync);
     sr_hle_register(0xa0b5a7c2, "sceIoReadAsync", h_IoReadAsync);
     sr_hle_register(0x71b19e77, "sceIoLseekAsync", h_IoLseekAsync);
+    sr_hle_register(0x63632449, "sceIoIoctl", h_IoIoctl);
+    sr_hle_register(0xe95a012b, "sceIoIoctlAsync", h_IoIoctlAsync);
     sr_hle_register(0xe23eec33, "sceIoWaitAsync", h_IoWaitAsync);
     sr_hle_register(0x35dbd746, "sceIoWaitAsyncCB", h_IoWaitAsyncCB);
     sr_hle_register(0x3251ea56, "sceIoPollAsync", h_IoPollAsync);

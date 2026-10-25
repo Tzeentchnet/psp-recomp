@@ -9,12 +9,20 @@
 # order) so the generated code can be diffed against the reference trace. Release builds
 # compile those hooks out unless SR_ENABLE_INSTRUCTION_TRACE is explicitly enabled.
 
+import os
+from pathlib import Path
 import re
 import struct
 import sys
 
 from analyze import Elf, exec_ranges, in_ranges, analyze, stub_ranges
 import codegen_ext as cx
+from function_reuse import (
+    CacheError,
+    FunctionCodeCache,
+    digest_files,
+    write_text_if_changed,
+)
 
 # Per-game hints, loaded by main() from --jumptables / --overrides (see codegen_ext):
 # jr address -> {"targets": [...]} for switch tables and computed gotos, and the set of
@@ -597,9 +605,43 @@ def vfpu_effect(addr, w):
                     f"sr_vwrite(s,{_arr(di)},_d,{n},s->vfpuCtrl[2]);{_EAT}")
             return "{ " + body + " }", None, 0
         raise Unsupported(f"VFPU3 sub {sub} at 0x{addr:08x}")
-    # VFPUMatrix1 (0x3c, bits[25:21]==28): vmidt(3)/vmzero(6)/vmone(7) NxN matrix init.
+    # VFPUMatrix1 (0x3c, bits[25:21]==28): vmmov(0) and matrix init.
     if op == 0x3c and sub == 7 and ((w >> 21) & 0x1F) == 28:
         which = (w >> 16) & 0xF
+        if which == 0:  # vmmov
+            side = n
+            reads = []
+            writes = []
+            for j in range(side):
+                src = [mreg_index(vs, side, j, i) for i in range(side)]
+                dst = [mreg_index(vd, side, j, i) for i in range(side)]
+                offset = j * 4
+                if j == side - 1:
+                    reads.append(
+                        f"sr_vread(&_m[{offset}],s,{_arr(src)},{side},"
+                        "s->vfpuCtrl[0]);"
+                    )
+                    writes.append(
+                        f"sr_vwrite(s,{_arr(dst)},&_m[{offset}],{side},"
+                        "s->vfpuCtrl[2]);"
+                    )
+                else:
+                    reads.extend(
+                        f"_m[{offset + i}]=s->v[{index}];"
+                        for i, index in enumerate(src)
+                    )
+                    writes.extend(
+                        f"s->v[{index}]=_m[{offset + i}];"
+                        for i, index in enumerate(dst)
+                    )
+            return (
+                "{ float _m[16]={0}; "
+                + " ".join(reads + writes)
+                + _EAT
+                + " }",
+                None,
+                0,
+            )
         if which in (3, 6, 7):
             side = n
             writes = []
@@ -1119,13 +1161,17 @@ def emit_function(
     symbol_prefix="",
     runtime_jal=False,
     verify_runtime_code=False,
+    analysis=None,
 ):
     if instruction_hooks is None:
         instruction_hooks = {}
     if used_instruction_hooks is None:
         used_instruction_hooks = set()
-    insns, labels = function_flow(elf, start, ranges, known)
-    direct_jalr = constant_jalr_targets(elf, insns, labels, known)
+    if analysis is None:
+        insns, labels = function_flow(elf, start, ranges, known)
+        direct_jalr = constant_jalr_targets(elf, insns, labels, known)
+    else:
+        insns, labels, direct_jalr = analysis
     if stats is not None:
         stats["constant_jalr"] = stats.get("constant_jalr", 0) + len(direct_jalr)
     out = []
@@ -1333,6 +1379,162 @@ def emit_function(
     return finalize_gpr_cache(out)
 
 
+def codegen_dependency_fingerprint(extra_abi_paths=()):
+    root = Path(__file__).resolve().parents[1]
+    dependencies = [
+        ("tools/codegen.py", Path(__file__).resolve()),
+        ("tools/codegen_ext.py", Path(cx.__file__).resolve()),
+        ("tools/analyze.py", Path(__file__).with_name("analyze.py")),
+        ("tools/prxload.py", Path(__file__).with_name("prxload.py")),
+        (
+            "tools/function_reuse.py",
+            Path(__file__).with_name("function_reuse.py"),
+        ),
+        ("src/rt/recomp.h", root / "src" / "rt" / "recomp.h"),
+    ]
+    dependencies.extend(
+        (f"extra-abi/{index}/{Path(path).name}", Path(path).resolve())
+        for index, path in enumerate(extra_abi_paths)
+    )
+    return digest_files(dependencies)
+
+
+def function_cache_context(
+    elf,
+    start,
+    known,
+    analysis,
+    instruction_hooks,
+    symbol_prefix,
+    runtime_jal,
+    verify_runtime_code,
+    generator_fingerprint,
+):
+    insns, labels, direct_jalr = analysis
+    instructions = []
+    target_decisions = []
+    switch_target_decisions = []
+    relevant_jump_tables = {}
+    for address in sorted(insns):
+        word = read32(elf, address)
+        if word is None:
+            continue
+        instructions.append([address, word])
+        opcode = word >> 26
+        if opcode in (2, 3):
+            target = jump_target(address, word)
+            target_decisions.append(
+                [address, target, target in known]
+            )
+        if address in JUMPTABLES:
+            table = JUMPTABLES[address]
+            relevant_jump_tables[f"0x{address:08x}"] = table
+            switch_target_decisions.extend(
+                [address, target, target in known]
+                for target in sorted(set(table["targets"]))
+            )
+    return {
+        "generator_fingerprint": generator_fingerprint,
+        "start": start,
+        "symbol_prefix": symbol_prefix,
+        "runtime_jal": runtime_jal,
+        "verify_runtime_code": verify_runtime_code,
+        "instructions": instructions,
+        "labels": sorted(labels),
+        "direct_jalr": [
+            [address, target]
+            for address, target in sorted(direct_jalr.items())
+        ],
+        "target_decisions": target_decisions,
+        "jump_tables": relevant_jump_tables,
+        "switch_target_decisions": switch_target_decisions,
+        "jal_next": sorted(address for address in insns if address in JAL_NEXT),
+        "instruction_hooks": [
+            [address, instruction_hooks[address]]
+            for address in sorted(insns)
+            if address in instruction_hooks
+        ],
+    }
+
+
+def emit_function_cached(
+    elf,
+    start,
+    ranges,
+    known,
+    cache,
+    generator_fingerprint,
+    stats=None,
+    instruction_hooks=None,
+    used_instruction_hooks=None,
+    symbol_prefix="",
+    runtime_jal=False,
+    verify_runtime_code=False,
+):
+    if instruction_hooks is None:
+        instruction_hooks = {}
+    if used_instruction_hooks is None:
+        used_instruction_hooks = set()
+    insns, labels = function_flow(elf, start, ranges, known)
+    direct_jalr = constant_jalr_targets(elf, insns, labels, known)
+    analysis = (insns, labels, direct_jalr)
+    context = function_cache_context(
+        elf,
+        start,
+        known,
+        analysis,
+        instruction_hooks,
+        symbol_prefix,
+        runtime_jal,
+        verify_runtime_code,
+        generator_fingerprint,
+    )
+    payload = cache.load(context)
+    if payload is not None:
+        lines = payload.get("lines")
+        cached_hooks = payload.get("used_instruction_hooks")
+        cached_jalr = payload.get("constant_jalr")
+        if (
+            not isinstance(lines, list)
+            or any(not isinstance(line, str) for line in lines)
+            or not isinstance(cached_hooks, list)
+            or any(not isinstance(address, int) for address in cached_hooks)
+            or cached_jalr != len(direct_jalr)
+        ):
+            raise CacheError(
+                f"invalid cached function payload for 0x{start:08x}"
+            )
+        used_instruction_hooks.update(cached_hooks)
+        if stats is not None:
+            stats["constant_jalr"] = (
+                stats.get("constant_jalr", 0) + cached_jalr
+            )
+        return lines, True, False
+
+    local_used_hooks = set()
+    lines = emit_function(
+        elf,
+        start,
+        ranges,
+        known,
+        stats,
+        instruction_hooks,
+        local_used_hooks,
+        symbol_prefix,
+        runtime_jal,
+        verify_runtime_code,
+        analysis=analysis,
+    )
+    used_instruction_hooks.update(local_used_hooks)
+    payload = {
+        "lines": lines,
+        "used_instruction_hooks": sorted(local_used_hooks),
+        "constant_jalr": len(direct_jalr),
+    }
+    wrote = cache.store(context, payload)
+    return lines, False, wrote
+
+
 SR_TO_W = """static inline uint32_t sr_to_w(float x, uint32_t fn) {
     if (isnan(x) || isinf(x)) return (isinf(x) && x < 0.0f) ? 0x80000000u : 0x7FFFFFFFu;
     int32_t r;
@@ -1355,11 +1557,14 @@ def main(argv):
             "usage: codegen.py <elf> <out.c> [--base=HEX] [--jumptables=TOML] "
             "[--overrides=TOML] [--function-entry=HEX] "
             "[--symbol-prefix=IDENTIFIER] [--runtime-jal] "
-            "[--verify-runtime-code] [--hot-functions=TXT]\n"
+            "[--verify-runtime-code] [--hot-functions=TXT] "
+            "[--cache-dir=PATH] [--cache-abi=PATH]\n"
         )
         return 2
     base = None
     hot_path = None
+    cache_dir = os.environ.get("PSP_RECOMP_CODEGEN_CACHE") or None
+    cache_abi_paths = []
     symbol_prefix = ""
     runtime_jal = False
     verify_runtime_code = False
@@ -1391,6 +1596,19 @@ def main(argv):
             verify_runtime_code = True
         elif o.startswith("--hot-functions="):
             hot_path = o.split("=", 1)[1]
+        elif o.startswith("--cache-dir="):
+            cache_dir = o.split("=", 1)[1]
+            if not cache_dir:
+                raise ValueError("--cache-dir requires a non-empty path")
+        elif o.startswith("--cache-abi="):
+            cache_abi_paths.append(o.split("=", 1)[1])
+            if not cache_abi_paths[-1]:
+                raise ValueError("--cache-abi requires a non-empty path")
+    function_cache = None
+    generator_fingerprint = ""
+    if cache_dir:
+        function_cache = FunctionCodeCache(cache_dir)
+        generator_fingerprint = codegen_dependency_fingerprint(cache_abi_paths)
     elf = Elf(args[0], base=base)
     ranges = exec_ranges(elf)
     known, _ = analyze(elf)
@@ -1467,7 +1685,12 @@ def main(argv):
     emitted = []
     stubbed = []
     used_instruction_hooks = set()
-    stats = {"constant_jalr": 0}
+    stats = {
+        "constant_jalr": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "cache_writes": 0,
+    }
     for a in sorted(known):
         out = []
         funcs.append(out)
@@ -1520,12 +1743,14 @@ def main(argv):
             emitted.append(a)
             continue
         try:
-            out.extend(
-                emit_function(
+            if function_cache is not None:
+                lines, cache_hit, cache_wrote = emit_function_cached(
                     elf,
                     a,
                     ranges,
                     known,
+                    function_cache,
+                    generator_fingerprint,
                     stats,
                     INSTRUCTION_HOOKS,
                     used_instruction_hooks,
@@ -1533,7 +1758,24 @@ def main(argv):
                     runtime_jal,
                     verify_runtime_code,
                 )
-            )
+                stats["cache_hits" if cache_hit else "cache_misses"] += 1
+                stats["cache_writes"] += int(cache_wrote)
+                out.extend(lines)
+            else:
+                out.extend(
+                    emit_function(
+                        elf,
+                        a,
+                        ranges,
+                        known,
+                        stats,
+                        INSTRUCTION_HOOKS,
+                        used_instruction_hooks,
+                        symbol_prefix,
+                        runtime_jal,
+                        verify_runtime_code,
+                    )
+                )
             emitted.append(a)
         except Unsupported as e:
             # Emit a loud-trapping stub so the dispatch table stays complete and reaching this
@@ -1561,11 +1803,14 @@ def main(argv):
     register = emit_dispatch_table(emitted, impmap, symbol_prefix)
     banner = "/* Generated by tools/codegen.py. Do not edit by hand. */"
     split = next((o for o in opts if o == "--split" or o.startswith("--split=")), None)
-    import os
     if split is None:
-        with open(args[1], "w", encoding="ascii", newline="\n") as f:
-            f.write("\n".join([banner] + includes + [""] + helpers + protos + [""]
-                              + [ln for fn in funcs for ln in fn] + register))
+        write_text_if_changed(
+            args[1],
+            "\n".join(
+                [banner] + includes + [""] + helpers + protos + [""]
+                + [ln for fn in funcs for ln in fn] + register
+            ),
+        )
         print(f"wrote {args[1]}: {len(emitted)}/{len(known)} functions ({len(stubbed)} trapping stubs)")
     else:
         # --split[=MB]: <stem>.h (prototypes), <stem>_NNN.c (about MB of functions each, so no
@@ -1575,22 +1820,24 @@ def main(argv):
         stem = os.path.splitext(os.path.basename(args[1]))[0]
         os.makedirs(out_dir, exist_ok=True)
         guard = f"{stem.upper()}_H"
-        with open(os.path.join(out_dir, f"{stem}.h"), "w", encoding="ascii", newline="\n") as f:
-            # The static inline helpers live in the header, so TUs that do not use them stay quiet.
-            registration = (
-                [
-                    f"extern const SrDispatchTable "
-                    f"{symbol_prefix}_dispatch_table;",
-                    f"int {symbol_prefix}_register(void);",
-                ]
-                if symbol_prefix
-                else ["void sr_register_all(void);"]
-            )
-            f.write("\n".join(
+        # The static inline helpers live in the header, so TUs that do not use them stay quiet.
+        registration = (
+            [
+                f"extern const SrDispatchTable "
+                f"{symbol_prefix}_dispatch_table;",
+                f"int {symbol_prefix}_register(void);",
+            ]
+            if symbol_prefix
+            else ["void sr_register_all(void);"]
+        )
+        write_text_if_changed(
+            os.path.join(out_dir, f"{stem}.h"),
+            "\n".join(
                 [banner, f"#ifndef {guard}", f"#define {guard}"]
                 + includes + [""] + helpers + protos
                 + registration + ["#endif", ""]
-            ))
+            ),
+        )
         tu_head = [banner, f'#include "{stem}.h"', ""]
         if hot_path:
             hot_addresses = load_hot_functions(hot_path)
@@ -1611,17 +1858,33 @@ def main(argv):
             hot_funcs = []
             groups = [("", chunk_functions(funcs, chunk))]
         part_count = 0
+        expected_parts = set()
         for kind, parts in groups:
             for i, part in enumerate(parts):
                 suffix = f"_{kind}_{i:03d}" if kind else f"_{i:03d}"
-                with open(
-                    os.path.join(out_dir, f"{stem}{suffix}.c"),
-                    "w", encoding="ascii", newline="\n",
-                ) as f:
-                    f.write("\n".join(tu_head + [ln for fn in part for ln in fn]) + "\n")
+                part_path = os.path.join(out_dir, f"{stem}{suffix}.c")
+                expected_parts.add(os.path.normcase(os.path.abspath(part_path)))
+                write_text_if_changed(
+                    part_path,
+                    "\n".join(
+                        tu_head + [ln for fn in part for ln in fn]
+                    ) + "\n",
+                )
                 part_count += 1
-        with open(os.path.join(out_dir, f"{stem}_register.c"), "w", encoding="ascii", newline="\n") as f:
-            f.write("\n".join([banner, f'#include "{stem}.h"', ""] + register))
+        stale_pattern = re.compile(
+            rf"{re.escape(stem)}_(?:(?:hot|cold)_)?\d{{3}}\.c"
+        )
+        for name in os.listdir(out_dir):
+            path = os.path.join(out_dir, name)
+            if (
+                stale_pattern.fullmatch(name)
+                and os.path.normcase(os.path.abspath(path)) not in expected_parts
+            ):
+                os.remove(path)
+        write_text_if_changed(
+            os.path.join(out_dir, f"{stem}_register.c"),
+            "\n".join([banner, f'#include "{stem}.h"', ""] + register),
+        )
         split_summary = f"{part_count} TUs"
         if hot_path:
             split_summary = (
@@ -1631,14 +1894,30 @@ def main(argv):
         print(f"wrote {out_dir}/{stem}.h + {split_summary} + {stem}_register.c: "
               f"{len(emitted)}/{len(known)} functions ({len(stubbed)} trapping stubs)")
     print(f"direct constant jalr calls: {stats['constant_jalr']}")
+    if function_cache is not None:
+        print(
+            "codegen cache: "
+            f"{stats['cache_hits']} hits, "
+            f"{stats['cache_misses']} misses, "
+            f"{stats['cache_writes']} writes ({cache_dir})"
+        )
     if stubbed:
         sp = os.path.join(os.path.dirname(args[1]) or ".", "stubs.txt")
-        with open(sp, "w", encoding="ascii", newline="\n") as f:
-            for a, r in stubbed:
-                f.write(f"0x{a:08x} {r}\n")
+        write_text_if_changed(
+            sp,
+            "".join(f"0x{a:08x} {r}\n" for a, r in stubbed),
+        )
         print(f"wrote stub list: {sp}")
+    else:
+        sp = os.path.join(os.path.dirname(args[1]) or ".", "stubs.txt")
+        if os.path.isfile(sp):
+            os.remove(sp)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    try:
+        sys.exit(main(sys.argv))
+    except CacheError as exc:
+        sys.stderr.write(f"codegen cache: {exc}\n")
+        sys.exit(2)

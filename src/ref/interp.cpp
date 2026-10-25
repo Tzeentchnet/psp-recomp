@@ -138,6 +138,8 @@ void StoreInfo(const CpuState *s, uint32_t op, uint32_t *addr, int *size) {
 	}
 	*addr = opcode == 0x3A || opcode == 0x3E
 		? VfpuMemoryAddress(s, op) : s->r[Rs(op)] + SImm(op);
+	if (opcode == 0x2A || opcode == 0x2E)
+		*addr &= ~3u;
 }
 
 }  // namespace
@@ -153,10 +155,9 @@ static StopReason Execute(CpuState *s, Memory *mem, uint32_t op) {
 	s->pc += 4;  // default sequential advance; branches override via next_pc/in_delay_slot
 
 	auto take_branch = [&](bool cond) {
-		if (cond) {
-			s->next_pc = branch_pc + 4 + (SImm(op) << 2);
-			s->in_delay_slot = true;
-		}
+		s->next_pc =
+			cond ? branch_pc + 4 + (SImm(op) << 2) : branch_pc + 8;
+		s->in_delay_slot = true;
 	};
 	auto skip_likely = [&](bool cond) {
 		// Branch-likely: when taken behaves like a normal branch; when not taken the delay
@@ -309,12 +310,54 @@ static StopReason Execute(CpuState *s, Memory *mem, uint32_t op) {
 		case 0x17: skip_likely((int32_t)s->r[Rs(op)] > 0); return StopReason::kRunning;     // bgtzl
 		case 0x20: SetR(s, Rt(op), (uint32_t)(int32_t)(int8_t)mem->Read8(s->r[Rs(op)] + SImm(op))); return StopReason::kRunning;   // lb
 		case 0x21: SetR(s, Rt(op), (uint32_t)(int32_t)(int16_t)mem->Read16(s->r[Rs(op)] + SImm(op))); return StopReason::kRunning; // lh
+		case 0x22: {  // lwl
+			uint32_t address = s->r[Rs(op)] + SImm(op);
+			uint32_t shift = (address & 3) * 8;
+			uint32_t value = mem->Read32(address & ~3u);
+			SetR(
+				s, Rt(op),
+				(s->r[Rt(op)] & (0x00ffffffu >> shift)) |
+					(value << (24 - shift)));
+			return StopReason::kRunning;
+		}
 		case 0x23: SetR(s, Rt(op), mem->Read32(s->r[Rs(op)] + SImm(op))); return StopReason::kRunning;  // lw
 		case 0x24: SetR(s, Rt(op), mem->Read8(s->r[Rs(op)] + SImm(op))); return StopReason::kRunning;   // lbu
 		case 0x25: SetR(s, Rt(op), mem->Read16(s->r[Rs(op)] + SImm(op))); return StopReason::kRunning;  // lhu
+		case 0x26: {  // lwr
+			uint32_t address = s->r[Rs(op)] + SImm(op);
+			uint32_t shift = (address & 3) * 8;
+			uint32_t value = mem->Read32(address & ~3u);
+			SetR(
+				s, Rt(op),
+				(s->r[Rt(op)] & (0xffffff00u << (24 - shift))) |
+					(value >> shift));
+			return StopReason::kRunning;
+		}
 		case 0x28: mem->Write8(s->r[Rs(op)] + SImm(op), (uint8_t)s->r[Rt(op)]); return StopReason::kRunning;   // sb
 		case 0x29: mem->Write16(s->r[Rs(op)] + SImm(op), (uint16_t)s->r[Rt(op)]); return StopReason::kRunning; // sh
-		case 0x2B: mem->Write32(s->r[Rs(op)] + SImm(op), s->r[Rt(op)]); return StopReason::kRunning;  // sw
+		case 0x2A: {  // swl
+			uint32_t address = s->r[Rs(op)] + SImm(op);
+			uint32_t shift = (address & 3) * 8;
+			uint32_t aligned = address & ~3u;
+			uint32_t value = mem->Read32(aligned);
+			mem->Write32(
+				aligned,
+				(s->r[Rt(op)] >> (24 - shift)) |
+					(value & (0xffffff00u << shift)));
+			return StopReason::kRunning;
+		}
+		case 0x2B: mem->Write32(s->r[Rs(op)] + SImm(op), s->r[Rt(op)]); return StopReason::kRunning;   // sw
+		case 0x2E: {  // swr
+			uint32_t address = s->r[Rs(op)] + SImm(op);
+			uint32_t shift = (address & 3) * 8;
+			uint32_t aligned = address & ~3u;
+			uint32_t value = mem->Read32(aligned);
+			mem->Write32(
+				aligned,
+				(s->r[Rt(op)] << shift) |
+					(value & (0x00ffffffu >> (24 - shift))));
+			return StopReason::kRunning;
+		}
 		case 0x12: {  // COP2 transfers between GPRs and VFPU data/control registers
 			uint32_t sub = Rs(op);
 			if (sub == 8) {  // bvf/bvt/bvfl/bvtl
@@ -486,7 +529,8 @@ StepResult Run(
 	void *instruction_fallback_context,
 	ExecutionHook execution_hook,
 	void *execution_hook_context) {
-	for (unsigned long long i = 0; i < max_steps; i++) {
+	unsigned long long i = 0;
+	for (; i < max_steps || s->in_delay_slot; i++) {
 		if (execution_hook && i != 0 && (i & 0xffu) == 0 &&
 			!s->in_delay_slot)
 			execution_hook(execution_hook_context, s, 256);
@@ -523,8 +567,8 @@ StepResult Run(
 			return {reason, pc, op, i + 1};
 	}
 	if (stop_at_pc && !s->in_delay_slot && s->pc == stop_pc)
-		return {StopReason::kTargetReached, s->pc, 0, max_steps};
-	return {StopReason::kStepLimit, s->pc, 0, max_steps};
+		return {StopReason::kTargetReached, s->pc, 0, i};
+	return {StopReason::kStepLimit, s->pc, 0, i};
 }
 
 }  // namespace ref

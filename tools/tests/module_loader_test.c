@@ -542,18 +542,24 @@ static void test_variable_import_rejection(void) {
 }
 
 static void test_hle_only_module(void) {
-    uint8_t encrypted[52] = {0};
-    memcpy(encrypted, "~PSP", 4);
-    reset_runtime();
-    uint32_t uid =
-        sr_module_load_image(encrypted, sizeof(encrypted), "sceCodec.prx");
-    CHECK(uid == 0x110u);
-    CHECK(!test_allocator.allocated);
-    uint32_t status = TEST_BASE + 0x20;
-    MEM_W32(status, 0xffffffffu);
-    CHECK(sr_module_start(uid, 0, 0, status, 0) == uid);
-    CHECK(MEM_R32(status) == 0);
-    CHECK(sr_module_unload(uid) == uid);
+    static const char signatures[][4] = {
+        {'~', 'P', 'S', 'P'},
+        {'~', 'S', 'C', 'E'},
+    };
+    for (uint32_t i = 0; i < 2; i++) {
+        uint8_t encrypted[52] = {0};
+        memcpy(encrypted, signatures[i], 4);
+        reset_runtime();
+        uint32_t uid = sr_module_load_image(
+            encrypted, sizeof(encrypted), "sceCodec.prx");
+        CHECK(uid == 0x110u);
+        CHECK(!test_allocator.allocated);
+        uint32_t status = TEST_BASE + 0x20;
+        MEM_W32(status, 0xffffffffu);
+        CHECK(sr_module_start(uid, 0, 0, status, 0) == uid);
+        CHECK(MEM_R32(status) == 0);
+        CHECK(sr_module_unload(uid) == uid);
+    }
 }
 
 static void test_explicit_module_policy(void) {
@@ -592,39 +598,45 @@ static void test_explicit_module_policy(void) {
 }
 
 static void test_encrypted_module_requires_policy(void) {
-    uint8_t encrypted[52] = {0};
-    char sha1[41];
-    memcpy(encrypted, "~PSP", 4);
-    module_sha1(encrypted, sizeof(encrypted), sha1);
-    SrModulePolicyEntry unrelated = {
-        "other.prx",
-        "*",
-        sha1,
-        SR_MODULE_HLE,
-        0,
-        NULL,
+    static const char signatures[][4] = {
+        {'~', 'P', 'S', 'P'},
+        {'~', 'S', 'C', 'E'},
     };
-    reset_runtime();
-    sr_module_set_policy(&unrelated, 1);
-    CHECK(
-        sr_module_load_image(
-            encrypted, sizeof(encrypted), "sceCodec.prx") ==
-        SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE);
+    for (uint32_t i = 0; i < 2; i++) {
+        uint8_t encrypted[52] = {0};
+        char sha1[41];
+        memcpy(encrypted, signatures[i], 4);
+        module_sha1(encrypted, sizeof(encrypted), sha1);
+        SrModulePolicyEntry unrelated = {
+            "other.prx",
+            "*",
+            sha1,
+            SR_MODULE_HLE,
+            0,
+            NULL,
+        };
+        reset_runtime();
+        sr_module_set_policy(&unrelated, 1);
+        CHECK(
+            sr_module_load_image(
+                encrypted, sizeof(encrypted), "sceCodec.prx") ==
+            SCE_KERNEL_ERROR_UNSUPPORTED_PRX_TYPE);
 
-    SrModulePolicyEntry matching = {
-        "sceCodec.prx",
-        "*",
-        sha1,
-        SR_MODULE_HLE,
-        0,
-        NULL,
-    };
-    reset_runtime();
-    sr_module_set_policy(&matching, 1);
-    uint32_t uid = sr_module_load_image(
-        encrypted, sizeof(encrypted), "sceCodec.prx");
-    CHECK(uid == 0x110u);
-    CHECK(sr_module_unload(uid) == uid);
+        SrModulePolicyEntry matching = {
+            "sceCodec.prx",
+            "*",
+            sha1,
+            SR_MODULE_HLE,
+            0,
+            NULL,
+        };
+        reset_runtime();
+        sr_module_set_policy(&matching, 1);
+        uint32_t uid = sr_module_load_image(
+            encrypted, sizeof(encrypted), "sceCodec.prx");
+        CHECK(uid == 0x110u);
+        CHECK(sr_module_unload(uid) == uid);
+    }
 }
 
 static void native_module_entry(CpuState *state) {

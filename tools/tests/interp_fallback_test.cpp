@@ -94,6 +94,15 @@ static uint32_t syscall_instruction(uint32_t code) {
     return (code << 6) | 0x0000000cu;
 }
 
+static uint32_t immediate_instruction(
+    uint32_t opcode, uint32_t source, uint32_t target, int16_t immediate) {
+    return
+        (opcode << 26) |
+        (source << 21) |
+        (target << 16) |
+        (uint16_t)immediate;
+}
+
 int main() {
     sr_mem_init();
 
@@ -144,6 +153,71 @@ int main() {
     CHECK(
         MEM_R32(SR_SCRATCHPAD_BASE + SR_SCRATCHPAD_SIZE - 4u) ==
         0x89abcdefu);
+
+    const uint32_t unaligned_function = 0x08810080u;
+    const uint32_t unaligned_data = 0x08811400u;
+    static const uint32_t lwl_expected[] = {
+        0x11bbccddu, 0x2211ccddu, 0x332211ddu, 0x44332211u,
+    };
+    static const uint32_t lwr_expected[] = {
+        0x44332211u, 0xaa443322u, 0xaabb4433u, 0xaabbcc44u,
+    };
+    static const uint32_t swl_expected[] = {
+        0x443322aau, 0x4433aabbu, 0x44aabbccu, 0xaabbccddu,
+    };
+    static const uint32_t swr_expected[] = {
+        0xaabbccddu, 0xbbccdd11u, 0xccdd2211u, 0xdd332211u,
+    };
+    MEM_W32(unaligned_function + 4, 0x03e00008u);
+    MEM_W32(unaligned_function + 8, 0);
+    for (uint32_t offset = 0; offset < 4; offset++) {
+        MEM_W32(
+            unaligned_function,
+            immediate_instruction(0x22, 4, 2, (int16_t)offset));
+        MEM_W32(unaligned_data, 0x44332211u);
+        std::memset(&state, 0, sizeof(state));
+        state.r[2] = 0xaabbccddu;
+        state.r[4] = unaligned_data;
+        state.r[31] = return_pc;
+        CHECK(sr_interpret_fallback(
+            &state, unaligned_function, return_pc, 8, 1, &stop));
+        CHECK(state.r[2] == lwl_expected[offset]);
+
+        MEM_W32(
+            unaligned_function,
+            immediate_instruction(0x26, 4, 2, (int16_t)offset));
+        std::memset(&state, 0, sizeof(state));
+        state.r[2] = 0xaabbccddu;
+        state.r[4] = unaligned_data;
+        state.r[31] = return_pc;
+        CHECK(sr_interpret_fallback(
+            &state, unaligned_function, return_pc, 8, 1, &stop));
+        CHECK(state.r[2] == lwr_expected[offset]);
+
+        MEM_W32(
+            unaligned_function,
+            immediate_instruction(0x2a, 4, 2, (int16_t)offset));
+        MEM_W32(unaligned_data, 0x44332211u);
+        std::memset(&state, 0, sizeof(state));
+        state.r[2] = 0xaabbccddu;
+        state.r[4] = unaligned_data;
+        state.r[31] = return_pc;
+        CHECK(sr_interpret_fallback(
+            &state, unaligned_function, return_pc, 8, 1, &stop));
+        CHECK(MEM_R32(unaligned_data) == swl_expected[offset]);
+
+        MEM_W32(
+            unaligned_function,
+            immediate_instruction(0x2e, 4, 2, (int16_t)offset));
+        MEM_W32(unaligned_data, 0x44332211u);
+        std::memset(&state, 0, sizeof(state));
+        state.r[2] = 0xaabbccddu;
+        state.r[4] = unaligned_data;
+        state.r[31] = return_pc;
+        CHECK(sr_interpret_fallback(
+            &state, unaligned_function, return_pc, 8, 1, &stop));
+        CHECK(MEM_R32(unaligned_data) == swr_expected[offset]);
+    }
 
     const uint32_t vfpu_function = 0x08810040u;
     const uint32_t vfpu_source = 0x08811200u;
@@ -221,6 +295,45 @@ int main() {
         &state, looping, return_pc, 8, 1, &stop));
     CHECK(stop.reason == SR_INTERP_STEP_LIMIT);
     CHECK(stop.steps == 8);
+
+    const uint32_t branch_boundary = 0x08810220u;
+    MEM_W32(
+        branch_boundary + 0,
+        immediate_instruction(0x04, 4, 5, 3));
+    MEM_W32(branch_boundary + 4, 0x24020011u);
+    MEM_W32(branch_boundary + 8, 0x03e00008u);
+    MEM_W32(branch_boundary + 12, 0);
+    MEM_W32(branch_boundary + 16, 0x24020022u);
+    MEM_W32(branch_boundary + 20, 0x03e00008u);
+    MEM_W32(branch_boundary + 24, 0);
+
+    std::memset(&state, 0, sizeof(state));
+    state.r[4] = 1;
+    state.r[5] = 1;
+    state.r[31] = return_pc;
+    CHECK(!sr_interpret_fallback(
+        &state, branch_boundary, return_pc, 1, 1, &stop));
+    CHECK(stop.reason == SR_INTERP_STEP_LIMIT);
+    CHECK(stop.steps == 2);
+    CHECK(state.pc == branch_boundary + 16);
+    CHECK(state.r[2] == 0x11u);
+    CHECK(sr_interpret_fallback(
+        &state, state.pc, return_pc, 4, 1, &stop));
+    CHECK(state.r[2] == 0x22u);
+
+    std::memset(&state, 0, sizeof(state));
+    state.r[4] = 1;
+    state.r[5] = 2;
+    state.r[31] = return_pc;
+    CHECK(!sr_interpret_fallback(
+        &state, branch_boundary, return_pc, 1, 1, &stop));
+    CHECK(stop.reason == SR_INTERP_STEP_LIMIT);
+    CHECK(stop.steps == 2);
+    CHECK(state.pc == branch_boundary + 8);
+    CHECK(state.r[2] == 0x11u);
+    CHECK(sr_interpret_fallback(
+        &state, state.pc, return_pc, 4, 1, &stop));
+    CHECK(state.r[2] == 0x11u);
 
     const uint32_t vnop_function = 0x08810240u;
     MEM_W32(vnop_function + 0, 0xffff040du);
