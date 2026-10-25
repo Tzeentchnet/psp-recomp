@@ -82,6 +82,57 @@ static bool reserve_batch(void) {
     return true;
 }
 
+/* Pipeline key and shader constants are pure functions of the GE state (plus the captured
+ * texture binding). Consecutive draws very often share all of it, so reuse the previous result
+ * when the whole state (ignoring the vertex/index pointers) and the binding are unchanged.
+ * SR_D3D12_VERIFY_STATE_MEMO=1 rebuilds and compares on every reuse. */
+static GeState s_memo_state;
+static GeD3D12PipelineKey s_memo_pipeline;
+static GeD3D12ShaderConstants s_memo_shader;
+static GeD3D12TextureBinding s_memo_texture;
+static int s_memo_primitive = -1;
+static int s_memo_perspective;
+static int s_memo_verify = -1;
+
+static void build_pipeline_and_shader(
+    GeD3D12Primitive primitive, int perspective, GeD3D12VertexBatch *batch) {
+    const GeState *state = ge_state_ptr();
+    if (s_memo_verify < 0) s_memo_verify = getenv("SR_D3D12_VERIFY_STATE_MEMO") ? 1 : 0;
+    bool reuse = false;
+    if (s_memo_primitive == (int)primitive && s_memo_perspective == perspective) {
+        s_memo_state.vaddr = state->vaddr;
+        s_memo_state.iaddr = state->iaddr;
+        reuse = memcmp(&s_memo_state, state, sizeof(*state)) == 0 &&
+                memcmp(&s_memo_texture, &batch->texture, sizeof(batch->texture)) == 0;
+    }
+    if (reuse && !s_memo_verify) {
+        batch->pipeline = s_memo_pipeline;
+        batch->shader = s_memo_shader;
+        return;
+    }
+    ged3d12_pipeline_key_build(
+        state, primitive != GE_D3D12_PRIMITIVE_TRIANGLE, &batch->pipeline);
+    ged3d12_shader_constants_build(
+        state, perspective,
+        primitive == GE_D3D12_PRIMITIVE_SPRITE,
+        primitive == GE_D3D12_PRIMITIVE_TRIANGLE,
+        &batch->texture, &batch->shader);
+    if (reuse) {
+        if (memcmp(&batch->pipeline, &s_memo_pipeline, sizeof(batch->pipeline)) != 0 ||
+            memcmp(&batch->shader, &s_memo_shader, sizeof(batch->shader)) != 0) {
+            fprintf(stderr, "ged3d12: state memo mismatch (primitive=%d)\n", (int)primitive);
+            abort();
+        }
+        return;
+    }
+    memcpy(&s_memo_state, state, sizeof(*state));
+    s_memo_pipeline = batch->pipeline;
+    s_memo_shader = batch->shader;
+    s_memo_texture = batch->texture;
+    s_memo_primitive = (int)primitive;
+    s_memo_perspective = perspective;
+}
+
 static bool begin_primitive_ex(
     GeD3D12Primitive primitive, int perspective, uint32_t vertex_count,
     uint32_t *first, bool allow_merge) {
@@ -121,9 +172,6 @@ static bool begin_primitive_ex(
     batch->draw_pc = debug.draw_pc;
     batch->draw_op = debug.draw_op;
     SrPerfCategory perf_previous = sr_perf_switch(SR_PERF_STATE_CAPTURE);
-    ged3d12_pipeline_key_build(
-        ge_state_ptr(), primitive != GE_D3D12_PRIMITIVE_TRIANGLE,
-        &batch->pipeline);
     if (!ged3d12_framebuffer_capture(&batch->framebuffer)) {
         sr_perf_switch(perf_previous);
         capture_error(
@@ -139,11 +187,7 @@ static bool begin_primitive_ex(
         return false;
     }
     sr_perf_switch(SR_PERF_STATE_CAPTURE);
-    ged3d12_shader_constants_build(
-        ge_state_ptr(), perspective,
-        primitive == GE_D3D12_PRIMITIVE_SPRITE,
-        primitive == GE_D3D12_PRIMITIVE_TRIANGLE,
-        &batch->texture, &batch->shader);
+    build_pipeline_and_shader(primitive, perspective, batch);
     sr_perf_switch(perf_previous);
     s_batch_count++;
     s_primitive_count[primitive]++;
@@ -369,6 +413,7 @@ bool ged3d12_vertex_capture_init(void) {
         ged3d12_vertex_capture_shutdown();
         return false;
     }
+    s_memo_primitive = -1;
     s_vertex_capacity = INITIAL_VERTEX_CAPACITY;
     s_batch_capacity = INITIAL_BATCH_CAPACITY;
     s_index_capacity = INITIAL_VERTEX_CAPACITY;
