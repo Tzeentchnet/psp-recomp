@@ -233,21 +233,19 @@ static INT_PTR CALLBACK input_dialog_proc(
         add_control(
             dialog, 0, "BUTTON", "Save",
             WS_TABSTOP | BS_DEFPUSHBUTTON,
-            context->allow_launch ? 274 : 414,
-            INPUT_DIALOG_BUTTON_Y, 80, 27, IDOK);
+            414, INPUT_DIALOG_BUTTON_Y, 80, 27, IDOK);
         if (context->allow_launch) {
             add_control(
-                dialog, 0, "BUTTON", "Save && Launch Game",
+                dialog, 0, "BUTTON", "Play Game",
                 WS_TABSTOP | BS_PUSHBUTTON,
-                364, INPUT_DIALOG_BUTTON_Y, 140, 27,
+                504, INPUT_DIALOG_BUTTON_Y, 80, 27,
                 IDC_LAUNCH_GAME);
+        } else {
+            add_control(
+                dialog, 0, "BUTTON", "Close",
+                WS_TABSTOP | BS_PUSHBUTTON,
+                504, INPUT_DIALOG_BUTTON_Y, 80, 27, IDCANCEL);
         }
-        add_control(
-            dialog, 0, "BUTTON", "Close",
-            WS_TABSTOP | BS_PUSHBUTTON,
-            context->allow_launch ? 514 : 504,
-            INPUT_DIALOG_BUTTON_Y,
-            context->allow_launch ? 70 : 80, 27, IDCANCEL);
         center_dialog(dialog);
         return TRUE;
     }
