@@ -1,22 +1,43 @@
-# Standalone PSP Static Recompiler Toolkit
+# PSP Static Recompiler Toolkit and Runtime
 
 This toolkit lets you translate a PSP game's relocatable executable (PRX/ELF) into C, link it with a native runtime (scheduler, HLE kernel, audio/video decoder, GPU renderer), and compile it into a native Windows executable.
+
+## Maintained branch and integrations
+
+`main` is the maintained integration branch. It contains the former `kzl`
+runtime history together with the title-neutral module loading, interpreter
+fallback, renderer, input, diagnostics, and code-generation work added for
+additional PSP recompilations. The `kzl` branch remains available as a
+compatibility branch, but new integrations should use `main` in branch
+metadata and continue pinning an exact commit for reproducible builds.
+
+The shared runtime is currently used by:
+
+- [Killzone: Liberation Recomp](https://github.com/Tzeentchnet/KillzoneLiberation-Recomp)
+- [Metal Gear Acid Recomp](https://github.com/Tzeentchnet/MetalGearAcid-Recomp)
+
+Compared with the original toolkit baseline, the integrated branch adds
+standalone module boot, relocatable runtime PRX support, bounded
+interpreter/native handoff, D3D12 rendering, PSP-quantized GPU sampling,
+XAudio2 and native media decode, secure savedata, portable graphics/input
+configuration, and deterministic validation/profiling tools.
 
 ## License & attribution (read this first)
 
 This project is **GPL-2.0-or-later** because it is a derivative/combined work of
 **[PPSSPP](https://github.com/hrydgard/ppsspp)** (Henrik Rydgård and
-contributors, GPL-2.0-or-later). See [`../LICENSE`](../LICENSE) and
-[`../CREDITS.md`](../CREDITS.md).
+contributors, GPL-2.0-or-later). See [`LICENSE`](LICENSE) and
+[`CREDITS.md`](CREDITS.md).
 
 To be clear about what is and is not this project's own work:
 
-- **Rendering is this project's own backend.** The active renderer is the
-  from-scratch SDL3 + Vulkan backend in `src/rt/gpu_sdl3vk/`. It does **not**
-  reuse PPSSPP's GPU. (An earlier experiment, `src/rt/gpu_vk/`, *did* wrap
-  PPSSPP's `GPU_Vulkan` behind a C ABI, but it was never activated and has been
-  removed.) The GE semantics it implements were validated against PPSSPP's
-  software renderer, but the code is original.
+- **Rendering uses this project's own backends.** The primary Windows path is
+  the D3D12 backend in `src/rt/gpu_d3d12/`; the SDL3 + Vulkan backend in
+  `src/rt/gpu_sdl3vk/` remains available as a reference and alternate path.
+  Neither reuses PPSSPP's GPU. (An earlier experiment, `src/rt/gpu_vk/`, *did*
+  wrap PPSSPP's `GPU_Vulkan` behind a C ABI, but it was never activated and has
+  been removed.) Their GE semantics were validated against PPSSPP's software
+  renderer, but the backend code is original.
 - **PPSSPP is still used in substantial ways**, which is why the GPL applies:
   it is the verification oracle (`PPSSPPHeadless.exe`), it supplies the bundled
   system fonts, the sceMpeg/PSMF runtime (`src/rt/mpeg.c`) is a direct port of
@@ -25,7 +46,8 @@ To be clear about what is and is not this project's own work:
   `third_party/at3_standalone/COPYING.LGPLv2.1`).
 
 The novel part here is the offline MIPS-to-C static recompiler, the runtime, and
-the GPU backend; significant HLE behaviour is ported from or modelled on PPSSPP.
+the GPU backends; significant HLE behaviour is ported from or modelled on
+PPSSPP.
 
 If you redistribute anything built with this toolkit, the GPL requires you to
 provide complete corresponding source to your recipients.
@@ -33,10 +55,29 @@ provide complete corresponding source to your recipients.
 ## Layout
 
 - `tools/`: Offline compilation scripts (ELF loader, control flow analysis, MIPS-to-C code generator, and HLE import-stub mapper).
-- `src/`: Native runtime libraries and the from-scratch SDL3 + Vulkan GPU renderer (`src/rt/gpu_sdl3vk`).
+- `src/`: Native runtime libraries, the primary D3D12 renderer
+  (`src/rt/gpu_d3d12`), and the SDL3 + Vulkan renderer
+  (`src/rt/gpu_sdl3vk`).
 - `font/`: Replacement system fonts from PPSSPP (needed for native text dialogs).
 - `SDL3.dll`: Prebuilt SDL3 library.
 - `Makefile`: Build driver for compiling the runtime and your recompiled game.
+
+## Documentation and agent workflow
+
+Start with the [PSP-to-PC recompilation knowledge base](docs/README.md) when
+bringing up another title or changing shared runtime behavior. It consolidates:
+
+- The proven [porting workflow](docs/PORTING_WORKFLOW.md).
+- Cross-title [shared findings](docs/SHARED_FINDINGS.md).
+- The [validation and evidence ladder](docs/VALIDATION.md).
+- [Safe function recognition and exact local reuse](docs/FUNCTION_REUSE.md).
+- A copyable [new-title project template](docs/TITLE_PROJECT_TEMPLATE.md).
+- [Killzone: Liberation and Metal Gear Acid title findings](docs/titles/README.md).
+
+Workspace-aware AI agents can invoke the
+[`psp-recomp-port`](.github/skills/psp-recomp-port/SKILL.md) skill to follow
+the same workflow, ownership boundaries, stop conditions, and validation
+requirements.
 
 ## Prerequisites
 
@@ -66,6 +107,12 @@ python tools/imports.py <path_to_eboot.elf> 0x08804000 --toml=build/mygame/mygam
 ```
 
 ### 3. Generate C Code
+Optionally match reviewed library identities before generation:
+```bash
+python tools/function_catalog.py match <path_to_eboot.elf> --base 0x08804000 --output build/mygame/function_matches.toml
+```
+Normalized matches require review and never authorize generated-code reuse.
+
 Run the code generator to translate MIPS machine instructions into native C code:
 ```bash
 python tools/codegen.py <path_to_eboot.elf> build/mygame/mygame_recomp.c --base=0x08804000
@@ -76,6 +123,11 @@ a bounded binary search instead of populating a fixed-capacity runtime hash.
 With `--split --hot-functions=<report>`, lines beginning with guest addresses in the report are
 grouped into `_hot_NNN.c` files and the remainder into `_cold_NNN.c` files, allowing a target build
 to apply different optimization levels without mixing hot and cold functions in one object.
+Set `PSP_RECOMP_CODEGEN_CACHE` or pass `--cache-dir=<private-path>` to reuse
+generated functions only when their exact code, flow, generator, ABI, hints,
+and options match. See [safe function reuse](docs/FUNCTION_REUSE.md).
+Set `PSP_RECOMP_FUNCTION_CATALOG` to a private provenance catalog that should
+be used by default across local projects.
 
 ### 4. Compile the Runtime & Game
 Build the game and compile the runtime objects:
@@ -86,18 +138,19 @@ mingw32-make GAME_NAME=mygame GAME_ELF=<path_to_eboot.elf> GAME_BASE=0x08804000 
 
 The output executable will land at `build/mygame/mygame.exe`.
 
-### KZL Standalone Boot
+### Standalone Module Boot
 
-The KZL branch can boot its pre-relocated `prxload.py` image without a PPSSPP trace:
+The maintained runtime can boot a pre-relocated `prxload.py` image without a
+PPSSPP trace:
 ```bash
 <driver> --boot <image.bin> 08804000 08804000 none --gui
 ```
-`--boot` enables the scheduler, creates the PSP-compatible `module_start` thread, and supplies KZL's
-`"modulename"` argument. Keep using `--image` with a PPSSPP reference trace for differential tracing.
-The KZL root build supplies `SR_EXPECTED_ISO_SIZE` and `SR_EXPECTED_ISO_SHA1`;
-standalone boot validates `PSP_ISO` against both before allocating guest memory.
-Generic users of the fork omit those definitions and retain the toolkit's
-game-agnostic behavior.
+`--boot` enables the scheduler, creates the PSP-compatible `module_start`
+thread, and supplies the compile-time `SR_BOOT_ARG` value (`"modulename"` by
+default). Keep using `--image` with a PPSSPP reference trace for differential
+tracing. Title builds can define `SR_EXPECTED_ISO_SIZE` and
+`SR_EXPECTED_ISO_SHA1` together to validate `PSP_ISO` before guest memory is
+allocated; omitting them retains game-agnostic behavior.
 
 ### 5. Setup Game Assets & Run
 1. Place your dumped game UMD ISO in the directory containing `mygame.exe` (name it `game.iso`, or set the `PSP_ISO` environment variable to point to the ISO path).
@@ -112,12 +165,12 @@ SDL3 maps connected gamepads automatically, and gamepad, mouse, and keyboard
 input can be mixed at any time. The default PC mappings are:
 - **WASD**: PSP analog stick movement
 - **Arrow Keys**: PSP D-pad
-- **Left Mouse / F**: Square (fire)
-- **Right Mouse / E**: R (aim)
-- **Middle Mouse / R**: Triangle (reload)
-- **Mouse X1 / G**: Circle (grenade)
-- **Mouse X2 / Q**: L (strafe/roll modifier)
-- **Space**: Cross (interact/confirm)
+- **Left Mouse / F**: Square
+- **Right Mouse / E**: R
+- **Middle Mouse / R**: Triangle
+- **Mouse X1 / G**: Circle
+- **Mouse X2 / Q**: L
+- **Space**: Cross
 - **Enter / Shift**: Start / Select
 
 Gamepads use the left stick, D-pad, standard south/east/west/north face
@@ -132,7 +185,7 @@ renderer = d3d12
 internal_resolution = 2
 ```
 
-Run `kzl.exe --configure` to reopen the dialog without starting the game.
+Run `mygame.exe --configure` to reopen the dialog without starting the game.
 `renderer` accepts `auto`, `d3d12`, `sw`, or `vk`; unavailable backends fail
 explicitly at startup. `internal_resolution` accepts every integer from 1
 through 8 and applies to D3D12 color/depth targets, feedback snapshots,
@@ -168,7 +221,10 @@ aim.invert_x = false
 aim.invert_y = false
 ```
 
-`twin_stick.enabled = true` enables the experimental gamepad-only scheme.
+### Optional Killzone: Liberation twin-stick extension
+
+When the Killzone-specific extension is compiled in,
+`twin_stick.enabled = true` enables its experimental gamepad-only scheme.
 While a controller is connected, the movement stick is converted to PSP D-pad
 directions with hysteresis. The aim stick is carried through a native side
 channel and replaces the base on-foot facing vector before the game's original
@@ -177,16 +233,17 @@ D-pad movement profile without marking it dirty and restores the original
 mappings when the controller disconnects. This experiment has not yet passed
 the full gameplay validation matrix, so back up saves before testing it.
 
-Title integrations without the Killzone-specific control extension can compile
-the runtime with `SR_ENABLE_KZL_TWIN_STICK=0`. That build keeps standard PSP
-button and analog input, omits twin-stick/reversal controls from the native
-dialog and generated `input.ini`, and ignores stale twin-stick settings in an
-existing configuration. The generic fork default remains enabled for Killzone.
+Title integrations without the Killzone-specific control extension should
+compile the runtime with `SR_ENABLE_KZL_TWIN_STICK=0`. That build keeps
+standard PSP button and analog input, omits twin-stick/reversal controls from
+the native dialog and generated `input.ini`, and ignores stale twin-stick
+settings in an existing configuration. The compatibility default remains
+enabled for Killzone.
 
-Run `kzl.exe --configure-input` to edit all twelve gamepad action bindings and
+Run `mygame.exe --configure-input` to edit all twelve gamepad action bindings and
 the twin-stick/reversal options in the native controller dialog. Each action
 accepts the same comma-separated names as `input.ini`, including combinations
-such as `west, right_trigger` for Square/fire. `kzl.exe --configure` opens the
+such as `west, right_trigger` for Square/fire. `mygame.exe --configure` opens the
 graphics dialog followed by controller settings.
 Turning twin-stick on from an unchecked state loads the tested default preset:
 `left_shoulder` for PSP L/strafe, `left_trigger` for PSP R/aim,
@@ -194,7 +251,7 @@ Turning twin-stick on from an unchecked state loads the tested default preset:
 change the built-in controls while twin-stick remains disabled.
 
 The running game checks `input.ini` four times per second. Saving from a second
-`kzl.exe --configure-input` process hot-reloads bindings, twin-stick enablement,
+`mygame.exe --configure-input` process hot-reloads bindings, twin-stick enablement,
 response settings, and aim reversal without restarting. Invalid edits are
 reported in the runtime log and the last valid configuration remains active
 until a corrected file is saved. The remapper remains open after saving so
@@ -312,14 +369,15 @@ Set these environment variables before running the game to control runtime featu
   allows until the requested presentation, keep host audio dormant during that phase, then align
   virtual time to the host clock and start real-time XAudio2 playback. This is intended for
   deterministic in-game testing rather than normal play.
-- `SR_PERF_LOG=1`: Measure presentation intervals and split time between game/GE work and the
-  graphics backend. `SR_PERF_START=<present>` selects the first measured presentation and
-  `SR_PERF_WINDOW=<1..600>` selects the reporting window. `SR_PERF_MIN_FPS=<fps>` terminates with
-  failure when a completed window falls below the required average, while
-  `SR_EXIT_AFTER_PRESENT=<present>` makes unattended benchmarks exit cleanly with final audio
-  synchronization statistics. `SR_PERF_FILE=<path>` additionally writes
-  per-presentation CSV with host, backend, and fenced D3D12 GPU time;
-  `SR_PERF_FRAME_BUDGET_MS=<milliseconds>` overrides its over-budget threshold.
+- `SR_PERF_LOG=1`: Record performance samples at actual host display flips and split each sample
+  between frontend and graphics-backend time. `SR_PERF_START=<present>` selects the first sample by
+  `sceDisplaySetFrameBuf` call count, while `SR_PERF_WINDOW=<1..600>` selects the reporting window.
+  `SR_PERF_MIN_FPS=<fps>` terminates with failure when a completed flip window falls below the
+  required average. `SR_EXIT_AFTER_PRESENT=<present>` exits after the specified
+  `sceDisplaySetFrameBuf` call count with final audio synchronization statistics.
+  `SR_PERF_FILE=<path>` writes CSV v2 columns
+  `flip,present,frame_ms,frontend_ms,backend_ms,gpu_ms,over_budget`;
+  `SR_PERF_FRAME_BUDGET_MS=<milliseconds>` overrides the over-budget threshold.
 - `PSP_VFPU_TABLES=<directory>`: Override the `assets/vfpu` lookup-table directory. The golden
   harness sets this explicitly so runtime execution does not depend on its working directory.
 - `SR_INTERP_MISS_LOG=<path>`: Write each distinct guest target that missed the generated

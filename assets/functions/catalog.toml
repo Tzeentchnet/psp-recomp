@@ -1,0 +1,3 @@
+# Public function identities only. Never store game bytes or generated C here.
+schema_version = 1
+fingerprint_algorithm = "allegrex-flow-mask-v1-sha256"

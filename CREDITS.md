@@ -19,10 +19,10 @@ it as a closed-source product.
 
 ## AI assistance disclosure
 
-Much of this project — including the SDL3 + Vulkan renderer (`src/rt/gpu_sdl3vk/`,
-i.e. `sdl3vk.c`, `ge_gpu.c`, and the `shaders/*.vert|*.frag`) — was written with
-substantial assistance from a large language model (Anthropic's Claude). AI was
-used across the runtime, the HLE layer and the renderer:
+Much of this project — including the D3D12 renderer (`src/rt/gpu_d3d12/`) and
+the SDL3 + Vulkan renderer (`src/rt/gpu_sdl3vk/`) — was written with
+substantial assistance from a large language model (Anthropic's Claude). AI
+was used across the runtime, the HLE layer and the renderers:
 to draft code, to translate/port C++ from PPSSPP into C (see the next section),
 and to write comments and documentation.
 
@@ -35,9 +35,10 @@ What this means for you:
   obligations apply regardless of whether a human or a model did the translating;
   using an AI tool does not change the license of derived code. The specific
   translated code is itemised below.
-- The renderer is an **original implementation** (it does not reuse PPSSPP's GPU),
-  but it reproduces PSP/GE pixel semantics that were derived from PPSSPP's
-  software renderer (see `src/rt/ge.c`), so it is still a derivative work.
+- The GPU backends are **original implementations** (they do not reuse
+  PPSSPP's GPU), but they reproduce PSP/GE pixel semantics that were derived
+  from PPSSPP's software renderer (see `src/rt/ge.c`), so the combined work
+  remains derivative.
 
 ## PPSSPP — the single biggest dependency
 
@@ -49,8 +50,9 @@ What this means for you:
     port of PPSSPP's `Core/HLE/sceMpeg.cpp` (control flow, ring-buffer
     accounting, AU getters); it is explicitly GPLv2+. Other HLE behaviour
     (sceGe handling, kernel semantics) is modelled on or derived from PPSSPP.
-  - **GE semantics reference.** The software GE rasterizer was validated against
-    PPSSPP's software renderer; the GPU backend (`src/rt/gpu_sdl3vk`) reproduces
+  - **GE semantics reference.** The software GE rasterizer was validated
+    against PPSSPP's software renderer; the D3D12 and Vulkan backends
+    (`src/rt/gpu_d3d12` and `src/rt/gpu_sdl3vk`) reproduce
     PPSSPP-documented GE rules.
   - **Verification oracle.** The build runs `PPSSPPHeadless.exe` (PPSSPP's
     headless interpreter) as the reference the recompiled code is diffed
@@ -66,7 +68,8 @@ What this means for you:
   Note: an earlier `src/rt/gpu_vk/` bridge reused PPSSPP's `GPU_Vulkan`
   wholesale behind a C ABI (modelled on `WindowsVulkanContext.cpp`, linking
   `GPU.lib`/`Common.lib`/`Core.lib`). It was never activated and has been
-  removed; the active renderer is the project's own SDL3 + Vulkan backend.
+  removed; the active renderers are the project's own D3D12 and SDL3 + Vulkan
+  backends.
 
 Where this project's code is "PPSSPP rewritten in C" (HLE kernel behaviour,
 sceGe handling, media engine glue, etc.), it is still a derivative of GPL'd
@@ -98,20 +101,21 @@ relative to `third_party/ppsspp/`.
 | `src/rt/atrac_decode.cpp`, Atrac wrappers in `src/rt/hle.c` | `Core/HW/Atrac3Standalone.cpp`, `Core/Util/AtracTrack.cpp`, `Core/HLE/AtracCtx.cpp` | C ABI and PSP RIFF/buffer/loop integration around the separately attributed LGPL standalone decoder above. |
 | `src/rt/pgf.c`, `src/rt/pgf.h` | `Core/Font/PGF.cpp` | C port of the PGF font reader: PGF parse, `PGFFontInfo`/`PGFCharInfo`/`GlyphImage` layouts, glyph rasterisation. |
 | `src/rt/vfpu_interp.c`; VFPU prefix + transcendental helpers behind `src/rt/recomp.h`/`recomp.c` | `Core/MIPS/MIPS.cpp` and PPSSPP's VFPU kernels | Exact ports of the table-based VFPU transcendentals and the `vcst` constant table; source/destination prefix application ported from PPSSPP. |
-| `src/rt/ge.c` (software GE rasterizer) | `GPU/Software/*` (`Clipper`, `TransformUnit`, `Sampler.cpp`, `Lighting.cpp`, `DrawPixel.cpp`, `SoftGpu.cpp`), `GPU/Common/VertexDecoder*`, `GPU/ge_constants.h` / `GECommands.h`, `GPU/Common/TextureCacheCommon` | Algorithm-for-algorithm reimplementation of PPSSPP's software renderer: vertex decode, T&L, near-clipping, primitive acceptance, culling-by-submission-order, sampler/CLUT offsets, depth/fog semantics, command decode. |
+| `src/rt/ge.c` (software GE rasterizer and shared GPU frontend) | `GPU/Software/*` (`Clipper`, `TransformUnit`, `Sampler.cpp`, `Lighting.cpp`, `DrawPixel.cpp`, `SoftGpu.cpp`), `GPU/Common/VertexDecoder*`, `GPU/ge_constants.h` / `GECommands.h`, `GPU/Common/TextureCacheCommon` | Algorithm-for-algorithm reimplementation of PPSSPP's software renderer: vertex decode, T&L, near-clipping, primitive acceptance, culling-by-submission-order, sampler/CLUT offsets, depth/fog semantics, command decode. |
 | `src/rt/hle.c` (kernel/HLE behaviour), `src/rt/sas_reverb.c` | `Core/HLE/*` (`sceUtility.cpp`, `sceCtrl.cpp`, `sceAtrac.cpp`, `sceSas.cpp`, kernel object/UID pool, `SetDeadbeefRegs`), `Core/HW/Display.cpp`, `Core/HW/SasAudio.cpp`, `Core/HW/SasReverb.cpp` | Modelled on PPSSPP: UID allocation, partition layout, `sceUtility` defaults, sceCtrl ring-buffer sampling, sceAtrac decode bookkeeping, SAS ADSR/mixing and PSX-style preset reverb, deadbeef register poisoning, vblank/line timing. |
 | `src/rt/nid_names.h` | `Core/HLE/*.cpp` function tables | Generated from PPSSPP's HLE NID tables (do not edit by hand). |
 | `src/rt/recomp.h` (`CpuState` layout, semantics) | `Core/MIPS/MIPS*` | VFPU `v[128]` physical ordering, `fpcond`/`fcr31` split, unaligned LWL/LWR/SWL/SWR, kernel object pool numbering all match PPSSPP. |
 
-The SDL3 + Vulkan renderer (`src/rt/gpu_sdl3vk/`) is **not** a port of PPSSPP
-code — it is an original implementation (AI-assisted; see the disclosure above).
-It does, however, consume screen-space primitives from `src/rt/ge.c` and
-reproduces PSP/GE pixel rules that were themselves derived from PPSSPP, so it is
-a derivative work for licensing purposes.
+The D3D12 and SDL3 + Vulkan renderers (`src/rt/gpu_d3d12/` and
+`src/rt/gpu_sdl3vk/`) are **not** ports of PPSSPP code — they are original
+implementations (AI-assisted; see the disclosure above). They do, however,
+consume primitives from `src/rt/ge.c` and reproduce PSP/GE pixel rules that
+were themselves derived from PPSSPP, so the combined work is derivative for
+licensing purposes.
 
 ## Other third-party components
 
-- **SDL3** (`SDL3.dll`, `src/rt/gpu_sdl3vk`) — zlib license — https://libsdl.org
+- **SDL3** (`SDL3.dll`, `src/rt/gpu_d3d12/`, `src/rt/gpu_sdl3vk/`) — zlib license — https://libsdl.org
 - **Vulkan loader / headers** — Apache-2.0 — https://github.com/KhronosGroup/Vulkan-Loader
 - **PSPSDK headers/defines/constants** — BSD-compatible (see top of
   `third_party/ppsspp/LICENSE.TXT`).
@@ -120,8 +124,8 @@ a derivative work for licensing purposes.
 
 ## If you only want the recompiler, not PPSSPP
 
-The MIPS-to-C recompiler itself (`tools/`, parts of `src/rt`) and the SDL3 +
-Vulkan renderer are independent of PPSSPP. But the runtime still contains
-PPSSPP-derived HLE/GE/VFPU code and uses PPSSPP as its verification oracle, so a
-GPL-free build is not available today; relicensing would require replacing
-those derivative parts.
+The MIPS-to-C recompiler itself (`tools/`, parts of `src/rt`) and the D3D12 and
+SDL3 + Vulkan backends are independent of PPSSPP. But the runtime still
+contains PPSSPP-derived HLE/GE/VFPU code and uses PPSSPP as its verification
+oracle, so a GPL-free build is not available today; relicensing would require
+replacing those derivative parts.
