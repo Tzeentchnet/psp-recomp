@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include "sr_env.h"
 
 /* Wall-clock ms (MinGW clock() is wall time with CLOCKS_PER_SEC=1000). */
 static unsigned long wall_ms(void) { return (unsigned long)(clock() * 1000ull / CLOCKS_PER_SEC); }
@@ -2381,6 +2382,25 @@ static void decode_model_vtx(uint32_t addr, const VFmt *vf, ModelVtx *out) {
     out->nz = nz;
 }
 
+/* Viewport/offset registers change per draw at most; decode them only when they do. */
+typedef struct { float vp[6]; float off[2]; } ViewportCache;
+static const ViewportCache *viewport_cache(void) {
+    static uint32_t raw[8];
+    static ViewportCache cache;
+    static int valid;
+    if (!valid || memcmp(raw, ge.viewport_raw, sizeof(uint32_t) * 6) != 0 ||
+        raw[6] != ge.offsetx || raw[7] != ge.offsety) {
+        memcpy(raw, ge.viewport_raw, sizeof(uint32_t) * 6);
+        raw[6] = ge.offsetx;
+        raw[7] = ge.offsety;
+        for (int i = 0; i < 6; i++) cache.vp[i] = decode_float24(raw[i]);
+        cache.off[0] = (float)(ge.offsetx & 0xFFFF) / 16.0f;
+        cache.off[1] = (float)(ge.offsety & 0xFFFF) / 16.0f;
+        valid = 1;
+    }
+    return &cache;
+}
+
 static void transform_model_vtx_clip(const ModelVtx *in, CVtx *o) {
     float mx = in->x, my = in->y, mz = in->z;
 
@@ -2501,9 +2521,10 @@ static void transform_model_vtx_clip(const ModelVtx *in, CVtx *o) {
         float zw = o->cz / o->cw;
         if (zw >= zoutside) o->ozp = 1;
         else if (-zw >= zoutside) o->ozn = 1;
-        float sx = o->cx * decode_float24(ge.viewport_raw[0]) / o->cw + decode_float24(ge.viewport_raw[3]);
-        float sy = o->cy * decode_float24(ge.viewport_raw[1]) / o->cw + decode_float24(ge.viewport_raw[4]);
-        float sz = o->cz * decode_float24(ge.viewport_raw[2]) / o->cw + decode_float24(ge.viewport_raw[5]);
+        const float *vp = viewport_cache()->vp;
+        float sx = o->cx * vp[0] / o->cw + vp[3];
+        float sy = o->cy * vp[1] / o->cw + vp[4];
+        float sz = o->cz * vp[2] / o->cw + vp[5];
         o->sx = sx; o->sy = sy; o->sz = sz;
         const float SB = 4095.0f + 15.5f / 16.0f;
         if (ge.depth_clip) {
@@ -2623,14 +2644,10 @@ static void project_cvtx(const CVtx *c, Vtx *o) {
     float inv_w = 1.0f / c->cw;
     float ndcx = c->cx * inv_w, ndcy = c->cy * inv_w, ndcz = c->cz * inv_w;
 
-    float vp_xs = decode_float24(ge.viewport_raw[0]);
-    float vp_ys = decode_float24(ge.viewport_raw[1]);
-    float vp_zs = decode_float24(ge.viewport_raw[2]);
-    float vp_xc = decode_float24(ge.viewport_raw[3]);
-    float vp_yc = decode_float24(ge.viewport_raw[4]);
-    float vp_zc = decode_float24(ge.viewport_raw[5]);
-    float off_x = (float)(ge.offsetx & 0xFFFF) / 16.0f;
-    float off_y = (float)(ge.offsety & 0xFFFF) / 16.0f;
+    const float *vp = viewport_cache()->vp, *off = viewport_cache()->off;
+    float vp_xs = vp[0], vp_ys = vp[1], vp_zs = vp[2];
+    float vp_xc = vp[3], vp_yc = vp[4], vp_zc = vp[5];
+    float off_x = off[0], off_y = off[1];
 
     o->x = ndcx * vp_xs + vp_xc - off_x;
     o->y = ndcy * vp_ys + vp_yc - off_y;

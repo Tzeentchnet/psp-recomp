@@ -91,6 +91,7 @@ void sr_swr(uint32_t addr, uint32_t rtv) {
 /* ---- VFPU transcendental kernels (exact ports of PPSSPP's table-based vfpu_rcp/vfpu_rsqrt) ---- */
 
 #include <math.h>
+#include "sr_env.h"
 
 static int8_t (*sr_rcp_lut)[2] = NULL;
 static uint32_t *sr_sin_lut8192 = NULL;

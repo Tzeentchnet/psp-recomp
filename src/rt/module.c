@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "../../third_party/ppsspp_savedata/SHA1.h"
+#include "sr_env.h"
 
 #define SR_MAX_MODULES 128
 #define SR_MAX_GUEST_EXPORTS 4096

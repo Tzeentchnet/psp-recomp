@@ -26,6 +26,7 @@ int  sr_h264_audio_frame(
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "sr_env.h"
 
 /* ---- constants (PPSSPP sceMpeg.cpp/.h) ---- */
 #define PSMF_MAGIC                 0x464D5350u

@@ -100,6 +100,7 @@ static struct {
     HANDLE thread;
     volatile LONG stop;
     uint32_t *rvas;
+    uintptr_t *ips;
     volatile LONG count;
     uint32_t start, end;
     int configured, running, done;
@@ -129,6 +130,7 @@ static DWORD WINAPI sampler_main(LPVOID unused) {
         ResumeThread(s_sampler.target);
         LONG index = s_sampler.count;
         if (got && index < (LONG)SR_SAMPLE_CAPACITY) {
+            s_sampler.ips[index] = rip;
             s_sampler.rvas[index] = rip >= base && rip - base < 0xffffffffu
                 ? (uint32_t)(rip - base) : 0xffffffffu;
             s_sampler.count = index + 1;
@@ -145,6 +147,25 @@ static void sampler_finish(void) {
     s_sampler.running = 0;
     s_sampler.done = 1;
     uint32_t count = (uint32_t)s_sampler.count;
+    /* Name the module of every sample outside the executable so driver time is attributable. */
+    const char *path0 = getenv("SR_SAMPLE_FILE");
+    char modules_path[MAX_PATH + 16];
+    snprintf(modules_path, sizeof(modules_path), "%s.modules.txt", path0 && path0[0] ? path0 : "ip_samples.txt");
+    FILE *modules = fopen(modules_path, "w");
+    if (modules) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (s_sampler.rvas[i] != 0xffffffffu) continue;
+            HMODULE module = NULL;
+            wchar_t name[MAX_PATH] = L"?";
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)s_sampler.ips[i], &module))
+                GetModuleFileNameW(module, name, MAX_PATH);
+            fprintf(modules, "%ls %llx\n", name,
+                    (unsigned long long)((uintptr_t)s_sampler.ips[i] - (uintptr_t)module));
+        }
+        fclose(modules);
+    }
     qsort(s_sampler.rvas, count, sizeof(uint32_t), compare_rva);
     const char *path = getenv("SR_SAMPLE_FILE");
     FILE *file = fopen(path && path[0] ? path : "ip_samples.txt", "w");
@@ -159,7 +180,9 @@ static void sampler_finish(void) {
         fclose(file);
     }
     free(s_sampler.rvas);
+    free(s_sampler.ips);
     s_sampler.rvas = NULL;
+    s_sampler.ips = NULL;
 }
 
 void sr_ip_sampler_present(uint32_t present) {
@@ -175,7 +198,8 @@ void sr_ip_sampler_present(uint32_t present) {
     }
     if (!s_sampler.running && present >= s_sampler.start && present < s_sampler.end) {
         s_sampler.rvas = (uint32_t *)malloc(SR_SAMPLE_CAPACITY * sizeof(uint32_t));
-        if (!s_sampler.rvas ||
+        s_sampler.ips = (uintptr_t *)malloc(SR_SAMPLE_CAPACITY * sizeof(uintptr_t));
+        if (!s_sampler.rvas || !s_sampler.ips ||
             !DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
                              &s_sampler.target, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
                              FALSE, 0)) {

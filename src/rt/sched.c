@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "sr_env.h"
 
 int     sr_sched_on = 0;
 int32_t sr_timeslice = 0;

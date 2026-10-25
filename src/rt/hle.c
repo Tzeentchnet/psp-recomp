@@ -39,6 +39,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
+#include "sr_env.h"
 
 uint32_t sr_last_nid = 0;
 
@@ -3300,7 +3301,7 @@ static int compare_double(const void *left, const void *right) {
 
 static uint32_t env_present_value(
     const char *name, uint32_t fallback) {
-    const char *value = getenv(name);
+    const char *value = (getenv)(name);
     if (!value || !value[0]) return fallback;
     char *end = NULL;
     unsigned long parsed = strtoul(value, &end, 10);
