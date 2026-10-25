@@ -928,7 +928,14 @@ bool ged3d12_pipeline_bind(
         s_stats.failures++;
         LeaveCriticalSection(&s_lock);
     }
-    ged3d12_command_list()->SetPipelineState(pipeline);
+    static ID3D12PipelineState *s_bound_pipeline;
+    static uint32_t s_bound_generation;
+    uint32_t generation = ged3d12_command_list_generation();
+    if (pipeline != s_bound_pipeline || generation != s_bound_generation) {
+        ged3d12_command_list()->SetPipelineState(pipeline);
+        s_bound_pipeline = pipeline;
+        s_bound_generation = generation;
+    }
     if (exact) *exact = exact_pipeline;
     return true;
 }

@@ -87,6 +87,8 @@ enum GeD3D12SamplerRegister : UINT {
 
 ID3D12Device *ged3d12_device(void);
 ID3D12GraphicsCommandList *ged3d12_command_list(void);
+/* Increments each time the command list is reset; cached bind state is only valid within one. */
+uint32_t ged3d12_command_list_generation(void);
 ID3D12CommandQueue *ged3d12_graphics_queue(void);
 ID3D12CommandQueue *ged3d12_copy_queue(void);
 ID3D12DescriptorHeap *ged3d12_srv_heap(void);

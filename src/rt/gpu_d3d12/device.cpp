@@ -107,6 +107,7 @@ static uint8_t s_dsv_used[DSV_DESCRIPTOR_COUNT];
 
 static FrameContext s_frames[FRAME_COUNT];
 static ID3D12GraphicsCommandList *s_command_list;
+static uint32_t s_command_list_generation = 1;
 static ID3D12GraphicsCommandList5 *s_command_list5;
 static ID3D12QueryHeap *s_timestamp_heap;
 static ID3D12Resource *s_timestamp_readback;
@@ -1117,6 +1118,7 @@ static int begin_frame(UINT *frame_index) {
                   "reset graphics command list")) {
         return 0;
     }
+    s_command_list_generation++;
     ID3D12DescriptorHeap *heaps[] = {s_srv_heap, s_sampler_heap};
     s_command_list->SetDescriptorHeaps(
         (UINT)(sizeof(heaps) / sizeof(heaps[0])), heaps);
@@ -1859,6 +1861,7 @@ extern "C" int ged3d12_capture_next(const char *path) {
 
 ID3D12Device *ged3d12_device(void) { return s_device; }
 ID3D12GraphicsCommandList *ged3d12_command_list(void) { return s_command_list; }
+uint32_t ged3d12_command_list_generation(void) { return s_command_list_generation; }
 ID3D12CommandQueue *ged3d12_graphics_queue(void) { return s_graphics_queue; }
 ID3D12CommandQueue *ged3d12_copy_queue(void) { return s_copy_queue; }
 ID3D12DescriptorHeap *ged3d12_srv_heap(void) { return s_srv_heap; }

@@ -733,11 +733,23 @@ bool ged3d12_texture_bind(const GeD3D12TextureBinding *binding) {
     }
     D3D12_GPU_DESCRIPTOR_HANDLE sampler = {};
     if (!sampler_binding(&binding->sampler, &sampler)) return false;
+    static D3D12_GPU_DESCRIPTOR_HANDLE s_bound_descriptors;
+    static D3D12_GPU_DESCRIPTOR_HANDLE s_bound_sampler;
+    static uint32_t s_bound_generation;
+    uint32_t generation = ged3d12_command_list_generation();
+    if (s_bound_generation == generation &&
+        s_bound_descriptors.ptr == descriptors.ptr &&
+        s_bound_sampler.ptr == sampler.ptr) {
+        return true;
+    }
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
     command_list->SetGraphicsRootDescriptorTable(
         GE_D3D12_ROOT_TEXTURES, descriptors);
     command_list->SetGraphicsRootDescriptorTable(
         GE_D3D12_ROOT_SAMPLER, sampler);
+    s_bound_descriptors = descriptors;
+    s_bound_sampler = sampler;
+    s_bound_generation = generation;
     return true;
 }
 

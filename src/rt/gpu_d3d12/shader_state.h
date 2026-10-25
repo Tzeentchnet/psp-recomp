@@ -49,6 +49,7 @@ struct GeD3D12ShaderConstants {
 struct GeD3D12ShaderConstantCache {
     GeD3D12ShaderConstants value;
     uint32_t valid;
+    uint32_t scissor_generation;
 };
 
 void ged3d12_shader_constants_build(
@@ -74,7 +75,7 @@ static_assert(
     "D3D12 shader constants ABI changed");
 static_assert(
     sizeof(GeD3D12ShaderConstantCache) ==
-        sizeof(GeD3D12ShaderConstants) + sizeof(uint32_t),
+        sizeof(GeD3D12ShaderConstants) + 2 * sizeof(uint32_t),
     "D3D12 shader constant cache ABI changed");
 
 #endif

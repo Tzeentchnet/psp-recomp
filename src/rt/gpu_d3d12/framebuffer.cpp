@@ -59,6 +59,8 @@ struct SnapshotRect {
 static ColorTarget s_targets[MAX_TARGETS];
 static DepthTarget s_depths[MAX_DEPTHS];
 static ColorTarget *s_active_target;
+static DepthTarget *s_bound_depth;
+static uint32_t s_bound_generation;
 static ID3D12Resource *s_snapshot;
 static D3D12_RESOURCE_STATES s_snapshot_state;
 static D3D12_GPU_DESCRIPTOR_HANDLE s_snapshot_descriptors;
@@ -105,6 +107,7 @@ static bool s_initialized;
 static bool s_log;
 static bool s_legacy_depth_uploads;
 static bool s_legacy_feedback_snapshots;
+static bool s_legacy_destination_snapshots;
 static bool s_disable_feedback_aliases;
 /* Upload heaps are write-combined: scaled rows are built here, then only written to the heap.
  * Duplicating rows by reading the heap back cost ~56 ms per movie frame at 2x. */
@@ -654,6 +657,7 @@ static void release_color(ColorTarget *target) {
 
 static void release_depth(DepthTarget *depth) {
     if (!depth->occupied) return;
+    if (s_bound_depth == depth) s_bound_depth = nullptr;
     if (depth->dsv.ptr) ged3d12_dsv_free(depth->dsv_index);
     RELEASE_COM(depth->resource);
     memset(depth, 0, sizeof(*depth));
@@ -917,6 +921,8 @@ bool ged3d12_framebuffer_cache_init(void) {
         getenv("SR_D3D12_LEGACY_DEPTH_UPLOADS") != nullptr;
     s_legacy_feedback_snapshots =
         getenv("SR_D3D12_LEGACY_FEEDBACK_SNAPSHOTS") != nullptr;
+    s_legacy_destination_snapshots =
+        getenv("SR_D3D12_LEGACY_DESTINATION_SNAPSHOTS") != nullptr;
     s_disable_feedback_aliases =
         getenv("SR_D3D12_DISABLE_FEEDBACK_ALIASES") != nullptr;
     fprintf(
@@ -1083,17 +1089,20 @@ bool ged3d12_framebuffer_bind(const GeD3D12FramebufferBinding *binding) {
                D3D12_RESOURCE_STATE_RENDER_TARGET);
     transition(command_list, depth->resource, &depth->state,
                D3D12_RESOURCE_STATE_DEPTH_WRITE);
-    command_list->OMSetRenderTargets(1, &target->rtv, FALSE, &depth->dsv);
-    D3D12_VIEWPORT viewport = {};
-    viewport.Width = (float)render_width();
-    viewport.Height = (float)render_height();
-    viewport.MaxDepth = 1.0f;
-    D3D12_RECT scissor = {
-        0, 0, (LONG)render_width(),
-        (LONG)render_height(),
-    };
-    command_list->RSSetViewports(1, &viewport);
-    command_list->RSSetScissorRects(1, &scissor);
+    uint32_t generation = ged3d12_command_list_generation();
+    if (s_active_target != target || s_bound_depth != depth ||
+        s_bound_generation != generation) {
+        command_list->OMSetRenderTargets(
+            1, &target->rtv, FALSE, &depth->dsv);
+        D3D12_VIEWPORT viewport = {};
+        viewport.Width = (float)render_width();
+        viewport.Height = (float)render_height();
+        viewport.MaxDepth = 1.0f;
+        command_list->RSSetViewports(1, &viewport);
+        s_bound_depth = depth;
+        s_bound_generation = generation;
+    }
+    /* The per-draw scissor is set by ged3d12_shader_constants_bind. */
     target->lru = s_lru++;
     depth->lru = s_lru++;
     s_active_target = target;
@@ -1118,19 +1127,46 @@ bool ged3d12_framebuffer_bind_destination(
                D3D12_RESOURCE_STATE_COPY_DEST);
     transition(command_list, s_depth_snapshot, &s_depth_snapshot_state,
                D3D12_RESOURCE_STATE_COPY_DEST);
+    /* The pixel shader only loads the destination at fragment positions, which lie inside
+     * the draw's vertex bounds. Copy that rectangle (one PSP pixel of margin) rather than the
+     * complete render target; texels outside it are never read for this draw. */
+    D3D12_BOX box = {
+        0, 0, 0, render_width(), render_height(), 1,
+    };
+    if (!s_legacy_destination_snapshots &&
+        binding->draw_right > binding->draw_left &&
+        binding->draw_bottom > binding->draw_top) {
+        uint32_t left = binding->draw_left ? binding->draw_left - 1u : 0u;
+        uint32_t top = binding->draw_top ? binding->draw_top - 1u : 0u;
+        uint32_t right = binding->draw_right + 1u;
+        uint32_t bottom = binding->draw_bottom + 1u;
+        if (right > GE_D3D12_FRAMEBUFFER_WIDTH)
+            right = GE_D3D12_FRAMEBUFFER_WIDTH;
+        if (bottom > GE_D3D12_FRAMEBUFFER_HEIGHT)
+            bottom = GE_D3D12_FRAMEBUFFER_HEIGHT;
+        if (right > left && bottom > top) {
+            box.left = left * s_render_scale;
+            box.top = top * s_render_scale;
+            box.right = right * s_render_scale;
+            box.bottom = bottom * s_render_scale;
+        }
+    }
     D3D12_TEXTURE_COPY_LOCATION color_source = {};
     color_source.pResource = target->resource;
     color_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_TEXTURE_COPY_LOCATION color_destination = {};
     color_destination.pResource = s_snapshot;
     color_destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    D3D12_BOX color_box = {
-        0, 0, 0,
-        render_width(), render_height(), 1,
-    };
     command_list->CopyTextureRegion(
-        &color_destination, 0, 0, 0, &color_source, &color_box);
-    command_list->CopyResource(s_depth_snapshot, depth->resource);
+        &color_destination, box.left, box.top, 0, &color_source, &box);
+    D3D12_TEXTURE_COPY_LOCATION depth_source = {};
+    depth_source.pResource = depth->resource;
+    depth_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION depth_destination = {};
+    depth_destination.pResource = s_depth_snapshot;
+    depth_destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    command_list->CopyTextureRegion(
+        &depth_destination, box.left, box.top, 0, &depth_source, &box);
     if (s_log && !s_destination_snapshots)
         fprintf(stderr, "ged3d12: destination snapshots active\n");
     s_destination_snapshots++;

@@ -285,16 +285,24 @@ bool ged3d12_shader_constants_bind(
     GeD3D12ShaderConstantCache *cache,
     const GeD3D12ShaderConstants *constants) {
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
+    bool scissor_current =
+        cache->valid && cache->scissor_generation ==
+            ged3d12_command_list_generation() &&
+        memcmp(cache->value.scissor, constants->scissor,
+               sizeof(constants->scissor)) == 0;
     bool updated = ged3d12_shader_constants_cache_update(cache, constants);
     if (updated) {
         command_list->SetGraphicsRoot32BitConstants(
             GE_D3D12_ROOT_GE_STATE,
             sizeof(*constants) / sizeof(uint32_t), constants, 0);
     }
-    D3D12_RECT scissor = {
-        constants->scissor[0], constants->scissor[1],
-        constants->scissor[2], constants->scissor[3],
-    };
-    command_list->RSSetScissorRects(1, &scissor);
+    if (!scissor_current) {
+        D3D12_RECT scissor = {
+            constants->scissor[0], constants->scissor[1],
+            constants->scissor[2], constants->scissor[3],
+        };
+        command_list->RSSetScissorRects(1, &scissor);
+        cache->scissor_generation = ged3d12_command_list_generation();
+    }
     return updated;
 }
