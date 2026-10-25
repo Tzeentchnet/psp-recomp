@@ -2,6 +2,7 @@
 #include "../../src/rt/gpu_d3d12/framebuffer.h"
 #include "../../src/rt/gpu_d3d12/present.h"
 #include "../../src/rt/gpu_d3d12/vertex.h"
+#include "../../src/rt/perf_stats.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -44,6 +45,10 @@ bool ged3d12_framebuffer_capture(GeD3D12FramebufferBinding *out) {
     out->color_handle = 1;
     out->depth_handle = 2;
     return true;
+}
+
+extern "C" SrPerfCategory sr_perf_switch(SrPerfCategory category) {
+    return category;
 }
 
 uint32_t ged3d12_command_list_generation(void) {

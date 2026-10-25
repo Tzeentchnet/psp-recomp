@@ -37,6 +37,67 @@
 
 GeState *ge_state_ptr(void);
 
+/* SR_GETRACE=1: bounded estimate of how much GE list execution could overlap guest execution
+ * if it ran on a worker. A chunk is one process_dl_queue run. Time spent in guest/scheduler
+ * code after the first unsynchronized chunk, until the next sceGeDrawSync/ListSync(wait) or
+ * display flip, bounds the overlap for the GE time accumulated in between. */
+#ifdef _WIN32
+#include <windows.h>
+#endif
+static struct {
+    int enabled, initialized;
+    long long frequency;
+    long long pending_ge_ticks;      /* GE time since the last sync event */
+    long long total_ge_ticks;        /* cumulative GE time */
+    long long first_start;           /* when the first pending chunk began, 0 if none */
+    long long first_total_ge;        /* total_ge_ticks when it began */
+    double ge_ms, overlap_ms, slack_ms;
+    unsigned chunks, syncs, syncs_with_work;
+} s_trace;
+
+static long long trace_now(void) {
+    LARGE_INTEGER value;
+    QueryPerformanceCounter(&value);
+    return value.QuadPart;
+}
+
+static int trace_on(void) {
+    if (!s_trace.initialized) {
+        s_trace.initialized = 1;
+        s_trace.enabled = getenv("SR_GETRACE") != NULL;
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        s_trace.frequency = frequency.QuadPart;
+    }
+    return s_trace.enabled;
+}
+
+void sr_ge_trace_sync(const char *reason) {
+    if (!trace_on()) return;
+    s_trace.syncs++;
+    if (!s_trace.pending_ge_ticks) return;
+    long long now = trace_now();
+    long long guest = (now - s_trace.first_start) -
+        (s_trace.total_ge_ticks - s_trace.first_total_ge);
+    if (guest < 0) guest = 0;
+    long long overlap = guest < s_trace.pending_ge_ticks ? guest : s_trace.pending_ge_ticks;
+    double scale = 1000.0 / (double)s_trace.frequency;
+    s_trace.ge_ms += (double)s_trace.pending_ge_ticks * scale;
+    s_trace.overlap_ms += (double)overlap * scale;
+    s_trace.slack_ms += (double)guest * scale;
+    s_trace.syncs_with_work++;
+    s_trace.pending_ge_ticks = 0;
+    s_trace.first_start = 0;
+    if (s_trace.syncs_with_work % 240u == 0) {
+        fprintf(stderr,
+                "GETRACE %s: syncs=%u with_work=%u chunks=%u ge=%.1fms overlappable=%.1fms (%.0f%%) guest_slack=%.1fms\n",
+                reason, s_trace.syncs, s_trace.syncs_with_work, s_trace.chunks,
+                s_trace.ge_ms, s_trace.overlap_ms,
+                s_trace.ge_ms > 0.0 ? 100.0 * s_trace.overlap_ms / s_trace.ge_ms : 0.0,
+                s_trace.slack_ms);
+    }
+}
+
 #define LIST_ID_MAGIC 0x35000000u
 #define MAX_LISTS     64
 
@@ -408,8 +469,19 @@ static void process_dl_queue(void) {
         SrPerfCategory previous_category =
             sr_perf_switch(SR_PERF_GE);
         sr_perf_counter_add(SR_PERF_GE_LISTS, 1);
+        long long trace_begin = trace_on() ? trace_now() : 0;
         run_list(l);
         sr_perf_switch(previous_category);
+        if (trace_begin) {
+            long long elapsed = trace_now() - trace_begin;
+            if (!s_trace.pending_ge_ticks) {
+                s_trace.first_start = trace_begin;
+                s_trace.first_total_ge = s_trace.total_ge_ticks;
+            }
+            s_trace.pending_ge_ticks += elapsed;
+            s_trace.total_ge_ticks += elapsed;
+            s_trace.chunks++;
+        }
         if (df) fprintf(df, "# end list %d pc=%08x state=%s\n", l->id, l->pc,
                         s_gpustate == GPU_STALL ? "stall" : s_gpustate == GPU_DONE ? "done" :
                         s_gpustate == GPU_INTERRUPT ? "interrupt" : "error");
@@ -634,6 +706,7 @@ static uint32_t h_GeListSync(CpuState *s) {
         }
     }
     if (sched_in_interrupt()) return ERR_ILLEGAL_CONTEXT;
+    sr_ge_trace_sync("listsync");
     if (dl->sync_pending) sched_block_on(GE_LIST_OBJ(listid));
     return LIST_COMPLETED;
 }
@@ -643,6 +716,7 @@ static uint32_t h_GeDrawSync(CpuState *s) {
     if (mode > 1) return ERR_INVALID_MODE;
     if (mode == 0) {
         if (sched_in_interrupt()) return ERR_ILLEGAL_CONTEXT;
+        sr_ge_trace_sync("drawsync");
         if (!s_draw_complete) {
             sched_block_on(GE_DRAW_OBJ);
         } else {

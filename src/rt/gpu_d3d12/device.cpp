@@ -143,6 +143,7 @@ static UINT64 s_constant_updates;
 static UINT64 s_constant_reuses;
 static UINT64 s_direct_draws;
 static UINT64 s_manual_draws;
+static UINT64 s_merged_batches;
 static int s_stage_log;
 static LARGE_INTEGER s_stage_frequency;
 
@@ -1052,6 +1053,7 @@ static int device_init(void) {
     s_constant_reuses = 0;
     s_direct_draws = 0;
     s_manual_draws = 0;
+    s_merged_batches = 0;
     s_vertex_max = 0;
     memset(s_vertex_primitives, 0, sizeof(s_vertex_primitives));
 
@@ -1443,6 +1445,23 @@ static void log_draw_batches(
     s_gpu_log_draws++;
 }
 
+/* Adjacent direct-path batches with identical complete state and contiguous vertices draw
+ * exactly as one larger batch. Manual (destination-aware) draws are never merged. */
+static bool can_merge_direct(
+    const GeD3D12VertexBatch *first, const GeD3D12VertexBatch *next,
+    uint32_t accumulated) {
+    return !(next->flags & GE_D3D12_BATCH_INDEXED) &&
+           same_list(first, next) &&
+           next->first == first->first + accumulated &&
+           next->primitive == first->primitive &&
+           next->perspective == first->perspective &&
+           next->framebuffer.color_handle == first->framebuffer.color_handle &&
+           next->framebuffer.depth_handle == first->framebuffer.depth_handle &&
+           memcmp(&next->pipeline, &first->pipeline, sizeof(first->pipeline)) == 0 &&
+           memcmp(&next->shader, &first->shader, sizeof(first->shader)) == 0 &&
+           memcmp(&next->texture, &first->texture, sizeof(first->texture)) == 0;
+}
+
 static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
     const GeD3D12VertexBatch *open_list = nullptr;
     const GeD3D12VertexBatch *open_draw = nullptr;
@@ -1513,6 +1532,28 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
             s_constant_reuses++;
         }
         ged3d12_set_coarse_shading(direct);
+        GeD3D12FramebufferBinding rendered = batch->framebuffer;
+        UINT draw_count = batch->count;
+        if (direct && !(batch->flags & GE_D3D12_BATCH_INDEXED) &&
+            batch->texture.framebuffer.handle ==
+                GE_D3D12_FRAMEBUFFER_HANDLE_NONE &&
+            (batch->texture.flags & GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT) == 0 &&
+            !gpu_log_active(s_vertex_frames + 1)) {
+            while (i + 1 < frame->batch_count &&
+                   can_merge_direct(batch, &frame->batches[i + 1], draw_count)) {
+                const GeD3D12VertexBatch *next = &frame->batches[++i];
+                draw_count += next->count;
+                if (next->framebuffer.draw_left < rendered.draw_left)
+                    rendered.draw_left = next->framebuffer.draw_left;
+                if (next->framebuffer.draw_top < rendered.draw_top)
+                    rendered.draw_top = next->framebuffer.draw_top;
+                if (next->framebuffer.draw_right > rendered.draw_right)
+                    rendered.draw_right = next->framebuffer.draw_right;
+                if (next->framebuffer.draw_bottom > rendered.draw_bottom)
+                    rendered.draw_bottom = next->framebuffer.draw_bottom;
+                s_merged_batches++;
+            }
+        }
         s_command_list->SetGraphicsRootShaderResourceView(
             GE_D3D12_ROOT_VERTICES,
             frame->buffer.BufferLocation +
@@ -1528,10 +1569,9 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
                 batch->count, 1, 0, 0, 0);
         } else {
             s_command_list->DrawInstanced(
-                batch->count, 1, 0, 0);
+                draw_count, 1, 0, 0);
         }
-        if (!ged3d12_framebuffer_mark_rendered(
-                &batch->framebuffer)) {
+        if (!ged3d12_framebuffer_mark_rendered(&rendered)) {
             ok = false;
             break;
         }
@@ -1635,6 +1675,7 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
                 (unsigned long long)s_direct_draws,
                 (unsigned long long)s_manual_draws);
         ged3d12_shader_manual_reasons_print();
+        fprintf(stderr, "ged3d12: merged direct batches=%llu\n", (unsigned long long)s_merged_batches);
     }
     if (gpu_log_active(s_vertex_frames)) {
         fprintf(

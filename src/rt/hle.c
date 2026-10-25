@@ -3379,7 +3379,8 @@ static void present_perf_init(void) {
                 "backend_present_ms,backend_submit_ms,"
                 "backend_vertices,backend_batches,framebuffer_readbacks,"
                 "framebuffer_aliases,feedback_snapshots,"
-                "feedback_snapshot_pixels,feedback_reuses\n") < 0) {
+                "feedback_snapshot_pixels,feedback_reuses,"
+                "capture_ms,texture_capture_ms,state_capture_ms\n") < 0) {
             if (s_present_perf.file)
                 fclose(s_present_perf.file);
             s_present_perf.file = NULL;
@@ -3468,7 +3469,10 @@ static void present_perf_finish(
             phases->category_ms[SR_PERF_SPLINE] +
             phases->category_ms[SR_PERF_PATCH_EVAL] +
             phases->category_ms[SR_PERF_PATCH_DRAW] +
-            phases->category_ms[SR_PERF_VERTEX_DECODE];
+            phases->category_ms[SR_PERF_VERTEX_DECODE] +
+            phases->category_ms[SR_PERF_CAPTURE] +
+            phases->category_ms[SR_PERF_TEXTURE_CAPTURE] +
+            phases->category_ms[SR_PERF_STATE_CAPTURE];
         if (s_present_perf.file &&
             fprintf(
                 s_present_perf.file,
@@ -3478,7 +3482,7 @@ static void present_perf_finish(
                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
                 "%llu,"
                 "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%u,"
-                "%llu,%llu,%llu,%llu,%llu\n",
+                "%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f\n",
                 flip, present, frame_ms,
                 s_present_perf.frontend_ms[index],
                 s_present_perf.previous_backend_ms,
@@ -3542,7 +3546,10 @@ static void present_perf_finish(
                 (unsigned long long)framebuffer_aliases,
                 (unsigned long long)feedback_snapshots,
                 (unsigned long long)feedback_snapshot_pixels,
-                (unsigned long long)feedback_reuses) < 0) {
+                (unsigned long long)feedback_reuses,
+                phases->category_ms[SR_PERF_CAPTURE],
+                phases->category_ms[SR_PERF_TEXTURE_CAPTURE],
+                phases->category_ms[SR_PERF_STATE_CAPTURE]) < 0) {
             fprintf(stderr, "SR_PERF_FILE: write failed\n");
             runtime_exit_cleanly(2);
         }

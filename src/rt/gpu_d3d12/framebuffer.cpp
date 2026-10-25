@@ -104,6 +104,12 @@ static uint32_t s_snapshot_dirty_count;
 static bool s_snapshot_dirty_all;
 static uint32_t s_render_scale = 1u;
 static bool s_initialized;
+/* Last framebuffer capture, valid until the capture generation changes or a target is released. */
+static GeD3D12FramebufferKey s_capture_memo_key;
+static GeD3D12FramebufferBinding s_capture_memo_binding;
+static uint64_t s_capture_memo_generation;
+static uint32_t s_release_epoch = 1;
+static uint32_t s_capture_memo_epoch;
 static bool s_log;
 static bool s_legacy_depth_uploads;
 static bool s_legacy_feedback_snapshots;
@@ -648,6 +654,7 @@ static bool readback_color(ColorTarget *target) {
 
 static void release_color(ColorTarget *target) {
     if (!target->occupied) return;
+    s_release_epoch++;
     if (s_active_target == target) s_active_target = nullptr;
     if (target->rtv.ptr) ged3d12_rtv_free(target->rtv_index);
     RELEASE_COM(target->resource);
@@ -657,6 +664,7 @@ static void release_color(ColorTarget *target) {
 
 static void release_depth(DepthTarget *depth) {
     if (!depth->occupied) return;
+    s_release_epoch++;
     if (s_bound_depth == depth) s_bound_depth = nullptr;
     if (depth->dsv.ptr) ged3d12_dsv_free(depth->dsv_index);
     RELEASE_COM(depth->resource);
@@ -1007,6 +1015,13 @@ bool ged3d12_framebuffer_capture(GeD3D12FramebufferBinding *out) {
         fprintf(stderr, "ged3d12: invalid framebuffer state\n");
         return false;
     }
+    if (s_capture_memo_epoch == s_release_epoch &&
+        s_capture_memo_generation == s_capture_generation &&
+        memcmp(&key, &s_capture_memo_key, sizeof(key)) == 0) {
+        *out = s_capture_memo_binding;
+        s_captures++;
+        return true;
+    }
     uint32_t color_slot;
     ColorTarget *target = acquire_color(&key, &color_slot);
     if (!target) return false;
@@ -1026,6 +1041,10 @@ bool ged3d12_framebuffer_capture(GeD3D12FramebufferBinding *out) {
     depth->lru = s_lru++;
     out->color_handle = color_handle(color_slot, target);
     out->depth_handle = depth_handle(depth_slot, depth);
+    s_capture_memo_key = key;
+    s_capture_memo_binding = *out;
+    s_capture_memo_generation = s_capture_generation;
+    s_capture_memo_epoch = s_release_epoch;
     s_captures++;
     return true;
 }

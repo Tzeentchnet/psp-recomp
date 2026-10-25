@@ -1,6 +1,7 @@
 #include "vertex.h"
 
 #include "device.h"
+#include "../perf_stats.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -119,25 +120,31 @@ static bool begin_primitive_ex(
     batch->draw_serial = debug.draw_serial;
     batch->draw_pc = debug.draw_pc;
     batch->draw_op = debug.draw_op;
+    SrPerfCategory perf_previous = sr_perf_switch(SR_PERF_STATE_CAPTURE);
     ged3d12_pipeline_key_build(
         ge_state_ptr(), primitive != GE_D3D12_PRIMITIVE_TRIANGLE,
         &batch->pipeline);
     if (!ged3d12_framebuffer_capture(&batch->framebuffer)) {
+        sr_perf_switch(perf_previous);
         capture_error(
             "framebuffer capture failed", s_batch_count + 1u,
             MAX_FRAME_BATCHES);
         return false;
     }
+    sr_perf_switch(SR_PERF_TEXTURE_CAPTURE);
     if (!ged3d12_texture_capture(&batch->texture)) {
+        sr_perf_switch(perf_previous);
         capture_error(
             "texture capture failed", s_batch_count + 1u, MAX_FRAME_BATCHES);
         return false;
     }
+    sr_perf_switch(SR_PERF_STATE_CAPTURE);
     ged3d12_shader_constants_build(
         ge_state_ptr(), perspective,
         primitive == GE_D3D12_PRIMITIVE_SPRITE,
         primitive == GE_D3D12_PRIMITIVE_TRIANGLE,
         &batch->texture, &batch->shader);
+    sr_perf_switch(perf_previous);
     s_batch_count++;
     s_primitive_count[primitive]++;
     return true;
@@ -412,7 +419,18 @@ int ged3d12_vertex_capture_tri(
     return 1;
 }
 
+static int capture_tri_list_impl(
+    const GeVtx *vertices, uint32_t count, int perspective);
+
 int ged3d12_vertex_capture_tri_list(
+    const GeVtx *vertices, uint32_t count, int perspective) {
+    SrPerfCategory previous = sr_perf_switch(SR_PERF_CAPTURE);
+    int result = capture_tri_list_impl(vertices, count, perspective);
+    sr_perf_switch(previous);
+    return result;
+}
+
+static int capture_tri_list_impl(
     const GeVtx *vertices, uint32_t count, int perspective) {
     if (!vertices || !count || count % 3u) return 0;
     uint32_t first;
@@ -440,7 +458,21 @@ int ged3d12_vertex_capture_tri_list(
     return 1;
 }
 
+static int capture_tri_indexed_impl(
+    const GeVtx *table, uint32_t table_count,
+    const uint16_t *indices, uint32_t index_count, int perspective);
+
 int ged3d12_vertex_capture_tri_indexed(
+    const GeVtx *table, uint32_t table_count,
+    const uint16_t *indices, uint32_t index_count, int perspective) {
+    SrPerfCategory previous = sr_perf_switch(SR_PERF_CAPTURE);
+    int result = capture_tri_indexed_impl(
+        table, table_count, indices, index_count, perspective);
+    sr_perf_switch(previous);
+    return result;
+}
+
+static int capture_tri_indexed_impl(
     const GeVtx *table, uint32_t table_count,
     const uint16_t *indices, uint32_t index_count, int perspective) {
     if (!table || !indices || !table_count || table_count > 65536u ||
