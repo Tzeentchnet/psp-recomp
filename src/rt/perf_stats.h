@@ -51,6 +51,7 @@ SrPerfCategory sr_perf_current(void);
 SrPerfCategory sr_perf_switch(SrPerfCategory category);
 void sr_perf_counter_add(SrPerfCounter counter, uint64_t value);
 void sr_perf_snapshot(SrPerfFrame *out);
+void sr_ip_sampler_present(uint32_t present);
 
 #ifdef __cplusplus
 }

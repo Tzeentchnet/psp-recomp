@@ -2,15 +2,6 @@
 
 #include <string.h>
 
-static uint64_t fnv64(uint64_t hash, const void *data, size_t size) {
-    const uint8_t *bytes = static_cast<const uint8_t *>(data);
-    for (size_t i = 0; i < size; i++) {
-        hash ^= bytes[i];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
 static void texture_level(
     const GeState *state, uint32_t level,
     uint32_t *address, uint32_t *stride, int *width, int *height) {
@@ -84,9 +75,9 @@ void ged3d12_texture_key_build(
 
     if (out->format >= 4 && out->format <= 7) {
         uint64_t hash = UINT64_C(14695981039346656037);
-        hash = fnv64(hash, state->clutram, sizeof(state->clutram));
-        hash = fnv64(hash, &state->clut_fmt, sizeof(state->clut_fmt));
-        hash = fnv64(hash, &out->clut_shared, sizeof(out->clut_shared));
+        hash = ged3d12_hash64(hash, state->clutram, sizeof(state->clutram));
+        hash = ged3d12_hash64(hash, &state->clut_fmt, sizeof(state->clut_fmt));
+        hash = ged3d12_hash64(hash, &out->clut_shared, sizeof(out->clut_shared));
         out->clut_hash = hash;
         out->clut_format = state->clut_fmt;
     }
@@ -94,7 +85,7 @@ void ged3d12_texture_key_build(
 
 uint64_t ged3d12_texture_key_hash(const GeD3D12TextureKey *key) {
     if (!key) return 0;
-    return fnv64(
+    return ged3d12_hash64(
         UINT64_C(14695981039346656037), key, sizeof(*key));
 }
 

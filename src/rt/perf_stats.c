@@ -4,6 +4,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include "perf_stats.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
@@ -87,4 +88,104 @@ void sr_perf_snapshot(SrPerfFrame *out) {
     memcpy(out->counters, s_perf.counters, sizeof(out->counters));
     memset(s_perf.ticks, 0, sizeof(s_perf.ticks));
     memset(s_perf.counters, 0, sizeof(s_perf.counters));
+}
+
+/* Diagnostic instruction-pointer sampler (SR_SAMPLE_START=<present>, SR_SAMPLE_WINDOW=<presents>,
+ * SR_SAMPLE_FILE=<path>). A helper thread suspends the main thread, copies only RIP, and
+ * resumes it. Samples are bucketed by module RVA after the window; resolve against a linker map. */
+#define SR_SAMPLE_CAPACITY (1u << 20)
+
+static struct {
+    HANDLE target;
+    HANDLE thread;
+    volatile LONG stop;
+    uint32_t *rvas;
+    volatile LONG count;
+    uint32_t start, end;
+    int configured, running, done;
+} s_sampler;
+
+static int compare_rva(const void *left, const void *right) {
+    uint32_t a = *(const uint32_t *)left, b = *(const uint32_t *)right;
+    return (a > b) - (a < b);
+}
+
+static DWORD WINAPI sampler_main(LPVOID unused) {
+    (void)unused;
+    uintptr_t base = (uintptr_t)GetModuleHandleW(NULL);
+    LARGE_INTEGER frequency, now, next;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&next);
+    LONGLONG interval = frequency.QuadPart / 4000;
+    while (!s_sampler.stop) {
+        next.QuadPart += interval;
+        do { QueryPerformanceCounter(&now); } while (now.QuadPart < next.QuadPart && !s_sampler.stop);
+        if (SuspendThread(s_sampler.target) == (DWORD)-1) continue;
+        CONTEXT context;
+        memset(&context, 0, sizeof(context));
+        context.ContextFlags = CONTEXT_CONTROL;
+        BOOL got = GetThreadContext(s_sampler.target, &context);
+        uintptr_t rip = got ? (uintptr_t)context.Rip : 0;
+        ResumeThread(s_sampler.target);
+        LONG index = s_sampler.count;
+        if (got && index < (LONG)SR_SAMPLE_CAPACITY) {
+            s_sampler.rvas[index] = rip >= base && rip - base < 0xffffffffu
+                ? (uint32_t)(rip - base) : 0xffffffffu;
+            s_sampler.count = index + 1;
+        }
+    }
+    return 0;
+}
+
+static void sampler_finish(void) {
+    InterlockedExchange(&s_sampler.stop, 1);
+    WaitForSingleObject(s_sampler.thread, INFINITE);
+    CloseHandle(s_sampler.thread);
+    CloseHandle(s_sampler.target);
+    s_sampler.running = 0;
+    s_sampler.done = 1;
+    uint32_t count = (uint32_t)s_sampler.count;
+    qsort(s_sampler.rvas, count, sizeof(uint32_t), compare_rva);
+    const char *path = getenv("SR_SAMPLE_FILE");
+    FILE *file = fopen(path && path[0] ? path : "ip_samples.txt", "w");
+    if (file) {
+        fprintf(file, "# samples %u\n", count);
+        for (uint32_t i = 0; i < count;) {
+            uint32_t j = i;
+            while (j < count && s_sampler.rvas[j] == s_sampler.rvas[i]) j++;
+            fprintf(file, "%08x %u\n", s_sampler.rvas[i], j - i);
+            i = j;
+        }
+        fclose(file);
+    }
+    free(s_sampler.rvas);
+    s_sampler.rvas = NULL;
+}
+
+void sr_ip_sampler_present(uint32_t present) {
+    if (s_sampler.done) return;
+    if (!s_sampler.configured) {
+        s_sampler.configured = 1;
+        const char *start = getenv("SR_SAMPLE_START");
+        if (!start || !start[0]) { s_sampler.done = 1; return; }
+        const char *window = getenv("SR_SAMPLE_WINDOW");
+        s_sampler.start = (uint32_t)strtoul(start, NULL, 10);
+        s_sampler.end = s_sampler.start +
+            (window && window[0] ? (uint32_t)strtoul(window, NULL, 10) : 120u);
+    }
+    if (!s_sampler.running && present >= s_sampler.start && present < s_sampler.end) {
+        s_sampler.rvas = (uint32_t *)malloc(SR_SAMPLE_CAPACITY * sizeof(uint32_t));
+        if (!s_sampler.rvas ||
+            !DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                             &s_sampler.target, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                             FALSE, 0)) {
+            s_sampler.done = 1;
+            return;
+        }
+        s_sampler.thread = CreateThread(NULL, 0, sampler_main, NULL, 0, NULL);
+        if (!s_sampler.thread) { s_sampler.done = 1; return; }
+        s_sampler.running = 1;
+    } else if (s_sampler.running && present >= s_sampler.end) {
+        sampler_finish();
+    }
 }

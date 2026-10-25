@@ -7,6 +7,42 @@
 
 #include <d3d12.h>
 #include <stdint.h>
+#include <string.h>
+
+
+/* Fast non-cryptographic content hash: four independent multiply lanes over 8-byte words.
+ * Used for texture/CLUT identity, where equal content must hash equally within one run. */
+static inline uint64_t ged3d12_hash64(
+    uint64_t seed, const void *data, size_t size) {
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    const uint64_t k0 = UINT64_C(0x9e3779b97f4a7c15);
+    const uint64_t k1 = UINT64_C(0xc2b2ae3d27d4eb4f);
+    uint64_t a = seed ^ k0, b = seed + k1, c = seed ^ k1, d = seed + k0;
+    size_t i = 0;
+    for (; i + 32 <= size; i += 32) {
+        uint64_t w[4];
+        memcpy(w, bytes + i, sizeof(w));
+        a = (a ^ w[0]) * k0; a ^= a >> 29;
+        b = (b ^ w[1]) * k1; b ^= b >> 29;
+        c = (c ^ w[2]) * k0; c ^= c >> 29;
+        d = (d ^ w[3]) * k1; d ^= d >> 29;
+    }
+    uint64_t hash = a ^ (b * 3) ^ (c * 5) ^ (d * 7) ^ size;
+    for (; i + 8 <= size; i += 8) {
+        uint64_t word;
+        memcpy(&word, bytes + i, sizeof(word));
+        hash = (hash ^ word) * k0;
+        hash ^= hash >> 31;
+    }
+    for (; i < size; i++) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    hash ^= hash >> 32;
+    hash *= k1;
+    hash ^= hash >> 29;
+    return hash;
+}
 
 #define GE_D3D12_TEXTURE_LEVELS 8
 #define GE_D3D12_TEXTURE_HANDLE_NONE UINT32_MAX

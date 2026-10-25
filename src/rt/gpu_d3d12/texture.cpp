@@ -82,17 +82,8 @@ static bool check_hr(HRESULT hr, const char *operation) {
     return false;
 }
 
-static uint64_t fnv64(uint64_t hash, const void *data, size_t size) {
-    const uint8_t *bytes = static_cast<const uint8_t *>(data);
-    for (size_t i = 0; i < size; i++) {
-        hash ^= bytes[i];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
 static bool capture_clut(const GeState *state, uint16_t *handle) {
-    uint64_t hash = fnv64(
+    uint64_t hash = ged3d12_hash64(
         UINT64_C(14695981039346656037),
         state->clutram, sizeof(state->clutram));
     ClutEntry *entry = nullptr;
@@ -184,21 +175,21 @@ static bool texture_memory(
 static bool texture_content_hash(
     const GeD3D12TextureKey *key, bool full, uint64_t *out) {
     uint64_t hash = UINT64_C(14695981039346656037);
-    hash = fnv64(hash, key, sizeof(*key));
+    hash = ged3d12_hash64(hash, key, sizeof(*key));
     for (uint32_t level = 0; level < key->mip_count; level++) {
         const uint8_t *data;
         uint64_t size;
         if (!texture_memory(key, level, &data, &size)) return false;
-        hash = fnv64(hash, &size, sizeof(size));
+        hash = ged3d12_hash64(hash, &size, sizeof(size));
         if (full || size <= 65536u) {
-            hash = fnv64(hash, data, (size_t)size);
+            hash = ged3d12_hash64(hash, data, (size_t)size);
             continue;
         }
         uint64_t step = size / 256u;
         if (step < 16u) step = 16u;
         for (uint64_t offset = 0; offset + 16u <= size; offset += step)
-            hash = fnv64(hash, data + offset, 16);
-        hash = fnv64(hash, data + size - 16u, 16);
+            hash = ged3d12_hash64(hash, data + offset, 16);
+        hash = ged3d12_hash64(hash, data + size - 16u, 16);
     }
     *out = hash;
     return true;

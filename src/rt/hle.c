@@ -3753,6 +3753,7 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
     present_perf_init();
     if (A0) {
         s_present_count++;
+        sr_ip_sampler_present(s_present_count);
         capture_requested = frame_capture_path(
             capture_path, sizeof(capture_path));
         if (capture_requested && gui_on())
