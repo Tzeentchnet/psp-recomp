@@ -106,6 +106,10 @@ void ged3d12_pipeline_key_build(
         : D3D12_COLOR_WRITE_ENABLE_RED |
           D3D12_COLOR_WRITE_ENABLE_GREEN |
           D3D12_COLOR_WRITE_ENABLE_BLUE;
+    if (!state->clear &&
+        ged3d12_shader_direct_stencil_write(state)) {
+        out->color_write_mask |= D3D12_COLOR_WRITE_ENABLE_ALPHA;
+    }
     if (state->clear) {
         out->depth_enable = (state->clear_mode & 0x400u) != 0;
         out->depth_write = out->depth_enable;

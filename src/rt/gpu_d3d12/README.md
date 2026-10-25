@@ -101,14 +101,21 @@ Exact unswizzled, single-level texture views can alias a cached target when thei
 format, stride, offset, and bounds match. Color resources retain a scaled 512×512
 texture envelope so the PSP's common 512×272 framebuffer-as-512×512-texture pattern
 stays GPU-resident with correct normalized coordinates. Same-target feedback samples from
-a snapshot copied before the target is rebound. A CLUT32 view of a compatible live
-8888 target follows the same ordered snapshot path instead of decoding stale guest
-VRAM: `texture.cpp` captures and deduplicates the draw's 2 KiB palette, binds it as an
-R32 buffer at `t1`, and the pixel shader reconstructs the packed 32-bit index before
-applying the PSP shift/mask/start lookup and nearest or linear filtering. Presentation
-copies only the scaled visible 480×272 rectangle from a compatible cached target.
+a snapshot copied before the target is rebound. CLUT32 views of compatible live 8888
+targets and CLUT16 views of compatible 565, 5551, or 4444 targets follow the same
+ordered snapshot path instead of decoding stale guest VRAM. `texture.cpp` captures and
+deduplicates the draw's 2 KiB palette and binds it as an R32 buffer at `t1`. The pixel
+shader center-samples the scaled target, repacks it to the target's native PSP format,
+then applies the PSP shift/mask/start lookup and nearest or linear filtering. These
+framebuffer views bypass content hashing, CPU decode, texture-cache allocation, and
+xBRZ; xBRZ remains limited to ordinary decoded textures. Presentation copies only the
+scaled visible 480×272 rectangle from a compatible cached target.
+
 Incompatible framebuffer texture reinterpretations materialize an overlapping
 GPU-newer target into guest VRAM before the fallback texture is hashed and decoded.
+That decoder synchronizes each complete texture level once, then reads the bounded
+host span directly. It does not invoke the watched VRAM callback once per texel while
+another target remains GPU-newer.
 The shader derives logical pixel coordinates from `SV_Position / scale` so the
 PSP dither matrix remains stable while destination color/depth loads use physical
 scaled coordinates.
@@ -135,6 +142,11 @@ color/depth snapshots at `t2`/`t3` and performs PSP fragment ordering, native pa
 component masks, and `SV_Depth` preservation manually for states that require destination
 access. Channel-aligned clear/source-replace and hardware-mappable blend/depth states take
 a direct branch and use specialized fixed-function PSOs, avoiding all destination copies.
+Always-pass stencil states can also use the direct branch when their depth-fail operation
+is a no-op and their depth-pass result is destination-independent. Hardware depth then
+orders fragments while the direct pixel shader writes the known packed stencil value.
+Masked, destination-dependent, and source-alpha-blended stencil writes retain the exact
+snapshot path.
 Until an asynchronous specialized PSO is ready, the draw clears its direct flag and falls
 back to the exact snapshot ubershader. Draw submission and the GPU-newer ownership mark
 occur together before presentation.
@@ -172,7 +184,9 @@ Set `SR_D3D12_FRAMEBUFFER_LOG=1` to print target creation and a shutdown summary
 captures, uploads, readbacks, aliases, invalidations, transfers, presentation hits,
 and live targets. Set `SR_D3D12_FRAMEBUFFER_SAFE=1` to force every cached target
 through a GPU readback after cached presentation; this is a diagnostic mode and
-intentionally stalls the graphics queue.
+intentionally stalls the graphics queue. Set
+`SR_D3D12_DISABLE_FEEDBACK_ALIASES=1` to route format-reinterpreted framebuffer
+textures through the synchronized CPU fallback for differential testing.
 
 Install PIX for Windows with `winget install --id Microsoft.PIX --exact`. The command
 list always carries nested `GE list` and `GE draw` events using D3D12's PIX-compatible

@@ -552,10 +552,15 @@ bool ged3d12_texture_capture(GeD3D12TextureBinding *out) {
             state, &out->framebuffer)) {
         return true;
     }
+    uint8_t framebuffer_format = 0;
     if (ged3d12_framebuffer_texture_feedback(
-            state, &out->framebuffer)) {
+            state, &out->framebuffer, &framebuffer_format)) {
         if (!capture_clut(state, &out->clut_handle)) return false;
-        out->flags |= GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT;
+        out->flags |=
+            GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT |
+            (uint8_t)(
+                framebuffer_format <<
+                GE_D3D12_TEXTURE_FRAMEBUFFER_FORMAT_SHIFT);
         return true;
     }
     if (s_texture_scale > 1u)

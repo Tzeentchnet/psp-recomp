@@ -180,8 +180,8 @@ float4 feedback_texel(int2 coordinate) {
 
     float4 source = psp_texture.Load(int3(coordinate, 0));
     uint4 bytes = (uint4)(source * 255.0 + 0.5);
-    uint index = bytes.r | (bytes.g << 8) |
-                 (bytes.b << 16) | (bytes.a << 24);
+    uint source_format = (clut_format >> 28) & 3;
+    uint index = pack_native((int4)bytes, (int)source_format);
     uint shift = (clut_format >> 2) & 31;
     uint mask = (clut_format >> 8) & 255;
     uint start = ((clut_format >> 16) & 31) << 4;
@@ -516,6 +516,12 @@ float4 main_direct(
     int format = stencil_state.w & 3;
     if ((flags & 1024) != 0)
         result.rgb += dither_value(pixel);
+    if ((flags & 2048) != 0) {
+        int stencil_reference = (stencil_state.x >> 8) & 255;
+        result.a = stencil_operation(
+            (stencil_state.y >> 16) & 7,
+            format, 0, stencil_reference);
+    }
     result = clamp(
         result, int4(0, 0, 0, 0),
         int4(255, 255, 255, 255));

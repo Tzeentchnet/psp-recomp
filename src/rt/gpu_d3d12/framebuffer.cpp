@@ -105,6 +105,7 @@ static bool s_initialized;
 static bool s_log;
 static bool s_legacy_depth_uploads;
 static bool s_legacy_feedback_snapshots;
+static bool s_disable_feedback_aliases;
 /* Upload heaps are write-combined: scaled rows are built here, then only written to the heap.
  * Duplicating rows by reading the heap back cost ~56 ms per movie frame at 2x. */
 static uint32_t s_scaled_color_row[GE_D3D12_FRAMEBUFFER_WIDTH * 8u];
@@ -903,6 +904,8 @@ bool ged3d12_framebuffer_cache_init(void) {
         getenv("SR_D3D12_LEGACY_DEPTH_UPLOADS") != nullptr;
     s_legacy_feedback_snapshots =
         getenv("SR_D3D12_LEGACY_FEEDBACK_SNAPSHOTS") != nullptr;
+    s_disable_feedback_aliases =
+        getenv("SR_D3D12_DISABLE_FEEDBACK_ALIASES") != nullptr;
     fprintf(
         stderr, "ged3d12: internal resolution %ux (%ux%u visible)\n",
         s_render_scale, 480u * s_render_scale,
@@ -970,6 +973,7 @@ void ged3d12_framebuffer_cache_shutdown(void) {
     s_log = false;
     s_legacy_depth_uploads = false;
     s_legacy_feedback_snapshots = false;
+    s_disable_feedback_aliases = false;
     sr_gpu_vram_watch_reads(0);
     sr_gpu_vram_watch_writes(0);
 }
@@ -1213,10 +1217,13 @@ bool ged3d12_framebuffer_texture_alias(
 }
 
 bool ged3d12_framebuffer_texture_feedback(
-    const GeState *state, GeD3D12FramebufferAlias *out) {
-    if (!out || !state || !s_initialized) return false;
+    const GeState *state, GeD3D12FramebufferAlias *out,
+    uint8_t *source_format) {
+    if (!out || !source_format || !state || !s_initialized) return false;
     memset(out, 0, sizeof(*out));
     out->handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
+    *source_format = 0;
+    if (s_disable_feedback_aliases) return false;
     if ((state->tex_filter & 4u) != 0 && state->tex_max_level > 0)
         return false;
     uint32_t stride = ge_texture_buffer_width(state->tex_fmt, state->tex_bufw);
@@ -1232,6 +1239,7 @@ bool ged3d12_framebuffer_texture_feedback(
         }
         alias.handle = color_handle(i, target);
         *out = alias;
+        *source_format = target->key.format;
         target->lru = s_lru++;
         s_aliases++;
         return true;

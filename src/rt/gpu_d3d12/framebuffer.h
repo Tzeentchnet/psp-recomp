@@ -104,7 +104,8 @@ bool ged3d12_framebuffer_mark_rendered(
 bool ged3d12_framebuffer_texture_alias(
     const GeState *state, GeD3D12FramebufferAlias *out);
 bool ged3d12_framebuffer_texture_feedback(
-    const GeState *state, GeD3D12FramebufferAlias *out);
+    const GeState *state, GeD3D12FramebufferAlias *out,
+    uint8_t *source_format);
 bool ged3d12_framebuffer_texture_bind(
     const GeD3D12FramebufferAlias *alias,
     const GeD3D12UploadSlice *clut,

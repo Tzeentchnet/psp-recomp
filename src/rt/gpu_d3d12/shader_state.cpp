@@ -33,6 +33,34 @@ static bool blend_factor_compatible(
             (fixed_color & 0xffffffu) == 0xffffffu);
 }
 
+static bool stencil_operation_keeps(uint32_t operation) {
+    operation &= 7u;
+    return operation == 0u || operation >= 6u;
+}
+
+static bool direct_stencil_compatible(
+    const GeState *state, bool *writes_stencil) {
+    *writes_stencil = false;
+    if (!state->stencil_test_enable) return true;
+    if ((state->stencil_test & 7u) != 1u)
+        return false;
+    if (!stencil_operation_keeps(state->stencil_op >> 8))
+        return false;
+
+    uint32_t pass_operation = (state->stencil_op >> 16) & 7u;
+    if (stencil_operation_keeps(pass_operation))
+        return true;
+    if ((uint32_t)state->mask_alpha != 0u)
+        return false;
+    if (pass_operation == 1u || pass_operation == 2u ||
+        ((state->fbfmt & 3u) <= 1u &&
+         (pass_operation == 4u || pass_operation == 5u))) {
+        *writes_stencil = true;
+        return true;
+    }
+    return false;
+}
+
 bool ged3d12_shader_direct_compatible(const GeState *state) {
     static int disabled = -1;
     if (disabled < 0)
@@ -40,7 +68,9 @@ bool ged3d12_shader_direct_compatible(const GeState *state) {
     if (disabled) return false;
     if (!state) return false;
     if (state->clear) return false;
-    if (state->stencil_test_enable || state->logic_op_enable ||
+    bool writes_stencil;
+    if (!direct_stencil_compatible(state, &writes_stencil) ||
+        state->logic_op_enable ||
         state->mask_rgb != 0u) {
         return false;
     }
@@ -49,6 +79,11 @@ bool ged3d12_shader_direct_compatible(const GeState *state) {
     uint32_t source_factor = mode & 0xfu;
     uint32_t destination_factor = (mode >> 4) & 0xfu;
     uint32_t equation = (mode >> 8) & 7u;
+    if (writes_stencil &&
+        (source_factor == 2u || source_factor == 3u ||
+         destination_factor == 2u || destination_factor == 3u)) {
+        return false;
+    }
     if (source_factor == 10u && destination_factor == 10u &&
         equation == 0u &&
         (state->blend_fixa & 0xffffffu) == 0xffffffu &&
@@ -62,6 +97,13 @@ bool ged3d12_shader_direct_compatible(const GeState *state) {
                source_factor, state->blend_fixa) &&
            blend_factor_compatible(
                destination_factor, state->blend_fixb);
+}
+
+bool ged3d12_shader_direct_stencil_write(const GeState *state) {
+    bool writes_stencil;
+    return state &&
+           direct_stencil_compatible(state, &writes_stencil) &&
+           writes_stencil;
 }
 
 D3D12_SHADING_RATE ged3d12_shader_shading_rate(
@@ -162,8 +204,17 @@ void ged3d12_shader_constants_build(
             ? state->color_test & 3u : 1u;
     out->color_test[1] = state->color_ref & 0xffffffu;
     out->color_test[2] = state->color_test_mask & 0xffffffu;
+    uint32_t clut_state = state->clut_fmt;
+    if (texture &&
+        (texture->flags & GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT) != 0) {
+        clut_state |=
+            ((uint32_t)texture->flags &
+             GE_D3D12_TEXTURE_FRAMEBUFFER_FORMAT_MASK)
+            << (GE_D3D12_SHADER_FRAMEBUFFER_FORMAT_SHIFT -
+                GE_D3D12_TEXTURE_FRAMEBUFFER_FORMAT_SHIFT);
+    }
     out->color_test[3] =
-        state->clut_fmt |
+        clut_state |
         (texture && texture->sampler.clamp_u ? 1u << 30 : 0u) |
         (texture && texture->sampler.clamp_v ? 1u << 31 : 0u);
     out->stencil_test[0] =

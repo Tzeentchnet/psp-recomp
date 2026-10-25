@@ -183,13 +183,15 @@ bool ged3d12_framebuffer_feedback_alias(
     if (!out) return false;
     memset(out, 0, sizeof(*out));
     out->handle = GE_D3D12_FRAMEBUFFER_HANDLE_NONE;
-    if (!target || swizzled || target->format != 3u ||
-        texture_format != 7u) {
+    if (!target || swizzled ||
+        !((target->format == 3u && texture_format == 7u) ||
+          (target->format <= 2u && texture_format == 6u))) {
         return false;
     }
     return framebuffer_alias_layout(
         target, texture_address, texture_stride,
-        texture_width, texture_height, 4u, out);
+        texture_width, texture_height,
+        framebuffer_bytes_per_pixel(target->format), out);
 }
 
 bool ged3d12_transfer_build(

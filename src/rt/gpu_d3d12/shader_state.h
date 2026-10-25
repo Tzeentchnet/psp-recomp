@@ -9,6 +9,9 @@
 #include <stdint.h>
 
 #define GE_D3D12_SHADER_CONSTANT_DWORDS 40u
+#define GE_D3D12_SHADER_FRAMEBUFFER_FORMAT_SHIFT 28u
+#define GE_D3D12_SHADER_FRAMEBUFFER_FORMAT_MASK \
+    (3u << GE_D3D12_SHADER_FRAMEBUFFER_FORMAT_SHIFT)
 
 enum GeD3D12ShaderFlag : uint32_t {
     GE_D3D12_SHADER_TEXTURE = 1u,
@@ -54,6 +57,7 @@ void ged3d12_shader_constants_build(
     const GeD3D12TextureBinding *texture,
     GeD3D12ShaderConstants *out);
 bool ged3d12_shader_direct_compatible(const GeState *state);
+bool ged3d12_shader_direct_stencil_write(const GeState *state);
 D3D12_SHADING_RATE ged3d12_shader_shading_rate(
     uint32_t scale, D3D12_VARIABLE_SHADING_RATE_TIER tier,
     bool additional_rates);

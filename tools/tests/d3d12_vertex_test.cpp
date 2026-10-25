@@ -343,7 +343,9 @@ static void test_shader_constants(void) {
     check_u32(
         "shader color mask", constants.color_test[2], 0x00f0ff0fu);
     GeD3D12TextureBinding feedback_texture = texture;
-    feedback_texture.flags = GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT;
+    feedback_texture.flags =
+        GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT |
+        (3u << GE_D3D12_TEXTURE_FRAMEBUFFER_FORMAT_SHIFT);
     feedback_texture.clut_handle = 3;
     feedback_texture.sampler.clamp_u = 1;
     state.clut_fmt = 3u | (8u << 2) | (0x7fu << 8) | (4u << 16);
@@ -357,7 +359,23 @@ static void test_shader_constants(void) {
         GE_D3D12_SHADER_FRAMEBUFFER_CLUT);
     check_u32(
         "framebuffer CLUT state", feedback_constants.color_test[3],
-        state.clut_fmt | (1u << 30));
+        state.clut_fmt |
+            (3u << GE_D3D12_SHADER_FRAMEBUFFER_FORMAT_SHIFT) |
+            (1u << 30));
+    for (uint32_t format = 0; format < 4; format++) {
+        feedback_texture.flags =
+            GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT |
+            (uint8_t)(
+                format <<
+                GE_D3D12_TEXTURE_FRAMEBUFFER_FORMAT_SHIFT);
+        ged3d12_shader_constants_build(
+            &state, 1, 0, 1, &feedback_texture, &feedback_constants);
+        check_u32(
+            "framebuffer source format state",
+            feedback_constants.color_test[3] &
+                GE_D3D12_SHADER_FRAMEBUFFER_FORMAT_MASK,
+            format << GE_D3D12_SHADER_FRAMEBUFFER_FORMAT_SHIFT);
+    }
     check_u32(
         "shader stencil test", constants.stencil_test[0],
         state.stencil_test);
@@ -579,6 +597,52 @@ static void test_pipeline_keys(void) {
         ((uint32_t)alpha_constants.config[0] >> 8) &
             GE_D3D12_SHADER_DIRECT,
         GE_D3D12_SHADER_DIRECT);
+
+    GeState direct_stencil = {};
+    direct_stencil.fbfmt = 1;
+    direct_stencil.ztest_enable = 1;
+    direct_stencil.ztest = 7;
+    direct_stencil.stencil_test_enable = 1;
+    direct_stencil.stencil_test =
+        1u | (1u << 8) | (0xffu << 16);
+    direct_stencil.stencil_op = 4u << 16;
+    if (!ged3d12_shader_direct_compatible(&direct_stencil))
+        fail("constant stencil write rejected from direct path");
+    if (!ged3d12_shader_direct_stencil_write(&direct_stencil))
+        fail("constant stencil write was not exposed to the pipeline");
+    ged3d12_pipeline_key_build(&direct_stencil, 0, &key);
+    check_u32(
+        "direct stencil RGBA color mask", key.color_write_mask,
+        D3D12_COLOR_WRITE_ENABLE_ALL);
+    check_u32(
+        "direct stencil depth function", key.depth_function,
+        D3D12_COMPARISON_FUNC_GREATER_EQUAL);
+    GeD3D12ShaderConstants direct_stencil_constants = {};
+    ged3d12_shader_constants_build(
+        &direct_stencil, 1, 0, 1, &no_alpha_texture,
+        &direct_stencil_constants);
+    check_u32(
+        "direct stencil shader flags",
+        ((uint32_t)direct_stencil_constants.config[0] >> 8) &
+            (GE_D3D12_SHADER_STENCIL | GE_D3D12_SHADER_DIRECT),
+        GE_D3D12_SHADER_STENCIL | GE_D3D12_SHADER_DIRECT);
+
+    direct_stencil.stencil_op = 1u << 8;
+    if (ged3d12_shader_direct_compatible(&direct_stencil))
+        fail("depth-fail stencil mutation accepted by direct path");
+    direct_stencil.stencil_op = 4u << 16;
+    direct_stencil.mask_alpha = 0xff;
+    if (ged3d12_shader_direct_compatible(&direct_stencil))
+        fail("masked stencil mutation accepted by direct path");
+    direct_stencil.mask_alpha = 0;
+    direct_stencil.stencil_op = 3u << 16;
+    if (ged3d12_shader_direct_compatible(&direct_stencil))
+        fail("destination-dependent stencil mutation accepted by direct path");
+    direct_stencil.stencil_op = 4u << 16;
+    direct_stencil.blend_enable = 1;
+    direct_stencil.blend_mode = 2u | (3u << 4);
+    if (ged3d12_shader_direct_compatible(&direct_stencil))
+        fail("source-alpha blend accepted with a direct stencil write");
 
     s_state.blend_enable = 1;
     s_state.blend_mode = 2u | (3u << 4) | (1u << 8);
@@ -848,6 +912,48 @@ static void test_framebuffer_keys(void) {
             &source, alias_address, source.stride, 64, 32, 6, false,
             &alias)) {
         fail("non-CLUT32 framebuffer feedback alias accepted");
+    }
+    for (uint32_t format = 0; format < 3; format++) {
+        GeD3D12FramebufferKey source16 = source;
+        source16.format = (uint8_t)format;
+        uint32_t address16 =
+            source16.address + (2u * source16.stride + 8u) * 2u;
+        if (!ged3d12_framebuffer_feedback_alias(
+                &source16, address16, source16.stride,
+                64, 32, 6, false, &alias)) {
+            fail("CLUT16 framebuffer feedback alias rejected");
+        }
+        check_u32("CLUT16 framebuffer feedback alias x", alias.x, 8);
+        check_u32("CLUT16 framebuffer feedback alias y", alias.y, 2);
+        if (ged3d12_framebuffer_feedback_alias(
+                &source16, address16, source16.stride,
+                64, 32, 7, false, &alias)) {
+            fail("CLUT32 view of 16-bit framebuffer accepted");
+        }
+    }
+    GeD3D12FramebufferKey source16 = source;
+    source16.format = 1;
+    uint32_t address16 =
+        source16.address + (2u * source16.stride + 8u) * 2u;
+    if (ged3d12_framebuffer_feedback_alias(
+            &source16, address16, source16.stride + 1u,
+            64, 32, 6, false, &alias)) {
+        fail("CLUT16 framebuffer feedback with bad stride accepted");
+    }
+    if (ged3d12_framebuffer_feedback_alias(
+            &source16, address16, source16.stride,
+            64, 32, 6, true, &alias)) {
+        fail("swizzled CLUT16 framebuffer feedback accepted");
+    }
+    if (ged3d12_framebuffer_feedback_alias(
+            &source16, source16.address + 1u, source16.stride,
+            64, 32, 6, false, &alias)) {
+        fail("misaligned CLUT16 framebuffer feedback accepted");
+    }
+    if (ged3d12_framebuffer_feedback_alias(
+            &source16, source16.address, source16.stride,
+            source16.stride + 1u, 32, 6, false, &alias)) {
+        fail("out-of-bounds CLUT16 framebuffer feedback accepted");
     }
     if (ged3d12_framebuffer_alias(
             &source, alias_address, source.stride, 64, 32, 3, true,
