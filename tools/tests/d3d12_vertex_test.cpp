@@ -46,6 +46,10 @@ bool ged3d12_framebuffer_capture(GeD3D12FramebufferBinding *out) {
     return true;
 }
 
+uint32_t ged3d12_command_list_generation(void) {
+    return 1;
+}
+
 uint32_t ged3d12_framebuffer_scale(void) {
     return s_render_scale;
 }
@@ -1273,6 +1277,46 @@ static void test_storage_growth(void) {
         "grown upload size", frame.buffer.SizeInBytes, 240003 * 32);
 }
 
+static void test_indexed_triangles(void) {
+    reset_upload();
+    memset(&s_state, 0, sizeof(s_state));
+    s_state.shade_gouraud = 1;
+    GeVtx table[4] = {
+        vertex(1.0f, 2.0f, 3.0f, 1.0f, 4.0f, 5.0f, 0.5f, 10, 20, 30, 40),
+        vertex(5.0f, 2.0f, 3.0f, 1.0f, 4.0f, 5.0f, 0.5f, 50, 60, 70, 80),
+        vertex(1.0f, 6.0f, 3.0f, 1.0f, 4.0f, 5.0f, 0.5f, 90, 100, 110, 120),
+        vertex(5.0f, 6.0f, 3.0f, 1.0f, 4.0f, 5.0f, 0.5f, 130, 140, 150, 160),
+    };
+    const uint16_t indices[6] = {0, 1, 2, 2, 1, 3};
+    const uint16_t bad[3] = {0, 1, 4};
+    check_u32("indexed hook is GPU-owned",
+              ged3d12_vertex_capture_tri_indexed(table, 4, indices, 6, 1), 1);
+    check_u32("indexed out-of-range index falls back",
+              ged3d12_vertex_capture_tri_indexed(table, 4, bad, 3, 1), 0);
+    check_u32("indexed partial triangle falls back",
+              ged3d12_vertex_capture_tri_indexed(table, 4, indices, 5, 1), 0);
+    check_u32("expanded hook after indexed",
+              ged3d12_vertex_capture_tri_list(table, 3, 1), 1);
+    GeD3D12VertexFrame frame = {};
+    if (!ged3d12_vertex_upload_pending(&frame)) {
+        fail("indexed upload failed");
+        return;
+    }
+    check_u32("indexed batch count", frame.batch_count, 2);
+    check_u32("indexed batch flag", frame.batches[0].flags, GE_D3D12_BATCH_INDEXED);
+    check_u32("indexed batch index count", frame.batches[0].count, 6);
+    check_u32("indexed batch table count", frame.batches[0].table_count, 4);
+    check_u32("indexed batch index offset", frame.batches[0].index_first, 0);
+    check_u32("expanded batch not indexed", frame.batches[1].flags, 0);
+    check_u32("expanded batch is not merged", frame.batches[1].count, 3);
+    check_u32("indexed vertex total", frame.vertex_count, 7);
+    check_u32("indexed triangle count",
+              frame.primitive_count[GE_D3D12_PRIMITIVE_TRIANGLE], 3);
+    const GeD3D12Vertex *vertices = uploaded_vertices(&frame);
+    check_u32("indexed table color", vertices[3].rgba, 0xa0968c82u);
+    check_u32("indexed upload reached the ring", frame.index_base != 0, 1);
+}
+
 int main(void) {
     if (!ged3d12_vertex_capture_init()) {
         fail("vertex capture initialization failed");
@@ -1288,6 +1332,7 @@ int main(void) {
         test_lines_and_points();
         test_draw_batching();
         test_storage_growth();
+        test_indexed_triangles();
         ged3d12_vertex_capture_shutdown();
     }
 

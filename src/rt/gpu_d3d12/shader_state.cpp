@@ -2,6 +2,7 @@
 
 #include "device.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -99,6 +100,44 @@ bool ged3d12_shader_direct_compatible(const GeState *state) {
                destination_factor, state->blend_fixb);
 }
 
+/* Diagnostic attribution: first reason a draw misses the fixed-function (direct) path. */
+static uint64_t s_manual_reasons[10];
+static const char *const k_manual_reason_names[10] = {
+    "clear", "stencil", "logic-op", "rgb-mask", "stencil-write-blend",
+    "fb-format", "dither", "equation", "blend-factor", "other",
+};
+
+static void note_manual_reason(const GeState *state) {
+    uint32_t reason = 9u;
+    bool writes_stencil;
+    if (state->clear) reason = 0;
+    else if (!direct_stencil_compatible(state, &writes_stencil)) reason = 1;
+    else if (state->logic_op_enable) reason = 2;
+    else if (state->mask_rgb != 0u) reason = 3;
+    else if (state->blend_enable) {
+        uint32_t mode = state->blend_mode;
+        uint32_t source_factor = mode & 0xfu;
+        uint32_t destination_factor = (mode >> 4) & 0xfu;
+        uint32_t equation = (mode >> 8) & 7u;
+        if (writes_stencil &&
+            (source_factor == 2u || source_factor == 3u ||
+             destination_factor == 2u || destination_factor == 3u)) reason = 4;
+        else if (state->fbfmt != 3u) reason = 5;
+        else if (state->dither_enable) reason = 6;
+        else if (equation > 4u) reason = 7;
+        else reason = 8;
+    }
+    s_manual_reasons[reason]++;
+}
+
+void ged3d12_shader_manual_reasons_print(void) {
+    fprintf(stderr, "ged3d12: manual-draw reasons");
+    for (uint32_t i = 0; i < 10; i++)
+        fprintf(stderr, " %s=%llu", k_manual_reason_names[i],
+                (unsigned long long)s_manual_reasons[i]);
+    fprintf(stderr, "\n");
+}
+
 bool ged3d12_shader_direct_stencil_write(const GeState *state) {
     bool writes_stencil;
     return state &&
@@ -176,6 +215,8 @@ void ged3d12_shader_constants_build(
         flags |= GE_D3D12_SHADER_CULL_BACK;
     if (ged3d12_shader_direct_compatible(state))
         flags |= GE_D3D12_SHADER_DIRECT;
+    else
+        note_manual_reason(state);
 
     out->config[0] =
         (int32_t)((state->tex_func & 7u) | (flags << 8));

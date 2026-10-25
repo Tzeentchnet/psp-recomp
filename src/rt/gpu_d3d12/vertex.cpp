@@ -16,6 +16,9 @@
 
 static GeD3D12Vertex *s_vertices;
 static GeD3D12VertexBatch *s_batches;
+static uint16_t *s_indices;
+static uint32_t s_index_count;
+static uint32_t s_index_capacity;
 static uint32_t s_vertex_count;
 static uint32_t s_vertex_capacity;
 static uint32_t s_batch_count;
@@ -78,17 +81,18 @@ static bool reserve_batch(void) {
     return true;
 }
 
-static bool begin_primitive(
+static bool begin_primitive_ex(
     GeD3D12Primitive primitive, int perspective, uint32_t vertex_count,
-    uint32_t *first) {
+    uint32_t *first, bool allow_merge) {
     if (s_capture_failed || !reserve_vertices(vertex_count)) {
         return false;
     }
     *first = s_vertex_count;
     GeDebugContext debug = ge_debug_context();
-    if (s_batch_count) {
+    if (s_batch_count && allow_merge) {
         GeD3D12VertexBatch *last = &s_batches[s_batch_count - 1u];
-        if (last->first + last->count == s_vertex_count &&
+        if (!(last->flags & GE_D3D12_BATCH_INDEXED) &&
+            last->first + last->count == s_vertex_count &&
             last->primitive == primitive &&
             last->perspective == (uint8_t)(perspective != 0) &&
             last->list_id == debug.list_id &&
@@ -107,7 +111,9 @@ static bool begin_primitive(
     batch->count = vertex_count;
     batch->primitive = primitive;
     batch->perspective = perspective != 0;
-    batch->reserved = 0;
+    batch->flags = 0;
+    batch->index_first = 0;
+    batch->table_count = 0;
     batch->list_id = debug.list_id;
     batch->list_addr = debug.list_addr;
     batch->draw_serial = debug.draw_serial;
@@ -134,6 +140,32 @@ static bool begin_primitive(
         &batch->texture, &batch->shader);
     s_batch_count++;
     s_primitive_count[primitive]++;
+    return true;
+}
+
+static bool begin_primitive(
+    GeD3D12Primitive primitive, int perspective, uint32_t vertex_count,
+    uint32_t *first) {
+    return begin_primitive_ex(primitive, perspective, vertex_count, first, true);
+}
+
+static bool reserve_indices(uint32_t additional) {
+    if (!s_indices || additional > MAX_FRAME_VERTICES * 4u - s_index_count) {
+        capture_error("index frame capacity exceeded",
+                      s_index_count + additional, MAX_FRAME_VERTICES * 4u);
+        return false;
+    }
+    uint32_t required = s_index_count + additional;
+    if (required <= s_index_capacity) return true;
+    uint32_t capacity = s_index_capacity;
+    while (capacity < required) capacity *= 2u;
+    void *memory = realloc(s_indices, (size_t)capacity * sizeof(*s_indices));
+    if (!memory) {
+        capture_error("could not grow index storage", required, capacity);
+        return false;
+    }
+    s_indices = static_cast<uint16_t *>(memory);
+    s_index_capacity = capacity;
     return true;
 }
 
@@ -323,13 +355,17 @@ bool ged3d12_vertex_capture_init(void) {
         malloc(INITIAL_VERTEX_CAPACITY * sizeof(*s_vertices)));
     s_batches = static_cast<GeD3D12VertexBatch *>(
         malloc(INITIAL_BATCH_CAPACITY * sizeof(*s_batches)));
-    if (!s_vertices || !s_batches) {
+    s_indices = static_cast<uint16_t *>(
+        malloc(INITIAL_VERTEX_CAPACITY * sizeof(*s_indices)));
+    if (!s_vertices || !s_batches || !s_indices) {
         fprintf(stderr, "ged3d12: could not allocate decoded vertex capture storage\n");
         ged3d12_vertex_capture_shutdown();
         return false;
     }
     s_vertex_capacity = INITIAL_VERTEX_CAPACITY;
     s_batch_capacity = INITIAL_BATCH_CAPACITY;
+    s_index_capacity = INITIAL_VERTEX_CAPACITY;
+    s_index_count = 0;
     s_vertex_count = 0;
     s_batch_count = 0;
     s_capture_failed = 0;
@@ -340,6 +376,10 @@ bool ged3d12_vertex_capture_init(void) {
 void ged3d12_vertex_capture_shutdown(void) {
     free(s_vertices);
     free(s_batches);
+    free(s_indices);
+    s_indices = nullptr;
+    s_index_count = 0;
+    s_index_capacity = 0;
     s_vertices = nullptr;
     s_batches = nullptr;
     s_vertex_count = 0;
@@ -397,6 +437,40 @@ int ged3d12_vertex_capture_tri_list(
     }
     s_primitive_count[GE_D3D12_PRIMITIVE_TRIANGLE] += count / 3u - 1u;
     update_batch_bounds(first, count);
+    return 1;
+}
+
+int ged3d12_vertex_capture_tri_indexed(
+    const GeVtx *table, uint32_t table_count,
+    const uint16_t *indices, uint32_t index_count, int perspective) {
+    if (!table || !indices || !table_count || table_count > 65536u ||
+        !index_count || index_count % 3u) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < index_count; i++)
+        if (indices[i] >= table_count) return 0;
+    uint32_t first;
+    if (!reserve_indices(index_count) ||
+        !begin_primitive_ex(
+            GE_D3D12_PRIMITIVE_TRIANGLE, perspective, table_count, &first,
+            false)) {
+        return 0;
+    }
+    GeD3D12VertexBatch *batch = &s_batches[s_batch_count - 1u];
+    batch->flags = GE_D3D12_BATCH_INDEXED;
+    batch->count = index_count;
+    batch->table_count = table_count;
+    batch->index_first = s_index_count;
+    for (uint32_t i = 0; i < table_count; i++) {
+        const GeVtx *v = &table[i];
+        put_vertex(v->x, v->y, v->z, v->rw, v->u, v->v, v->fog,
+                   v->r, v->g, v->b, v->a);
+    }
+    memcpy(&s_indices[s_index_count], indices,
+           (size_t)index_count * sizeof(*indices));
+    s_index_count += index_count;
+    s_primitive_count[GE_D3D12_PRIMITIVE_TRIANGLE] += index_count / 3u - 1u;
+    update_batch_bounds(first, table_count);
     return 1;
 }
 
@@ -545,6 +619,17 @@ bool ged3d12_vertex_upload_pending(GeD3D12VertexFrame *out) {
         return false;
     }
     memcpy(upload.cpu, s_vertices, (size_t)size);
+    if (s_index_count) {
+        UINT64 index_size = (UINT64)s_index_count * sizeof(*s_indices);
+        GeD3D12UploadSlice index_upload = {};
+        if (!ged3d12_upload_alloc(index_size, 16, &index_upload)) {
+            fprintf(stderr, "ged3d12: could not allocate %llu bytes for indices\n",
+                    (unsigned long long)index_size);
+            return false;
+        }
+        memcpy(index_upload.cpu, s_indices, (size_t)index_size);
+        out->index_base = index_upload.gpu;
+    }
 
     out->buffer.BufferLocation = upload.gpu;
     out->buffer.SizeInBytes = (UINT)size;
@@ -557,6 +642,7 @@ bool ged3d12_vertex_upload_pending(GeD3D12VertexFrame *out) {
     out->hash = 0;
 
     s_vertex_count = 0;
+    s_index_count = 0;
     s_batch_count = 0;
     memset(s_primitive_count, 0, sizeof(s_primitive_count));
     return true;

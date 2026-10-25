@@ -27,12 +27,18 @@ enum GeD3D12Primitive : uint8_t {
     GE_D3D12_PRIMITIVE_COUNT = 4,
 };
 
+#define GE_D3D12_BATCH_INDEXED 1u
+
+/* Indexed batches: `first`/`table_count` locate the vertex table, `index_first`/`count` the
+ * 16-bit index list in the frame index buffer. Otherwise `first`/`count` are vertices. */
 struct GeD3D12VertexBatch {
     uint32_t first;
     uint32_t count;
+    uint32_t index_first;
+    uint32_t table_count;
     uint8_t primitive;
     uint8_t perspective;
-    uint16_t reserved;
+    uint16_t flags;
     uint32_t list_id;
     uint32_t list_addr;
     uint32_t draw_serial;
@@ -46,6 +52,7 @@ struct GeD3D12VertexBatch {
 
 struct GeD3D12VertexFrame {
     D3D12_VERTEX_BUFFER_VIEW buffer;
+    D3D12_GPU_VIRTUAL_ADDRESS index_base;
     const GeD3D12Vertex *vertices;
     const GeD3D12VertexBatch *batches;
     uint32_t vertex_count;
@@ -62,6 +69,9 @@ int ged3d12_vertex_capture_tri(
     const GeVtx *a, const GeVtx *b, const GeVtx *c, int perspective);
 int ged3d12_vertex_capture_tri_list(
     const GeVtx *vertices, uint32_t count, int perspective);
+int ged3d12_vertex_capture_tri_indexed(
+    const GeVtx *table, uint32_t table_count,
+    const uint16_t *indices, uint32_t index_count, int perspective);
 int ged3d12_vertex_capture_sprite(
     const GeVtx *p0, const GeVtx *p1, int perspective);
 int ged3d12_vertex_capture_line(
@@ -85,6 +95,6 @@ static_assert(offsetof(GeD3D12Vertex, rw) == 12, "D3D12 GE position ABI changed"
 static_assert(offsetof(GeD3D12Vertex, u) == 16, "D3D12 GE texture ABI changed");
 static_assert(offsetof(GeD3D12Vertex, fog) == 24, "D3D12 GE fog ABI changed");
 static_assert(offsetof(GeD3D12Vertex, rgba) == 28, "D3D12 GE color ABI changed");
-static_assert(sizeof(GeD3D12VertexBatch) == 264, "D3D12 GE batch ABI changed");
+static_assert(sizeof(GeD3D12VertexBatch) == 272, "D3D12 GE batch ABI changed");
 
 #endif

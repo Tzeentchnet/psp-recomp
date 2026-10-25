@@ -59,6 +59,7 @@ void ged3d12_shader_constants_build(
     GeD3D12ShaderConstants *out);
 bool ged3d12_shader_direct_compatible(const GeState *state);
 bool ged3d12_shader_direct_stencil_write(const GeState *state);
+void ged3d12_shader_manual_reasons_print(void);
 D3D12_SHADING_RATE ged3d12_shader_shading_rate(
     uint32_t scale, D3D12_VARIABLE_SHADING_RATE_TIER tier,
     bool additional_rates);

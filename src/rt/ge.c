@@ -2660,6 +2660,109 @@ static void project_cvtx(const CVtx *c, Vtx *o) {
     o->r = c->r; o->g = c->g; o->b = c->b; o->a = c->a;
 }
 
+/* ---- Indexed triangle capture ----
+ * Unclipped Gouraud triangles whose vertices come from the indexed transform cache are
+ * recorded as a projected vertex table plus an ordered 16-bit index list, so each shared
+ * vertex is projected and staged once. Clipped triangles (and anything else) keep the
+ * expanded path; the two kinds are flushed in submission order whenever the kind changes. */
+static Vtx *s_idx_table;
+static uint32_t s_idx_table_count, s_idx_table_capacity;
+static uint16_t *s_idx_list;
+static uint32_t s_idx_list_count, s_idx_list_capacity;
+static uint32_t *s_idx_slot_tag;
+static uint16_t *s_idx_slot_value;
+static size_t s_idx_slot_capacity;
+static uint32_t s_idx_generation;
+static int s_idx_active;
+
+static void idx_flush(void) {
+    uint32_t table_count = s_idx_table_count;
+    uint32_t list_count = s_idx_list_count;
+    s_idx_active = 0;
+    s_idx_table_count = 0;
+    s_idx_list_count = 0;
+    if (!list_count) return;
+    if (s_backend && s_backend->tri_indexed &&
+        s_backend->tri_indexed(
+            s_idx_table, table_count, s_idx_list, list_count, 1)) {
+        return;
+    }
+    for (uint32_t i = 0; i < list_count; i += 3u) {
+        raster_tri(
+            &s_idx_table[s_idx_list[i]], &s_idx_table[s_idx_list[i + 1u]],
+            &s_idx_table[s_idx_list[i + 2u]], 1);
+    }
+}
+
+static int idx_reserve(void) {
+    if (s_idx_table_count + 3u > s_idx_table_capacity) {
+        uint32_t capacity = s_idx_table_capacity ? s_idx_table_capacity * 2u : 4096u;
+        Vtx *table = (Vtx *)realloc(s_idx_table, (size_t)capacity * sizeof(*table));
+        if (!table) return 0;
+        s_idx_table = table;
+        s_idx_table_capacity = capacity;
+    }
+    if (s_idx_list_count + 3u > s_idx_list_capacity) {
+        uint32_t capacity = s_idx_list_capacity ? s_idx_list_capacity * 2u : 8192u;
+        uint16_t *list = (uint16_t *)realloc(s_idx_list, (size_t)capacity * sizeof(*list));
+        if (!list) return 0;
+        s_idx_list = list;
+        s_idx_list_capacity = capacity;
+    }
+    if (s_indexed_transform_capacity > s_idx_slot_capacity) {
+        size_t capacity = s_indexed_transform_capacity;
+        uint32_t *tags = (uint32_t *)realloc(s_idx_slot_tag, capacity * sizeof(*tags));
+        if (!tags) return 0;
+        s_idx_slot_tag = tags;
+        uint16_t *values = (uint16_t *)realloc(s_idx_slot_value, capacity * sizeof(*values));
+        if (!values) return 0;
+        s_idx_slot_value = values;
+        memset(s_idx_slot_tag + s_idx_slot_capacity, 0,
+               (capacity - s_idx_slot_capacity) * sizeof(*tags));
+        s_idx_slot_capacity = capacity;
+    }
+    return 1;
+}
+
+static void idx_begin(void) {
+    s_idx_active = 1;
+    s_idx_table_count = 0;
+    s_idx_list_count = 0;
+    if (++s_idx_generation == 0) {
+        if (s_idx_slot_tag)
+            memset(s_idx_slot_tag, 0, s_idx_slot_capacity * sizeof(*s_idx_slot_tag));
+        s_idx_generation = 1;
+    }
+}
+
+/* Returns 1 when the triangle was recorded; 0 leaves it for the expanded path. */
+static int idx_add_triangle(const CVtx *const cv[3]) {
+    size_t slot[3];
+    for (int k = 0; k < 3; k++) {
+        if (cv[k] < s_indexed_transform_cache ||
+            cv[k] >= s_indexed_transform_cache + s_indexed_transform_capacity) {
+            return 0;
+        }
+        slot[k] = (size_t)(cv[k] - s_indexed_transform_cache);
+    }
+    if (!idx_reserve()) return 0;
+    if (s_backend_tri_batch_count) {
+        end_backend_tri_batch();
+        begin_backend_tri_batch(1);
+    }
+    if (s_idx_active && s_idx_table_count + 3u > 65535u) idx_flush();
+    if (!s_idx_active) idx_begin();
+    for (int k = 0; k < 3; k++) {
+        if (s_idx_slot_tag[slot[k]] != s_idx_generation) {
+            project_cvtx(cv[k], &s_idx_table[s_idx_table_count]);
+            s_idx_slot_tag[slot[k]] = s_idx_generation;
+            s_idx_slot_value[slot[k]] = (uint16_t)s_idx_table_count++;
+        }
+        s_idx_list[s_idx_list_count++] = s_idx_slot_value[slot[k]];
+    }
+    return 1;
+}
+
 /* Compatibility wrapper for points/lines/sprites: reject behind-camera vertices. */
 static int transform_vtx_3d(uint32_t addr, const VFmt *vf, Vtx *o) {
     CVtx c;
@@ -4169,6 +4272,10 @@ static void draw_prim(uint32_t op) {
                     roffx, roffy, ge.scis_x1, ge.scis_y1, ge.scis_x2, ge.scis_y2,
                     ge.world[9], ge.world[10], ge.world[11], ge.view[9], ge.view[10], ge.view[11]);
         }
+        static int no_indexed = -1;
+        if (no_indexed < 0) no_indexed = getenv("SR_D3D12_NO_INDEXED") ? 1 : 0;
+        int use_indexed = cached && !rt && !no_indexed && ge.shade_gouraud && !ge.clear &&
+            s_backend && s_backend->tri_indexed;
         begin_backend_tri_batch(1);
         for (int i = 2; i < count; i++) {
             int i0, i1, i2;
@@ -4277,10 +4384,15 @@ static void draw_prim(uint32_t op) {
             }
 
             if (dec == D_DRAW) {
+                if (use_indexed) {
+                    if (idx_add_triangle(cv)) continue;
+                    idx_flush();
+                }
                 Vtx a, b, c;
                 project_cvtx(cv[0],&a); project_cvtx(cv[1],&b); project_cvtx(cv[2],&c);
                 raster_tri(&a,&b,&c,1);
             } else if (dec == D_CLIP) {
+                if (use_indexed) idx_flush();
                 clip_input[0] = *cv[0];
                 clip_input[1] = *cv[1];
                 clip_input[2] = *cv[2];
@@ -4313,6 +4425,7 @@ static void draw_prim(uint32_t op) {
                 }
             }
         }
+        idx_flush();
         end_backend_tri_batch();
         if (rt) {
             fprintf(stderr, "TRIDRW+ f=%u d=%u tris=%lu draw=%lu clip=%lu drop[oor=%lu wneg=%lu zout=%lu "

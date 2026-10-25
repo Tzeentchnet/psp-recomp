@@ -169,6 +169,11 @@ typedef struct GeBackend {
      * this blit per frame (motion blur, pause capture); the CPU route costs a GPU drain +
      * PCIe readback + re-upload each time, which dwarfs the frame itself on discrete GPUs. */
     int  (*xfer)(uint32_t startdata);
+    /* Optional indexed triangle list: `table` holds projected vertices (Gouraud colors only),
+     * `indices` reference it in submission order. Returns 0 to decline; the caller then
+     * replays the triangles through the ordinary path. */
+    int  (*tri_indexed)(const GeVtx *table, uint32_t table_count,
+                        const uint16_t *indices, uint32_t index_count, int persp);
 } GeBackend;
 
 /* Implemented in ge.c. */

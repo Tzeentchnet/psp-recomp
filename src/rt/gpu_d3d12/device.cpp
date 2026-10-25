@@ -1400,7 +1400,9 @@ static void log_draw_batches(
     const GeD3D12VertexBatch *batch = &frame->batches[first];
     const GeD3D12Vertex *v0 = &frame->vertices[batch->first];
     const GeD3D12Vertex *v1 =
-        &frame->vertices[batch->first + batch->count - 2u];
+        &frame->vertices[batch->first +
+            ((batch->flags & GE_D3D12_BATCH_INDEXED)
+                ? batch->table_count : batch->count) - 2u];
     UINT end = first + 1;
     uint32_t vertices = batch->count;
     while (end < frame->batch_count &&
@@ -1515,8 +1517,19 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
             GE_D3D12_ROOT_VERTICES,
             frame->buffer.BufferLocation +
                 (UINT64)batch->first * sizeof(GeD3D12Vertex));
-        s_command_list->DrawInstanced(
-            batch->count, 1, 0, 0);
+        if (batch->flags & GE_D3D12_BATCH_INDEXED) {
+            D3D12_INDEX_BUFFER_VIEW index_view = {};
+            index_view.BufferLocation = frame->index_base +
+                (UINT64)batch->index_first * sizeof(uint16_t);
+            index_view.SizeInBytes = batch->count * sizeof(uint16_t);
+            index_view.Format = DXGI_FORMAT_R16_UINT;
+            s_command_list->IASetIndexBuffer(&index_view);
+            s_command_list->DrawIndexedInstanced(
+                batch->count, 1, 0, 0, 0);
+        } else {
+            s_command_list->DrawInstanced(
+                batch->count, 1, 0, 0);
+        }
         if (!ged3d12_framebuffer_mark_rendered(
                 &batch->framebuffer)) {
             ok = false;
@@ -1621,6 +1634,7 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
                 (unsigned long long)s_constant_reuses,
                 (unsigned long long)s_direct_draws,
                 (unsigned long long)s_manual_draws);
+        ged3d12_shader_manual_reasons_print();
     }
     if (gpu_log_active(s_vertex_frames)) {
         fprintf(
@@ -1811,6 +1825,7 @@ static const GeBackend k_backend = {
     ged3d12_vertex_capture_line, ged3d12_vertex_capture_point,
     device_flush, device_vram_dirty, device_vram_read,
     device_vram_write, ged3d12_framebuffer_transfer,
+    ged3d12_vertex_capture_tri_indexed,
 };
 
 extern "C" const GeBackend *ged3d12_backend(void) { return &k_backend; }
