@@ -60,6 +60,7 @@ struct FrameContext {
     ID3D12CommandAllocator *allocator;
     UINT64 fence_value;
     bool timestamp_valid;
+    UINT64 timestamp_flip;
     UINT64 upload_begin;
     UINT64 upload_cursor;
     UINT64 upload_end;
@@ -112,6 +113,7 @@ static ID3D12Resource *s_timestamp_readback;
 static uint64_t *s_timestamp_map;
 static UINT64 s_timestamp_frequency;
 static double s_last_gpu_ms = -1.0;
+static UINT64 s_last_gpu_flip;
 static UINT s_active_frame = UINT32_MAX;
 static D3D12_SHADING_RATE s_direct_shading_rate =
     D3D12_SHADING_RATE_1X1;
@@ -155,6 +157,7 @@ struct StageTimingTotals {
 };
 
 static StageTimingTotals s_stage_totals;
+static GeD3D12BackendTiming s_last_backend_timing;
 static UINT64 s_vertex_primitives[GE_D3D12_PRIMITIVE_COUNT];
 static UINT s_vertex_max;
 
@@ -181,6 +184,21 @@ static void record_stage_timings(
     LONGLONG textures_done, LONGLONG draws_done,
     LONGLONG present_done, LONGLONG submit_done) {
     if (!s_stage_log) return;
+    s_last_backend_timing.flip = s_vertex_frames;
+    s_last_backend_timing.begin_ms =
+        stage_milliseconds(start, begin_done);
+    s_last_backend_timing.vertices_ms =
+        stage_milliseconds(begin_done, vertices_done);
+    s_last_backend_timing.framebuffer_ms =
+        stage_milliseconds(vertices_done, framebuffer_done);
+    s_last_backend_timing.textures_ms =
+        stage_milliseconds(framebuffer_done, textures_done);
+    s_last_backend_timing.draws_ms =
+        stage_milliseconds(textures_done, draws_done);
+    s_last_backend_timing.present_ms =
+        stage_milliseconds(draws_done, present_done);
+    s_last_backend_timing.submit_ms =
+        stage_milliseconds(present_done, submit_done);
     s_stage_totals.begin +=
         stage_milliseconds(start, begin_done);
     s_stage_totals.vertices +=
@@ -214,6 +232,7 @@ static void record_stage_timings(
         s_stage_totals.present / divisor,
         s_stage_totals.submit / divisor);
     memset(&s_stage_totals, 0, sizeof(s_stage_totals));
+    memset(&s_last_backend_timing, 0, sizeof(s_last_backend_timing));
 }
 
 static UINT64 env_u64(const char *name, UINT64 fallback) {
@@ -1085,6 +1104,7 @@ static int begin_frame(UINT *frame_index) {
             s_last_gpu_ms =
                 (double)(end - begin) * 1000.0 /
                 (double)s_timestamp_frequency;
+            s_last_gpu_flip = frame->timestamp_flip;
         }
         frame->timestamp_valid = false;
     }
@@ -1683,6 +1703,7 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     s_active_frame = UINT32_MAX;
     if (!check_hr(signal_hr, "signal frame fence")) return -2;
     s_frames[frame_index].timestamp_valid = true;
+    s_frames[frame_index].timestamp_flip = s_vertex_frames;
     if (FAILED(present_hr)) {
         check_hr(present_hr, "present swapchain");
         HRESULT removed = s_device->GetDeviceRemovedReason();
@@ -1706,6 +1727,8 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
         return -2;
     }
     LONGLONG stage_submit_done = stage_counter();
+    s_last_backend_timing.vertices = vertices.vertex_count;
+    s_last_backend_timing.batches = vertices.batch_count;
     record_stage_timings(
         stage_start, stage_begin_done, stage_vertices_done,
         stage_framebuffer_done, stage_textures_done,
@@ -1781,7 +1804,8 @@ static void device_vram_write(uint32_t address, uint32_t bytes) {
 
 static const GeBackend k_backend = {
     "d3d12", device_init, device_present, device_shutdown,
-    ged3d12_vertex_capture_tri, ged3d12_vertex_capture_sprite,
+    ged3d12_vertex_capture_tri, ged3d12_vertex_capture_tri_list,
+    ged3d12_vertex_capture_sprite,
     ged3d12_vertex_capture_line, ged3d12_vertex_capture_point,
     device_flush, device_vram_dirty, device_vram_read,
     device_vram_write, ged3d12_framebuffer_transfer,
@@ -1796,6 +1820,31 @@ extern "C" void ged3d12_analog(uint8_t *lx, uint8_t *ly) {
 extern "C" int ged3d12_pad_present(void) { return s_pad_present; }
 extern "C" double ged3d12_last_gpu_ms(void) {
     return s_last_gpu_ms;
+}
+
+extern "C" int ged3d12_last_gpu_sample(
+    uint64_t *flip, double *milliseconds) {
+    if (!s_last_gpu_flip || s_last_gpu_ms < 0.0) return 0;
+    if (flip) *flip = s_last_gpu_flip;
+    if (milliseconds) *milliseconds = s_last_gpu_ms;
+    return 1;
+}
+
+extern "C" int ged3d12_last_backend_timing(
+    GeD3D12BackendTiming *timing) {
+    if (!timing || !s_last_backend_timing.flip) return 0;
+    *timing = s_last_backend_timing;
+    return 1;
+}
+
+extern "C" int ged3d12_framebuffer_stats(
+    GeD3D12FramebufferStats *stats) {
+    if (!stats) return 0;
+    ged3d12_framebuffer_get_stats(
+        &stats->readbacks, &stats->aliases,
+        &stats->feedback_snapshots, &stats->feedback_snapshot_pixels,
+        &stats->feedback_reuses);
+    return 1;
 }
 extern "C" int ged3d12_capture_next(const char *path) {
     if (!path || !path[0] || s_capture_path[0]) return 0;

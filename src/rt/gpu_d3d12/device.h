@@ -20,6 +20,32 @@ void     ged3d12_analog(uint8_t *lx, uint8_t *ly);
 int      ged3d12_pad_present(void);
 int ged3d12_capture_next(const char *path);
 double ged3d12_last_gpu_ms(void);
+int ged3d12_last_gpu_sample(uint64_t *flip, double *milliseconds);
+
+typedef struct GeD3D12BackendTiming {
+    uint64_t flip;
+    double begin_ms;
+    double vertices_ms;
+    double framebuffer_ms;
+    double textures_ms;
+    double draws_ms;
+    double present_ms;
+    double submit_ms;
+    uint32_t vertices;
+    uint32_t batches;
+} GeD3D12BackendTiming;
+
+int ged3d12_last_backend_timing(GeD3D12BackendTiming *timing);
+
+typedef struct GeD3D12FramebufferStats {
+    uint64_t readbacks;
+    uint64_t aliases;
+    uint64_t feedback_snapshots;
+    uint64_t feedback_snapshot_pixels;
+    uint64_t feedback_reuses;
+} GeD3D12FramebufferStats;
+
+int ged3d12_framebuffer_stats(GeD3D12FramebufferStats *stats);
 
 #ifdef __cplusplus
 }

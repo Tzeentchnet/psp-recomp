@@ -200,6 +200,19 @@ static void feedback_snapshot_mark_dirty(
     s_snapshot_dirty[s_snapshot_dirty_count++] = rect;
 }
 
+static SnapshotRect feedback_snapshot_refresh_rect(
+    SnapshotRect source) {
+    for (uint32_t i = 0; i < s_snapshot_dirty_count; i++) {
+        const SnapshotRect *dirty = &s_snapshot_dirty[i];
+        if (dirty->left < source.left) source.left = dirty->left;
+        if (dirty->top < source.top) source.top = dirty->top;
+        if (dirty->right > source.right) source.right = dirty->right;
+        if (dirty->bottom > source.bottom)
+            source.bottom = dirty->bottom;
+    }
+    return source;
+}
+
 bool ged3d12_framebuffer_configure(uint32_t scale) {
     if (s_initialized || scale < 1u || scale > 8u) return false;
     s_render_scale = scale;
@@ -1298,23 +1311,63 @@ bool ged3d12_framebuffer_texture_bind(
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
     if (target == s_active_target) {
         if (feedback_snapshot_needs_refresh(target, alias)) {
+            SnapshotRect source = feedback_source_rect(alias);
+            bool target_changed =
+                s_feedback_snapshot_target != target;
+            bool full_snapshot =
+                s_legacy_feedback_snapshots ||
+                target_changed ||
+                s_snapshot_dirty_all;
             transition(command_list, target->resource, &target->state,
                        D3D12_RESOURCE_STATE_COPY_SOURCE);
             transition(command_list, s_snapshot, &s_snapshot_state,
                        D3D12_RESOURCE_STATE_COPY_DEST);
-            command_list->CopyResource(s_snapshot, target->resource);
+            if (full_snapshot) {
+                command_list->CopyResource(
+                    s_snapshot, target->resource);
+                s_snapshot_dirty_count = 0;
+                s_snapshot_dirty_all = false;
+            } else {
+                source = feedback_snapshot_refresh_rect(source);
+                D3D12_TEXTURE_COPY_LOCATION destination = {};
+                destination.pResource = s_snapshot;
+                destination.Type =
+                    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                destination.SubresourceIndex = 0;
+                D3D12_TEXTURE_COPY_LOCATION origin = {};
+                origin.pResource = target->resource;
+                origin.Type =
+                    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                origin.SubresourceIndex = 0;
+                D3D12_BOX source_box = {
+                    (UINT)source.left * s_render_scale,
+                    (UINT)source.top * s_render_scale,
+                    0,
+                    (UINT)source.right * s_render_scale,
+                    (UINT)source.bottom * s_render_scale,
+                    1,
+                };
+                command_list->CopyTextureRegion(
+                    &destination,
+                    (UINT)source.left * s_render_scale,
+                    (UINT)source.top * s_render_scale,
+                    0, &origin, &source_box);
+                s_snapshot_dirty_count = 0;
+            }
             transition(command_list, s_snapshot, &s_snapshot_state,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             transition(command_list, target->resource, &target->state,
                        D3D12_RESOURCE_STATE_RENDER_TARGET);
             s_feedback_snapshot_target = target;
-            s_snapshot_dirty_count = 0;
-            s_snapshot_dirty_all = false;
             s_feedback_snapshots++;
             s_feedback_snapshot_pixels +=
-                (uint64_t)render_width() * texture_height();
+                full_snapshot
+                    ? (uint64_t)render_width() * texture_height()
+                    : (uint64_t)(source.right - source.left) *
+                      (uint64_t)(source.bottom - source.top) *
+                      (uint64_t)s_render_scale *
+                      (uint64_t)s_render_scale;
             if (s_log && s_feedback_snapshots <= 32u) {
-                SnapshotRect source = feedback_source_rect(alias);
                 fprintf(
                     stderr,
                     "ged3d12: feedback snapshot #%llu "
@@ -1601,7 +1654,22 @@ void ged3d12_framebuffer_flush(const char *reason) {
             ged3d12_framebuffer_read(
                 transfer.source_address, (uint32_t)bytes);
         }
+
     } else if (strcmp(reason, "loadclut") == 0) {
         ged3d12_framebuffer_read(state->clut_addr, sizeof(state->clutram));
     }
+}
+
+void ged3d12_framebuffer_get_stats(
+    uint64_t *readbacks, uint64_t *aliases,
+    uint64_t *feedback_snapshots, uint64_t *feedback_snapshot_pixels,
+    uint64_t *feedback_reuses) {
+    if (readbacks) *readbacks = s_readbacks;
+    if (aliases) *aliases = s_aliases;
+    if (feedback_snapshots)
+        *feedback_snapshots = s_feedback_snapshots;
+    if (feedback_snapshot_pixels)
+        *feedback_snapshot_pixels = s_feedback_snapshot_pixels;
+    if (feedback_reuses)
+        *feedback_reuses = s_feedback_snapshot_reuses;
 }

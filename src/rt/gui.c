@@ -567,6 +567,56 @@ double gui_last_gpu_ms(void) {
 #endif
     return -1.0;
 }
+int gui_last_gpu_sample(uint64_t *flip, double *milliseconds) {
+#ifdef SR_D3D12
+    if (s_on && s_d3d12)
+        return ged3d12_last_gpu_sample(flip, milliseconds);
+#else
+    (void)flip;
+    (void)milliseconds;
+#endif
+    return 0;
+}
+int gui_last_backend_timing(SrBackendTiming *timing) {
+#ifdef SR_D3D12
+    if (s_on && s_d3d12 && timing) {
+        GeD3D12BackendTiming source;
+        if (!ged3d12_last_backend_timing(&source)) return 0;
+        timing->flip = source.flip;
+        timing->begin_ms = source.begin_ms;
+        timing->vertices_ms = source.vertices_ms;
+        timing->framebuffer_ms = source.framebuffer_ms;
+        timing->textures_ms = source.textures_ms;
+        timing->draws_ms = source.draws_ms;
+        timing->present_ms = source.present_ms;
+        timing->submit_ms = source.submit_ms;
+        timing->vertices = source.vertices;
+        timing->batches = source.batches;
+        return 1;
+    }
+#else
+    (void)timing;
+#endif
+    return 0;
+}
+int gui_framebuffer_stats(SrFramebufferStats *stats) {
+#ifdef SR_D3D12
+    if (s_on && s_d3d12 && stats) {
+        GeD3D12FramebufferStats source;
+        if (!ged3d12_framebuffer_stats(&source)) return 0;
+        stats->readbacks = source.readbacks;
+        stats->aliases = source.aliases;
+        stats->feedback_snapshots = source.feedback_snapshots;
+        stats->feedback_snapshot_pixels =
+            source.feedback_snapshot_pixels;
+        stats->feedback_reuses = source.feedback_reuses;
+        return 1;
+    }
+#else
+    (void)stats;
+#endif
+    return 0;
+}
 
 /* Present a framebuffer at guest address fbaddr. fmt: 0=5650, 1=5551, 2=4444, 3=8888.
  * stride is in pixels (PSP buffer width, typically 512). */

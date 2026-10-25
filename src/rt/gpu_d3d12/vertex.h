@@ -60,6 +60,8 @@ void ged3d12_vertex_capture_shutdown(void);
 /* Successful hooks take ownership of the primitive and suppress software rasterization. */
 int ged3d12_vertex_capture_tri(
     const GeVtx *a, const GeVtx *b, const GeVtx *c, int perspective);
+int ged3d12_vertex_capture_tri_list(
+    const GeVtx *vertices, uint32_t count, int perspective);
 int ged3d12_vertex_capture_sprite(
     const GeVtx *p0, const GeVtx *p1, int perspective);
 int ged3d12_vertex_capture_line(

@@ -101,9 +101,16 @@ Exact unswizzled, single-level texture views can alias a cached target when thei
 format, stride, offset, and bounds match. Color resources retain a scaled 512×512
 texture envelope so the PSP's common 512×272 framebuffer-as-512×512-texture pattern
 stays GPU-resident with correct normalized coordinates. Same-target feedback samples from
-a snapshot copied before the target is rebound. CLUT32 views of compatible live 8888
-targets and CLUT16 views of compatible 565, 5551, or 4444 targets follow the same
-ordered snapshot path instead of decoding stale guest VRAM. `texture.cpp` captures and
+a snapshot copied before the target is rebound. The first snapshot for a target
+copies its complete resource. Later draws accumulate dirty PSP-space rectangles;
+a feedback refresh copies the scaled bounding union of the sampled source and
+those dirty rectangles, then clears the dirty set because the snapshot is
+globally current again. This preserves draw ordering and safe snapshot reuse
+without copying the complete 2048x2048 resource for every small sampled region.
+Set `SR_D3D12_LEGACY_FEEDBACK_SNAPSHOTS=1` to force a complete copy at every
+refresh for differential diagnosis. CLUT32 views of compatible live 8888
+targets and CLUT16 views of compatible 565, 5551, or 4444 targets follow the
+same ordered snapshot path instead of decoding stale guest VRAM. `texture.cpp` captures and
 deduplicates the draw's 2 KiB palette and binds it as an R32 buffer at `t1`. The pixel
 shader center-samples the scaled target, repacks it to the target's native PSP format,
 then applies the PSP shift/mask/start lookup and nearest or linear filtering. These

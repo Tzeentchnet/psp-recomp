@@ -279,6 +279,28 @@ int      gui_message(
 void     gui_present(uint32_t fbaddr, int fmt, uint32_t stride);
 int gui_capture_next(const char *path);
 double gui_last_gpu_ms(void);
+int gui_last_gpu_sample(uint64_t *flip, double *milliseconds);
+typedef struct SrBackendTiming {
+    uint64_t flip;
+    double begin_ms;
+    double vertices_ms;
+    double framebuffer_ms;
+    double textures_ms;
+    double draws_ms;
+    double present_ms;
+    double submit_ms;
+    uint32_t vertices;
+    uint32_t batches;
+} SrBackendTiming;
+int gui_last_backend_timing(SrBackendTiming *timing);
+typedef struct SrFramebufferStats {
+    uint64_t readbacks;
+    uint64_t aliases;
+    uint64_t feedback_snapshots;
+    uint64_t feedback_snapshot_pixels;
+    uint64_t feedback_reuses;
+} SrFramebufferStats;
+int gui_framebuffer_stats(SrFramebufferStats *stats);
 int sr_kzl_patch_offline_menu(uint8_t *data, uint32_t size);
 void sr_kzl_killzone_com_disabled(CpuState *s);
 void sr_kzl_downloads_unavailable(CpuState *s);

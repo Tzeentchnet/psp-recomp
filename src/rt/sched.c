@@ -15,6 +15,7 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
+#include "perf_stats.h"
 
 #include <windows.h>
 
@@ -65,6 +66,7 @@ typedef struct {
     int      cb_woken;           /* readied only to run callbacks; the wait resumes afterwards */
     SrHleThreadFn hle_entry;      /* host HLE helper body, instead of a recompiled guest entry */
     uint32_t hle_arg;
+    SrPerfCategory perf_category;
     CpuState saved;              /* register file while not running */
 } TCB;
 
@@ -99,6 +101,7 @@ void sched_init(CpuState *cpu) {
     s_sched_fiber = ConvertThreadToFiber(NULL);
     sr_sched_on = 1;
     sr_timeslice = TIMESLICE;
+    sr_perf_switch(SR_PERF_SCHEDULER);
 }
 
 uint32_t sched_current_uid(void) { return s_cur >= 0 ? s_tcb[s_cur].uid : 0; }
@@ -139,7 +142,10 @@ void sched_run_interrupt(CpuState *s, uint32_t fn, uint32_t a0, uint32_t a1, uin
     int save_cur = s_cur; s_cur = -1;
     s_intr_depth++;
     sr_timeslice = TIMESLICE;
+    SrPerfCategory previous_category =
+        sr_perf_switch(SR_PERF_NATIVE);
     dispatch(s, fn);
+    sr_perf_switch(previous_category);
     s_intr_depth--;
     s_cur = save_cur;
     sr_timeslice = save_slice;
@@ -367,16 +373,20 @@ static void CALLBACK fiber_proc(void *param) {
     TCB *t = (TCB *)param;
     for (;;) {
         /* Registers, args and ra were set when the thread was started (start_reset). */
-        if (t->hle_entry)
+        if (t->hle_entry) {
+            SrPerfCategory previous_category =
+                sr_perf_switch(SR_PERF_HLE);
             t->hle_entry(t->hle_arg);
-        else
+            sr_perf_switch(previous_category);
+        } else {
             dispatch(s_cpu, t->entry);    /* runs until the thread returns or exits */
+        }
         /* Returned without calling sceKernelExitThread: treat as exit. */
         t->exit_status = (int32_t)s_cpu->r[2];
         t->state = TH_DORMANT;
         sched_wake(t->uid);           /* release threads in sceKernelWaitThreadEnd on this thread */
         if (t->delete_on_exit) delete_tcb(t, 1);
-        SwitchToFiber(s_sched_fiber); /* back to scheduler; fiber may be reused if restarted */
+        switch_to_scheduler(); /* back to scheduler; fiber may be reused if restarted */
     }
 }
 
@@ -583,7 +593,12 @@ static int pick_next(void) {
 /* Save the running thread's registers, return to the scheduler, which selects and resumes the
  * next thread. Called from a thread fiber. */
 static void switch_to_scheduler(void) {
+    SrPerfCategory category = sr_perf_current();
+    if (s_cur >= 0)
+        s_tcb[s_cur].perf_category = category;
+    sr_perf_switch(SR_PERF_SCHEDULER);
     SwitchToFiber(s_sched_fiber);
+    sr_perf_switch(category);
 }
 
 void sr_yield(CpuState *s) {
@@ -1028,7 +1043,9 @@ void sched_run(uint32_t entry, uint32_t arglen, uint32_t argp, int create_start_
              * stack. Reserve a large fiber stack (committed on demand) to match. */
             t->fiber = CreateFiberEx((SIZE_T)1 << 18, (SIZE_T)64 << 20, 0, fiber_proc, t);
         }
+        sr_perf_switch(t->perf_category);
         SwitchToFiber(t->fiber);           /* run until it yields/blocks/exits */
+        sr_perf_switch(SR_PERF_SCHEDULER);
         if (t->deleted && t->fiber) { DeleteFiber(t->fiber); t->fiber = NULL; }   /* deleted itself */
         s_cur = -1;
         s_tick++;

@@ -46,6 +46,7 @@ src/ref/interp.cpp \
               src/rt/module.c \
               src/rt/vfpu_interp.c \
               src/rt/vfpu_asin.c \
+              src/rt/perf_stats.c \
               src/rt/hle.c \
               src/rt/memstick_state.c \
               src/rt/net.c \
@@ -88,6 +89,7 @@ DXC        ?= dxc
 
 .PHONY: all pipeline compile clean run shaders-d3d12 check-shaders-d3d12 \
         test-d3d12-vertex test-dispatch-table test-fps-counter \
+        test-perf-stats \
         test-input-config test-module-loader test-memstick-state \
         test-interpreter test-texture-scaler test-runtime
 
@@ -260,6 +262,13 @@ test-fps-counter:
 		-o build/tests/fps_counter_test.exe -lm
 	./build/tests/fps_counter_test.exe
 
+test-perf-stats:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
+		tools/tests/perf_stats_test.c src/rt/perf_stats.c \
+		-o build/tests/perf_stats_test.exe
+	./build/tests/perf_stats_test.exe
+
 test-memstick-state:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
@@ -303,7 +312,7 @@ test-texture-scaler:
 		third_party/xbrz/xbrz.cpp -o build/tests/texture_scaler_test.exe
 	./build/tests/texture_scaler_test.exe
 
-test-runtime: test-dispatch-table test-fps-counter test-input-config \
+test-runtime: test-dispatch-table test-fps-counter test-perf-stats test-input-config \
 	test-module-loader test-memstick-state test-interpreter \
 	test-texture-scaler
 

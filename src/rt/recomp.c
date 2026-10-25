@@ -1,6 +1,7 @@
 /* Runtime implementation. See recomp.h. */
 
 #include "recomp.h"
+#include "perf_stats.h"
 #include "settings_path.h"
 
 #include <errno.h>
@@ -585,9 +586,14 @@ static int sr_interpret_segment(
     size_t profile_index,
     SrInterpStop *stop) {
     for (;;) {
+        SrPerfCategory previous =
+            sr_perf_switch(SR_PERF_INTERPRETER);
         int returned = sr_interpret_fallback(
                 s, target, return_pc, *remaining,
                 allow_native_handoff, stop);
+        sr_perf_switch(previous);
+        sr_perf_counter_add(
+            SR_PERF_INTERP_INSTRUCTIONS, stop->steps);
         SrInterpProfile *profile =
             sr_interp_profile_at(profile_index);
         if (profile) {

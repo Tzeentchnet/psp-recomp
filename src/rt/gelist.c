@@ -28,6 +28,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
 #include "ge_shared.h"
+#include "perf_stats.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -321,6 +322,7 @@ static void run_list(DisplayList *l) {
         if (!sr_inrange(l->pc)) { s_gpustate = GPU_ERROR; break; }
         uint32_t op = MEM_R32(l->pc);
         uint32_t cmd = op >> 24;
+        sr_perf_counter_add(SR_PERF_GE_COMMANDS, 1);
         s_cmdmem[cmd] = op;
         if (s_dump) fprintf(s_dump, "%08x %08x\n", l->pc, op);
         switch (cmd) {
@@ -402,7 +404,11 @@ static void process_dl_queue(void) {
         FILE *df = dump_file();
         if (df) fprintf(df, "# list %d %s pc=%08x stall=%08x\n", l->id,
                         l->pc == l->startpc ? "start" : "resume", l->pc, l->stall);
+        SrPerfCategory previous_category =
+            sr_perf_switch(SR_PERF_GE);
+        sr_perf_counter_add(SR_PERF_GE_LISTS, 1);
         run_list(l);
+        sr_perf_switch(previous_category);
         if (df) fprintf(df, "# end list %d pc=%08x state=%s\n", l->id, l->pc,
                         s_gpustate == GPU_STALL ? "stall" : s_gpustate == GPU_DONE ? "done" :
                         s_gpustate == GPU_INTERRUPT ? "interrupt" : "error");

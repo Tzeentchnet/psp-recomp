@@ -274,6 +274,25 @@ cache reused only one two-instruction function whose complete generation
 context was identical. Normalized identity candidates therefore remain useful
 for naming and provenance without weakening exact generated-code reuse.
 
+### PSP-F-038 — Profile across guest, scheduler, frontend, backend, and GPU boundaries
+
+An aggregate host-frame time cannot distinguish generated guest work from
+intentional scheduler waiting, GE decode, vertex processing, synchronization,
+backend recording, or delayed GPU execution. Use exclusive fiber-aware CPU
+categories, workload counters, and GPU samples tagged with their source host
+flip. Warm up after fast-forward before collecting an acceptance window.
+
+### PSP-F-039 — Ordered framebuffer snapshots should copy proven dirty regions
+
+Framebuffer-feedback correctness requires the sampled snapshot to reflect all
+writes ordered before that draw, but it does not require copying a target's
+complete scaled envelope for every refresh. Take a complete snapshot when the
+active target changes, track subsequent dirty draw rectangles, and refresh the
+union of accumulated dirt and the requested sample area. Clear dirty tracking
+only after that union copy makes the snapshot globally current. Record both
+snapshot count and copied physical pixels, and retain a full-copy diagnostic
+mode for differential validation.
+
 ## Common failure patterns
 
 - Copying another title's boot state.

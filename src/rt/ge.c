@@ -21,6 +21,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
 #include "ge_shared.h"
+#include "perf_stats.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -133,10 +134,18 @@ void sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes) {
     if (s_backend && s_backend->vram_dirty) s_backend->vram_dirty(addr, bytes);
 }
 void sr_gpu_vram_read(uint32_t addr, uint32_t bytes) {
-    if (s_backend && s_backend->vram_read) s_backend->vram_read(addr, bytes);
+    if (s_backend && s_backend->vram_read) {
+        SrPerfCategory previous = sr_perf_switch(SR_PERF_SYNC);
+        s_backend->vram_read(addr, bytes);
+        sr_perf_switch(previous);
+    }
 }
 void sr_gpu_vram_prepare_write(uint32_t addr, uint32_t bytes) {
-    if (s_backend && s_backend->vram_write) s_backend->vram_write(addr, bytes);
+    if (s_backend && s_backend->vram_write) {
+        SrPerfCategory previous = sr_perf_switch(SR_PERF_SYNC);
+        s_backend->vram_write(addr, bytes);
+        sr_perf_switch(previous);
+    }
 }
 void sr_gpu_vram_watch_reads(int enabled) {
     g_sr_gpu_vram_read_watch = enabled != 0;
@@ -1694,6 +1703,17 @@ static void put_px_rgba_z(int x, int y, uint16_t pz, int r, int g, int b, int a)
  * mode u/v are stored pre-multiplied by rw (texel coords over w). */
 typedef GeVtx Vtx;
 
+#define GE_BACKEND_TRI_BATCH_LIMIT (1024u * 1024u)
+
+static Vtx *s_backend_tri_batch;
+static uint32_t s_backend_tri_batch_count;
+static uint32_t s_backend_tri_batch_capacity;
+static int s_backend_tri_batch_active;
+static int s_backend_tri_batch_perspective;
+
+static int reserve_backend_tri_batch(uint32_t additional);
+static void end_backend_tri_batch(void);
+
 static void load_vtx(uint32_t addr, const VFmt *vf, Vtx *o) {
     float pz; read_pos(addr, vf, &o->x, &o->y, &pz);
     o->z = pz; o->rw = 1.0f; o->fog = 1.0f;
@@ -1713,6 +1733,44 @@ static uint32_t index_value(uint32_t ibase, int idxfmt, int i) {
 static uint32_t prim_vtx_addr(uint32_t vbase, uint32_t ibase, int idxfmt, int i, int stride) {
     uint32_t vi = idxfmt ? index_value(ibase, idxfmt, i) : (uint32_t)i;
     return vbase + vi * (uint32_t)stride;
+}
+
+static Vtx *s_through_vertex_cache;
+static size_t s_through_vertex_capacity;
+
+static Vtx *cache_through_vertices(
+    uint32_t vbase, uint32_t ibase, int idxfmt,
+    const VFmt *vf, int count) {
+    if (count <= 0) return NULL;
+    if ((size_t)count > s_through_vertex_capacity) {
+        size_t capacity = s_through_vertex_capacity
+            ? s_through_vertex_capacity : 256u;
+        while (capacity < (size_t)count)
+            capacity *= 2u;
+        Vtx *grown = (Vtx *)realloc(
+            s_through_vertex_cache, capacity * sizeof(*grown));
+        if (!grown) return NULL;
+        s_through_vertex_cache = grown;
+        s_through_vertex_capacity = capacity;
+    }
+    for (int i = 0; i < count; i++) {
+        load_vtx(
+            prim_vtx_addr(vbase, ibase, idxfmt, i, vf->stride),
+            vf, &s_through_vertex_cache[i]);
+    }
+    return s_through_vertex_cache;
+}
+
+static void load_primitive_vertex(
+    const Vtx *cache, uint32_t vbase, uint32_t ibase,
+    int idxfmt, int index, const VFmt *vf, Vtx *out) {
+    if (cache) {
+        *out = cache[index];
+        return;
+    }
+    load_vtx(
+        prim_vtx_addr(vbase, ibase, idxfmt, index, vf->stride),
+        vf, out);
 }
 
 /* Programmable alpha test (ALPHATEST 0xDB: func | ref<<8 | mask<<16). */
@@ -1866,6 +1924,16 @@ static int who_active(void) {
 }
 
 static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
+    if (s_backend_tri_batch_active) {
+        if (persp == s_backend_tri_batch_perspective &&
+            reserve_backend_tri_batch(3u)) {
+            s_backend_tri_batch[s_backend_tri_batch_count++] = *A;
+            s_backend_tri_batch[s_backend_tri_batch_count++] = *B;
+            s_backend_tri_batch[s_backend_tri_batch_count++] = *C;
+            return;
+        }
+        end_backend_tri_batch();
+    }
     /* GPU capture seam: a registered backend takes the triangle (and reproduces culling,
      * depth, shading, blending on the GPU); if it declines it has already flushed, so the
      * software path below stays correctly ordered against prior GPU work. */
@@ -2209,6 +2277,8 @@ static void light_vertex(float wx, float wy, float wz, float nx, float ny, float
  * linear interpolation and only then projected. The old pipeline rejected any vertex with
  * clipw <= 0, which discarded every triangle touching the camera plane — in close-up
  * scenes (the hangar floor/aircraft) that erased whole models. */
+#define NEAR_W 1e-3f
+
 typedef struct {
     float cx, cy, cz, cw; float u, v; float fog; int r, g, b, a;
     /* PSP primitive-acceptance flags (PPSSPP Clipper::ProcessTriangle / ClipToScreenInternal):
@@ -2218,6 +2288,56 @@ typedef struct {
      * meaningful when cw != 0. */
     float sx, sy, sz;
 } CVtx;
+
+static int reserve_backend_tri_batch(uint32_t additional) {
+    if (additional >
+        GE_BACKEND_TRI_BATCH_LIMIT - s_backend_tri_batch_count) {
+        return 0;
+    }
+    uint32_t required = s_backend_tri_batch_count + additional;
+    if (required <= s_backend_tri_batch_capacity) return 1;
+    uint32_t capacity = s_backend_tri_batch_capacity
+        ? s_backend_tri_batch_capacity : 3072u;
+    while (capacity < required) {
+        capacity = capacity > GE_BACKEND_TRI_BATCH_LIMIT / 2u
+            ? GE_BACKEND_TRI_BATCH_LIMIT : capacity * 2u;
+    }
+    void *memory = realloc(
+        s_backend_tri_batch, (size_t)capacity * sizeof(*s_backend_tri_batch));
+    if (!memory) return 0;
+    s_backend_tri_batch = (Vtx *)memory;
+    s_backend_tri_batch_capacity = capacity;
+    return 1;
+}
+
+static void end_backend_tri_batch(void) {
+    uint32_t count = s_backend_tri_batch_count;
+    int perspective = s_backend_tri_batch_perspective;
+    s_backend_tri_batch_active = 0;
+    s_backend_tri_batch_count = 0;
+    if (!count) return;
+    if (s_backend && s_backend->tri_list &&
+        s_backend->tri_list(
+            s_backend_tri_batch, count, perspective)) {
+        return;
+    }
+    for (uint32_t i = 0; i < count; i += 3u) {
+        raster_tri(
+            &s_backend_tri_batch[i],
+            &s_backend_tri_batch[i + 1u],
+            &s_backend_tri_batch[i + 2u],
+            perspective);
+    }
+}
+
+static void begin_backend_tri_batch(int perspective) {
+    if (s_backend_tri_batch_active) end_backend_tri_batch();
+    if (s_backend && s_backend->tri_list) {
+        s_backend_tri_batch_active = 1;
+        s_backend_tri_batch_perspective = perspective;
+        s_backend_tri_batch_count = 0;
+    }
+}
 
 typedef struct {
     float x, y, z;
@@ -2400,8 +2520,103 @@ static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
     transform_model_vtx_clip(&model, o);
 }
 
-/* Smallest clip-space w kept by the near clipper. */
-#define NEAR_W 1e-3f
+static CVtx *s_transform_vertex_cache;
+static CVtx **s_transform_vertex_refs;
+static size_t s_transform_vertex_capacity;
+static CVtx *s_indexed_transform_cache;
+static uint32_t *s_indexed_transform_tags;
+static size_t s_indexed_transform_capacity;
+static uint32_t s_indexed_transform_generation;
+
+static int reserve_indexed_transform_cache(size_t count) {
+    if (count <= s_indexed_transform_capacity) return 1;
+    size_t capacity = s_indexed_transform_capacity
+        ? s_indexed_transform_capacity : 256u;
+    while (capacity < count)
+        capacity *= 2u;
+    CVtx *vertices = (CVtx *)realloc(
+        s_indexed_transform_cache, capacity * sizeof(*vertices));
+    if (!vertices) return 0;
+    s_indexed_transform_cache = vertices;
+    uint32_t *tags = (uint32_t *)realloc(
+        s_indexed_transform_tags, capacity * sizeof(*tags));
+    if (!tags) return 0;
+    memset(
+        tags + s_indexed_transform_capacity, 0,
+        (capacity - s_indexed_transform_capacity) * sizeof(*tags));
+    s_indexed_transform_tags = tags;
+    s_indexed_transform_capacity = capacity;
+    return 1;
+}
+
+static const CVtx *const *cache_transform_vertices(
+    uint32_t vbase, uint32_t ibase, int idxfmt,
+    const VFmt *vf, int count) {
+    if (count <= 0) return NULL;
+    if ((size_t)count > s_transform_vertex_capacity) {
+        size_t capacity = s_transform_vertex_capacity
+            ? s_transform_vertex_capacity : 256u;
+        while (capacity < (size_t)count)
+            capacity *= 2u;
+        CVtx *grown = (CVtx *)realloc(
+            s_transform_vertex_cache, capacity * sizeof(*grown));
+        if (!grown) return NULL;
+        s_transform_vertex_cache = grown;
+        CVtx **refs = (CVtx **)realloc(
+            s_transform_vertex_refs, capacity * sizeof(*refs));
+        if (!refs) return NULL;
+        s_transform_vertex_refs = refs;
+        s_transform_vertex_capacity = capacity;
+    }
+    uint32_t maximum_index = 0;
+    int cache_indices = idxfmt != 0;
+    if (cache_indices) {
+        for (int i = 0; i < count; i++) {
+            uint32_t index = index_value(ibase, idxfmt, i);
+            if (index > maximum_index) maximum_index = index;
+        }
+        cache_indices =
+            maximum_index < 65536u &&
+            reserve_indexed_transform_cache(
+                (size_t)maximum_index + 1u);
+        if (cache_indices &&
+            ++s_indexed_transform_generation == 0) {
+            memset(
+                s_indexed_transform_tags, 0,
+                s_indexed_transform_capacity *
+                    sizeof(*s_indexed_transform_tags));
+            s_indexed_transform_generation = 1;
+        }
+    }
+    uint64_t transformed = 0;
+    for (int i = 0; i < count; i++) {
+        if (cache_indices) {
+            uint32_t index = index_value(ibase, idxfmt, i);
+            if (s_indexed_transform_tags[index] !=
+                s_indexed_transform_generation) {
+                transform_vtx_clip(
+                    vbase + index * (uint32_t)vf->stride,
+                    vf, &s_indexed_transform_cache[index]);
+                transformed++;
+                s_indexed_transform_tags[index] =
+                    s_indexed_transform_generation;
+            }
+            s_transform_vertex_refs[i] =
+                &s_indexed_transform_cache[index];
+        } else {
+            transform_vtx_clip(
+                prim_vtx_addr(
+                    vbase, ibase, idxfmt, i, vf->stride),
+                vf, &s_transform_vertex_cache[i]);
+            s_transform_vertex_refs[i] =
+                &s_transform_vertex_cache[i];
+            transformed++;
+        }
+    }
+    sr_perf_counter_add(
+        SR_PERF_GE_TRANSFORM_UNIQUE_VERTICES, transformed);
+    return (const CVtx *const *)s_transform_vertex_refs;
+}
 
 /* Perspective divide + viewport: clip-space vertex (cw > 0 required) → screen vertex. */
 static void project_cvtx(const CVtx *c, Vtx *o) {
@@ -2417,13 +2632,13 @@ static void project_cvtx(const CVtx *c, Vtx *o) {
     float off_x = (float)(ge.offsetx & 0xFFFF) / 16.0f;
     float off_y = (float)(ge.offsety & 0xFFFF) / 16.0f;
 
-    o->x  = ndcx * vp_xs + vp_xc - off_x;
-    o->y  = ndcy * vp_ys + vp_yc - off_y;
+    o->x = ndcx * vp_xs + vp_xc - off_x;
+    o->y = ndcy * vp_ys + vp_yc - off_y;
     float sz = ndcz * vp_zs + vp_zc;
-    o->z  = sz < 0.0f ? 0.0f : sz > 65535.0f ? 65535.0f : sz;
-    o->rw = inv_w;          /* 1/clipw for perspective-correct UV interpolation */
-    o->u  = c->u * inv_w;
-    o->v  = c->v * inv_w;
+    o->z = sz < 0.0f ? 0.0f : sz > 65535.0f ? 65535.0f : sz;
+    o->rw = inv_w;
+    o->u = c->u * inv_w;
+    o->v = c->v * inv_w;
     o->fog = c->fog;
     o->r = c->r; o->g = c->g; o->b = c->b; o->a = c->a;
 }
@@ -2438,6 +2653,23 @@ static int transform_vtx_3d(uint32_t addr, const VFmt *vf, Vtx *o) {
     if (c.oor) { s_stat.nearclip++; return 0; }
     if (!ge.depth_clip && (c.ozp || c.ozn)) { s_stat.nearclip++; return 0; }
     project_cvtx(&c, o);
+    return 1;
+}
+
+static int project_cached_vtx(const CVtx *c, Vtx *out) {
+    if (c->cw <= NEAR_W) {
+        s_stat.nearclip++;
+        return 0;
+    }
+    if (c->oor) {
+        s_stat.nearclip++;
+        return 0;
+    }
+    if (!ge.depth_clip && (c->ozp || c->ozn)) {
+        s_stat.nearclip++;
+        return 0;
+    }
+    project_cvtx(c, out);
     return 1;
 }
 
@@ -3067,46 +3299,67 @@ static float patch_ge_row_sum(const PatchRowTerm terms[2]) {
         ldexpf((float)sum, lsb_exponent));
 }
 
-static int build_spline_axis_params(
-    int point_count, int tessellation, int edge_type,
-    PatchAxisParam **out_params, int *out_count) {
+typedef struct {
+    PatchAxisParam *params;
+    size_t capacity;
+    int point_count;
+    int tessellation;
+    int edge_type;
+    int count;
+} PatchAxisCache;
+
+static PatchAxisParam *get_spline_axis_params(
+    PatchAxisCache *cache, int point_count,
+    int tessellation, int edge_type, int *out_count) {
     int patch_count = point_count - 3;
     int count = patch_count * tessellation + 1;
-    PatchAxisParam *params = (PatchAxisParam *)malloc(
-        (size_t)count * sizeof(*params));
-    if (!params) return 0;
+    if ((size_t)count > cache->capacity) {
+        size_t capacity = cache->capacity ? cache->capacity : 32u;
+        while (capacity < (size_t)count)
+            capacity *= 2u;
+        void *memory = realloc(
+            cache->params, capacity * sizeof(*cache->params));
+        if (!memory) return NULL;
+        cache->params = (PatchAxisParam *)memory;
+        cache->capacity = capacity;
+    }
+    if (cache->point_count == point_count &&
+        cache->tessellation == tessellation &&
+        cache->edge_type == edge_type) {
+        *out_count = cache->count;
+        return cache->params;
+    }
     for (int index = 0; index < count; index++)
         patch_spline_param(
             index, tessellation, patch_count, edge_type,
-            &params[index]);
-    *out_params = params;
+            &cache->params[index]);
+    cache->point_count = point_count;
+    cache->tessellation = tessellation;
+    cache->edge_type = edge_type;
+    cache->count = count;
     *out_count = count;
-    return 1;
+    return cache->params;
 }
 
-static void evaluate_patch_vertex(
+static void build_patch_columns(
     const ModelVtx *control, int point_stride,
-    const PatchAxisParam *u_param,
-    const PatchAxisParam *v_param, int spline,
-    float generated_u, float generated_v,
-    int has_texcoord, int needs_normal,
-    ModelVtx *out) {
-    PatchColumn columns[4];
-    float tangent_u[3] = {0.0f, 0.0f, 0.0f};
-    float tangent_v[3] = {0.0f, 0.0f, 0.0f};
+    int u_segment, const PatchAxisParam *v_param, int spline,
+    int has_texcoord, int needs_normal, PatchColumn columns[4]) {
     for (int column = 0; column < 4; column++) {
         for (int component = 0; component < 3; component++) {
             float values[4];
             for (int row = 0; row < 4; row++) {
                 const ModelVtx *point = &control[
                     (v_param->segment + row) * point_stride +
-                    u_param->segment + column];
+                    u_segment + column];
                 values[row] = (&point->x)[component];
             }
             columns[column].position[component] = patch_axis_eval(
                 values, v_param, spline,
-                &columns[column].before[component],
-                &columns[column].after[component]);
+                needs_normal
+                    ? &columns[column].before[component] : NULL,
+                needs_normal
+                    ? &columns[column].after[component] : NULL);
         }
         if (has_texcoord) {
             for (int component = 0; component < 2; component++) {
@@ -3114,7 +3367,7 @@ static void evaluate_patch_vertex(
                 for (int row = 0; row < 4; row++) {
                     const ModelVtx *point = &control[
                         (v_param->segment + row) * point_stride +
-                        u_param->segment + column];
+                        u_segment + column];
                     values[row] = (&point->u)[component];
                 }
                 columns[column].texcoord[component] =
@@ -3127,7 +3380,7 @@ static void evaluate_patch_vertex(
             for (int row = 0; row < 4; row++) {
                 const ModelVtx *point = &control[
                     (v_param->segment + row) * point_stride +
-                    u_param->segment + column];
+                    u_segment + column];
                 values[row] =
                     ((&point->r)[component] << 7) | 0x7f;
             }
@@ -3135,23 +3388,43 @@ static void evaluate_patch_vertex(
                 patch_axis_color(values, v_param, spline);
         }
     }
+}
 
+static void evaluate_patch_columns(
+    const PatchColumn columns[4],
+    const PatchAxisParam *u_param, int spline,
+    float generated_u, float generated_v,
+    int has_texcoord, int needs_normal,
+    ModelVtx *out) {
+    float tangent_u[3] = {0.0f, 0.0f, 0.0f};
+    float tangent_v[3] = {0.0f, 0.0f, 0.0f};
     for (int component = 0; component < 3; component++) {
-        float values[4], before_values[4], after_values[4];
+        float values[4];
         for (int column = 0; column < 4; column++) {
             values[column] = columns[column].position[component];
-            before_values[column] = columns[column].before[component];
-            after_values[column] = columns[column].after[component];
         }
-        float before, after;
-        (&out->x)[component] = patch_axis_eval(
-            values, u_param, spline, &before, &after);
-        tangent_u[component] = patch_ge_add(after, -before);
-        tangent_v[component] = patch_ge_add(
-            patch_axis_eval(
-                after_values, u_param, spline, NULL, NULL),
-            -patch_axis_eval(
-                before_values, u_param, spline, NULL, NULL));
+        if (needs_normal) {
+            float before_values[4], after_values[4];
+            for (int column = 0; column < 4; column++) {
+                before_values[column] =
+                    columns[column].before[component];
+                after_values[column] =
+                    columns[column].after[component];
+            }
+            float before, after;
+            (&out->x)[component] = patch_axis_eval(
+                values, u_param, spline, &before, &after);
+            tangent_u[component] =
+                patch_ge_add(after, -before);
+            tangent_v[component] = patch_ge_add(
+                patch_axis_eval(
+                    after_values, u_param, spline, NULL, NULL),
+                -patch_axis_eval(
+                    before_values, u_param, spline, NULL, NULL));
+        } else {
+            (&out->x)[component] = patch_axis_eval(
+                values, u_param, spline, NULL, NULL);
+        }
     }
     if (has_texcoord) {
         for (int component = 0; component < 2; component++) {
@@ -3198,35 +3471,156 @@ static void evaluate_patch_vertex(
     }
 }
 
+static Vtx *s_patch_through_cache;
+static CVtx *s_patch_transform_cache;
+static size_t s_patch_cache_capacity;
+
+static int reserve_patch_cache(size_t count) {
+    if (count <= s_patch_cache_capacity) return 1;
+    size_t capacity = s_patch_cache_capacity
+        ? s_patch_cache_capacity : 256u;
+    while (capacity < count)
+        capacity *= 2u;
+    Vtx *through = (Vtx *)realloc(
+        s_patch_through_cache, capacity * sizeof(*through));
+    if (!through) return 0;
+    s_patch_through_cache = through;
+    CVtx *transform = (CVtx *)realloc(
+        s_patch_transform_cache, capacity * sizeof(*transform));
+    if (!transform) return 0;
+    s_patch_transform_cache = transform;
+    s_patch_cache_capacity = capacity;
+    return 1;
+}
+
+static void draw_patch_through_triangle(
+    const Vtx *a, const Vtx *b, const Vtx *c) {
+    Vtx first = *a;
+    Vtx second = *b;
+    if (ge.cull_enable && !ge.clear && (ge.cull & 1u) == 0u) {
+        Vtx swap = first;
+        first = second;
+        second = swap;
+    }
+    raster_tri(&first, &second, c, 0);
+}
+
 static void draw_patch_grid(
     const ModelVtx *vertices, int width, int height,
     const VFmt *vf) {
+    size_t count = (size_t)width * (size_t)height;
+    Vtx *through = NULL;
+    CVtx *transform = NULL;
+    if (reserve_patch_cache(count)) {
+        if (vf->through) {
+            through = s_patch_through_cache;
+            for (size_t i = 0; i < count; i++)
+                model_to_through_vtx(&vertices[i], &through[i]);
+        } else {
+            transform = s_patch_transform_cache;
+            for (size_t i = 0; i < count; i++)
+                transform_model_vtx_clip(&vertices[i], &transform[i]);
+        }
+    }
+    int batch_triangles = (ge.patch_primitive & 3u) == 0u;
+    if (batch_triangles) begin_backend_tri_batch(!vf->through);
     for (int v = 0; v + 1 < height; v++) {
         for (int u = 0; u + 1 < width; u++) {
+            int top_left_index = v * width + u;
+            int top_right_index = top_left_index + 1;
+            int bottom_left_index = (v + 1) * width + u;
+            int bottom_right_index = bottom_left_index + 1;
             const ModelVtx *top_left = &vertices[v * width + u];
             const ModelVtx *top_right = top_left + 1;
             const ModelVtx *bottom_left =
                 &vertices[(v + 1) * width + u];
             const ModelVtx *bottom_right = bottom_left + 1;
             if ((ge.patch_primitive & 3u) == 0u) {
-                draw_patch_triangle(
-                    top_left, bottom_left, top_right, vf);
-                draw_patch_triangle(
-                    top_right, bottom_left, bottom_right, vf);
+                if (through) {
+                    draw_patch_through_triangle(
+                        &through[top_left_index],
+                        &through[bottom_left_index],
+                        &through[top_right_index]);
+                    draw_patch_through_triangle(
+                        &through[top_right_index],
+                        &through[bottom_left_index],
+                        &through[bottom_right_index]);
+                } else if (transform) {
+                    draw_patch_cvtx_triangle(
+                        transform[top_left_index],
+                        transform[bottom_left_index],
+                        transform[top_right_index]);
+                    draw_patch_cvtx_triangle(
+                        transform[top_right_index],
+                        transform[bottom_left_index],
+                        transform[bottom_right_index]);
+                } else {
+                    draw_patch_triangle(
+                        top_left, bottom_left, top_right, vf);
+                    draw_patch_triangle(
+                        top_right, bottom_left, bottom_right, vf);
+                }
             } else if ((ge.patch_primitive & 3u) == 1u) {
-                draw_patch_line(top_left, bottom_left, vf);
-                draw_patch_line(bottom_left, top_right, vf);
-                draw_patch_line(top_right, bottom_right, vf);
+                if (through) {
+                    draw_line_vtx(
+                        &through[top_left_index],
+                        &through[bottom_left_index], 0);
+                    draw_line_vtx(
+                        &through[bottom_left_index],
+                        &through[top_right_index], 0);
+                    draw_line_vtx(
+                        &through[top_right_index],
+                        &through[bottom_right_index], 0);
+                } else if (transform) {
+                    draw_patch_cvtx_line(
+                        transform[top_left_index],
+                        transform[bottom_left_index]);
+                    draw_patch_cvtx_line(
+                        transform[bottom_left_index],
+                        transform[top_right_index]);
+                    draw_patch_cvtx_line(
+                        transform[top_right_index],
+                        transform[bottom_right_index]);
+                } else {
+                    draw_patch_line(top_left, bottom_left, vf);
+                    draw_patch_line(bottom_left, top_right, vf);
+                    draw_patch_line(top_right, bottom_right, vf);
+                }
             } else {
-                draw_patch_point(top_left, vf);
-                draw_patch_point(bottom_left, vf);
-                draw_patch_point(bottom_left, vf);
-                draw_patch_point(top_right, vf);
-                draw_patch_point(top_right, vf);
-                draw_patch_point(bottom_right, vf);
+                if (through) {
+                    draw_point_vtx(&through[top_left_index], 0);
+                    draw_point_vtx(&through[bottom_left_index], 0);
+                    draw_point_vtx(&through[bottom_left_index], 0);
+                    draw_point_vtx(&through[top_right_index], 0);
+                    draw_point_vtx(&through[top_right_index], 0);
+                    draw_point_vtx(&through[bottom_right_index], 0);
+                } else if (transform) {
+                    static const int offsets[6][2] = {
+                        {0, 0}, {0, 1}, {0, 1},
+                        {1, 0}, {1, 0}, {1, 1},
+                    };
+                    for (int i = 0; i < 6; i++) {
+                        int index =
+                            (v + offsets[i][1]) * width +
+                            u + offsets[i][0];
+                        Vtx projected;
+                        if (project_cached_vtx(
+                                &transform[index], &projected)) {
+                            draw_point_vtx(&projected, 1);
+                        }
+                    }
+                } else {
+                    draw_patch_point(top_left, vf);
+                    draw_patch_point(bottom_left, vf);
+                    draw_patch_point(bottom_left, vf);
+                    draw_patch_point(top_right, vf);
+                    draw_patch_point(top_right, vf);
+                    draw_patch_point(bottom_right, vf);
+                }
             }
         }
     }
+    if (batch_triangles) end_backend_tri_batch();
 }
 
 static void limit_patch_tessellation(
@@ -3252,11 +3646,32 @@ static void limit_patch_tessellation(
     }
 }
 
+static ModelVtx *s_patch_control_cache;
+static size_t s_patch_control_capacity;
+static ModelVtx *s_patch_vertex_cache;
+static size_t s_patch_vertex_capacity;
+static PatchAxisCache s_patch_u_axis_cache;
+static PatchAxisCache s_patch_v_axis_cache;
+
+static ModelVtx *reserve_patch_model_cache(
+    ModelVtx **cache, size_t *capacity, size_t count) {
+    if (count <= *capacity) return *cache;
+    size_t next = *capacity ? *capacity : 64u;
+    while (next < count)
+        next *= 2u;
+    void *memory = realloc(*cache, next * sizeof(**cache));
+    if (!memory) return NULL;
+    *cache = (ModelVtx *)memory;
+    *capacity = next;
+    return *cache;
+}
+
 static ModelVtx *decode_patch_controls(
     uint32_t vbase, uint32_t ibase, int index_format,
     const VFmt *vf, int count) {
-    ModelVtx *control = (ModelVtx *)malloc(
-        (size_t)count * sizeof(*control));
+    ModelVtx *control = reserve_patch_model_cache(
+        &s_patch_control_cache, &s_patch_control_capacity,
+        (size_t)count);
     if (!control) return NULL;
     for (int i = 0; i < count; i++) {
         uint32_t address = prim_vtx_addr(
@@ -3305,16 +3720,22 @@ static void draw_bezier(uint32_t op) {
         &tess_u, &tess_v, (uint64_t)patch_u, (uint64_t)patch_v, 1);
     int width = tess_u + 1;
     int height = tess_v + 1;
+    uint32_t texture_map_mode = ge.tex_map_mode & 3u;
     int needs_normal =
-        vf.nrm_off >= 0 || ge.lighting_enable ||
-        (ge.tex_map_mode & 3u) == 2u;
-    ModelVtx *vertices = (ModelVtx *)malloc(
-        (size_t)width * (size_t)height * sizeof(*vertices));
+        !vf.through &&
+        (ge.lighting_enable ||
+         texture_map_mode == 2u ||
+         (texture_map_mode == 1u &&
+          ((ge.tex_map_mode >> 8) & 3u) >= 2u));
+    ModelVtx *vertices = reserve_patch_model_cache(
+        &s_patch_vertex_cache, &s_patch_vertex_capacity,
+        (size_t)width * (size_t)height);
     if (!vertices) {
         fprintf(stderr, "GE: Bezier tessellation allocation failed\n");
-        free(control);
         return;
     }
+    SrPerfCategory patch_previous =
+        sr_perf_switch(SR_PERF_PATCH_EVAL);
     for (int pu = 0; pu < patch_u; pu++) {
         for (int pv = 0; pv < patch_v; pv++) {
             const ModelVtx *patch =
@@ -3322,22 +3743,27 @@ static void draw_bezier(uint32_t op) {
             for (int v = 0; v <= tess_v; v++) {
                 PatchAxisParam param_v = {0};
                 param_v.k = patch_param_256(v, tess_v);
+                PatchColumn columns[4];
+                build_patch_columns(
+                    patch, points_u, 0, &param_v, 0,
+                    vf.tc_off >= 0, needs_normal, columns);
                 for (int u = 0; u <= tess_u; u++) {
                     PatchAxisParam param_u = {0};
                     param_u.k = patch_param_256(u, tess_u);
-                    evaluate_patch_vertex(
-                        patch, points_u, &param_u, &param_v, 0,
+                    evaluate_patch_columns(
+                        columns, &param_u, 0,
                         (float)pu + (float)param_u.k / 256.0f,
                         (float)pv + (float)param_v.k / 256.0f,
                         vf.tc_off >= 0, needs_normal,
                         &vertices[v * width + u]);
                 }
             }
+            sr_perf_switch(SR_PERF_PATCH_DRAW);
             draw_patch_grid(vertices, width, height, &vf);
+            sr_perf_switch(SR_PERF_PATCH_EVAL);
         }
     }
-    free(vertices);
-    free(control);
+    sr_perf_switch(patch_previous);
 }
 
 static void draw_spline(uint32_t op) {
@@ -3366,39 +3792,49 @@ static void draw_spline(uint32_t op) {
     if (tess_v < 1) tess_v = 1;
     limit_patch_tessellation(
         &tess_u, &tess_v, (uint64_t)patch_u, (uint64_t)patch_v, 0);
-    PatchAxisParam *params_u = NULL;
-    PatchAxisParam *params_v = NULL;
     int width = 0, height = 0;
     int type_u = (int)((op >> 16) & 3u);
     int type_v = (int)((op >> 18) & 3u);
-    if (!build_spline_axis_params(
-            points_u, tess_u, type_u, &params_u, &width) ||
-        !build_spline_axis_params(
-            points_v, tess_v, type_v, &params_v, &height)) {
+    PatchAxisParam *params_u = get_spline_axis_params(
+        &s_patch_u_axis_cache,
+        points_u, tess_u, type_u, &width);
+    PatchAxisParam *params_v = get_spline_axis_params(
+        &s_patch_v_axis_cache,
+        points_v, tess_v, type_v, &height);
+    if (!params_u || !params_v) {
         fprintf(stderr, "GE: spline parameter allocation failed\n");
-        free(params_u);
-        free(params_v);
-        free(control);
         return;
     }
-    ModelVtx *vertices = (ModelVtx *)malloc(
-        (size_t)width * (size_t)height * sizeof(*vertices));
+    ModelVtx *vertices = reserve_patch_model_cache(
+        &s_patch_vertex_cache, &s_patch_vertex_capacity,
+        (size_t)width * (size_t)height);
     if (!vertices) {
         fprintf(stderr, "GE: spline tessellation allocation failed\n");
-        free(params_u);
-        free(params_v);
-        free(control);
         return;
     }
+    uint32_t texture_map_mode = ge.tex_map_mode & 3u;
     int needs_normal =
-        vf.nrm_off >= 0 || ge.lighting_enable ||
-        (ge.tex_map_mode & 3u) == 2u;
+        !vf.through &&
+        (ge.lighting_enable ||
+         texture_map_mode == 2u ||
+         (texture_map_mode == 1u &&
+          ((ge.tex_map_mode >> 8) & 3u) >= 2u));
+    SrPerfCategory patch_previous =
+        sr_perf_switch(SR_PERF_PATCH_EVAL);
     for (int v = 0; v < height; v++) {
+        PatchColumn columns[4];
+        int column_segment = -1;
         for (int u = 0; u < width; u++) {
             const PatchAxisParam *param_u = &params_u[u];
             const PatchAxisParam *param_v = &params_v[v];
-            evaluate_patch_vertex(
-                control, points_u, param_u, param_v, 1,
+            if (param_u->segment != column_segment) {
+                column_segment = param_u->segment;
+                build_patch_columns(
+                    control, points_u, column_segment, param_v, 1,
+                    vf.tc_off >= 0, needs_normal, columns);
+            }
+            evaluate_patch_columns(
+                columns, param_u, 1,
                 (float)param_u->segment +
                     (float)param_u->k / 256.0f,
                 (float)param_v->segment +
@@ -3407,17 +3843,25 @@ static void draw_spline(uint32_t op) {
                 &vertices[v * width + u]);
         }
     }
+    sr_perf_switch(SR_PERF_PATCH_DRAW);
     draw_patch_grid(vertices, width, height, &vf);
-    free(vertices);
-    free(params_u);
-    free(params_v);
-    free(control);
+    sr_perf_switch(patch_previous);
 }
 
 static void draw_prim(uint32_t op) {
     int type = (op >> 16) & 7;
     int count = op & 0xFFFF;
     VFmt vf; decode_vtype(ge.vtype, &vf);
+    sr_perf_counter_add(
+        vf.through
+            ? SR_PERF_GE_THROUGH_DRAWS
+            : SR_PERF_GE_TRANSFORM_DRAWS,
+        1);
+    sr_perf_counter_add(
+        vf.through
+            ? SR_PERF_GE_THROUGH_VERTICES
+            : SR_PERF_GE_TRANSFORM_VERTICES,
+        (uint64_t)count);
     if (s_gelog < 0) s_gelog = getenv("SR_GEDUMP") ? 1 : 0;
     if (s_gewatch < 0) s_gewatch = getenv("SR_GEWATCH") ? 1 : 0;
     if (s_gewatch_after < 0) { const char *p=getenv("SR_GEWATCH_AFTER"); s_gewatch_after=p?atoi(p):0; }
@@ -3438,29 +3882,42 @@ static void draw_prim(uint32_t op) {
 
     /* ---- THROUGH-MODE (2D, screen coords) ---- */
     if (vf.through) {
+        SrPerfCategory decode_previous =
+            sr_perf_switch(SR_PERF_VERTEX_DECODE);
+        const Vtx *cached = cache_through_vertices(
+            vbase, ibase, idxfmt, &vf, count);
+        sr_perf_switch(decode_previous);
         if (type == 0) {           /* points */
             for (int i = 0; i < count; i++) {
-                Vtx a; load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i,vf.stride),&vf,&a);
+                Vtx a;
+                load_primitive_vertex(
+                    cached, vbase, ibase, idxfmt, i, &vf, &a);
                 draw_point_vtx(&a, 0);
             }
         } else if (type == 1 || type == 2) {   /* lines / line strip */
             for (int i = 1; i < count; i++) {
                 if (type == 1 && (i & 1) == 0) continue;
                 Vtx a, b;
-                load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i-1,vf.stride),&vf,&a);
-                load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i,  vf.stride),&vf,&b);
+                load_primitive_vertex(
+                    cached, vbase, ibase, idxfmt, i - 1, &vf, &a);
+                load_primitive_vertex(
+                    cached, vbase, ibase, idxfmt, i, &vf, &b);
                 draw_line_vtx(&a,&b,0);
             }
         } else if (type == 3 || type == 4 || type == 5) {
+            begin_backend_tri_batch(0);
             for (int i = 2; i < count; i++) {
                 int i0, i1, i2;
                 if      (type == 3) { if (i%3!=2) continue; i0=i-2; i1=i-1; i2=i; }
                 else if (type == 4) { i0=i-2; i1=i-1; i2=i; }
                 else                { i0=0;   i1=i-1; i2=i; }
                 Vtx a, b, c;
-                load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i0,vf.stride),&vf,&a);
-                load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i1,vf.stride),&vf,&b);
-                load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i2,vf.stride),&vf,&c);
+                load_primitive_vertex(
+                    cached, vbase, ibase, idxfmt, i0, &vf, &a);
+                load_primitive_vertex(
+                    cached, vbase, ibase, idxfmt, i1, &vf, &b);
+                load_primitive_vertex(
+                    cached, vbase, ibase, idxfmt, i2, &vf, &c);
                 /* Same submission-order culling as transform mode (the GE culls in through
                  * mode too); strips alternate, provoking vertex stays last. */
                 if (ge.cull_enable && !ge.clear) {
@@ -3469,11 +3926,14 @@ static void draw_prim(uint32_t op) {
                 }
                 raster_tri(&a,&b,&c,0);
             }
+            end_backend_tri_batch();
         } else if (type == 6) {   /* sprites */
             for (int i = 1; i < count; i += 2) {
                 Vtx p0, p1;
-                load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i-1,vf.stride),&vf,&p0);
-                load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i,  vf.stride),&vf,&p1);
+                load_primitive_vertex(
+                    cached, vbase, ibase, idxfmt, i - 1, &vf, &p0);
+                load_primitive_vertex(
+                    cached, vbase, ibase, idxfmt, i, &vf, &p1);
                 if (watch_now) {
                     int xa=(int)fminf(p0.x,p1.x), xb=(int)fmaxf(p0.x,p1.x);
                     int ya=(int)fminf(p0.y,p1.y), yb=(int)fmaxf(p0.y,p1.y);
@@ -3604,10 +4064,21 @@ static void draw_prim(uint32_t op) {
         }
     }
 
+    SrPerfCategory decode_previous =
+        sr_perf_switch(SR_PERF_VERTEX_DECODE);
+    const CVtx *const *cached = cache_transform_vertices(
+        vbase, ibase, idxfmt, &vf, count);
+    sr_perf_switch(decode_previous);
     if (type == 0) {           /* points */
         for (int i = 0; i < count; i++) {
             Vtx a;
-            if (!transform_vtx_3d(prim_vtx_addr(vbase,ibase,idxfmt,i,vf.stride),&vf,&a)) continue;
+            int visible = cached
+                ? project_cached_vtx(cached[i], &a)
+                : transform_vtx_3d(
+                    prim_vtx_addr(
+                        vbase, ibase, idxfmt, i, vf.stride),
+                    &vf, &a);
+            if (!visible) continue;
             draw_point_vtx(&a, 1);
         }
     } else if (type == 1 || type == 2) {   /* lines / line strip */
@@ -3615,8 +4086,19 @@ static void draw_prim(uint32_t op) {
         for (int i = 1; i < count; i++) {
             if (type == 1 && (i & 1) == 0) continue;
             CVtx ca, cb;
-            transform_vtx_clip(prim_vtx_addr(vbase,ibase,idxfmt,i-1,vf.stride),&vf,&ca);
-            transform_vtx_clip(prim_vtx_addr(vbase,ibase,idxfmt,i,  vf.stride),&vf,&cb);
+            if (cached) {
+                ca = *cached[i - 1];
+                cb = *cached[i];
+            } else {
+                transform_vtx_clip(
+                    prim_vtx_addr(
+                        vbase, ibase, idxfmt, i - 1, vf.stride),
+                    &vf, &ca);
+                transform_vtx_clip(
+                    prim_vtx_addr(
+                        vbase, ibase, idxfmt, i, vf.stride),
+                    &vf, &cb);
+            }
             /* PSP line acceptance (PPSSPP Clipper::ProcessLine): same drop rules as triangles. */
             if (ca.oor || cb.oor) { s_stat.nearclip++; continue; }
             if (ca.cw < 0.0f && cb.cw < 0.0f) { s_stat.nearclip++; continue; }
@@ -3670,15 +4152,35 @@ static void draw_prim(uint32_t op) {
                     roffx, roffy, ge.scis_x1, ge.scis_y1, ge.scis_x2, ge.scis_y2,
                     ge.world[9], ge.world[10], ge.world[11], ge.view[9], ge.view[10], ge.view[11]);
         }
+        begin_backend_tri_batch(1);
         for (int i = 2; i < count; i++) {
             int i0, i1, i2;
             if      (type == 3) { if (i%3!=2) continue; i0=i-2; i1=i-1; i2=i; }
             else if (type == 4) { i0=i-2; i1=i-1; i2=i; }
             else                { i0=0;   i1=i-1; i2=i; }
-            CVtx cv[3], cl[4];
-            transform_vtx_clip(prim_vtx_addr(vbase,ibase,idxfmt,i0,vf.stride),&vf,&cv[0]);
-            transform_vtx_clip(prim_vtx_addr(vbase,ibase,idxfmt,i1,vf.stride),&vf,&cv[1]);
-            transform_vtx_clip(prim_vtx_addr(vbase,ibase,idxfmt,i2,vf.stride),&vf,&cv[2]);
+            CVtx local[3], clip_input[3], cl[4];
+            const CVtx *cv[3];
+            if (cached) {
+                cv[0] = cached[i0];
+                cv[1] = cached[i1];
+                cv[2] = cached[i2];
+            } else {
+                transform_vtx_clip(
+                    prim_vtx_addr(
+                        vbase, ibase, idxfmt, i0, vf.stride),
+                    &vf, &local[0]);
+                transform_vtx_clip(
+                    prim_vtx_addr(
+                        vbase, ibase, idxfmt, i1, vf.stride),
+                    &vf, &local[1]);
+                transform_vtx_clip(
+                    prim_vtx_addr(
+                        vbase, ibase, idxfmt, i2, vf.stride),
+                    &vf, &local[2]);
+                cv[0] = &local[0];
+                cv[1] = &local[1];
+                cv[2] = &local[2];
+            }
 
             /* Culling via submission order (PPSSPP TransformUnit::SendTriangle): the
              * rasterizer keeps only positive-winding triangles, so cull mode 0 (CW front)
@@ -3689,7 +4191,11 @@ static void draw_prim(uint32_t op) {
              * for flat shading) stays in place. */
             if (ge.cull_enable && !ge.clear) {
                 int flip = ((ge.cull & 1) == 0) ^ ((type == 4) ? (i & 1) : 0);
-                if (flip) { CVtx t = cv[0]; cv[0] = cv[1]; cv[1] = t; }
+                if (flip) {
+                    const CVtx *t = cv[0];
+                    cv[0] = cv[1];
+                    cv[1] = t;
+                }
             }
 
             /* PSP triangle acceptance (PPSSPP Clipper::ProcessTriangle). The hardware DROPS
@@ -3697,18 +4203,18 @@ static void draw_prim(uint32_t op) {
              * z range; games rely on it (effect passes, behind-camera geometry). Drawing them
              * (the old behaviour) scattered runaway triangles across the scene. */
             int dec = D_DRAW;
-            if (cv[0].oor || cv[1].oor || cv[2].oor) dec = D_OOR;
-            else if (cv[0].cw < 0.0f && cv[1].cw < 0.0f && cv[2].cw < 0.0f) dec = D_WNEG;
+            if (cv[0]->oor || cv[1]->oor || cv[2]->oor) dec = D_OOR;
+            else if (cv[0]->cw < 0.0f && cv[1]->cw < 0.0f && cv[2]->cw < 0.0f) dec = D_WNEG;
             else {
-                int zp = cv[0].ozp + cv[1].ozp + cv[2].ozp;
-                int zn = cv[0].ozn + cv[1].ozn + cv[2].ozn;
+                int zp = cv[0]->ozp + cv[1]->ozp + cv[2]->ozp;
+                int zn = cv[0]->ozn + cv[1]->ozn + cv[2]->ozn;
                 if (!ge.depth_clip && zp + zn > 0) dec = D_ZOUT;
                 else if (zp >= 3 || zn >= 3) dec = D_ZSAME;
             }
             if (dec == D_DRAW) {
-                if (clip_d_nearz(&cv[0]) >= 0.0f && clip_d_nearz(&cv[1]) >= 0.0f && clip_d_nearz(&cv[2]) >= 0.0f) {
-                    if (!(cv[0].cw > NEAR_W && cv[1].cw > NEAR_W && cv[2].cw > NEAR_W)) dec = D_CWLOW;
-                } else if (clip_d_nearz(&cv[0]) < 0.0f && clip_d_nearz(&cv[1]) < 0.0f && clip_d_nearz(&cv[2]) < 0.0f) {
+                if (clip_d_nearz(cv[0]) >= 0.0f && clip_d_nearz(cv[1]) >= 0.0f && clip_d_nearz(cv[2]) >= 0.0f) {
+                    if (!(cv[0]->cw > NEAR_W && cv[1]->cw > NEAR_W && cv[2]->cw > NEAR_W)) dec = D_CWLOW;
+                } else if (clip_d_nearz(cv[0]) < 0.0f && clip_d_nearz(cv[1]) < 0.0f && clip_d_nearz(cv[2]) < 0.0f) {
                     dec = D_NEARALL;
                 } else {
                     dec = D_CLIP;   /* crosses the z >= -w plane: clip and fan */
@@ -3726,8 +4232,8 @@ static void draw_prim(uint32_t op) {
                     float bx0 = 1e30f, bx1 = -1e30f, by0 = 1e30f, by1 = -1e30f;
                     int unbounded = 0;
                     for (int k = 0; k < 3; k++) {
-                        if (cv[k].cw <= 0.0f) { unbounded = 1; continue; }
-                        float px = cv[k].sx - roffx, py = cv[k].sy - roffy;
+                        if (cv[k]->cw <= 0.0f) { unbounded = 1; continue; }
+                        float px = cv[k]->sx - roffx, py = cv[k]->sy - roffy;
                         if (px < bx0) bx0 = px;
                         if (px > bx1) bx1 = px;
                         if (py < by0) by0 = py;
@@ -3744,21 +4250,24 @@ static void draw_prim(uint32_t op) {
                             " v1[c=(%.4g,%.4g,%.4g,%.4g) s=(%.1f,%.1f,%.0f) f=%d%d%d rgba=%d,%d,%d,%d uv=(%.3g,%.3g)]"
                             " v2[c=(%.4g,%.4g,%.4g,%.4g) s=(%.1f,%.1f,%.0f) f=%d%d%d rgba=%d,%d,%d,%d uv=(%.3g,%.3g)]\n",
                             s_ge_frame, s_rt_draw, i, dec_name[dec], probe ? " PROBE" : "",
-                            cv[0].cx, cv[0].cy, cv[0].cz, cv[0].cw, cv[0].sx - roffx, cv[0].sy - roffy, cv[0].sz,
-                            cv[0].oor, cv[0].ozp, cv[0].ozn, cv[0].r, cv[0].g, cv[0].b, cv[0].a, cv[0].u, cv[0].v,
-                            cv[1].cx, cv[1].cy, cv[1].cz, cv[1].cw, cv[1].sx - roffx, cv[1].sy - roffy, cv[1].sz,
-                            cv[1].oor, cv[1].ozp, cv[1].ozn, cv[1].r, cv[1].g, cv[1].b, cv[1].a, cv[1].u, cv[1].v,
-                            cv[2].cx, cv[2].cy, cv[2].cz, cv[2].cw, cv[2].sx - roffx, cv[2].sy - roffy, cv[2].sz,
-                            cv[2].oor, cv[2].ozp, cv[2].ozn, cv[2].r, cv[2].g, cv[2].b, cv[2].a, cv[2].u, cv[2].v);
+                            cv[0]->cx, cv[0]->cy, cv[0]->cz, cv[0]->cw, cv[0]->sx - roffx, cv[0]->sy - roffy, cv[0]->sz,
+                            cv[0]->oor, cv[0]->ozp, cv[0]->ozn, cv[0]->r, cv[0]->g, cv[0]->b, cv[0]->a, cv[0]->u, cv[0]->v,
+                            cv[1]->cx, cv[1]->cy, cv[1]->cz, cv[1]->cw, cv[1]->sx - roffx, cv[1]->sy - roffy, cv[1]->sz,
+                            cv[1]->oor, cv[1]->ozp, cv[1]->ozn, cv[1]->r, cv[1]->g, cv[1]->b, cv[1]->a, cv[1]->u, cv[1]->v,
+                            cv[2]->cx, cv[2]->cy, cv[2]->cz, cv[2]->cw, cv[2]->sx - roffx, cv[2]->sy - roffy, cv[2]->sz,
+                            cv[2]->oor, cv[2]->ozp, cv[2]->ozn, cv[2]->r, cv[2]->g, cv[2]->b, cv[2]->a, cv[2]->u, cv[2]->v);
                 }
             }
 
             if (dec == D_DRAW) {
                 Vtx a, b, c;
-                project_cvtx(&cv[0],&a); project_cvtx(&cv[1],&b); project_cvtx(&cv[2],&c);
+                project_cvtx(cv[0],&a); project_cvtx(cv[1],&b); project_cvtx(cv[2],&c);
                 raster_tri(&a,&b,&c,1);
             } else if (dec == D_CLIP) {
-                int m = clip_poly_near(cv, 3, cl);
+                clip_input[0] = *cv[0];
+                clip_input[1] = *cv[1];
+                clip_input[2] = *cv[2];
+                int m = clip_poly_near(clip_input, 3, cl);
                 if (m >= 3) {
                     /* PPSSPP discards each SUB-triangle whose vertices include a clip-created
                      * vertex that re-projects outside the screen grid (clip_vtx_out_of_range);
@@ -3787,6 +4296,7 @@ static void draw_prim(uint32_t op) {
                 }
             }
         }
+        end_backend_tri_batch();
         if (rt) {
             fprintf(stderr, "TRIDRW+ f=%u d=%u tris=%lu draw=%lu clip=%lu drop[oor=%lu wneg=%lu zout=%lu "
                     "zsame=%lu nearall=%lu cwlow=%lu] rast=%lu cull=%lu deg=%lu px=%lu zfail=%lu afail=%lu "
@@ -3804,8 +4314,19 @@ static void draw_prim(uint32_t op) {
          * The Z/depth comes from the second vertex. */
         for (int i = 1; i < count; i += 2) {
             Vtx p0, p1;
-            if (!transform_vtx_3d(prim_vtx_addr(vbase,ibase,idxfmt,i-1,vf.stride),&vf,&p0)) continue;
-            if (!transform_vtx_3d(prim_vtx_addr(vbase,ibase,idxfmt,i,  vf.stride),&vf,&p1)) continue;
+            int first_visible = cached
+                ? project_cached_vtx(cached[i - 1], &p0)
+                : transform_vtx_3d(
+                    prim_vtx_addr(
+                        vbase, ibase, idxfmt, i - 1, vf.stride),
+                    &vf, &p0);
+            int second_visible = cached
+                ? project_cached_vtx(cached[i], &p1)
+                : transform_vtx_3d(
+                    prim_vtx_addr(
+                        vbase, ibase, idxfmt, i, vf.stride),
+                    &vf, &p1);
+            if (!first_visible || !second_visible) continue;
             fill_sprite(&p0,&p1,1);
         }
     }
@@ -3910,8 +4431,17 @@ static void ge_block_transfer(uint32_t startdata) {
     uint32_t w = (ge.xf_size & 0x3FFu) + 1, h = ((ge.xf_size >> 10) & 0x3FFu) + 1;
     uint32_t bpp = (startdata & 1) ? 4 : 2;
     if (!srcStride || !dstStride) return;
-    if (s_backend && s_backend->xfer && s_backend->xfer(startdata)) return;   /* GPU-side blit */
-    if (s_backend && s_backend->flush) s_backend->flush("xfersrc");
+    if (s_backend && s_backend->xfer) {
+        SrPerfCategory previous = sr_perf_switch(SR_PERF_SYNC);
+        int transferred = s_backend->xfer(startdata);
+        sr_perf_switch(previous);
+        if (transferred) return;   /* GPU-side blit */
+    }
+    if (s_backend && s_backend->flush) {
+        SrPerfCategory previous = sr_perf_switch(SR_PERF_SYNC);
+        s_backend->flush("xfersrc");
+        sr_perf_switch(previous);
+    }
     sr_gpu_vram_prepare_write(
         dstBase + (dstY * dstStride + dstX) * bpp,
         ((h - 1) * dstStride + w) * bpp);
@@ -3939,7 +4469,11 @@ void ge_list_begin(uint32_t list_addr) {
 
 void ge_list_end(void) {
     extern unsigned long g_tex_nonzero;
-    if (s_backend && s_backend->flush) s_backend->flush("listend");
+    if (s_backend && s_backend->flush) {
+        SrPerfCategory previous = sr_perf_switch(SR_PERF_SYNC);
+        s_backend->flush("listend");
+        sr_perf_switch(previous);
+    }
     if (s_list_snap > 0 && g_tex_nonzero > s_list_start_nz) ge_snapshot("fb_content.ppm");
     g_ge_list_sig = s_list_sig; g_ge_prim_count = s_list_prims;
     if (s_gewatch > 0 && s_ge_frame >= (uint32_t)s_gewatch_after)
@@ -4204,15 +4738,25 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
             case GE_TEXLEVEL: ge.tex_level=data; break;
             case GE_TEXLODSLOPE: break;
             case GE_TEXFLUSH:
-                if (s_backend && s_backend->flush) s_backend->flush("texflush");
+                if (s_backend && s_backend->flush) {
+                    SrPerfCategory previous =
+                        sr_perf_switch(SR_PERF_SYNC);
+                    s_backend->flush("texflush");
+                    sr_perf_switch(previous);
+                }
                 break;
             case GE_TEXSYNC: break;
             case GE_LOADCLUT: {
                 /* Copy (data&0x3F) 32-byte blocks from clut_addr into internal CLUT RAM, like
                  * the hardware (PPSSPP TextureCacheCommon::LoadClut). */
                 /* CLUT sourced from VRAM may read pixels the GPU backend hasn't written back. */
-                if (s_backend && s_backend->flush && (ge.clut_addr & 0x0F000000u) == 0x04000000u)
+                if (s_backend && s_backend->flush &&
+                    (ge.clut_addr & 0x0F000000u) == 0x04000000u) {
+                    SrPerfCategory previous =
+                        sr_perf_switch(SR_PERF_SYNC);
                     s_backend->flush("loadclut");
+                    sr_perf_switch(previous);
+                }
                 uint32_t bytes = (data & 0x3F) * 32;
                 if (bytes > sizeof(ge.clutram)) bytes = sizeof(ge.clutram);
                 for (uint32_t i = 0; i < bytes; i += 4) {
@@ -4242,21 +4786,44 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
             case GE_TRANSFERSIZE:   ge.xf_size = data; break;
             case GE_TRANSFERSTART:  ge_block_transfer(data); break;
 
-            case GE_PRIM:
+            case GE_PRIM: {
+                SrPerfCategory previous =
+                    sr_perf_switch(SR_PERF_PRIMITIVE);
+                sr_perf_counter_add(SR_PERF_GE_DRAWS, 1);
+                sr_perf_counter_add(
+                    SR_PERF_GE_VERTICES, op & 0xffffu);
                 s_list_prims++;
                 ge_debug_begin_draw(pc, op);
                 draw_prim(op);
+                sr_perf_switch(previous);
                 break;
-            case GE_BEZIER:
+            }
+            case GE_BEZIER: {
+                SrPerfCategory previous =
+                    sr_perf_switch(SR_PERF_BEZIER);
+                sr_perf_counter_add(SR_PERF_GE_DRAWS, 1);
+                sr_perf_counter_add(
+                    SR_PERF_GE_VERTICES,
+                    (op & 0xffu) * ((op >> 8) & 0xffu));
                 s_list_prims++;
                 ge_debug_begin_draw(pc, op);
                 draw_bezier(op);
+                sr_perf_switch(previous);
                 break;
-            case GE_SPLINE:
+            }
+            case GE_SPLINE: {
+                SrPerfCategory previous =
+                    sr_perf_switch(SR_PERF_SPLINE);
+                sr_perf_counter_add(SR_PERF_GE_DRAWS, 1);
+                sr_perf_counter_add(
+                    SR_PERF_GE_VERTICES,
+                    (op & 0xffu) * ((op >> 8) & 0xffu));
                 s_list_prims++;
                 ge_debug_begin_draw(pc, op);
                 draw_spline(op);
+                sr_perf_switch(previous);
                 break;
+            }
             /* The bounding-box test result is kept by gelist.c (BJUMP); nothing to draw. */
             case GE_BOUNDINGBOX: break;
             /* SIGNAL and FINISH only take effect at the END that follows (gelist.c). */

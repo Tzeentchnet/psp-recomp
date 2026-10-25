@@ -119,6 +119,10 @@ void ged3d12_framebuffer_invalidate(uint32_t address, uint32_t bytes);
 void ged3d12_framebuffer_read(uint32_t address, uint32_t bytes);
 int ged3d12_framebuffer_transfer(uint32_t start_data);
 void ged3d12_framebuffer_flush(const char *reason);
+void ged3d12_framebuffer_get_stats(
+    uint64_t *readbacks, uint64_t *aliases,
+    uint64_t *feedback_snapshots, uint64_t *feedback_snapshot_pixels,
+    uint64_t *feedback_reuses);
 
 static_assert(
     sizeof(GeD3D12FramebufferKey) == 16,

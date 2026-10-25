@@ -154,6 +154,7 @@ typedef struct GeBackend {
     int  (*present)(uint32_t fbaddr, int fmt, uint32_t stride);
     void (*shutdown)(void);
     int  (*tri)(const GeVtx *a, const GeVtx *b, const GeVtx *c, int persp);
+    int  (*tri_list)(const GeVtx *vertices, uint32_t count, int persp);
     int  (*sprite)(const GeVtx *p0, const GeVtx *p1, int persp);
     int  (*line)(const GeVtx *a, const GeVtx *b, int persp);
     int  (*point)(const GeVtx *a, int persp);

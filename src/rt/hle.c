@@ -22,6 +22,7 @@
 #include "iso.h"
 #include "kzl_twinstick.h"
 #include "memstick_state.h"
+#include "perf_stats.h"
 #include "pgf.h"
 #include "sas_reverb.h"
 #include "settings_path.h"
@@ -3214,6 +3215,11 @@ typedef struct PresentPerf {
     LARGE_INTEGER frequency;
     LONGLONG previous_entry;
     double previous_backend_ms;
+    SrBackendTiming previous_backend_timing;
+    int previous_backend_timing_valid;
+    SrFramebufferStats previous_framebuffer_stats;
+    int previous_framebuffer_stats_valid;
+    uint64_t last_gpu_source_flip;
     double frame_ms[PRESENT_PERF_MAX_SAMPLES];
     double frontend_ms[PRESENT_PERF_MAX_SAMPLES];
     double backend_ms[PRESENT_PERF_MAX_SAMPLES];
@@ -3356,9 +3362,23 @@ static void present_perf_init(void) {
         if (!s_present_perf.file ||
             fprintf(
                 s_present_perf.file,
-                "# psp-recomp display performance v2\n"
+                "# psp-recomp display performance v3\n"
                 "flip,present,frame_ms,frontend_ms,backend_ms,gpu_ms,"
-                "over_budget\n") < 0) {
+                "over_budget,gpu_source_flip,scheduler_ms,native_ms,"
+                "interpreter_ms,hle_ms,ge_ms,vertex_ms,sync_ms,"
+                "primitive_ms,bezier_ms,spline_ms,patch_eval_ms,"
+                "patch_draw_ms,vertex_decode_ms,"
+                "hle_calls,interp_instructions,ge_lists,ge_commands,"
+                "ge_draws,ge_vertices,ge_through_draws,"
+                "ge_through_vertices,ge_transform_draws,"
+                "ge_transform_vertices,ge_transform_unique_vertices,"
+                "backend_begin_ms,"
+                "backend_vertices_ms,backend_framebuffer_ms,"
+                "backend_textures_ms,backend_draws_ms,"
+                "backend_present_ms,backend_submit_ms,"
+                "backend_vertices,backend_batches,framebuffer_readbacks,"
+                "framebuffer_aliases,feedback_snapshots,"
+                "feedback_snapshot_pixels,feedback_reuses\n") < 0) {
             if (s_present_perf.file)
                 fclose(s_present_perf.file);
             s_present_perf.file = NULL;
@@ -3379,12 +3399,26 @@ static LONGLONG present_perf_entry(void) {
 }
 
 static void present_perf_finish(
-    uint32_t flip, uint32_t present, LONGLONG entry, LONGLONG exit) {
+    uint32_t flip, uint32_t present, LONGLONG entry, LONGLONG exit,
+    const SrPerfFrame *phases,
+    const SrBackendTiming *current_backend_timing,
+    int current_backend_timing_valid,
+    const SrFramebufferStats *current_framebuffer_stats,
+    int current_framebuffer_stats_valid) {
     present_perf_init();
     double ticks_per_ms =
         (double)s_present_perf.frequency.QuadPart / 1000.0;
     double backend_ms = (double)(exit - entry) / ticks_per_ms;
-    double gpu_ms = gui_last_gpu_ms();
+    uint64_t gpu_source_flip = 0;
+    double gpu_ms = -1.0;
+    if (gui_last_gpu_sample(&gpu_source_flip, &gpu_ms)) {
+        if (gpu_source_flip == s_present_perf.last_gpu_source_flip) {
+            gpu_source_flip = 0;
+            gpu_ms = -1.0;
+        } else {
+            s_present_perf.last_gpu_source_flip = gpu_source_flip;
+        }
+    }
     if (s_present_perf.enabled &&
         present > s_present_perf.start &&
         s_present_perf.previous_entry) {
@@ -3401,14 +3435,113 @@ static void present_perf_finish(
         s_present_perf.gpu_ms[index] = gpu_ms;
         int over_budget =
             frame_ms > s_present_perf.frame_budget_ms;
+        uint64_t framebuffer_readbacks = 0;
+        uint64_t framebuffer_aliases = 0;
+        uint64_t feedback_snapshots = 0;
+        uint64_t feedback_snapshot_pixels = 0;
+        uint64_t feedback_reuses = 0;
+        if (current_framebuffer_stats_valid &&
+            s_present_perf.previous_framebuffer_stats_valid) {
+            framebuffer_readbacks =
+                current_framebuffer_stats->readbacks -
+                s_present_perf.previous_framebuffer_stats.readbacks;
+            framebuffer_aliases =
+                current_framebuffer_stats->aliases -
+                s_present_perf.previous_framebuffer_stats.aliases;
+            feedback_snapshots =
+                current_framebuffer_stats->feedback_snapshots -
+                s_present_perf.previous_framebuffer_stats.feedback_snapshots;
+            feedback_snapshot_pixels =
+                current_framebuffer_stats->feedback_snapshot_pixels -
+                s_present_perf.previous_framebuffer_stats
+                    .feedback_snapshot_pixels;
+            feedback_reuses =
+                current_framebuffer_stats->feedback_reuses -
+                s_present_perf.previous_framebuffer_stats.feedback_reuses;
+        }
         if (over_budget) s_present_perf.over_budget++;
+        double vertex_ms =
+            phases->category_ms[SR_PERF_VERTEX] +
+            phases->category_ms[SR_PERF_PRIMITIVE] +
+            phases->category_ms[SR_PERF_BEZIER] +
+            phases->category_ms[SR_PERF_SPLINE] +
+            phases->category_ms[SR_PERF_PATCH_EVAL] +
+            phases->category_ms[SR_PERF_PATCH_DRAW] +
+            phases->category_ms[SR_PERF_VERTEX_DECODE];
         if (s_present_perf.file &&
             fprintf(
                 s_present_perf.file,
-                "%u,%u,%.6f,%.6f,%.6f,%.6f,%d\n",
+                "%u,%u,%.6f,%.6f,%.6f,%.6f,%d,%llu,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+                "%llu,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%u,"
+                "%llu,%llu,%llu,%llu,%llu\n",
                 flip, present, frame_ms,
                 s_present_perf.frontend_ms[index],
-                backend_ms, gpu_ms, over_budget) < 0) {
+                s_present_perf.previous_backend_ms,
+                gpu_ms, over_budget,
+                (unsigned long long)gpu_source_flip,
+                phases->category_ms[SR_PERF_SCHEDULER],
+                phases->category_ms[SR_PERF_NATIVE],
+                phases->category_ms[SR_PERF_INTERPRETER],
+                phases->category_ms[SR_PERF_HLE],
+                phases->category_ms[SR_PERF_GE],
+                vertex_ms,
+                phases->category_ms[SR_PERF_SYNC],
+                phases->category_ms[SR_PERF_PRIMITIVE],
+                phases->category_ms[SR_PERF_BEZIER],
+                phases->category_ms[SR_PERF_SPLINE],
+                phases->category_ms[SR_PERF_PATCH_EVAL],
+                phases->category_ms[SR_PERF_PATCH_DRAW],
+                phases->category_ms[SR_PERF_VERTEX_DECODE],
+                (unsigned long long)
+                    phases->counters[SR_PERF_HLE_CALLS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_INTERP_INSTRUCTIONS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_LISTS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_COMMANDS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_DRAWS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_VERTICES],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_THROUGH_DRAWS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_THROUGH_VERTICES],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_TRANSFORM_DRAWS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_TRANSFORM_VERTICES],
+                (unsigned long long)
+                    phases->counters[
+                        SR_PERF_GE_TRANSFORM_UNIQUE_VERTICES],
+                s_present_perf.previous_backend_timing_valid
+                    ? s_present_perf.previous_backend_timing.begin_ms : -1.0,
+                s_present_perf.previous_backend_timing_valid
+                    ? s_present_perf.previous_backend_timing.vertices_ms : -1.0,
+                s_present_perf.previous_backend_timing_valid
+                    ? s_present_perf.previous_backend_timing.framebuffer_ms : -1.0,
+                s_present_perf.previous_backend_timing_valid
+                    ? s_present_perf.previous_backend_timing.textures_ms : -1.0,
+                s_present_perf.previous_backend_timing_valid
+                    ? s_present_perf.previous_backend_timing.draws_ms : -1.0,
+                s_present_perf.previous_backend_timing_valid
+                    ? s_present_perf.previous_backend_timing.present_ms : -1.0,
+                s_present_perf.previous_backend_timing_valid
+                    ? s_present_perf.previous_backend_timing.submit_ms : -1.0,
+                s_present_perf.previous_backend_timing_valid
+                    ? s_present_perf.previous_backend_timing.vertices : 0,
+                s_present_perf.previous_backend_timing_valid
+                    ? s_present_perf.previous_backend_timing.batches : 0,
+                (unsigned long long)framebuffer_readbacks,
+                (unsigned long long)framebuffer_aliases,
+                (unsigned long long)feedback_snapshots,
+                (unsigned long long)feedback_snapshot_pixels,
+                (unsigned long long)feedback_reuses) < 0) {
             fprintf(stderr, "SR_PERF_FILE: write failed\n");
             runtime_exit_cleanly(2);
         }
@@ -3486,6 +3619,26 @@ static void present_perf_finish(
     }
     s_present_perf.previous_entry = entry;
     s_present_perf.previous_backend_ms = backend_ms;
+    if (current_backend_timing_valid) {
+        s_present_perf.previous_backend_timing =
+            *current_backend_timing;
+        s_present_perf.previous_backend_timing_valid = 1;
+    } else {
+        memset(
+            &s_present_perf.previous_backend_timing, 0,
+            sizeof(s_present_perf.previous_backend_timing));
+        s_present_perf.previous_backend_timing_valid = 0;
+    }
+    if (current_framebuffer_stats_valid) {
+        s_present_perf.previous_framebuffer_stats =
+            *current_framebuffer_stats;
+        s_present_perf.previous_framebuffer_stats_valid = 1;
+    } else {
+        memset(
+            &s_present_perf.previous_framebuffer_stats, 0,
+            sizeof(s_present_perf.previous_framebuffer_stats));
+        s_present_perf.previous_framebuffer_stats_valid = 0;
+    }
 }
 
 static void present_limit_check(uint32_t present) {
@@ -3520,6 +3673,11 @@ static void runtime_exit_cleanly(int code) {
 static void display_present(const SrDisplayFramebuffer *framebuffer) {
     LONGLONG perf_entry;
     LONGLONG perf_exit;
+    SrPerfFrame phases;
+    SrBackendTiming backend_timing;
+    int backend_timing_valid;
+    SrFramebufferStats framebuffer_stats;
+    int framebuffer_stats_valid;
     if (!gui_on() || !framebuffer->address) return;
     if (s_display_flip_count &&
         s_last_display_flip_vcount == s_vcount) {
@@ -3527,10 +3685,18 @@ static void display_present(const SrDisplayFramebuffer *framebuffer) {
     }
     present_perf_init();
     perf_entry = present_perf_entry();
+    sr_perf_snapshot(&phases);
+    framebuffer_stats_valid =
+        gui_framebuffer_stats(&framebuffer_stats);
+    SrPerfCategory previous_category =
+        sr_perf_switch(SR_PERF_BACKEND);
     gui_present(
         framebuffer->address, (int)framebuffer->format,
         framebuffer->stride);
+    sr_perf_switch(previous_category);
     perf_exit = present_perf_entry();
+    backend_timing_valid =
+        gui_last_backend_timing(&backend_timing);
     s_display_flip_count++;
     s_last_display_flip_vcount = s_vcount;
     if (getenv("SR_DISPLAY_LOG")) {
@@ -3543,7 +3709,9 @@ static void display_present(const SrDisplayFramebuffer *framebuffer) {
             framebuffer->stride);
     }
     present_perf_finish(
-        s_display_flip_count, s_present_count, perf_entry, perf_exit);
+        s_display_flip_count, s_present_count, perf_entry, perf_exit,
+        &phases, &backend_timing, backend_timing_valid,
+        &framebuffer_stats, framebuffer_stats_valid);
 }
 
 static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
@@ -4840,7 +5008,11 @@ void sr_syscall_lib(CpuState *s, const char *library, uint32_t nid) {
         if (j < 512) g_cc[j].n++;
     }
     s_skip_deadbeef = 0;
+    SrPerfCategory previous_category =
+        sr_perf_switch(SR_PERF_HLE);
+    sr_perf_counter_add(SR_PERF_HLE_CALLS, 1);
     uint32_t ret = e->fn(s);
+    sr_perf_switch(previous_category);
     /* Poison caller-saved temps exactly like PPSSPP SetDeadbeefRegs: r1, r4-r15, r24, r25,
      * hi, lo. The return value in v0 (and v1) is written afterward and survives. */
     if (!s_skip_deadbeef) {

@@ -372,6 +372,34 @@ int ged3d12_vertex_capture_tri(
     return 1;
 }
 
+int ged3d12_vertex_capture_tri_list(
+    const GeVtx *vertices, uint32_t count, int perspective) {
+    if (!vertices || !count || count % 3u) return 0;
+    uint32_t first;
+    if (!begin_primitive(
+            GE_D3D12_PRIMITIVE_TRIANGLE, perspective, count, &first)) {
+        return 0;
+    }
+    const GeState *state = ge_state_ptr();
+    int flat = !state->shade_gouraud || state->clear;
+    for (uint32_t i = 0; i < count; i += 3u) {
+        const GeVtx *a = &vertices[i];
+        const GeVtx *b = &vertices[i + 1u];
+        const GeVtx *c = &vertices[i + 2u];
+        const GeVtx *color_a = flat ? c : a;
+        const GeVtx *color_b = flat ? c : b;
+        put_vertex(a->x, a->y, a->z, a->rw, a->u, a->v, a->fog,
+                   color_a->r, color_a->g, color_a->b, color_a->a);
+        put_vertex(b->x, b->y, b->z, b->rw, b->u, b->v, b->fog,
+                   color_b->r, color_b->g, color_b->b, color_b->a);
+        put_vertex(c->x, c->y, c->z, c->rw, c->u, c->v, c->fog,
+                   c->r, c->g, c->b, c->a);
+    }
+    s_primitive_count[GE_D3D12_PRIMITIVE_TRIANGLE] += count / 3u - 1u;
+    update_batch_bounds(first, count);
+    return 1;
+}
+
 int ged3d12_vertex_capture_sprite(
     const GeVtx *p0, const GeVtx *p1, int perspective) {
     float xa = floorf(fminf(p0->x, p1->x));

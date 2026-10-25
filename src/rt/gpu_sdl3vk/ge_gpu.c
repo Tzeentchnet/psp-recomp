@@ -1449,7 +1449,7 @@ static void gegpu_shutdown(void);
 
 static const GeBackend k_backend = {
     "vk", gegpu_init, gegpu_present, gegpu_shutdown,
-    hook_tri, hook_sprite, hook_line, hook_point, gegpu_flush,
+    hook_tri, NULL, hook_sprite, hook_line, hook_point, gegpu_flush,
     hook_vram_dirty, hook_vram_read, hook_vram_write, hook_xfer,
 };
 

@@ -1082,6 +1082,34 @@ static void test_triangle(void) {
         check_u32("empty upload vertex count", frame.vertex_count, 0);
         check_u32("empty upload batch count", frame.batch_count, 0);
     }
+
+    reset_upload();
+    GeVtx triangles[6] = {a, b, c, c, b, a};
+    check_u32(
+        "triangle-list hook is GPU-owned",
+        ged3d12_vertex_capture_tri_list(triangles, 6, 1), 1);
+    check_u32(
+        "invalid triangle-list hook falls back",
+        ged3d12_vertex_capture_tri_list(triangles, 5, 1), 0);
+    if (!ged3d12_vertex_upload_pending(&frame)) {
+        fail("triangle-list upload failed");
+    } else {
+        check_u32(
+            "triangle-list vertex count", frame.vertex_count, 6);
+        check_u32(
+            "triangle-list batch count", frame.batch_count, 1);
+        check_u32(
+            "triangle-list primitive count",
+            frame.primitive_count[GE_D3D12_PRIMITIVE_TRIANGLE], 2);
+        const GeD3D12Vertex *list_vertices =
+            uploaded_vertices(&frame);
+        check_u32(
+            "triangle-list first flat color",
+            list_vertices[0].rgba, 0xff8000ffu);
+        check_u32(
+            "triangle-list second flat color",
+            list_vertices[3].rgba, 0x04030201u);
+    }
 }
 
 static void test_sprites(void) {
