@@ -574,6 +574,115 @@ static bool upload_depth(DepthTarget *depth) {
     return true;
 }
 
+static bool readback_color(ColorTarget *target);
+
+static bool readback_color_rect(
+    ColorTarget *target, uint32_t address, uint32_t bytes) {
+    if (!target->gpu_newer) return true;
+    address = SR_PHYS(address);
+    uint32_t bpp = target_bytes_per_pixel(target);
+    uint64_t key_bytes = ged3d12_framebuffer_key_bytes(&target->key);
+    uint32_t target_address = target->key.address & 0x1fffffffu;
+    if (!bytes || !key_bytes || address < target_address ||
+        (uint64_t)address + bytes >
+            (uint64_t)target_address + key_bytes) {
+        return readback_color(target);
+    }
+
+    uint32_t first = (address - target_address) / bpp;
+    uint64_t last_address = (uint64_t)address + bytes - 1u;
+    uint32_t last = (uint32_t)(last_address - target_address) / bpp;
+    uint32_t left = first % target->key.stride;
+    uint32_t top = first / target->key.stride;
+    uint32_t right = (last % target->key.stride) + 1u;
+    uint32_t bottom = (last / target->key.stride) + 1u;
+    if (right <= left || bottom <= top ||
+        right > target->key.stride ||
+        bottom > GE_D3D12_FRAMEBUFFER_HEIGHT) {
+        return readback_color(target);
+    }
+    if (top == bottom - 1u && left == 0u &&
+        right == target->key.stride) {
+        return readback_color(target);
+    }
+
+    const uint32_t sample_offset = s_render_scale / 2u;
+    const uint32_t physical_width = render_width();
+    const uint32_t physical_left = left * s_render_scale;
+    const uint32_t physical_top = top * s_render_scale;
+    const uint32_t physical_right = right * s_render_scale;
+    const uint32_t physical_bottom = bottom * s_render_scale;
+    if (physical_right > physical_width ||
+        physical_bottom > render_height()) {
+        return readback_color(target);
+    }
+
+    if (!immediate_begin()) return false;
+    transition(s_immediate_list, target->resource, &target->state,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = target->resource;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = s_readback;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint.Footprint.Format =
+        DXGI_FORMAT_B8G8R8A8_UNORM;
+    destination.PlacedFootprint.Footprint.Width = physical_width;
+    destination.PlacedFootprint.Footprint.Height = render_height();
+    destination.PlacedFootprint.Footprint.Depth = 1;
+    destination.PlacedFootprint.Footprint.RowPitch = physical_width * 4u;
+    D3D12_BOX source_box = {
+        physical_left, physical_top, 0,
+        physical_right, physical_bottom, 1,
+    };
+    s_immediate_list->CopyTextureRegion(
+        &destination, physical_left, physical_top, 0, &source, &source_box);
+    transition(s_immediate_list, target->resource, &target->state,
+               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (!immediate_submit()) return false;
+
+    const uint64_t readback_bytes =
+        (uint64_t)physical_width * render_height() * 4u;
+    D3D12_RANGE read_range = {0, (SIZE_T)readback_bytes};
+    void *mapped = nullptr;
+    if (!check_hr(s_readback->Map(0, &read_range, &mapped),
+                  "map partial framebuffer readback")) {
+        return false;
+    }
+    const uint32_t *source_pixels = static_cast<const uint32_t *>(mapped);
+    uint8_t *destination_bytes =
+        static_cast<uint8_t *>(SR_HOST(target->key.address));
+    for (uint32_t y = top; y < bottom; y++) {
+        const uint32_t *row =
+            source_pixels + (y * s_render_scale + sample_offset) * physical_width;
+        if (target->key.format == 3u) {
+            uint32_t *destination_row =
+                reinterpret_cast<uint32_t *>(
+                    destination_bytes + y * target->key.stride * 4u);
+            for (uint32_t x = left; x < right; x++) {
+                destination_row[x] = ged3d12_framebuffer_encode_pixel(
+                    row[x * s_render_scale + sample_offset], target->key.format);
+            }
+        } else {
+            uint16_t *destination_row =
+                reinterpret_cast<uint16_t *>(
+                    destination_bytes + y * target->key.stride * 2u);
+            for (uint32_t x = left; x < right; x++) {
+                destination_row[x] = (uint16_t)ged3d12_framebuffer_encode_pixel(
+                    row[x * s_render_scale + sample_offset], target->key.format);
+            }
+        }
+    }
+    D3D12_RANGE written = {0, 0};
+    s_readback->Unmap(0, &written);
+    /* Keep GPU-newer set: outside this rectangle is still unread. */
+    target->pending_upload = false;
+    s_readbacks++;
+    update_read_watch();
+    return true;
+}
+
 static bool readback_color(ColorTarget *target) {
     const uint32_t physical_width = render_width();
     const uint32_t physical_height = render_height();
@@ -1557,8 +1666,8 @@ void ged3d12_framebuffer_read(uint32_t address, uint32_t bytes) {
         if (target->occupied && target->gpu_newer &&
             ged3d12_framebuffer_key_overlaps(
                 &target->key, address, bytes)) {
-            if (!readback_color(target)) {
-                fprintf(stderr, "ged3d12: framebuffer lazy readback failed\n");
+            if (!readback_color_rect(target, address, bytes)) {
+                fprintf(stderr, "ged3d12: framebuffer partial readback failed\n");
                 return;
             }
         }
