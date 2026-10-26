@@ -198,6 +198,14 @@ uint32_t  ge_zbuf_stride(void);
 void      ge_decode_tex_rgba(uint32_t *out);
 void      ge_decode_tex_rgba_level(uint32_t *out, int level);
 uint64_t  ge_texture_level_byte_size(const GeState *state, int level);
+/* Thread-safe texture decoding: capture copies the current texture's source bytes, palette and
+ * decode state on the GE thread; the decode itself touches nothing else. It produces exactly
+ * the pixels ge_decode_tex_rgba_level produces for the same state. */
+typedef struct GeTexSnapshot GeTexSnapshot;
+GeTexSnapshot *ge_tex_snapshot_capture(uint32_t level_count);
+void      ge_tex_snapshot_decode_level(
+              const GeTexSnapshot *snapshot, uint32_t *out, int level);
+void      ge_tex_snapshot_free(GeTexSnapshot *snapshot);
 int       ge_color_test_pass(
               uint32_t test, uint32_t reference, uint32_t mask,
               int red, int green, int blue);

@@ -3234,8 +3234,11 @@ typedef struct PresentPerf {
     uint32_t window_first_present;
     double frame_budget_ms;
     double minimum_fps;
+    double slow_frame_ms;
+    uint32_t previous_alt_mask;
     int initialized;
     int enabled;
+    int trace_stalls;
 } PresentPerf;
 
 static PresentPerf s_present_perf;
@@ -3340,6 +3343,19 @@ static void present_perf_init(void) {
             _Exit(2);
         }
     }
+    s_present_perf.trace_stalls = getenv("SR_TRACE_STALLS") ? 1 : 0;
+    s_present_perf.slow_frame_ms = s_present_perf.frame_budget_ms * 1.25;
+    const char *slow_frame = getenv("SR_SLOW_FRAME_MS");
+    if (slow_frame && slow_frame[0]) {
+        char *end = NULL;
+        s_present_perf.slow_frame_ms = strtod(slow_frame, &end);
+        if (!end || *end || s_present_perf.slow_frame_ms <= 0.0) {
+            fprintf(
+                stderr, "SR_SLOW_FRAME_MS: expected a positive number, got %s\n",
+                slow_frame);
+            _Exit(2);
+        }
+    }
     const char *minimum_fps = getenv("SR_PERF_MIN_FPS");
     if (minimum_fps && minimum_fps[0]) {
         char *end = NULL;
@@ -3363,7 +3379,7 @@ static void present_perf_init(void) {
         if (!s_present_perf.file ||
             fprintf(
                 s_present_perf.file,
-                "# psp-recomp display performance v3\n"
+                "# psp-recomp display performance v4\n"
                 "flip,present,frame_ms,frontend_ms,backend_ms,gpu_ms,"
                 "over_budget,gpu_source_flip,scheduler_ms,native_ms,"
                 "interpreter_ms,hle_ms,ge_ms,vertex_ms,sync_ms,"
@@ -3380,7 +3396,9 @@ static void present_perf_init(void) {
                 "backend_vertices,backend_batches,framebuffer_readbacks,"
                 "framebuffer_aliases,feedback_snapshots,"
                 "feedback_snapshot_pixels,feedback_reuses,"
-                "capture_ms,texture_capture_ms,state_capture_ms\n") < 0) {
+                "capture_ms,texture_capture_ms,state_capture_ms,"
+                "texture_misses,texture_decode_wait_us,pso_fallbacks,"
+                "alt_off\n") < 0) {
             if (s_present_perf.file)
                 fclose(s_present_perf.file);
             s_present_perf.file = NULL;
@@ -3398,6 +3416,61 @@ static LONGLONG present_perf_entry(void) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return now.QuadPart;
+}
+
+/* SR_TRACE_STALLS=1: name where a slow frame's time went. Printed for every host flip longer
+ * than SR_SLOW_FRAME_MS (default 1.25 x the frame budget), whether or not the sample window
+ * is open, so a spike seen in play can be attributed without a capture. */
+static void present_slow_frame_report(
+    uint32_t flip, uint32_t present, double frame_ms,
+    const SrPerfFrame *phases,
+    const SrBackendTiming *backend_timing, int backend_timing_valid,
+    double gpu_ms) {
+    static const char *const names[SR_PERF_CATEGORY_COUNT] = {
+        "native", "hle", "interpreter", "ge", "vertex", "sync", "backend",
+        "scheduler", "primitive", "bezier", "spline", "patch_eval",
+        "patch_draw", "vertex_decode", "capture", "texture_capture",
+        "state_capture",
+    };
+    /* The nested vertex-phase categories are exclusive, so the three largest are additive. */
+    int top[3] = { -1, -1, -1 };
+    for (int pick = 0; pick < 3; pick++) {
+        for (int i = 0; i < SR_PERF_CATEGORY_COUNT; i++) {
+            if (i == SR_PERF_SCHEDULER) continue;
+            if (pick > 0 && i == top[0]) continue;
+            if (pick > 1 && i == top[1]) continue;
+            if (top[pick] < 0 ||
+                phases->category_ms[i] > phases->category_ms[top[pick]]) {
+                top[pick] = i;
+            }
+        }
+    }
+    fprintf(
+        stderr,
+        "[slow-frame] flip=%u present=%u frame=%.2f ms (limit %.2f) "
+        "top: %s %.2f, %s %.2f, %s %.2f | scheduler idle %.2f | "
+        "texture misses=%llu decode wait=%llu us pso fallbacks=%llu | "
+        "gpu=%.2f",
+        flip, present, frame_ms, s_present_perf.slow_frame_ms,
+        names[top[0]], phases->category_ms[top[0]],
+        names[top[1]], phases->category_ms[top[1]],
+        names[top[2]], phases->category_ms[top[2]],
+        phases->category_ms[SR_PERF_SCHEDULER],
+        (unsigned long long)phases->counters[SR_PERF_TEXTURE_MISSES],
+        (unsigned long long)phases->counters[SR_PERF_TEXTURE_DECODE_WAIT_US],
+        (unsigned long long)phases->counters[SR_PERF_PSO_FALLBACKS],
+        gpu_ms);
+    if (backend_timing_valid) {
+        fprintf(
+            stderr,
+            " | previous flip backend: begin %.2f vertices %.2f framebuffer "
+            "%.2f textures %.2f draws %.2f present %.2f submit %.2f",
+            backend_timing->begin_ms, backend_timing->vertices_ms,
+            backend_timing->framebuffer_ms, backend_timing->textures_ms,
+            backend_timing->draws_ms, backend_timing->present_ms,
+            backend_timing->submit_ms);
+    }
+    fputc('\n', stderr);
 }
 
 static void present_perf_finish(
@@ -3421,6 +3494,16 @@ static void present_perf_finish(
             s_present_perf.last_gpu_source_flip = gpu_source_flip;
         }
     }
+    if (s_present_perf.trace_stalls && s_present_perf.previous_entry) {
+        double slow_ms =
+            (double)(entry - s_present_perf.previous_entry) / ticks_per_ms;
+        if (slow_ms > s_present_perf.slow_frame_ms) {
+            present_slow_frame_report(
+                flip, present, slow_ms, phases,
+                &s_present_perf.previous_backend_timing,
+                s_present_perf.previous_backend_timing_valid, gpu_ms);
+        }
+    }
     if (s_present_perf.enabled &&
         present > s_present_perf.start &&
         s_present_perf.previous_entry) {
@@ -3437,6 +3520,11 @@ static void present_perf_finish(
         s_present_perf.gpu_ms[index] = gpu_ms;
         int over_budget =
             frame_ms > s_present_perf.frame_budget_ms;
+        /* Paths currently alternated off; bit 31 marks a flip whose frame straddled a
+         * change, which A/B comparisons must discard. */
+        uint32_t alt_off = sr_perf_alternate_mask;
+        if (alt_off != s_present_perf.previous_alt_mask)
+            alt_off |= 0x80000000u;
         uint64_t framebuffer_readbacks = 0;
         uint64_t framebuffer_aliases = 0;
         uint64_t feedback_snapshots = 0;
@@ -3482,7 +3570,8 @@ static void present_perf_finish(
                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
                 "%llu,"
                 "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%u,"
-                "%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f\n",
+                "%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,"
+                "%llu,%llu,%llu,%u\n",
                 flip, present, frame_ms,
                 s_present_perf.frontend_ms[index],
                 s_present_perf.previous_backend_ms,
@@ -3549,7 +3638,14 @@ static void present_perf_finish(
                 (unsigned long long)feedback_reuses,
                 phases->category_ms[SR_PERF_CAPTURE],
                 phases->category_ms[SR_PERF_TEXTURE_CAPTURE],
-                phases->category_ms[SR_PERF_STATE_CAPTURE]) < 0) {
+                phases->category_ms[SR_PERF_STATE_CAPTURE],
+                (unsigned long long)
+                    phases->counters[SR_PERF_TEXTURE_MISSES],
+                (unsigned long long)
+                    phases->counters[SR_PERF_TEXTURE_DECODE_WAIT_US],
+                (unsigned long long)
+                    phases->counters[SR_PERF_PSO_FALLBACKS],
+                alt_off) < 0) {
             fprintf(stderr, "SR_PERF_FILE: write failed\n");
             runtime_exit_cleanly(2);
         }
@@ -3626,6 +3722,7 @@ static void present_perf_finish(
         }
     }
     s_present_perf.previous_entry = entry;
+    s_present_perf.previous_alt_mask = sr_perf_alternate_mask;
     s_present_perf.previous_backend_ms = backend_ms;
     if (current_backend_timing_valid) {
         s_present_perf.previous_backend_timing =
@@ -3762,6 +3859,7 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
     if (A0) {
         s_present_count++;
         sr_ip_sampler_present(s_present_count);
+        sr_perf_alternate_tick(s_present_count);
         capture_requested = frame_capture_path(
             capture_path, sizeof(capture_path));
         if (capture_requested && gui_on())

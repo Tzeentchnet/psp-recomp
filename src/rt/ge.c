@@ -1223,64 +1223,91 @@ static int prepare_texture_level(
     return 1;
 }
 
-static void decode_prepared_texel(
-    const uint8_t *data, uint32_t stride, int level,
+/* Everything the texture decoders read from GE state. Decoding through this context rather
+ * than the live `ge` lets a snapshot taken at capture time be decoded on a worker thread. */
+typedef struct {
+    uint32_t fmt;
+    int swizzle;
+    uint32_t clut_fmt;
+    uint32_t tex_mode;
+    const uint8_t *clutram;
+} TexDecodeCtx;
+
+static void clut_lookup_ctx(
+    const TexDecodeCtx *ctx, uint32_t index, int level,
+    int *r, int *g, int *b, int *a) {
+    uint32_t shift = (ctx->clut_fmt >> 2) & 0x1F;
+    uint32_t mask  = (ctx->clut_fmt >> 8) & 0xFF;
+    uint32_t start = ((ctx->clut_fmt >> 16) & 0x1F) << 4;
+    uint32_t start_mask = (ctx->clut_fmt & 3) == 3 ? 0xFFu : 0x1FFu;
+    index = ((index >> shift) & mask) | (start & start_mask);
+    if ((ctx->tex_mode & 0x100u) != 0) {
+        if (ctx->fmt == 4) index += (uint32_t)level * 16u;
+        else if (ctx->fmt == 5 && (ctx->clut_fmt & 3) != 3)
+            index += (uint32_t)(level & 1) * 256u;
+    }
+    int epsm = ctx->clut_fmt & 3;
+    if (epsm == 3) {
+        uint32_t raw;
+        memcpy(&raw, &ctx->clutram[(index * 4) & 2047], 4);
+        unpack_color(raw, 3, r, g, b, a);
+    } else {
+        uint16_t raw;
+        memcpy(&raw, &ctx->clutram[(index * 2) & 2047], 2);
+        unpack_color(raw, epsm, r, g, b, a);
+    }
+}
+
+static void decode_texel_ctx(
+    const TexDecodeCtx *ctx, const uint8_t *data, uint32_t stride, int level,
     uint32_t u, uint32_t v, int *r, int *g, int *b, int *a) {
-    g_tex_samples++;
-    switch (ge.tex_fmt) {
+    switch (ctx->fmt) {
         case 0: case 1: case 2:
             unpack_color(
                 prepared_r16(
-                    data, texel_offset(
-                        stride, u, v, 16, ge.tex_swizzle)),
-                ge.tex_fmt, r, g, b, a);
+                    data, texel_offset(stride, u, v, 16, ctx->swizzle)),
+                (int)ctx->fmt, r, g, b, a);
             break;
         case 3:
             unpack_color(
                 prepared_r32(
-                    data, texel_offset(
-                        stride, u, v, 32, ge.tex_swizzle)),
+                    data, texel_offset(stride, u, v, 32, ctx->swizzle)),
                 3, r, g, b, a);
             break;
         case 4: {
-            uint32_t offset =
-                texel_offset(stride, u, v, 4, ge.tex_swizzle);
+            uint32_t offset = texel_offset(stride, u, v, 4, ctx->swizzle);
             uint8_t packed = data[offset];
-            uint32_t index =
-                (u & 1u) ? packed >> 4 : packed & 0x0fu;
-            clut_lookup_level(
-                index, level, ge.tex_fmt, r, g, b, a);
+            uint32_t index = (u & 1u) ? packed >> 4 : packed & 0x0fu;
+            clut_lookup_ctx(ctx, index, level, r, g, b, a);
             break;
         }
         case 5:
-            clut_lookup_level(
-                data[texel_offset(
-                    stride, u, v, 8, ge.tex_swizzle)],
-                level, ge.tex_fmt, r, g, b, a);
+            clut_lookup_ctx(
+                ctx, data[texel_offset(stride, u, v, 8, ctx->swizzle)],
+                level, r, g, b, a);
             break;
         case 6:
-            clut_lookup_level(
+            clut_lookup_ctx(
+                ctx,
                 prepared_r16(
-                    data, texel_offset(
-                        stride, u, v, 16, ge.tex_swizzle)),
-                level, ge.tex_fmt, r, g, b, a);
+                    data, texel_offset(stride, u, v, 16, ctx->swizzle)),
+                level, r, g, b, a);
             break;
         case 7:
-            clut_lookup_level(
+            clut_lookup_ctx(
+                ctx,
                 prepared_r32(
-                    data, texel_offset(
-                        stride, u, v, 32, ge.tex_swizzle)),
-                level, ge.tex_fmt, r, g, b, a);
+                    data, texel_offset(stride, u, v, 32, ctx->swizzle)),
+                level, r, g, b, a);
             break;
         case 8: case 9: case 10: {
             uint32_t blocks_per_row = (stride + 3u) >> 2;
             if (!blocks_per_row) blocks_per_row = 1;
-            uint32_t block_size = ge.tex_fmt == 8 ? 8u : 16u;
+            uint32_t block_size = ctx->fmt == 8 ? 8u : 16u;
             uint32_t block_index =
                 (v >> 2) * blocks_per_row + (u >> 2);
             uint32_t color = dxt_decode(
-                data + block_index * block_size,
-                ge.tex_fmt, u, v);
+                data + block_index * block_size, ctx->fmt, u, v);
             *r = color & 0xff;
             *g = (color >> 8) & 0xff;
             *b = (color >> 16) & 0xff;
@@ -1291,8 +1318,41 @@ static void decode_prepared_texel(
             *r = *g = *b = *a = 255;
             break;
     }
-    if (*r | *g | *b) g_tex_nonzero++;
-    if (s_stat_on > 0 && *a == 0) s_stat.texa0++;
+}
+
+static void decode_level_ctx(
+    const TexDecodeCtx *ctx, const uint8_t *data, uint32_t stride,
+    int width, int height, int level, uint32_t *out) {
+    if (!ctx->swizzle && ctx->fmt <= 3) {
+        for (int v = 0; v < height; v++) {
+            uint32_t *dst = out + (uint32_t)v * (uint32_t)width;
+            if (ctx->fmt == 3) {
+                memcpy(dst, data + (size_t)v * stride * 4,
+                       (size_t)width * 4);
+            } else {
+                const uint8_t *src = data + (size_t)v * stride * 2;
+                for (int u = 0; u < width; u++) {
+                    int r, g, b, a;
+                    unpack_color(
+                        prepared_r16(src, (uint32_t)u * 2u), (int)ctx->fmt,
+                        &r, &g, &b, &a);
+                    dst[u] = (uint32_t)r | ((uint32_t)g << 8) |
+                             ((uint32_t)b << 16) | ((uint32_t)a << 24);
+                }
+            }
+        }
+        return;
+    }
+    for (int v = 0; v < height; v++)
+        for (int u = 0; u < width; u++) {
+            int r, g, b, a;
+            decode_texel_ctx(
+                ctx, data, stride, level,
+                (uint32_t)u, (uint32_t)v, &r, &g, &b, &a);
+            out[v * width + u] =
+                (uint32_t)(r & 0xFF) | ((uint32_t)(g & 0xFF) << 8) |
+                ((uint32_t)(b & 0xFF) << 16) | ((uint32_t)(a & 0xFF) << 24);
+        }
 }
 
 /* GPU backend texture decode: synchronize each level once, then decode its bounded
@@ -1305,37 +1365,135 @@ void ge_decode_tex_rgba_level(uint32_t *out, int level) {
     if (!address || width <= 0 || height <= 0) return;
     const uint8_t *data;
     if (!prepare_texture_level(level, address, &data)) return;
-    if (!ge.tex_swizzle && ge.tex_fmt <= 3) {
-        for (int v = 0; v < height; v++) {
-            uint32_t *dst = out + (uint32_t)v * (uint32_t)width;
-            if (ge.tex_fmt == 3) {
-                const uint32_t *src =
-                    (const uint32_t *)(
-                        data + (uint32_t)v * stride * 4);
-                memcpy(dst, src, (size_t)width * 4);
-            } else {
-                const uint16_t *src =
-                    (const uint16_t *)(
-                        data + (uint32_t)v * stride * 2);
-                for (int u = 0; u < width; u++) {
-                    int r, g, b, a;
-                    unpack_color(src[u], (int)ge.tex_fmt, &r, &g, &b, &a);
-                    dst[u] = (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | ((uint32_t)a << 24);
-                }
+    TexDecodeCtx ctx = {
+        ge.tex_fmt, ge.tex_swizzle, ge.clut_fmt, ge.tex_mode, ge.clutram,
+    };
+    decode_level_ctx(&ctx, data, stride, width, height, level, out);
+}
+
+/* Snapshot of one texture's source bytes and decode state. Capture runs on the GE thread (it
+ * synchronizes watched VRAM); ge_tex_snapshot_decode_level has no other dependency on GE
+ * state and may run on any thread. */
+struct GeTexSnapshot {
+    TexDecodeCtx ctx;
+    uint8_t clutram[2048];
+    uint32_t level_count;
+    uint32_t stride[8];
+    int width[8];
+    int height[8];
+    uint32_t offset[8];
+    uint32_t bytes[8];
+    uint8_t *data;
+};
+
+/* Highest byte the decoder reads (exclusive) for the current format, with the given buffer
+ * width. Only needed when the width exceeds the buffer width; otherwise
+ * ge_texture_level_byte_size already covers every read. */
+static uint64_t texture_level_read_extent(
+    uint32_t stride, int width, int height) {
+    uint32_t format = ge.tex_fmt;
+    if (format >= 8 && format <= 10) {
+        uint32_t blocks_per_row = (stride + 3u) >> 2;
+        if (!blocks_per_row) blocks_per_row = 1;
+        uint64_t last_block =
+            (uint64_t)(((uint32_t)height - 1u) >> 2) * blocks_per_row +
+            (((uint32_t)width - 1u) >> 2);
+        return (last_block + 1u) * (format == 8 ? 8u : 16u);
+    }
+    uint32_t bits = ge_texture_bits_per_pixel(format);
+    uint32_t read_bytes = bits <= 8 ? 1u : bits >> 3;
+    if (!bits) return 0;
+    uint64_t extent = 0;
+    for (uint32_t v = 0; v < (uint32_t)height; v++)
+        for (uint32_t u = 0; u < (uint32_t)width; u++) {
+            uint64_t end = (uint64_t)texel_offset(
+                stride, u, v, bits, ge.tex_swizzle) + read_bytes;
+            if (end > extent) extent = end;
+        }
+    return extent;
+}
+
+GeTexSnapshot *ge_tex_snapshot_capture(uint32_t level_count) {
+    if (level_count == 0 || level_count > 8) return NULL;
+    GeTexSnapshot *snapshot = (GeTexSnapshot *)calloc(1, sizeof(*snapshot));
+    if (!snapshot) return NULL;
+    uint64_t total = 0;
+    const uint8_t *source[8] = {0};
+    for (uint32_t level = 0; level < level_count; level++) {
+        uint32_t address;
+        texture_level_info(
+            (int)level, &address, &snapshot->stride[level],
+            &snapshot->width[level], &snapshot->height[level]);
+        if (!address || snapshot->width[level] <= 0 ||
+            snapshot->height[level] <= 0) {
+            continue;       /* the live decoder leaves such a level untouched; so do we */
+        }
+        uint64_t size = ge_texture_level_byte_size(&ge, (int)level);
+        if (!size || size > UINT32_MAX ||
+            !prepare_texture_level((int)level, address, &source[level])) {
+            source[level] = NULL;
+            continue;
+        }
+        /* A buffer width narrower than the texture makes the decoder read past the declared
+         * span, as the live decode does; copy everything it touches so both decode the same
+         * bytes. */
+        if (snapshot->width[level] > (int)snapshot->stride[level]) {
+            uint64_t extent = texture_level_read_extent(
+                snapshot->stride[level], snapshot->width[level],
+                snapshot->height[level]);
+            uint64_t last = (uint64_t)address + extent - 1u;
+            if (extent > size && extent <= UINT32_MAX &&
+                last <= UINT32_MAX && sr_inrange((uint32_t)last)) {
+                size = extent;
             }
         }
+        snapshot->offset[level] = (uint32_t)total;
+        snapshot->bytes[level] = (uint32_t)size;
+        total += size;
+        if (total > UINT32_MAX) {
+            free(snapshot);
+            return NULL;
+        }
+    }
+    if (total) {
+        snapshot->data = (uint8_t *)malloc((size_t)total);
+        if (!snapshot->data) {
+            free(snapshot);
+            return NULL;
+        }
+        for (uint32_t level = 0; level < level_count; level++) {
+            if (source[level] && snapshot->bytes[level])
+                memcpy(snapshot->data + snapshot->offset[level],
+                       source[level], snapshot->bytes[level]);
+        }
+    }
+    snapshot->level_count = level_count;
+    memcpy(snapshot->clutram, ge.clutram, sizeof(snapshot->clutram));
+    snapshot->ctx.fmt = ge.tex_fmt;
+    snapshot->ctx.swizzle = ge.tex_swizzle;
+    snapshot->ctx.clut_fmt = ge.clut_fmt;
+    snapshot->ctx.tex_mode = ge.tex_mode;
+    snapshot->ctx.clutram = snapshot->clutram;
+    return snapshot;
+}
+
+void ge_tex_snapshot_decode_level(
+    const GeTexSnapshot *snapshot, uint32_t *out, int level) {
+    if (!snapshot || !out || level < 0 ||
+        (uint32_t)level >= snapshot->level_count) {
         return;
     }
-    for (int v = 0; v < height; v++)
-        for (int u = 0; u < width; u++) {
-            int r, g, b, a;
-            decode_prepared_texel(
-                data, stride, level,
-                (uint32_t)u, (uint32_t)v, &r, &g, &b, &a);
-            out[v * width + u] =
-                (uint32_t)(r & 0xFF) | ((uint32_t)(g & 0xFF) << 8) |
-                ((uint32_t)(b & 0xFF) << 16) | ((uint32_t)(a & 0xFF) << 24);
-        }
+    if (!snapshot->bytes[level]) return;
+    decode_level_ctx(
+        &snapshot->ctx, snapshot->data + snapshot->offset[level],
+        snapshot->stride[level], snapshot->width[level],
+        snapshot->height[level], level, out);
+}
+
+void ge_tex_snapshot_free(GeTexSnapshot *snapshot) {
+    if (!snapshot) return;
+    free(snapshot->data);
+    free(snapshot);
 }
 
 void ge_decode_tex_rgba(uint32_t *out) {
@@ -4602,7 +4760,8 @@ static void draw_prim(uint32_t op) {
         }
         static int no_indexed = -1;
         if (no_indexed < 0) no_indexed = getenv("SR_D3D12_NO_INDEXED") ? 1 : 0;
-        int use_indexed = cached && !rt && !no_indexed && ge.shade_gouraud && !ge.clear &&
+        int use_indexed = cached && !rt && !no_indexed && !sr_perf_path_off(SR_PATH_INDEXED_CAPTURE) &&
+            ge.shade_gouraud && !ge.clear &&
             s_backend && s_backend->tri_indexed;
         begin_backend_tri_batch(1);
         for (int i = 2; i < count; i++) {

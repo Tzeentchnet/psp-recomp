@@ -99,7 +99,8 @@ static void build_pipeline_and_shader(
     const GeState *state = ge_state_ptr();
     if (s_memo_verify < 0) s_memo_verify = getenv("SR_D3D12_VERIFY_STATE_MEMO") ? 1 : 0;
     bool reuse = false;
-    if (s_memo_primitive == (int)primitive && s_memo_perspective == perspective) {
+    if (s_memo_primitive == (int)primitive && s_memo_perspective == perspective &&
+        !sr_perf_path_off(SR_PATH_STATE_MEMO)) {
         s_memo_state.vaddr = state->vaddr;
         s_memo_state.iaddr = state->iaddr;
         reuse = memcmp(&s_memo_state, state, sizeof(*state)) == 0 &&

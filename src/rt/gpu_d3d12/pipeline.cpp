@@ -5,6 +5,8 @@
 #include "pipeline.h"
 
 #include "device.h"
+#include "../perf_stats.h"
+#include "../settings_path.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -73,6 +75,33 @@ static int s_stopping;
 static int s_library_dirty;
 static int s_ready;
 static int s_log;
+
+/* Pipeline keys seen by earlier runs. The serialized pipeline library is not stable across
+ * launches, but the keys that built it are plain state, so a run records every key it asks for
+ * and the next run compiles them on the worker thread from the start. A new area or effect then
+ * finds its pipelines ready instead of drawing with the ubershader fallback for the frames its
+ * compile takes. */
+struct PipelineKeysHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t key_size;
+    uint32_t count;
+    uint32_t reserved;
+};
+
+static const char k_keys_magic[8] = {
+    'S', 'R', 'D', '1', '2', 'K', 'Y', '\0',
+};
+#define PIPELINE_KEYS_VERSION 1u
+#define PIPELINE_KEYS_SAVE_INTERVAL_MS 2000u
+#define PIPELINE_KEYS_PRELOAD_LIMIT (PIPELINE_CACHE_CAPACITY * 3u / 4u)
+
+static char s_keys_path[PIPELINE_CACHE_PATH_CAPACITY];
+static GeD3D12PipelineKey s_known_keys[PIPELINE_CACHE_CAPACITY];
+static UINT s_known_count;
+static UINT s_saved_count;
+static DWORD s_keys_saved_tick;
+static UINT s_preloaded;
 
 static_assert(
     sizeof(PipelineLibraryHeader) == 40,
@@ -315,6 +344,129 @@ static void initialize_pipeline_library(void) {
         fprintf(stderr,
                 "ged3d12: loaded %llu-byte PSO disk cache %s\n",
                 (unsigned long long)blob_size, s_cache_path);
+    }
+}
+
+static void configure_keys_path(void) {
+    s_keys_path[0] = '\0';
+    if (env_enabled("SR_D3D12_NO_PSO_KEYS")) return;
+    const char *override_path = getenv("SR_D3D12_PSO_KEYS");
+    if (override_path && override_path[0]) {
+        int count = snprintf(
+            s_keys_path, sizeof(s_keys_path), "%s", override_path);
+        if (count < 0 || (size_t)count >= sizeof(s_keys_path)) {
+            fprintf(stderr, "ged3d12: PSO key list path is too long\n");
+            s_keys_path[0] = '\0';
+            return;
+        }
+    } else {
+        char error[128];
+        if (!sr_settings_path(
+                "pso_keys.bin", s_keys_path, sizeof(s_keys_path),
+                error, sizeof(error))) {
+            s_keys_path[0] = '\0';
+            return;
+        }
+    }
+    if (!ensure_parent_directories(s_keys_path)) s_keys_path[0] = '\0';
+}
+
+/* Reads the previous runs' keys into s_known_keys. A missing, stale or damaged file is simply
+ * a cold start. */
+static void load_known_keys(void) {
+    s_known_count = 0;
+    s_saved_count = 0;
+    if (!s_keys_path[0]) return;
+    FILE *file = fopen(s_keys_path, "rb");
+    if (!file) return;
+    PipelineKeysHeader header = {};
+    bool valid =
+        fread(&header, 1, sizeof(header), file) == sizeof(header) &&
+        memcmp(header.magic, k_keys_magic, sizeof(header.magic)) == 0 &&
+        header.version == PIPELINE_KEYS_VERSION &&
+        header.key_size == sizeof(GeD3D12PipelineKey) &&
+        header.count <= PIPELINE_CACHE_CAPACITY;
+    if (valid) {
+        UINT read = (UINT)fread(
+            s_known_keys, sizeof(GeD3D12PipelineKey), header.count, file);
+        valid = read == header.count;
+        if (valid) s_known_count = read;
+    }
+    fclose(file);
+    if (!valid) {
+        fprintf(stderr,
+                "ged3d12: ignoring incompatible or corrupt PSO key list %s\n",
+                s_keys_path);
+        s_known_count = 0;
+        return;
+    }
+    s_saved_count = s_known_count;
+}
+
+/* Writes the key list through a temporary file so a crash never leaves a torn list. The
+ * snapshot is taken under the lock; the file I/O is not. */
+static void save_known_keys(void) {
+    if (!s_keys_path[0]) return;
+    GeD3D12PipelineKey *keys = nullptr;
+    UINT count = 0;
+    if (s_lock_initialized) EnterCriticalSection(&s_lock);
+    if (s_known_count != s_saved_count) {
+        keys = static_cast<GeD3D12PipelineKey *>(
+            malloc(sizeof(GeD3D12PipelineKey) * s_known_count));
+        if (keys) {
+            memcpy(keys, s_known_keys,
+                   sizeof(GeD3D12PipelineKey) * s_known_count);
+            count = s_known_count;
+        }
+    }
+    if (s_lock_initialized) LeaveCriticalSection(&s_lock);
+    if (!keys) return;
+
+    PipelineKeysHeader header = {};
+    memcpy(header.magic, k_keys_magic, sizeof(header.magic));
+    header.version = PIPELINE_KEYS_VERSION;
+    header.key_size = sizeof(GeD3D12PipelineKey);
+    header.count = count;
+    char temporary[PIPELINE_CACHE_PATH_CAPACITY + 32];
+    int length = snprintf(
+        temporary, sizeof(temporary), "%s.tmp.%lu",
+        s_keys_path, (unsigned long)GetCurrentProcessId());
+    bool ok = length > 0 && (size_t)length < sizeof(temporary);
+    HANDLE file = INVALID_HANDLE_VALUE;
+    if (ok) {
+        file = CreateFileA(
+            temporary, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        ok = file != INVALID_HANDLE_VALUE;
+    }
+    if (ok) {
+        DWORD written = 0;
+        DWORD key_bytes = (DWORD)(sizeof(GeD3D12PipelineKey) * count);
+        ok = WriteFile(file, &header, sizeof(header), &written, nullptr) &&
+             written == sizeof(header) &&
+             WriteFile(file, keys, key_bytes, &written, nullptr) &&
+             written == key_bytes && FlushFileBuffers(file);
+        CloseHandle(file);
+        if (ok) {
+            ok = MoveFileExA(
+                temporary, s_keys_path,
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+        }
+        if (!ok) DeleteFileA(temporary);
+    }
+    free(keys);
+    s_keys_saved_tick = GetTickCount();
+    if (ok) {
+        if (s_lock_initialized) EnterCriticalSection(&s_lock);
+        if (count > s_saved_count) s_saved_count = count;
+        if (s_lock_initialized) LeaveCriticalSection(&s_lock);
+        if (s_log) {
+            fprintf(stderr, "ged3d12: wrote %u PSO keys to %s\n",
+                    count, s_keys_path);
+        }
+    } else {
+        fprintf(stderr, "ged3d12: write PSO key list failed (path=%s)\n",
+                s_keys_path);
     }
 }
 
@@ -625,7 +777,17 @@ static DWORD WINAPI pipeline_worker(void *) {
         LeaveCriticalSection(&s_lock);
 
         if (index == UINT_MAX) {
-            DWORD wait = WaitForSingleObject(s_worker_event, INFINITE);
+            DWORD now = GetTickCount();
+            if (s_known_count != s_saved_count &&
+                now - s_keys_saved_tick >= PIPELINE_KEYS_SAVE_INTERVAL_MS) {
+                save_known_keys();
+            }
+            /* Wake after the save interval when keys are waiting to be written. */
+            DWORD wait = WaitForSingleObject(
+                s_worker_event,
+                s_known_count != s_saved_count
+                    ? PIPELINE_KEYS_SAVE_INTERVAL_MS : INFINITE);
+            if (wait == WAIT_TIMEOUT) continue;
             if (wait != WAIT_OBJECT_0) {
                 fprintf(stderr,
                         "ged3d12: PSO worker wait failed "
@@ -679,6 +841,10 @@ static bool queue_pipeline_locked(
     entry->key = *key;
     entry->hash = hash;
     entry->state = PIPELINE_ENTRY_PENDING;
+    if (count_miss && s_keys_path[0] &&
+        s_known_count < PIPELINE_CACHE_CAPACITY) {
+        s_known_keys[s_known_count++] = *key;
+    }
     s_queue[s_queue_write] = index;
     s_queue_write =
         (s_queue_write + 1) & (PIPELINE_CACHE_CAPACITY - 1);
@@ -721,8 +887,12 @@ bool ged3d12_pipeline_cache_init(void) {
     s_library_loaded_from_disk = 0;
     s_log = env_enabled("SR_D3D12_PSO_LOG");
     s_cache_path[0] = '\0';
+    s_preloaded = 0;
+    s_keys_saved_tick = GetTickCount();
     configure_cache_path();
     initialize_pipeline_library();
+    configure_keys_path();
+    load_known_keys();
 
     ged3d12_pipeline_uber_key(&s_uber_key);
     PipelineBuildResult uber = load_or_create_pipeline(&s_uber_key);
@@ -799,12 +969,47 @@ bool ged3d12_pipeline_cache_init(void) {
         s_stats.failures++;
         LeaveCriticalSection(&s_lock);
     }
+    /* Queue the keys earlier runs asked for, so the worker compiles them while the title
+     * loads. A queued key that is already present (the uber or cull key) is skipped. */
+    bool wake = false;
+    EnterCriticalSection(&s_lock);
+    for (UINT i = 0; i < s_known_count && s_preloaded < PIPELINE_KEYS_PRELOAD_LIMIT; i++) {
+        const GeD3D12PipelineKey *key = &s_known_keys[i];
+        if (memcmp(key, &s_uber_key, sizeof(*key)) == 0) continue;
+        uint64_t hash = ged3d12_pipeline_key_hash(key);
+        UINT slot = UINT_MAX;
+        bool present = false;
+        for (UINT probe = 0; probe < PIPELINE_CACHE_CAPACITY; probe++) {
+            UINT index =
+                (UINT)(hash + probe) & (PIPELINE_CACHE_CAPACITY - 1);
+            PipelineEntry *entry = &s_entries[index];
+            if (entry->state == PIPELINE_ENTRY_FREE) {
+                slot = index;
+                break;
+            }
+            if (entry->hash == hash &&
+                memcmp(&entry->key, key, sizeof(*key)) == 0) {
+                present = true;
+                break;
+            }
+        }
+        if (present) continue;
+        if (queue_pipeline_locked(key, hash, slot, false)) {
+            s_preloaded++;
+            wake = true;
+        }
+    }
+    LeaveCriticalSection(&s_lock);
+    if (wake) SetEvent(s_worker_event);
     if (s_log) {
         fprintf(
             stderr,
             "ged3d12: ubershader fallback PSO source=%s; "
-            "async compiler ready, cull PSO prewarmed\n",
-            uber.library_hit ? "library" : "compiler");
+            "async compiler ready, cull PSO prewarmed, %u of %u known "
+            "keys queued from %s\n",
+            uber.library_hit ? "library" : "compiler",
+            s_preloaded, s_known_count,
+            s_keys_path[0] ? s_keys_path : "(key list disabled)");
     }
     return true;
 }
@@ -832,6 +1037,7 @@ void ged3d12_pipeline_cache_shutdown(void) {
     }
 
     if (save_pipeline_library()) s_stats.cache_writes++;
+    save_known_keys();
     if (s_log && s_ready) {
         fprintf(
             stderr,
@@ -864,6 +1070,10 @@ void ged3d12_pipeline_cache_shutdown(void) {
     s_ready = 0;
     s_log = 0;
     s_cache_path[0] = '\0';
+    s_keys_path[0] = '\0';
+    s_known_count = 0;
+    s_saved_count = 0;
+    s_preloaded = 0;
 }
 
 bool ged3d12_pipeline_bind(
@@ -918,7 +1128,9 @@ bool ged3d12_pipeline_bind(
             s_stats.fallback_binds++;
         }
     }
+    bool inexact_fallback = !exact_pipeline && pipeline == s_uber_pipeline;
     LeaveCriticalSection(&s_lock);
+    if (inexact_fallback) sr_perf_counter_add(SR_PERF_PSO_FALLBACKS, 1);
 
     if (wake_worker && !SetEvent(s_worker_event)) {
         fprintf(stderr,

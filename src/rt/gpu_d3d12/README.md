@@ -185,8 +185,19 @@ Set `SR_D3D12_PSO_LOG=1` to print ubershader setup, asynchronous PSO sources, di
 writes, and a shutdown cache summary. `SR_D3D12_PSO_CACHE=<path>` opts into
 pipeline-library persistence. It is disabled by default because some drivers reject
 a library they previously serialized; the in-memory asynchronous cache remains active.
+The serialized library is unstable, but the pipeline *keys* are plain state, so the backend
+also keeps a small key list (`pso_keys.bin` beside the executable, or `SR_SETTINGS_DIR`).
+Every key a run requests is recorded; the next run queues them on the PSO worker at startup,
+so a scene's pipelines are compiled before it draws instead of during its first frames with
+the ubershader fallback. `SR_D3D12_PSO_KEYS=<path>` relocates the list and
+`SR_D3D12_NO_PSO_KEYS=1` disables it. A stale or damaged file is ignored.
 Set `SR_D3D12_TEXTURE_LOG=1` to print texture-version misses and a shutdown summary of
-lookups, hits, uploads, invalidations, evictions, and live entries.
+lookups, hits, uploads, invalidations, evictions, background decodes, and live entries.
+A texture first captured during a frame is decoded and xBRZ-scaled on worker threads: the GE
+thread copies the level bytes, palette and decode state (`ge_tex_snapshot_*`), and texture
+preparation waits for the result before recording the upload. `SR_D3D12_SYNC_TEXTURE_DECODE=1`
+decodes in line instead, and `SR_D3D12_VERIFY_TEXTURE_DECODE=1` decodes every texture both
+ways and aborts on any difference.
 Set `SR_D3D12_FRAMEBUFFER_LOG=1` to print target creation and a shutdown summary of
 captures, uploads, readbacks, aliases, invalidations, transfers, presentation hits,
 and live targets. Set `SR_D3D12_FRAMEBUFFER_SAFE=1` to force every cached target

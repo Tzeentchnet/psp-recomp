@@ -41,6 +41,9 @@ typedef enum SrPerfCounter {
     SR_PERF_GE_TRANSFORM_DRAWS,
     SR_PERF_GE_TRANSFORM_VERTICES,
     SR_PERF_GE_TRANSFORM_UNIQUE_VERTICES,
+    SR_PERF_TEXTURE_MISSES,
+    SR_PERF_TEXTURE_DECODE_WAIT_US,
+    SR_PERF_PSO_FALLBACKS,
     SR_PERF_COUNTER_COUNT
 } SrPerfCounter;
 
@@ -55,6 +58,25 @@ SrPerfCategory sr_perf_switch(SrPerfCategory category);
 void sr_perf_counter_add(SrPerfCounter counter, uint64_t value);
 void sr_perf_snapshot(SrPerfFrame *out);
 void sr_ip_sampler_present(uint32_t present);
+
+/* Optimization paths that SR_PERF_ALTERNATE=<name>[,<name>...] can switch off every other
+ * SR_PERF_ALTERNATE_PRESENTS presentations (default 60) so one run measures a path on and off
+ * in the same scene. Only output-identical paths are listed. The state changes at presentation
+ * boundaries, so a frame never sees a path half on. */
+typedef enum SrPerfPath {
+    SR_PATH_TEXTURE_DECODE = 0, /* background texture decode and scale */
+    SR_PATH_DRAW_MERGE,         /* adjacent direct draw merging */
+    SR_PATH_STATE_MEMO,         /* pipeline key and shader constant memo */
+    SR_PATH_INDEXED_CAPTURE,    /* indexed triangle capture */
+    SR_PATH_COUNT
+} SrPerfPath;
+
+extern volatile uint32_t sr_perf_alternate_mask;
+void sr_perf_alternate_tick(uint32_t present);
+/* Nonzero while an alternating run has `path` switched off. */
+static inline int sr_perf_path_off(SrPerfPath path) {
+    return (int)((sr_perf_alternate_mask >> path) & 1u);
+}
 
 #ifdef __cplusplus
 }

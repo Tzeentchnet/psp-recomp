@@ -29,6 +29,7 @@ static void perf_init(void) {
     s_perf.initialized = 1;
     s_perf.enabled =
         getenv("SR_PERF_LOG") != NULL ||
+        getenv("SR_TRACE_STALLS") != NULL ||
         (getenv("SR_PERF_FILE") && getenv("SR_PERF_FILE")[0]);
     if (!s_perf.enabled) return;
     QueryPerformanceFrequency(&s_perf.frequency);
@@ -88,6 +89,64 @@ void sr_perf_snapshot(SrPerfFrame *out) {
     memcpy(out->counters, s_perf.counters, sizeof(out->counters));
     memset(s_perf.ticks, 0, sizeof(s_perf.ticks));
     memset(s_perf.counters, 0, sizeof(s_perf.counters));
+}
+
+volatile uint32_t sr_perf_alternate_mask;
+
+static const char *const k_path_names[SR_PATH_COUNT] = {
+    "texdecode", "merge", "memo", "indexed",
+};
+
+static struct {
+    uint32_t paths;     /* bit per SrPerfPath named in SR_PERF_ALTERNATE */
+    uint32_t period;    /* presentations per on/off half */
+    int configured;
+} s_alternate;
+
+static void alternate_configure(void) {
+    s_alternate.configured = 1;
+    s_alternate.period = 60;
+    const char *periods = getenv("SR_PERF_ALTERNATE_PRESENTS");
+    if (periods && periods[0]) {
+        unsigned long parsed = strtoul(periods, NULL, 10);
+        if (parsed == 0 || parsed > 100000ul) {
+            fprintf(stderr,
+                    "SR_PERF_ALTERNATE_PRESENTS: expected 1..100000, got %s\n",
+                    periods);
+            _Exit(2);
+        }
+        s_alternate.period = (uint32_t)parsed;
+    }
+    const char *list = getenv("SR_PERF_ALTERNATE");
+    while (list && list[0]) {
+        const char *end = strchr(list, ',');
+        size_t length = end ? (size_t)(end - list) : strlen(list);
+        int found = 0;
+        for (int i = 0; i < SR_PATH_COUNT; i++) {
+            if (strlen(k_path_names[i]) == length &&
+                strncmp(list, k_path_names[i], length) == 0) {
+                s_alternate.paths |= 1u << i;
+                found = 1;
+            }
+        }
+        if (!found) {
+            fprintf(stderr,
+                    "SR_PERF_ALTERNATE: unknown path '%.*s' (known: "
+                    "texdecode, merge, memo, indexed)\n",
+                    (int)length, list);
+            _Exit(2);
+        }
+        list = end ? end + 1 : NULL;
+    }
+}
+
+/* Called once per presentation, before the next frame starts. The first half of every cycle
+ * keeps the paths on and the second half switches them off. */
+void sr_perf_alternate_tick(uint32_t present) {
+    if (!s_alternate.configured) alternate_configure();
+    if (!s_alternate.paths) return;
+    sr_perf_alternate_mask =
+        ((present / s_alternate.period) & 1u) ? s_alternate.paths : 0u;
 }
 
 /* Diagnostic instruction-pointer sampler (SR_SAMPLE_START=<present>, SR_SAMPLE_WINDOW=<presents>,

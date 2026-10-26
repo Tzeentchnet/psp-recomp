@@ -16,6 +16,7 @@
 #include "device.h"
 #include "framebuffer.h"
 #include "pipeline.h"
+#include "../perf_stats.h"
 #include "present.h"
 #include "shader_state.h"
 #include "texture.h"
@@ -1535,6 +1536,7 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
         GeD3D12FramebufferBinding rendered = batch->framebuffer;
         UINT draw_count = batch->count;
         if (direct && !(batch->flags & GE_D3D12_BATCH_INDEXED) &&
+            !sr_perf_path_off(SR_PATH_DRAW_MERGE) &&
             batch->texture.framebuffer.handle ==
                 GE_D3D12_FRAMEBUFFER_HANDLE_NONE &&
             (batch->texture.flags & GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT) == 0 &&

@@ -51,6 +51,8 @@ extern "C" SrPerfCategory sr_perf_switch(SrPerfCategory category) {
     return category;
 }
 
+extern "C" volatile uint32_t sr_perf_alternate_mask = 0;
+
 uint32_t ged3d12_command_list_generation(void) {
     return 1;
 }

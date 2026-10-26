@@ -378,6 +378,17 @@ Set these environment variables before running the game to control runtime featu
   `SR_PERF_FILE=<path>` writes CSV v2 columns
   `flip,present,frame_ms,frontend_ms,backend_ms,gpu_ms,over_budget`;
   `SR_PERF_FRAME_BUDGET_MS=<milliseconds>` overrides the over-budget threshold.
+  The CSV is now v4: it appends `texture_misses`, `texture_decode_wait_us`, `pso_fallbacks` and
+  `alt_off` to the v3 columns.
+- `SR_TRACE_STALLS=1`: Print a `[slow-frame]` line for every host flip longer than
+  `SR_SLOW_FRAME_MS` (default 1.25 x the frame budget) naming the three largest phases, scheduler
+  idle time, texture misses and decode wait, PSO fallback binds, and the previous flip's backend
+  stages. It works with or without `SR_PERF_FILE`.
+- `SR_PERF_ALTERNATE=<path>[,<path>...]`: Switch output-identical optimization paths (`texdecode`,
+  `merge`, `memo`, `indexed`) off every other `SR_PERF_ALTERNATE_PRESENTS` (default 60) guest
+  presentations, so one run measures them on and off in the same scene. The `alt_off` column
+  holds the paths currently off; bit 31 marks a flip whose frame straddled a change, which
+  comparisons should discard.
 - `PSP_VFPU_TABLES=<directory>`: Override the `assets/vfpu` lookup-table directory. The golden
   harness sets this explicitly so runtime execution does not depend on its working directory.
 - `SR_INTERP_MISS_LOG=<path>`: Write each distinct guest target that missed the generated

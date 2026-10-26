@@ -33,6 +33,24 @@ int main(void) {
 
     sr_perf_snapshot(&frame);
     require(frame.counters[SR_PERF_HLE_CALLS] == 0, "counters did not reset");
+
+    /* A/B alternation: ten presentations per half, two paths. */
+    _putenv_s("SR_PERF_ALTERNATE", "merge,memo");
+    _putenv_s("SR_PERF_ALTERNATE_PRESENTS", "10");
+    sr_perf_alternate_tick(0);
+    require(sr_perf_alternate_mask == 0, "alternation starts with paths on");
+    require(!sr_perf_path_off(SR_PATH_DRAW_MERGE), "merge should start on");
+    sr_perf_alternate_tick(9);
+    require(sr_perf_alternate_mask == 0, "first half keeps paths on");
+    sr_perf_alternate_tick(10);
+    require(sr_perf_path_off(SR_PATH_DRAW_MERGE), "merge should switch off");
+    require(sr_perf_path_off(SR_PATH_STATE_MEMO), "memo should switch off");
+    require(!sr_perf_path_off(SR_PATH_TEXTURE_DECODE),
+            "unnamed paths must stay on");
+    require(!sr_perf_path_off(SR_PATH_INDEXED_CAPTURE),
+            "unnamed paths must stay on");
+    sr_perf_alternate_tick(20);
+    require(sr_perf_alternate_mask == 0, "paths should switch back on");
     puts("perf_stats_test: PASS");
     return 0;
 }
