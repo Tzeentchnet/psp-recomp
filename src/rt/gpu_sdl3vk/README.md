@@ -1,118 +1,147 @@
 # SDL3 + Vulkan GPU renderer
 
-New GPU renderer for the recompiled runtime, replacing the Win32/GDI presentation path and
-(eventually) the software GE rasterizer in `src/rt/ge.c`. Built from scratch in this
-directory — it is the project's own Vulkan backend and does **not** reuse PPSSPP's GPU. (An
-earlier PPSSPP-GPU bridge under `src/rt/gpu_vk/` was a frozen experiment and has been removed.)
+This directory contains the runtime's original Vulkan renderer. It does not
+reuse PPSSPP's GPU implementation. The software GE in `ge.c` remains the
+pixel oracle and continues to perform vertex decode, transformation,
+clipping, primitive acceptance, and cull-order handling. The Vulkan backend
+receives accepted screen-space primitives through `GeBackend` and owns
+rasterization, persistent render targets, texture caching, and presentation.
 
-> **AI disclosure:** this renderer was written with substantial assistance from an LLM
-> (Anthropic Claude). It is an original implementation, but it reproduces PSP/GE pixel
-> semantics derived from PPSSPP's software renderer (through `ge.c`), so it is GPL-2.0-or-later.
-> See [`../../../CREDITS.md`](../../../CREDITS.md). Treat "faithfulness" claims below as
-> intent, not an audited guarantee.
+> **AI disclosure:** this renderer was written with substantial assistance
+> from an LLM (Anthropic Claude). It reproduces PSP/GE semantics derived from
+> the PPSSPP-informed software renderer and is GPL-2.0-or-later. See
+> [`../../../CREDITS.md`](../../../CREDITS.md).
 
-## Why this shape
+## Runtime model
 
-The software GE in `ge.c` is now the reference-correct implementation (clipping, PSP
-primitive acceptance, strip cull parity, depth semantics — all validated against PPSSPP's
-software renderer and in-game). The GPU renderer is introduced *under* it in phases, so at
-every step there is a known-good fallback and an A/B comparison target. `ge.c` stays the
-arbiter of GE semantics; this backend starts as a presenter and absorbs stages of the
-pipeline one at a time.
+Enable the backend with `SR_GPU=vk`. The renderer uses:
 
-## Build / toolchain
+- a 512x512 RGBA8 color envelope for each PSP framebuffer, with a 512x272
+  writable/presented region;
+- D16 depth images keyed by depth address and stride;
+- persistent GPU ownership, with watched guest-VRAM reads/writes providing
+  explicit materialization and invalidation;
+- direct GPU aliases for compatible sibling framebuffer textures and ordered
+  snapshots for self-feedback;
+- the software decoder for ordinary RAM textures, followed by a bounded
+  Vulkan texture cache and optional xBRZ upload scaling; and
+- direct swapchain presentation of GPU-resident targets.
 
-- SDL3 (`mingw-w64-ucrt-x86_64-sdl3`, currently 3.2.20) and Vulkan headers + loader
-  (`mingw-w64-ucrt-x86_64-vulkan-headers`, `-vulkan-loader`) from MSYS2 ucrt64 —
-  installed already. Link: `-lSDL3 -lvulkan-1`. Deploy `SDL3.dll` beside the exe.
-- Shader compiler for Phase 1+: `glslc` from the Vulkan SDK (`C:\VulkanSDK\1.4.350.0\Bin`).
-- Built into the game exe by the top-level `Makefile` (the runtime always links this SDL3 +
-  Vulkan backend; `-DSR_SDL3VK`). Inside that build, `SR_VIDEO=gdi` falls back to the classic
-  Win32/GDI window at runtime.
+The 512x512 color envelope is intentional. PSP titles commonly render to a
+512x272 region and later sample the same address as a 512x512 texture. Only
+the visible 480x272 area is copied to the swapchain.
 
-## Phases
+## Exact fragment ordering
 
-### Phase 0 — presentation (DONE, this directory)
-SDL3 window + Vulkan instance/device/swapchain. The software GE keeps rasterizing into
-guest VRAM; `gui_present` converts the flipped framebuffer to BGRA once (same loop as the
-GDI path) and `sdl3vk_present_rgba()` uploads + blits it to the swapchain (FIFO/vsync,
-aspect-correct letterbox). Input moves to SDL3 (keyboard + SDL_Gamepad, same PSP-bit
-mapping as gui.c). Deliverable: pixel-identical output to the GDI build at lower CPU cost,
-resizable window, fullscreen-capable.
+Vulkan fixed-function state is used only when
+`ge_vk_shader_direct_compatible()` proves that the PSP state is representable.
+All other draws use a destination-aware fragment path:
 
-### Phase 1 — GE draw capture → Vulkan rasterization (DONE, `ge_gpu.c`)
-Enabled with `SR_GPU=vk`. Implementation:
-- Capture seam: the runtime `GeBackend` descriptor in `src/rt/ge_shared.h`, registered via
-  `ge_set_backend`, at the top of `raster_tri` and `fill_sprite`. ge.c still does
-  vertex decode, T&L, near-clipping, primitive acceptance and cull-order reordering;
-  the backend receives finished screen-space primitives. The GDI build registers
-  nothing and is bit-identical to before.
-- Vulkan side: 512x272 RGBA8 + D16 offscreen target, classic render pass (LOAD/STORE),
-  one uber fragment shader (`shaders/psp.frag`: texfunc 0-7 + RGBA/double bits, alpha
-  test, fog, minz/maxz discard, clear mode), pipelines cached per
-  blend/depth/cull/write-mask key, dynamic viewport/scissor/blend-constants, vertices
-  pre-snapped to the 28.4 grid, noperspective interpolation of (u·rw, v·rw, rw) to
-  match the software inner loop exactly.
-- **Guest VRAM stays authoritative**: at every flush point (GE list END, framebuffer
-  retarget, texture-from-VRAM, CLUT-from-VRAM, present, software fallback) the target
-  is rendered and written back to guest VRAM + the software z-buffer in the native
-  format (16-bit round trip is lossless). Anything unsupported — lines, points,
-  doubled-alpha blend factors, min/max/absdiff blend equations, two distinct FIX
-  constants, partial-byte write masks — flushes and falls back to the software
-  rasterizer in correct order. Presentation/snapshot code is unchanged.
-- Not reproduced on GPU: ordered dithering (±4 LSB on 16-bit targets) and the integer
-  truncation of the software blender (±1 LSB).
-- A/B harness: run twice with `SR_FBSNAP=1` (once `SR_GPU=sw`), then
-  `python tools/ppmdiff.py dirA dirB`. Title/menu sequence matches pixel-exactly
-  except dithering. Measured GE cost on the intro: ~1700ms/60-frames software →
-  ~330ms/60-frames GPU (~5x).
+1. End the current render pass.
+2. Snapshot the prior RGBA8 color and D16 depth.
+3. Restart rendering with blending disabled and depth comparison set to
+   `ALWAYS`.
+4. Evaluate texture combine, alpha/color tests, stencil fail/depth-fail/pass,
+   PSP blend factors and equations, dithering, logic operations, native
+   framebuffer packing, bit write masks, and depth preservation in
+   `shaders/psp.frag`.
 
-### Phase 2 — textures on GPU (DONE, folded into Phase 1)
-- Texture cache keyed by (addr, fmt, dims, bufw, swizzle, wrap, filter) + a sparse FNV
-  content hash (CLUT RAM + format word included for CLUT4/CLUT8). Decode goes through
-  `ge_decode_tex_rgba()` in ge.c — the exact software sampler path — so swizzle/CLUT
-  behaviour is reference-correct by construction. 256 entries, full-drop eviction.
-- Invalidation is the content hash ("hash on use", PPSSPP-style). Render-to-texture
-  works because texturing from VRAM forces a flush+writeback first, then the hash
-  sees the new pixels.
+The manual path writes both the final color and either the source or preserved
+destination depth. Batches that need destination state merge only within one
+GE draw identity, preserving ordered behavior between draws. Clear operations
+also use this path so partial color, alpha, and depth clears remain exact.
 
-### Phase 3 — full GE on GPU / cleanup
-- Move T&L (world/view/proj, skinning, morphing, lighting, texgen) into the vertex shader;
-  CPU then only decodes vertex formats. Validate against `transform_vtx_clip` with the
-  existing SR_VDUMP machinery.
-- Render-to-texture chains (the hangar uses fbp swaps), depth readbacks if any game code
-  reads zbuf, small-tri rasterization rules (top-left bias already documented in
-  raster_tri) via conservative settings.
-- Only after Phase 3 ships does GDI/software become optional at build time. The software
-  GE is never deleted: it is the documentation of GE semantics.
+Destination alpha stores the PSP stencil value. RGB565, RGBA5551, RGBA4444,
+and RGBA8888 packing occurs before native bit masks are applied. Direct-path
+alpha writes are admitted only for destination-independent stencil
+operations.
+
+## Synchronization and ownership
+
+Color targets are identified by address, stride, and format. Their framebuffer
+binding is rebuilt whenever the depth address or stride changes. Compatible
+framebuffer aliases remain on the GPU; incompatible format or stride
+reinterpretations are materialized before software decode. CPU/DMA writes
+invalidate every overlapping 512-row texture envelope after first
+materializing GPU-newer render rows.
+
+Destination-aware draws use portable core Vulkan image copies and barriers;
+no framebuffer-feedback-loop extension is required. Presentation uses one
+render-finished semaphore per swapchain image so a semaphore is not reused
+while the presentation engine still owns it. All Vulkan objects are destroyed
+before the SDL device shuts down.
+
+## Build and shader checks
+
+The backend requires SDL3 and the Vulkan SDK. `psp.vert` and `psp.frag` are
+compiled with `glslangValidator`; checked-in SPIR-V initializers keep normal
+runtime builds independent of the shader compiler.
+
+```powershell
+python tools\compile_vulkan_shaders.py
+python tools\compile_vulkan_shaders.py --check
+```
+
+Equivalent Makefile targets are `shaders-vulkan` and
+`check-shaders-vulkan`. The pure state classifier/packer test is:
+
+```powershell
+mingw32-make test-vulkan-shader-state
+```
+
+Title CMake builds can run the corresponding
+`mga2_vulkan_shader_state` CTest.
+
+## Validation
+
+Set `SR_VK_VALIDATION=1` to require
+`VK_LAYER_KHRONOS_validation` and route warning/error messages to stderr. The
+runtime fails initialization if validation was requested but the layer is not
+installed.
+
+The Metal Gear Acid 2 integration has a deterministic visual gate:
+
+```powershell
+python tools\mga2\validate_vulkan.py `
+  --memstick build\mga2\arena-d3d12-shadow-fix\memstick `
+  --include-d3d12
+```
+
+It captures the Dead Cell cinematic at presentation 28000 and Arena gameplay
+at presentation 38000, then compares whole frames plus character, stage,
+map-preview, and card-UI regions against the software renderer. The fixed
+thresholds are calibrated against the native-resolution D3D12 cross-check;
+Vulkan does not receive a wider error budget.
 
 ## Files
 
-- `sdl3vk.h` — C ABI used by `gui.c` (`-DSR_SDL3VK`); also exports the shared Vulkan
-  device handles (`sdl3vk_get_vk`).
-- `sdl3vk.c` — Phase 0: window, device, swapchain, upload/blit presenter, SDL input.
-- `ge_gpu.h` / `ge_gpu.c` — Phase 1+2: capture, batching, pipeline/texture caches,
-  flush + guest-VRAM writeback. Hooks defined in `src/rt/ge_shared.h`.
-- `shaders/psp.vert`, `shaders/psp.frag` — compiled by glslc (`GLSLC` in the Makefile)
-  into `psp_{vert,frag}.inc` at build time.
-- `tools/ppmdiff.py`, `tools/ppm2png.py` (repo root) — A/B snapshot comparison.
+- `sdl3vk.c` / `sdl3vk.h`: SDL window/input, Vulkan instance/device,
+  swapchain, validation, and presentation.
+- `ge_gpu.c` / `ge_gpu.h`: persistent targets/depth, batching, descriptors,
+  texture cache, feedback, guest-VRAM coherence, and GE hooks.
+- `shader_state.c` / `shader_state.h`: pure direct/manual classification and
+  the packed 112-byte push-constant ABI.
+- `shaders/psp.vert` / `shaders/psp.frag`: Vulkan GE shaders.
+- `psp_vert.inc` / `psp_frag.inc`: generated checked-in SPIR-V.
 
 ## Environment variables
 
-- `SR_GPU=vk` — enable the Vulkan GE backend.
-- `SR_GPU=sw` — keep the reference software rasterizer.
-- `SR_GPU_LOG=1` — one line per flush (reason, batches, verts, target).
-- `SR_GPU_GE` and `SR_VIDEO=gdi` — legacy compatibility switches; prefer `SR_GPU`.
+- `SR_GPU=vk`: select Vulkan.
+- `SR_GPU=sw`: select the software oracle.
+- `SR_GPU_LOG=1`: log each Vulkan GE submit.
+- `SR_GPU_SAFE=1`: materialize a presented target into guest VRAM; intended
+  for guest-frame captures and diagnostics.
+- `SR_GPU_NORTT=1`: force framebuffer textures through materialization and
+  software decode for alias diagnostics.
+- `SR_GPU_PSP_SAMPLER=0`: disable integer-quantized PSP texture filtering.
+- `SR_NOCULL=1`: disable Vulkan culling for diagnostics.
+- `SR_VK_VALIDATION=1`: enable and require Khronos validation.
 
-## PSP/GE semantics that MUST carry over (hard-won, see ge.c comments)
+## Remaining renderer work
 
-1. Primitive acceptance: whole-triangle drops on out-of-grid / z-range vertices
-   (oor/ozp/ozn, depth-clamp on/off variants) happen **before** rasterization.
-2. Near clip only against z >= -w; clip-created vertices outside the 4096-grid kill their
-   sub-triangle (PPSSPP `clip_interpolate` rule).
-3. Culling is submission-order: rasterizer keeps positive-winding only; cull mode reverses
-   order, strips flip per parity. Map to VK_CULL_MODE with care (or pre-flip on CPU).
-4. Depth: 16-bit, often inverted range (viewport zscale < 0), GEQUAL tests, minz/maxz is a
-   per-pixel *discard* range, not a clamp.
-5. CLUT-format quirks, swizzled textures, color-double texfunc bit, alpha 0..0xFF with
-   0x80 = 1.0 semantics in blending.
+The backend still renders the offscreen GE target at native resolution.
+High-resolution Vulkan parity requires scaling color, depth, feedback,
+copies, raster coordinates, and presentation together. CPU-side GE
+transformation also remains shared with the software reference; moving T&L
+into a Vulkan vertex shader is a separate optimization, not a correctness
+requirement.

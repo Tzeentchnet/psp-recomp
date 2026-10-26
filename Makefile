@@ -80,18 +80,23 @@ src/ref/interp.cpp \
               src/rt/osk_win.c \
               src/rt/driver.c \
               src/rt/gpu_sdl3vk/sdl3vk.c \
-              src/rt/gpu_sdl3vk/ge_gpu.c
+              src/rt/gpu_sdl3vk/ge_gpu.c \
+              src/rt/gpu_sdl3vk/shader_state.c
 AT3_NAMES  := atrac atrac3 atrac3plus atrac3plusdec atrac3plusdsp get_bits compat fft mem
 AT3_OBJS   := $(addprefix $(BUILD_DIR)/at3_,$(addsuffix .o,$(AT3_NAMES))) \
               $(BUILD_DIR)/atrac_decode.o
 
 DXC        ?= dxc
+GLSLANG_VALIDATOR ?= glslangValidator
 
-.PHONY: all pipeline compile clean run shaders-d3d12 check-shaders-d3d12 \
+.PHONY: all pipeline compile clean run \
+        shaders-d3d12 check-shaders-d3d12 \
+        shaders-vulkan check-shaders-vulkan \
         test-d3d12-vertex test-dispatch-table test-fps-counter \
         test-perf-stats test-ge-patch-math \
         test-input-config test-module-loader test-memstick-state \
-        test-interpreter test-texture-scaler test-runtime
+        test-interpreter test-texture-scaler \
+        test-vulkan-shader-state test-runtime
 
 all: pipeline compile
 
@@ -241,6 +246,22 @@ shaders-d3d12:
 check-shaders-d3d12:
 	$(PYTHON) tools/compile_d3d12_shaders.py --dxc "$(DXC)" --check
 
+shaders-vulkan:
+	$(PYTHON) tools/compile_vulkan_shaders.py \
+		--glslang "$(GLSLANG_VALIDATOR)"
+
+check-shaders-vulkan:
+	$(PYTHON) tools/compile_vulkan_shaders.py \
+		--glslang "$(GLSLANG_VALIDATOR)" --check
+
+test-vulkan-shader-state:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt -Wall -Wextra \
+		tools/tests/vulkan_shader_state_test.c \
+		src/rt/gpu_sdl3vk/shader_state.c \
+		-o build/tests/vulkan_shader_state_test.exe
+	./build/tests/vulkan_shader_state_test.exe
+
 test-module-loader:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
@@ -322,7 +343,7 @@ test-texture-scaler:
 test-runtime: test-dispatch-table test-fps-counter test-perf-stats \
 	test-ge-patch-math test-input-config \
 	test-module-loader test-memstick-state test-interpreter \
-	test-texture-scaler
+	test-texture-scaler test-vulkan-shader-state
 
 # Generated C code gets huge. Cache the compiled object to avoid rebuilding it on runtime changes.
 $(BUILD_DIR)/$(GAME_NAME)_recomp.o: $(BUILD_DIR)/$(GAME_NAME)_recomp.c src/rt/recomp.h

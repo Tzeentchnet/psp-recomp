@@ -1,11 +1,9 @@
-/* SDL3 + Vulkan presentation backend, Phase 0 (see README.md for the full renderer plan).
+/* SDL3 + Vulkan window, input, device, and presentation backend.
  *
- * Scope of this phase: a real Vulkan swapchain fed by the (proven-correct) software GE.
- * Per frame: the 480x272 BGRA framebuffer is memcpy'd into a persistently-mapped host
- * buffer, copied to a device image, and vkCmdBlitImage'd (linear filter, aspect-correct
- * letterbox) onto the swapchain image. No pipelines/descriptors/shaders yet — those arrive
- * in Phase 1 with the GPU rasterizer. Input (keyboard + gamepads) comes from SDL3, mapped
- * to the same PSP sceCtrl bits gui.c uses.
+ * Software frames use a persistently mapped upload buffer. The Vulkan GE backend can
+ * instead present its persistent target directly. Both paths blit the visible 480x272
+ * region into an aspect-correct swapchain rectangle. Input (keyboard + gamepads) comes
+ * from SDL3 and maps to the same PSP sceCtrl bits as the other presenters.
  *
  * Deliberately single-frame-in-flight (fence after submit): presentation cost is trivial
  * and it keeps swapchain recreation and shutdown simple while the architecture settles.
@@ -39,7 +37,8 @@ static VkQueue          s_queue;
 static VkCommandPool    s_pool;
 static VkCommandBuffer  s_cmd;
 static VkFence          s_fence;
-static VkSemaphore      s_sem_acq, s_sem_done;
+static VkSemaphore      s_sem_acq, s_sem_done[8];
+static VkDebugUtilsMessengerEXT s_debug_messenger;
 
 static VkSwapchainKHR s_swap;
 static VkFormat       s_swap_fmt;
@@ -59,6 +58,61 @@ static int      s_pad_present;
 
 #define VK_TRY(expr) do { VkResult vr_ = (expr); if (vr_ != VK_SUCCESS) { \
     fprintf(stderr, "sdl3vk: %s failed: %d\n", #expr, (int)vr_); return 0; } } while (0)
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL validation_message(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT type,
+    const VkDebugUtilsMessengerCallbackDataEXT *data,
+    void *user) {
+    const char *level =
+        severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error" :
+        severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT ? "warning" :
+        "info";
+    (void)type;
+    (void)user;
+    fprintf(
+        stderr, "sdl3vk validation %s: %s\n",
+        level, data && data->pMessage ? data->pMessage : "(no message)");
+    return VK_FALSE;
+}
+
+static int validation_layer_available(void) {
+    uint32_t count = 0;
+    if (vkEnumerateInstanceLayerProperties(&count, NULL) != VK_SUCCESS)
+        return 0;
+    VkLayerProperties *properties =
+        (VkLayerProperties *)malloc(count * sizeof(*properties));
+    if (!properties) return 0;
+    int found = 0;
+    if (vkEnumerateInstanceLayerProperties(&count, properties) ==
+        VK_SUCCESS) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (strcmp(
+                    properties[i].layerName,
+                    "VK_LAYER_KHRONOS_validation") == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    free(properties);
+    return found;
+}
+
+static VkDebugUtilsMessengerCreateInfoEXT validation_create_info(void) {
+    VkDebugUtilsMessengerCreateInfoEXT info = {
+        VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT
+    };
+    info.messageSeverity =
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    info.messageType =
+        VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+    info.pfnUserCallback = validation_message;
+    return info;
+}
 
 static uint32_t find_mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
     VkPhysicalDeviceMemoryProperties mp;
@@ -153,14 +207,68 @@ int sdl3vk_init(const char *title) {
 
     Uint32 next = 0;
     const char * const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&next);
+    const char *instance_extensions[32];
+    const char *validation_layers[] = {
+        "VK_LAYER_KHRONOS_validation"
+    };
+    int validation =
+        getenv("SR_VK_VALIDATION") &&
+        getenv("SR_VK_VALIDATION")[0] &&
+        strcmp(getenv("SR_VK_VALIDATION"), "0") != 0;
+    if (next > 31) {
+        fprintf(stderr, "sdl3vk: too many required instance extensions\n");
+        return 0;
+    }
+    for (Uint32 i = 0; i < next; i++)
+        instance_extensions[i] = sdl_ext[i];
+    if (validation) {
+        if (!validation_layer_available()) {
+            fprintf(
+                stderr,
+                "sdl3vk: SR_VK_VALIDATION requested but "
+                "VK_LAYER_KHRONOS_validation is unavailable\n");
+            return 0;
+        }
+        int has_debug_utils = 0;
+        for (Uint32 i = 0; i < next; i++)
+            if (strcmp(
+                    instance_extensions[i],
+                    VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0)
+                has_debug_utils = 1;
+        if (!has_debug_utils)
+            instance_extensions[next++] =
+                VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    }
     VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
     ai.pApplicationName = "psp_recomp";
     ai.apiVersion = VK_API_VERSION_1_1;
     VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    VkDebugUtilsMessengerCreateInfoEXT debug_info =
+        validation_create_info();
     ici.pApplicationInfo = &ai;
     ici.enabledExtensionCount = next;
-    ici.ppEnabledExtensionNames = sdl_ext;
+    ici.ppEnabledExtensionNames = instance_extensions;
+    if (validation) {
+        ici.enabledLayerCount = 1;
+        ici.ppEnabledLayerNames = validation_layers;
+        ici.pNext = &debug_info;
+    }
     VK_TRY(vkCreateInstance(&ici, NULL, &s_inst));
+    if (validation) {
+        PFN_vkCreateDebugUtilsMessengerEXT create_debug =
+            (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+                s_inst, "vkCreateDebugUtilsMessengerEXT");
+        if (!create_debug ||
+            create_debug(
+                s_inst, &debug_info, NULL,
+                &s_debug_messenger) != VK_SUCCESS) {
+            fprintf(
+                stderr,
+                "sdl3vk: failed to create Vulkan validation messenger\n");
+            return 0;
+        }
+        fprintf(stderr, "sdl3vk: Vulkan validation enabled\n");
+    }
 
     if (!SDL_Vulkan_CreateSurface(s_win, s_inst, NULL, &s_surf)) {
         fprintf(stderr, "sdl3vk: SDL_Vulkan_CreateSurface failed: %s\n", SDL_GetError());
@@ -217,7 +325,9 @@ int sdl3vk_init(const char *title) {
     VK_TRY(vkCreateFence(s_dev, &fci, NULL, &s_fence));
     VkSemaphoreCreateInfo sci2 = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     VK_TRY(vkCreateSemaphore(s_dev, &sci2, NULL, &s_sem_acq));
-    VK_TRY(vkCreateSemaphore(s_dev, &sci2, NULL, &s_sem_done));
+    for (uint32_t i = 0; i < 8; i++)
+        VK_TRY(vkCreateSemaphore(
+            s_dev, &sci2, NULL, &s_sem_done[i]));
 
     /* Persistently-mapped upload buffer + the device-local blit source image. */
     VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
@@ -442,12 +552,12 @@ static int present_common(VkImage src, int srcw, int srch, int do_upload) {
         si.commandBufferCount = 1;
         si.pCommandBuffers = &s_cmd;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &s_sem_done;
+        si.pSignalSemaphores = &s_sem_done[idx];
         vkQueueSubmit(s_queue, 1, &si, s_fence);
 
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &s_sem_done;
+        pi.pWaitSemaphores = &s_sem_done[idx];
         pi.swapchainCount = 1;
         pi.pSwapchains = &s_swap;
         pi.pImageIndices = &idx;
@@ -483,11 +593,20 @@ void sdl3vk_shutdown(void) {
     if (s_staging)     vkDestroyBuffer(s_dev, s_staging, NULL);
     if (s_staging_mem) vkFreeMemory(s_dev, s_staging_mem, NULL);
     if (s_sem_acq)     vkDestroySemaphore(s_dev, s_sem_acq, NULL);
-    if (s_sem_done)    vkDestroySemaphore(s_dev, s_sem_done, NULL);
+    for (uint32_t i = 0; i < 8; i++)
+        if (s_sem_done[i])
+            vkDestroySemaphore(s_dev, s_sem_done[i], NULL);
     if (s_fence)       vkDestroyFence(s_dev, s_fence, NULL);
     if (s_pool)        vkDestroyCommandPool(s_dev, s_pool, NULL);
     if (s_dev)         vkDestroyDevice(s_dev, NULL);
     if (s_surf)        vkDestroySurfaceKHR(s_inst, s_surf, NULL);
+    if (s_debug_messenger) {
+        PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug =
+            (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+                s_inst, "vkDestroyDebugUtilsMessengerEXT");
+        if (destroy_debug)
+            destroy_debug(s_inst, s_debug_messenger, NULL);
+    }
     if (s_inst)        vkDestroyInstance(s_inst, NULL);
     if (s_pad)         SDL_CloseGamepad(s_pad);
     if (s_win)         SDL_DestroyWindow(s_win);
