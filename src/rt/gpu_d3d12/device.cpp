@@ -820,6 +820,8 @@ static int acquire_backbuffers(void) {
     return 1;
 }
 
+static int s_tearing;
+
 static int create_swapchain(IDXGIFactory4 *factory) {
     int pixel_width = 0;
     int pixel_height = 0;
@@ -840,6 +842,22 @@ static int create_swapchain(IDXGIFactory4 *factory) {
     desc.Scaling = DXGI_SCALING_STRETCH;
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    s_tearing = 0;
+    if (env_enabled("SR_D3D12_TEARING")) {
+        IDXGIFactory5 *factory5 = nullptr;
+        BOOL allowed = FALSE;
+        if (SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&factory5)))) {
+            factory5->CheckFeatureSupport(
+                DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowed, sizeof(allowed));
+            RELEASE_COM(factory5);
+        }
+        if (allowed) {
+            desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+            s_tearing = 1;
+        }
+        fprintf(stderr, "ged3d12: allow-tearing present %s\n",
+                allowed ? "enabled" : "unsupported");
+    }
 
     IDXGISwapChain1 *swapchain1 = nullptr;
     if (!check_hr(factory->CreateSwapChainForHwnd(
@@ -880,7 +898,9 @@ static int resize_swapchain(void) {
     for (UINT i = 0; i < FRAME_COUNT; i++) RELEASE_COM(s_backbuffers[i]);
     if (!check_hr(s_swapchain->ResizeBuffers(
             FRAME_COUNT, (UINT)pixel_width, (UINT)pixel_height,
-            DXGI_FORMAT_B8G8R8A8_UNORM, 0), "resize swapchain")) {
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            s_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0),
+            "resize swapchain")) {
         return 0;
     }
     if (!acquire_backbuffers()) return 0;
@@ -1092,13 +1112,21 @@ static int device_init(void) {
     return 1;
 }
 
+static double s_begin_fence_wait_ms;
+static UINT64 s_begin_fence_lag;
+
 static int begin_frame(UINT *frame_index) {
     UINT index = s_swapchain->GetCurrentBackBufferIndex();
     FrameContext *frame = &s_frames[index];
+    LONGLONG fence_start = stage_counter();
+    s_begin_fence_lag = frame->fence_value >
+        s_graphics_fence->GetCompletedValue()
+        ? frame->fence_value - s_graphics_fence->GetCompletedValue() : 0;
     if (!wait_for_fence(s_graphics_fence, frame->fence_value, s_graphics_event,
                         "wait for frame fence")) {
         return 0;
     }
+    s_begin_fence_wait_ms = stage_milliseconds(fence_start, stage_counter());
     if (frame->timestamp_valid && s_timestamp_map &&
         s_timestamp_frequency) {
         const UINT query = index * 2u;
@@ -1635,12 +1663,26 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     LONGLONG stage_start = stage_counter();
     int quit = 0;
     poll_input(&quit);
+    LONGLONG stage_poll_done = stage_counter();
     if (quit) return 0;
     if (!resize_swapchain()) return -2;
+    LONGLONG stage_resize_done = stage_counter();
 
     UINT frame_index;
     if (!begin_frame(&frame_index)) return -2;
     LONGLONG stage_begin_done = stage_counter();
+    if (s_stage_log && stage_milliseconds(stage_start, stage_begin_done) > 4.0) {
+        fprintf(stderr,
+                "ged3d12: slow begin flip=%llu total=%.2f poll=%.2f resize=%.2f "
+                "fence_wait=%.2f (lag=%llu) rest=%.2f ms\n",
+                (unsigned long long)s_vertex_frames,
+                stage_milliseconds(stage_start, stage_begin_done),
+                stage_milliseconds(stage_start, stage_poll_done),
+                stage_milliseconds(stage_poll_done, stage_resize_done),
+                s_begin_fence_wait_ms, (unsigned long long)s_begin_fence_lag,
+                stage_milliseconds(stage_resize_done, stage_begin_done) -
+                    s_begin_fence_wait_ms);
+    }
 
     GeD3D12VertexFrame vertices = {};
     if (!ged3d12_vertex_upload_pending(&vertices)) return -2;
@@ -1754,7 +1796,8 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
 
     ID3D12CommandList *lists[] = {s_command_list};
     s_graphics_queue->ExecuteCommandLists(1, lists);
-    HRESULT present_hr = s_swapchain->Present(0, 0);
+    HRESULT present_hr = s_swapchain->Present(
+        0, s_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
 
     UINT64 fence_value = s_next_graphics_fence++;
     HRESULT signal_hr = s_graphics_queue->Signal(s_graphics_fence, fence_value);
