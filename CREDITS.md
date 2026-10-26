@@ -121,6 +121,10 @@ licensing purposes.
   `third_party/ppsspp/LICENSE.TXT`).
 - **Media Foundation H.264 path** (`src/rt/h264_mf.c`) — uses Microsoft Media
   Foundation, part of Windows.
+- **Yakumo** (TeamGDB, MIT) — https://github.com/TeamGDB/Yakumo — design reference only: the
+  background texture decode, persistent pipeline-key prewarm, on/off path alternation and
+  slow-frame stall attribution follow ideas from its Vulkan renderer and performance tooling.
+  No Yakumo source is included.
 
 ## If you only want the recompiler, not PPSSPP
 
