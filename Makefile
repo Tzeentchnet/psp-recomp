@@ -89,7 +89,7 @@ DXC        ?= dxc
 
 .PHONY: all pipeline compile clean run shaders-d3d12 check-shaders-d3d12 \
         test-d3d12-vertex test-dispatch-table test-fps-counter \
-        test-perf-stats \
+        test-perf-stats test-ge-patch-math \
         test-input-config test-module-loader test-memstick-state \
         test-interpreter test-texture-scaler test-runtime
 
@@ -110,7 +110,7 @@ $(BUILD_DIR)/$(GAME_NAME)_imports.toml: $(GAME_ELF) tools/imports.py tools/analy
 	$(PYTHON) tools/imports.py $(GAME_ELF) $(GAME_BASE) --toml=$@
 
 # ge.c is the software rasterizer fallback, compile with -O2
-$(RT_GE_O): src/rt/ge.c src/rt/recomp.h
+$(RT_GE_O): src/rt/ge.c src/rt/ge_patch_math.h src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) -O2 -fno-math-errno -Wall -Wextra -Isrc/rt -c src/rt/ge.c -o $@
 
@@ -269,6 +269,13 @@ test-perf-stats:
 		-o build/tests/perf_stats_test.exe
 	./build/tests/perf_stats_test.exe
 
+test-ge-patch-math:
+	@$(PYTHON) -c "from pathlib import Path; Path(r'build/tests').mkdir(parents=True, exist_ok=True)"
+	$(CC) -std=c11 -O2 -ffp-contract=off -fno-strict-aliasing \
+		-Isrc/rt -Wall -Wextra tools/tests/ge_patch_math_test.c \
+		-o build/tests/ge_patch_math_test.exe -lm
+	./build/tests/ge_patch_math_test.exe
+
 test-memstick-state:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
@@ -312,7 +319,8 @@ test-texture-scaler:
 		third_party/xbrz/xbrz.cpp -o build/tests/texture_scaler_test.exe
 	./build/tests/texture_scaler_test.exe
 
-test-runtime: test-dispatch-table test-fps-counter test-perf-stats test-input-config \
+test-runtime: test-dispatch-table test-fps-counter test-perf-stats \
+	test-ge-patch-math test-input-config \
 	test-module-loader test-memstick-state test-interpreter \
 	test-texture-scaler
 

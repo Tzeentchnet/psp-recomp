@@ -20,6 +20,7 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
+#include "ge_patch_math.h"
 #include "ge_shared.h"
 #include "perf_stats.h"
 
@@ -98,6 +99,11 @@ enum {
 static GeState ge;
 static int s_ge_inited = 0;
 static uint32_t s_ge_frame = 0;
+static int s_spline_log = -1;
+static uint32_t s_spline_log_frame;
+static uint64_t s_spline_log_hash;
+static uint64_t s_spline_log_draws;
+static uint64_t s_spline_log_vertices;
 static GeDebugContext s_debug_context = {
     0, UINT32_MAX, 0, 0, 0, 0
 };
@@ -754,6 +760,23 @@ static int thru_ztest(void) {
 uint32_t ge_get_frame(void) { return s_ge_frame; }
 
 void ge_set_frame(uint32_t frame) {
+    if (s_spline_log < 0) {
+        s_spline_log = getenv("SR_GE_SPLINE_LOG") ? 1 : 0;
+        s_spline_log_frame = frame;
+        s_spline_log_hash = UINT64_C(14695981039346656037);
+    } else if (s_spline_log && frame != s_spline_log_frame) {
+        fprintf(
+            stderr,
+            "GESPLINE f=%u draws=%llu vertices=%llu hash=%016llx\n",
+            s_spline_log_frame,
+            (unsigned long long)s_spline_log_draws,
+            (unsigned long long)s_spline_log_vertices,
+            (unsigned long long)s_spline_log_hash);
+        s_spline_log_frame = frame;
+        s_spline_log_hash = UINT64_C(14695981039346656037);
+        s_spline_log_draws = 0;
+        s_spline_log_vertices = 0;
+    }
     s_ge_frame = frame;
     if (s_stat_on < 0) s_stat_on = getenv("SR_GESTAT") ? 1 : 0;
     if (s_stat_on && frame && (frame % 60) == 0) {
@@ -2347,6 +2370,28 @@ typedef struct {
     int r, g, b, a;
 } ModelVtx;
 
+static void log_spline_vertices(
+    const ModelVtx *vertices, int width, int height) {
+    if (s_spline_log != 1) return;
+    uint32_t dimensions[2] = {
+        (uint32_t)width, (uint32_t)height,
+    };
+    const unsigned char *bytes =
+        (const unsigned char *)dimensions;
+    for (size_t i = 0; i < sizeof(dimensions); i++) {
+        s_spline_log_hash ^= bytes[i];
+        s_spline_log_hash *= UINT64_C(1099511628211);
+    }
+    size_t count = (size_t)width * (size_t)height;
+    bytes = (const unsigned char *)vertices;
+    for (size_t i = 0; i < count * sizeof(*vertices); i++) {
+        s_spline_log_hash ^= bytes[i];
+        s_spline_log_hash *= UINT64_C(1099511628211);
+    }
+    s_spline_log_draws++;
+    s_spline_log_vertices += count;
+}
+
 static void decode_model_vtx(uint32_t addr, const VFmt *vf, ModelVtx *out) {
     read_pos(addr, vf, &out->x, &out->y, &out->z);
     read_nrm(addr, vf, &out->nx, &out->ny, &out->nz);
@@ -3200,37 +3245,7 @@ static int patch_param_256(int index, int tessellation) {
 }
 
 static float patch_ge_lerp(float a, float b, int k) {
-    if (k == 0) return a;
-    if (k == 256) return b;
-    uint32_t bits_a, bits_b;
-    memcpy(&bits_a, &a, sizeof(bits_a));
-    memcpy(&bits_b, &b, sizeof(bits_b));
-    int exponent_a = (int)((bits_a >> 23) & 0xffu);
-    int exponent_b = (int)((bits_b >> 23) & 0xffu);
-    int exponent =
-        exponent_a > exponent_b ? exponent_a : exponent_b;
-    if (exponent == 0) return 0.0f;
-    int fixed_a = 0;
-    int fixed_b = 0;
-    if (exponent_a != 0 && exponent - exponent_a < 16) {
-        fixed_a = (int)(
-            ((bits_a & 0x7fffffu) | 0x800000u) >>
-            (exponent - exponent_a + 8));
-        if ((bits_a & 0x80000000u) != 0) fixed_a = -fixed_a;
-    }
-    if (exponent_b != 0 && exponent - exponent_b < 16) {
-        fixed_b = (int)(
-            ((bits_b & 0x7fffffu) | 0x800000u) >>
-            (exponent - exponent_b + 8));
-        if ((bits_b & 0x80000000u) != 0) fixed_b = -fixed_b;
-    }
-    int result = fixed_a + (((fixed_b - fixed_a) * k) >> 8);
-    if (exponent <= 15)
-        return ldexpf((float)result, exponent - 127 - 15);
-    uint32_t scale_bits = (uint32_t)(exponent - 15) << 23;
-    float scale;
-    memcpy(&scale, &scale_bits, sizeof(scale));
-    return (float)result * scale;
+    return sr_patch_ge_lerp(a, b, k);
 }
 
 static float patch_bezier_eval(
@@ -3246,7 +3261,7 @@ static float patch_bezier_eval(
 }
 
 static int patch_color_lerp(int a, int b, int k) {
-    return a + (((b - a) * k) >> 8);
+    return sr_patch_color_lerp(a, b, k);
 }
 
 static int patch_bezier_color(const int values[4], int k) {
@@ -3299,27 +3314,12 @@ static void patch_spline_param(
 static float patch_spline_eval(
     const float values[4], const int alpha[6],
     float *before, float *after) {
-    float left0 = patch_ge_lerp(values[0], values[1], alpha[0]);
-    float left1 = patch_ge_lerp(values[1], values[2], alpha[1]);
-    float left2 = patch_ge_lerp(values[2], values[3], alpha[2]);
-    float middle0 = patch_ge_lerp(left0, left1, alpha[3]);
-    float middle1 = patch_ge_lerp(left1, left2, alpha[4]);
-    if (before) *before = middle0;
-    if (after) *after = middle1;
-    return patch_ge_lerp(middle0, middle1, alpha[5]);
+    return sr_patch_spline_eval(values, alpha, before, after);
 }
 
 static int patch_spline_color(
     const int values[4], const int alpha[6]) {
-    int left0 =
-        patch_color_lerp(values[0], values[1], alpha[0]);
-    int left1 =
-        patch_color_lerp(values[1], values[2], alpha[1]);
-    int left2 =
-        patch_color_lerp(values[2], values[3], alpha[2]);
-    return patch_color_lerp(
-        patch_color_lerp(left0, left1, alpha[3]),
-        patch_color_lerp(left1, left2, alpha[4]), alpha[5]);
+    return sr_patch_spline_color(values, alpha);
 }
 
 static float patch_axis_eval(
@@ -3590,6 +3590,319 @@ static void evaluate_patch_columns(
         out->nz = -out->nz;
     }
 }
+
+#if SR_GE_PATCH_SIMD_SUPPORTED
+enum {
+    PATCH_SIMD_POSITION = 0,
+    PATCH_SIMD_BEFORE = 3,
+    PATCH_SIMD_AFTER = 6,
+    PATCH_SIMD_TEXCOORD = 9,
+    PATCH_SIMD_COMPONENTS = 11,
+    PATCH_SIMD_MAX_STRIDE = 256,
+};
+
+static __m128 patch_spline_float_row(
+    const float *values, const int segments[4], int point,
+    int one_segment) {
+    if (one_segment)
+        return _mm_set1_ps(values[segments[0] + point]);
+    return _mm_setr_ps(
+        values[segments[0] + point],
+        values[segments[1] + point],
+        values[segments[2] + point],
+        values[segments[3] + point]);
+}
+
+static __m128i patch_spline_color_row(
+    const int *values, const int segments[4], int point,
+    int one_segment) {
+    if (one_segment)
+        return _mm_set1_epi32(values[segments[0] + point]);
+    return _mm_setr_epi32(
+        values[segments[0] + point],
+        values[segments[1] + point],
+        values[segments[2] + point],
+        values[segments[3] + point]);
+}
+
+static void patch_spline_alpha4(
+    const PatchAxisParam *params, int count, int first,
+    SrPatchSplineAlpha4 *out, int segments[4], int ks[4]) {
+    int alpha[6][4];
+    for (int lane = 0; lane < 4; lane++) {
+        int index = first + lane;
+        if (index >= count) index = count - 1;
+        segments[lane] = params[index].segment;
+        ks[lane] = params[index].k;
+        for (int level = 0; level < 6; level++)
+            alpha[level][lane] = params[index].alpha[level];
+    }
+    sr_patch_spline_alpha4_init(out, alpha);
+}
+
+static int patch_spline_simd_enabled(void) {
+    static int scalar_override = -1;
+    if (scalar_override < 0)
+        scalar_override = getenv("SR_GE_SCALAR_SPLINE") ? 1 : 0;
+    return !scalar_override;
+}
+
+static void evaluate_spline_grid_simd(
+    const ModelVtx *control, int points_u,
+    const PatchAxisParam *params_u, int width,
+    const PatchAxisParam *params_v, int height,
+    int has_texcoord, int needs_normal, int flip_normal,
+    ModelVtx *vertices) {
+    float columns[PATCH_SIMD_COMPONENTS * PATCH_SIMD_MAX_STRIDE];
+    int column_colors[4 * PATCH_SIMD_MAX_STRIDE];
+    int stride = (points_u + 3) & ~3;
+
+    for (int v = 0; v < height; v++) {
+        const PatchAxisParam *param_v = &params_v[v];
+        int alpha_values[6][4];
+        for (int level = 0; level < 6; level++) {
+            for (int lane = 0; lane < 4; lane++)
+                alpha_values[level][lane] = param_v->alpha[level];
+        }
+        SrPatchSplineAlpha4 alpha_v;
+        sr_patch_spline_alpha4_init(&alpha_v, alpha_values);
+
+        for (int column = 0; column < points_u; column += 4) {
+            for (int component = 0; component < 3; component++) {
+                __m128 values[4];
+                for (int row = 0; row < 4; row++) {
+                    float lanes[4];
+                    for (int lane = 0; lane < 4; lane++) {
+                        int point_column = column + lane;
+                        if (point_column >= points_u)
+                            point_column = points_u - 1;
+                        const ModelVtx *point = &control[
+                            (param_v->segment + row) * points_u +
+                            point_column];
+                        lanes[lane] = (&point->x)[component];
+                    }
+                    values[row] = _mm_loadu_ps(lanes);
+                }
+                __m128 before, after;
+                __m128 position = sr_patch_spline_eval4(
+                    values, &alpha_v,
+                    needs_normal ? &before : NULL,
+                    needs_normal ? &after : NULL);
+                _mm_storeu_ps(
+                    &columns[
+                        (PATCH_SIMD_POSITION + component) * stride +
+                        column],
+                    position);
+                if (needs_normal) {
+                    _mm_storeu_ps(
+                        &columns[
+                            (PATCH_SIMD_BEFORE + component) * stride +
+                            column],
+                        before);
+                    _mm_storeu_ps(
+                        &columns[
+                            (PATCH_SIMD_AFTER + component) * stride +
+                            column],
+                        after);
+                }
+            }
+            if (has_texcoord) {
+                for (int component = 0; component < 2; component++) {
+                    __m128 values[4];
+                    for (int row = 0; row < 4; row++) {
+                        float lanes[4];
+                        for (int lane = 0; lane < 4; lane++) {
+                            int point_column = column + lane;
+                            if (point_column >= points_u)
+                                point_column = points_u - 1;
+                            const ModelVtx *point = &control[
+                                (param_v->segment + row) * points_u +
+                                point_column];
+                            lanes[lane] = (&point->u)[component];
+                        }
+                        values[row] = _mm_loadu_ps(lanes);
+                    }
+                    _mm_storeu_ps(
+                        &columns[
+                            (PATCH_SIMD_TEXCOORD + component) * stride +
+                            column],
+                        sr_patch_spline_eval4(
+                            values, &alpha_v, NULL, NULL));
+                }
+            }
+            for (int component = 0; component < 4; component++) {
+                __m128i values[4];
+                for (int row = 0; row < 4; row++) {
+                    int lanes[4];
+                    for (int lane = 0; lane < 4; lane++) {
+                        int point_column = column + lane;
+                        if (point_column >= points_u)
+                            point_column = points_u - 1;
+                        const ModelVtx *point = &control[
+                            (param_v->segment + row) * points_u +
+                            point_column];
+                        lanes[lane] =
+                            ((&point->r)[component] << 7) | 0x7f;
+                    }
+                    values[row] = _mm_loadu_si128(
+                        (const __m128i *)lanes);
+                }
+                _mm_storeu_si128(
+                    (__m128i *)&column_colors[
+                        component * stride + column],
+                    sr_patch_spline_color4(values, &alpha_v));
+            }
+        }
+
+        for (int first_u = 0; first_u < width; first_u += 4) {
+            SrPatchSplineAlpha4 alpha_u;
+            int segments[4], ks[4];
+            patch_spline_alpha4(
+                params_u, width, first_u,
+                &alpha_u, segments, ks);
+            int one_segment =
+                segments[0] == segments[1] &&
+                segments[0] == segments[2] &&
+                segments[0] == segments[3];
+            float positions[3][4];
+            float tangent_u[3][4], tangent_v[3][4];
+            float texcoords[2][4];
+            int colors[4][4];
+
+            for (int component = 0; component < 3; component++) {
+                __m128 values[4];
+                const float *position_values = &columns[
+                    (PATCH_SIMD_POSITION + component) * stride];
+                for (int point = 0; point < 4; point++) {
+                    values[point] = patch_spline_float_row(
+                        position_values, segments, point, one_segment);
+                }
+                __m128 before, after;
+                _mm_storeu_ps(
+                    positions[component],
+                    sr_patch_spline_eval4(
+                        values, &alpha_u, &before, &after));
+                if (needs_normal) {
+                    _mm_storeu_ps(
+                        tangent_u[component],
+                        sr_patch_ge_add4(
+                            after,
+                            _mm_xor_ps(
+                                before,
+                                _mm_set1_ps(-0.0f))));
+                    const float *before_values = &columns[
+                        (PATCH_SIMD_BEFORE + component) * stride];
+                    const float *after_values = &columns[
+                        (PATCH_SIMD_AFTER + component) * stride];
+                    for (int point = 0; point < 4; point++) {
+                        values[point] = patch_spline_float_row(
+                            before_values, segments,
+                            point, one_segment);
+                    }
+                    __m128 vertical_before =
+                        sr_patch_spline_eval4(
+                            values, &alpha_u, NULL, NULL);
+                    for (int point = 0; point < 4; point++) {
+                        values[point] = patch_spline_float_row(
+                            after_values, segments,
+                            point, one_segment);
+                    }
+                    _mm_storeu_ps(
+                        tangent_v[component],
+                        sr_patch_ge_add4(
+                            sr_patch_spline_eval4(
+                                values, &alpha_u, NULL, NULL),
+                            _mm_xor_ps(
+                                vertical_before,
+                                _mm_set1_ps(-0.0f))));
+                }
+            }
+
+            if (has_texcoord) {
+                for (int component = 0; component < 2; component++) {
+                    __m128 values[4];
+                    const float *texcoord_values = &columns[
+                        (PATCH_SIMD_TEXCOORD + component) * stride];
+                    for (int point = 0; point < 4; point++) {
+                        values[point] = patch_spline_float_row(
+                            texcoord_values, segments,
+                            point, one_segment);
+                    }
+                    _mm_storeu_ps(
+                        texcoords[component],
+                        sr_patch_spline_eval4(
+                            values, &alpha_u, NULL, NULL));
+                }
+            }
+
+            for (int component = 0; component < 4; component++) {
+                __m128i values[4];
+                const int *color_values =
+                    &column_colors[component * stride];
+                for (int point = 0; point < 4; point++) {
+                    values[point] = patch_spline_color_row(
+                        color_values, segments, point, one_segment);
+                }
+                _mm_storeu_si128(
+                    (__m128i *)colors[component],
+                    _mm_srai_epi32(
+                        sr_patch_spline_color4(values, &alpha_u), 7));
+            }
+
+            int lanes = width - first_u;
+            if (lanes > 4) lanes = 4;
+            for (int lane = 0; lane < lanes; lane++) {
+                ModelVtx *out =
+                    &vertices[v * width + first_u + lane];
+                out->x = positions[0][lane];
+                out->y = positions[1][lane];
+                out->z = positions[2][lane];
+                if (has_texcoord) {
+                    out->u = texcoords[0][lane];
+                    out->v = texcoords[1][lane];
+                } else {
+                    out->u =
+                        (float)segments[lane] +
+                        (float)ks[lane] / 256.0f;
+                    out->v =
+                        (float)param_v->segment +
+                        (float)param_v->k / 256.0f;
+                }
+                out->r = clamp8(colors[0][lane]);
+                out->g = clamp8(colors[1][lane]);
+                out->b = clamp8(colors[2][lane]);
+                out->a = clamp8(colors[3][lane]);
+
+                if (needs_normal) {
+                    for (int component = 0; component < 3; component++) {
+                        int first = (component + 1) % 3;
+                        int second = (component + 2) % 3;
+                        PatchRowTerm terms[2] = {
+                            patch_ge_product(
+                                tangent_u[first][lane],
+                                tangent_v[second][lane]),
+                            patch_ge_product(
+                                -tangent_u[second][lane],
+                                tangent_v[first][lane]),
+                        };
+                        (&out->nx)[component] =
+                            patch_ge_row_sum(terms);
+                    }
+                } else {
+                    out->nx = 0.0f;
+                    out->ny = 0.0f;
+                    out->nz = 1.0f;
+                }
+                if (flip_normal) {
+                    out->nx = -out->nx;
+                    out->ny = -out->ny;
+                    out->nz = -out->nz;
+                }
+            }
+        }
+    }
+}
+#endif
 
 static Vtx *s_patch_through_cache;
 static CVtx *s_patch_transform_cache;
@@ -3941,28 +4254,43 @@ static void draw_spline(uint32_t op) {
           ((ge.tex_map_mode >> 8) & 3u) >= 2u));
     SrPerfCategory patch_previous =
         sr_perf_switch(SR_PERF_PATCH_EVAL);
-    for (int v = 0; v < height; v++) {
-        PatchColumn columns[4];
-        int column_segment = -1;
-        for (int u = 0; u < width; u++) {
-            const PatchAxisParam *param_u = &params_u[u];
-            const PatchAxisParam *param_v = &params_v[v];
-            if (param_u->segment != column_segment) {
-                column_segment = param_u->segment;
-                build_patch_columns(
-                    control, points_u, column_segment, param_v, 1,
-                    vf.tc_off >= 0, needs_normal, columns);
+#if SR_GE_PATCH_SIMD_SUPPORTED
+    if (patch_spline_simd_enabled()) {
+        int flip_normal =
+            (ge.patch_facing ^
+             (uint32_t)(ge.reverse_normal != 0)) != 0;
+        evaluate_spline_grid_simd(
+            control, points_u,
+            params_u, width, params_v, height,
+            vf.tc_off >= 0, needs_normal, flip_normal,
+            vertices);
+    } else
+#endif
+    {
+        for (int v = 0; v < height; v++) {
+            PatchColumn columns[4];
+            int column_segment = -1;
+            for (int u = 0; u < width; u++) {
+                const PatchAxisParam *param_u = &params_u[u];
+                const PatchAxisParam *param_v = &params_v[v];
+                if (param_u->segment != column_segment) {
+                    column_segment = param_u->segment;
+                    build_patch_columns(
+                        control, points_u, column_segment, param_v, 1,
+                        vf.tc_off >= 0, needs_normal, columns);
+                }
+                evaluate_patch_columns(
+                    columns, param_u, 1,
+                    (float)param_u->segment +
+                        (float)param_u->k / 256.0f,
+                    (float)param_v->segment +
+                        (float)param_v->k / 256.0f,
+                    vf.tc_off >= 0, needs_normal,
+                    &vertices[v * width + u]);
             }
-            evaluate_patch_columns(
-                columns, param_u, 1,
-                (float)param_u->segment +
-                    (float)param_u->k / 256.0f,
-                (float)param_v->segment +
-                    (float)param_v->k / 256.0f,
-                vf.tc_off >= 0, needs_normal,
-                &vertices[v * width + u]);
         }
     }
+    log_spline_vertices(vertices, width, height);
     sr_perf_switch(SR_PERF_PATCH_DRAW);
     draw_patch_grid(vertices, width, height, &vf);
     sr_perf_switch(patch_previous);
