@@ -183,6 +183,7 @@ resolution (960x544) are the defaults:
 ```ini
 renderer = d3d12
 internal_resolution = 2
+anti_aliasing = off
 ```
 
 Run `mygame.exe --configure` to reopen the dialog without starting the game.
@@ -191,6 +192,9 @@ explicitly at startup. `internal_resolution` accepts every integer from 1
 through 8 and applies to D3D12 color/depth targets, feedback snapshots,
 copies, readback, and presentation. PSP-visible framebuffer addresses,
 coordinates, and captures remain at their original logical resolution.
+`anti_aliasing` accepts `off` or `smaa`. SMAA selects the D3D12-only SMAA 1x
+High post-process, runs at the selected internal resolution, and is included in
+D3D12 captures. The launcher rejects SMAA with software or Vulkan rendering.
 On Variable Rate Shading hardware, direct draws retain scaled geometry,
 coverage and D16 depth while shading at approximately one fragment per logical
 PSP pixel. Set `SR_D3D12_VRS=0` to force full-rate shading; on the measured RTX

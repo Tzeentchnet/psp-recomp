@@ -20,11 +20,17 @@ enum SrGraphicsRenderer {
     SR_GRAPHICS_RENDERER_VULKAN,
 };
 
+enum SrGraphicsAntiAliasing {
+    SR_GRAPHICS_ANTI_ALIASING_OFF,
+    SR_GRAPHICS_ANTI_ALIASING_SMAA,
+};
+
 typedef struct SrGraphicsConfig {
     int renderer;
     uint32_t internal_resolution;
     uint32_t texture_scale;
     uint32_t d3d12_full_rate;
+    int anti_aliasing;
 } SrGraphicsConfig;
 
 void sr_graphics_config_defaults(SrGraphicsConfig *config);
@@ -36,6 +42,7 @@ int sr_graphics_config_first_run(void);
 const SrGraphicsConfig *sr_graphics_config_get(void);
 const char *sr_graphics_config_path(void);
 const char *sr_graphics_renderer_name(int renderer);
+const char *sr_graphics_anti_aliasing_name(int anti_aliasing);
 int sr_graphics_config_save(
     const SrGraphicsConfig *config, char *error, size_t error_size);
 int sr_graphics_effective_scale(

@@ -117,6 +117,10 @@ licensing purposes.
 
 - **SDL3** (`SDL3.dll`, `src/rt/gpu_d3d12/`, `src/rt/gpu_sdl3vk/`) — zlib license — https://libsdl.org
 - **Vulkan loader / headers** — Apache-2.0 — https://github.com/KhronosGroup/Vulkan-Loader
+- **SMAA** (`third_party/smaa/`, D3D12 optional post-processing) — MIT —
+  https://github.com/iryoku/smaa at commit
+  `71c806a838bdd7d517df19192a20f0c61b3ca29d`. The original shader and
+  precomputed area/search lookup data are included with their license.
 - **PSPSDK headers/defines/constants** — BSD-compatible (see top of
   `third_party/ppsspp/LICENSE.TXT`).
 - **Media Foundation H.264 path** (`src/rt/h264_mf.c`) — uses Microsoft Media

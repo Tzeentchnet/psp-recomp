@@ -2,6 +2,8 @@
 
 #include "device.h"
 #include "framebuffer.h"
+#include "smaa.h"
+#include "../graphics_config.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -29,6 +31,7 @@ static UINT s_display_width;
 static UINT s_display_height;
 static UINT s_capture_row_pitch;
 static UINT64 s_capture_bytes;
+static bool s_smaa_enabled;
 
 static bool check_hr(HRESULT hr, const char *operation) {
     if (SUCCEEDED(hr)) return true;
@@ -202,10 +205,16 @@ bool ged3d12_present_init(void) {
         fprintf(stderr, "ged3d12: present renderer already initialized\n");
         return false;
     }
+    const SrGraphicsConfig *config = sr_graphics_config_get();
+    s_smaa_enabled =
+        config &&
+        config->anti_aliasing == SR_GRAPHICS_ANTI_ALIASING_SMAA;
     if (!create_display_texture() ||
         !create_capture_readback() ||
         !create_present_root_signature() ||
-        !create_present_pipeline()) {
+        !create_present_pipeline() ||
+        (s_smaa_enabled &&
+         !ged3d12_smaa_init(s_display_width, s_display_height))) {
         ged3d12_present_shutdown();
         return false;
     }
@@ -213,6 +222,7 @@ bool ged3d12_present_init(void) {
 }
 
 void ged3d12_present_shutdown(void) {
+    ged3d12_smaa_shutdown();
     RELEASE_COM(s_present_pipeline);
     RELEASE_COM(s_present_root_signature);
     RELEASE_COM(s_capture_readback);
@@ -223,6 +233,7 @@ void ged3d12_present_shutdown(void) {
     s_display_height = 0;
     s_capture_row_pitch = 0;
     s_capture_bytes = 0;
+    s_smaa_enabled = false;
 }
 
 bool ged3d12_present_record(
@@ -252,6 +263,13 @@ bool ged3d12_present_record(
                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     s_display_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
+    ID3D12Resource *present_texture = s_display_texture;
+    if (s_smaa_enabled) {
+        if (!ged3d12_smaa_record(s_display_texture)) return false;
+        present_texture = ged3d12_smaa_output();
+        if (!present_texture) return false;
+    }
+
     GeD3D12DescriptorSlice display_srv = {};
     if (!ged3d12_srv_alloc(1, &display_srv)) return false;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
@@ -260,7 +278,7 @@ bool ged3d12_present_record(
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
     ged3d12_device()->CreateShaderResourceView(
-        s_display_texture, &srv, display_srv.cpu);
+        present_texture, &srv, display_srv.cpu);
 
     transition(command_list, backbuffer,
                D3D12_RESOURCE_STATE_PRESENT,
@@ -293,11 +311,23 @@ bool ged3d12_present_capture_record(void) {
         return false;
     }
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
-    transition(command_list, s_display_texture, s_display_state,
+    ID3D12Resource *capture_source =
+        s_smaa_enabled
+            ? ged3d12_smaa_output()
+            : s_display_texture;
+    if (!capture_source) {
+        fprintf(stderr, "ged3d12: present capture source is unavailable\n");
+        return false;
+    }
+    D3D12_RESOURCE_STATES capture_state =
+        s_smaa_enabled
+            ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            : s_display_state;
+    transition(command_list, capture_source, capture_state,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
 
     D3D12_TEXTURE_COPY_LOCATION source = {};
-    source.pResource = s_display_texture;
+    source.pResource = capture_source;
     source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_TEXTURE_COPY_LOCATION destination = {};
     destination.pResource = s_capture_readback;
@@ -311,10 +341,11 @@ bool ged3d12_present_capture_record(void) {
     command_list->CopyTextureRegion(
         &destination, 0, 0, 0, &source, nullptr);
 
-    transition(command_list, s_display_texture,
+    transition(command_list, capture_source,
                D3D12_RESOURCE_STATE_COPY_SOURCE,
                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    s_display_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (!s_smaa_enabled)
+        s_display_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     return true;
 }
 

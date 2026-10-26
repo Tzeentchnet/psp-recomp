@@ -21,6 +21,22 @@ SHADERS = (
     ("psp_ps.hlsl", "ps_6_0", "main_direct", "psp_ps_direct.inc"),
     ("present_vs.hlsl", "vs_6_0", "main", "present_vs.inc"),
     ("present_ps.hlsl", "ps_6_0", "main", "present_ps.inc"),
+    ("smaa.hlsl", "vs_6_0", "smaa_edge_vs", "smaa_edge_vs.inc"),
+    ("smaa.hlsl", "ps_6_0", "smaa_edge_ps", "smaa_edge_ps.inc"),
+    ("smaa.hlsl", "vs_6_0", "smaa_blend_vs", "smaa_blend_vs.inc"),
+    ("smaa.hlsl", "ps_6_0", "smaa_blend_ps", "smaa_blend_ps.inc"),
+    (
+        "smaa.hlsl",
+        "vs_6_0",
+        "smaa_neighborhood_vs",
+        "smaa_neighborhood_vs.inc",
+    ),
+    (
+        "smaa.hlsl",
+        "ps_6_0",
+        "smaa_neighborhood_ps",
+        "smaa_neighborhood_ps.inc",
+    ),
 )
 
 

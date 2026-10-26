@@ -32,6 +32,7 @@ RT_D3D12_PIPELINE_O := $(BUILD_DIR)/gpu_d3d12_pipeline.o
 RT_D3D12_PIPELINE_KEY_O := $(BUILD_DIR)/gpu_d3d12_pipeline_key.o
 RT_D3D12_PRESENT_O := $(BUILD_DIR)/gpu_d3d12_present.o
 RT_D3D12_PRESENT_LAYOUT_O := $(BUILD_DIR)/gpu_d3d12_present_layout.o
+RT_D3D12_SMAA_O := $(BUILD_DIR)/gpu_d3d12_smaa.o
 RT_D3D12_SHADER_STATE_O := $(BUILD_DIR)/gpu_d3d12_shader_state.o
 RT_D3D12_TEXTURE_O := $(BUILD_DIR)/gpu_d3d12_texture.o
 RT_D3D12_TEXTURE_KEY_O := $(BUILD_DIR)/gpu_d3d12_texture_key.o
@@ -176,6 +177,7 @@ $(RT_D3D12_PIPELINE_KEY_O): src/rt/gpu_d3d12/pipeline_key.cpp \
 
 $(RT_D3D12_PRESENT_O): src/rt/gpu_d3d12/present.cpp src/rt/gpu_d3d12/present.h \
                        src/rt/gpu_d3d12/device.h \
+                       src/rt/gpu_d3d12/smaa.h src/rt/graphics_config.h \
                        src/rt/gpu_d3d12/shaders/present_vs.inc \
                        src/rt/gpu_d3d12/shaders/present_ps.inc
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
@@ -185,6 +187,20 @@ $(RT_D3D12_PRESENT_LAYOUT_O): src/rt/gpu_d3d12/present_layout.cpp \
                               src/rt/gpu_d3d12/present.h
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/present_layout.cpp -o $@
+
+$(RT_D3D12_SMAA_O): src/rt/gpu_d3d12/smaa.cpp \
+                     src/rt/gpu_d3d12/smaa.h \
+                     src/rt/gpu_d3d12/device.h \
+                     src/rt/gpu_d3d12/shaders/smaa_edge_vs.inc \
+                     src/rt/gpu_d3d12/shaders/smaa_edge_ps.inc \
+                     src/rt/gpu_d3d12/shaders/smaa_blend_vs.inc \
+                     src/rt/gpu_d3d12/shaders/smaa_blend_ps.inc \
+                     src/rt/gpu_d3d12/shaders/smaa_neighborhood_vs.inc \
+                     src/rt/gpu_d3d12/shaders/smaa_neighborhood_ps.inc \
+                     third_party/smaa/Textures/AreaTex.h \
+                     third_party/smaa/Textures/SearchTex.h
+	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
+	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/smaa.cpp -o $@
 
 $(RT_D3D12_SHADER_STATE_O): src/rt/gpu_d3d12/shader_state.cpp \
                             src/rt/gpu_d3d12/shader_state.h \
@@ -353,6 +369,7 @@ compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_AUDIO_XAUDIO2_O) $(R
          $(RT_D3D12_FRAMEBUFFER_O) $(RT_D3D12_FRAMEBUFFER_KEY_O) \
          $(RT_D3D12_VERTEX_O) $(RT_D3D12_PIPELINE_O) $(RT_D3D12_PIPELINE_KEY_O) \
          $(RT_D3D12_PRESENT_O) $(RT_D3D12_PRESENT_LAYOUT_O) \
+         $(RT_D3D12_SMAA_O) \
          $(RT_D3D12_SHADER_STATE_O) \
          $(RT_D3D12_TEXTURE_O) $(RT_D3D12_TEXTURE_KEY_O) \
          $(RT_TEXTURE_SCALER_O) $(RT_XBRZ_O) $(AT3_OBJS)
@@ -368,6 +385,7 @@ compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_AUDIO_XAUDIO2_O) $(R
 		$(RT_D3D12_PIPELINE_KEY_O) \
 		$(RT_D3D12_PRESENT_O) \
 		$(RT_D3D12_PRESENT_LAYOUT_O) \
+		$(RT_D3D12_SMAA_O) \
 		$(RT_D3D12_SHADER_STATE_O) \
 		$(RT_D3D12_TEXTURE_O) \
 		$(RT_D3D12_TEXTURE_KEY_O) \

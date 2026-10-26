@@ -35,6 +35,8 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
   preservation for generated stores, DMA, MPEG output, and block transfers;
 - a persistent `(480×scale)×(272×scale)` display texture and fullscreen-triangle
   presentation pass that preserve the exact PSP aspect ratio through window resizing;
+- optional SMAA 1x High at the internal display resolution, using the official
+  MIT-licensed area/search lookup data before the existing aspect-correct presentation;
 - direct presentation from compatible cached targets, with a scaled 512×512 color
   envelope for PSP power-of-two sampling and a scaled 512×272 render region;
 - Tier-1/2 Variable Rate Shading for direct scaled draws, keeping geometry,
@@ -157,6 +159,13 @@ snapshot path.
 Until an asynchronous specialized PSO is ready, the draw clears its direct flag and falls
 back to the exact snapshot ubershader. Draw submission and the GPU-newer ownership mark
 occur together before presentation.
+
+`smaa.cpp` owns the optional three-pass post-process: luma edge detection,
+blending-weight calculation, and neighborhood blending. The setting is persisted as
+`anti_aliasing = smaa`; `off` retains the original presentation path. SMAA runs on the
+internal-resolution display texture, and D3D12 captures read the filtered output when it
+is enabled. The official shader and lookup data live in `third_party/smaa/` with their
+MIT license.
 
 Regenerate or verify the shaders with:
 

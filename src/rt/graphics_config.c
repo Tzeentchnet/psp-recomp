@@ -65,12 +65,21 @@ static int renderer_from_name(const char *name) {
     return -1;
 }
 
+static int anti_aliasing_from_name(const char *name) {
+    if (text_equal(name, "off") || text_equal(name, "none"))
+        return SR_GRAPHICS_ANTI_ALIASING_OFF;
+    if (text_equal(name, "smaa"))
+        return SR_GRAPHICS_ANTI_ALIASING_SMAA;
+    return -1;
+}
+
 void sr_graphics_config_defaults(SrGraphicsConfig *config) {
     if (!config) return;
     config->renderer = SR_GRAPHICS_RENDERER_D3D12;
     config->internal_resolution = 2u;
     config->texture_scale = 1u;
     config->d3d12_full_rate = 0u;
+    config->anti_aliasing = SR_GRAPHICS_ANTI_ALIASING_OFF;
 }
 
 const char *sr_graphics_renderer_name(int renderer) {
@@ -79,6 +88,14 @@ const char *sr_graphics_renderer_name(int renderer) {
         case SR_GRAPHICS_RENDERER_D3D12: return "d3d12";
         case SR_GRAPHICS_RENDERER_SOFTWARE: return "sw";
         case SR_GRAPHICS_RENDERER_VULKAN: return "vk";
+        default: return NULL;
+    }
+}
+
+const char *sr_graphics_anti_aliasing_name(int anti_aliasing) {
+    switch (anti_aliasing) {
+        case SR_GRAPHICS_ANTI_ALIASING_OFF: return "off";
+        case SR_GRAPHICS_ANTI_ALIASING_SMAA: return "smaa";
         default: return NULL;
     }
 }
@@ -224,6 +241,23 @@ int sr_graphics_config_parse(
             }
             seen |= setting;
             config->d3d12_full_rate = (uint32_t)parsed;
+        } else if (text_equal(name, "anti_aliasing")) {
+            int anti_aliasing = anti_aliasing_from_name(value);
+            setting = 16u;
+            if (anti_aliasing < 0) {
+                set_error(
+                    error, error_size, line_number,
+                    "expected off or smaa", value);
+                return 0;
+            }
+            if (seen & setting) {
+                set_error(
+                    error, error_size, line_number,
+                    "duplicate setting", name);
+                return 0;
+            }
+            seen |= setting;
+            config->anti_aliasing = anti_aliasing;
         } else {
             set_error(
                 error, error_size, line_number,
@@ -340,10 +374,11 @@ int sr_graphics_config_init(void) {
     fprintf(
         stderr,
         "graphics: loaded %s (renderer %s, internal resolution %ux, "
-        "texture scale %ux, D3D12 full-rate %s)\n",
+        "texture scale %ux, D3D12 full-rate %s, anti-aliasing %s)\n",
         s_config_path, sr_graphics_renderer_name(s_config.renderer),
         s_config.internal_resolution, s_config.texture_scale,
-        s_config.d3d12_full_rate ? "on" : "off");
+        s_config.d3d12_full_rate ? "on" : "off",
+        sr_graphics_anti_aliasing_name(s_config.anti_aliasing));
     return 1;
 }
 
@@ -363,6 +398,7 @@ int sr_graphics_config_save(
     const SrGraphicsConfig *config, char *error, size_t error_size) {
     char temporary[1100];
     const char *renderer;
+    const char *anti_aliasing;
     FILE *file;
     int length;
     int ok;
@@ -375,7 +411,9 @@ int sr_graphics_config_save(
         return 0;
     }
     renderer = sr_graphics_renderer_name(config->renderer);
-    if (!renderer ||
+    anti_aliasing =
+        sr_graphics_anti_aliasing_name(config->anti_aliasing);
+    if (!renderer || !anti_aliasing ||
         config->internal_resolution < SR_GRAPHICS_SCALE_MIN ||
         config->internal_resolution > SR_GRAPHICS_SCALE_MAX ||
         config->texture_scale < SR_TEXTURE_SCALE_MIN ||
@@ -403,13 +441,15 @@ int sr_graphics_config_save(
     }
     ok = fprintf(
             file,
-        "# PSP recomp graphics config v2\n"
-            "renderer = %s\n"
+        "# PSP recomp graphics config v3\n"
+        "renderer = %s\n"
         "internal_resolution = %u\n"
         "texture_scale = %u\n"
-        "d3d12_full_rate = %u\n",
+        "d3d12_full_rate = %u\n"
+        "anti_aliasing = %s\n",
         renderer, config->internal_resolution,
-        config->texture_scale, config->d3d12_full_rate) > 0 &&
+        config->texture_scale, config->d3d12_full_rate,
+        anti_aliasing) > 0 &&
          fflush(file) == 0 &&
          _commit(_fileno(file)) == 0;
     if (fclose(file) != 0) ok = 0;
@@ -438,10 +478,11 @@ int sr_graphics_config_save(
     fprintf(
         stderr,
         "graphics: saved %s (renderer %s, internal resolution %ux, "
-        "texture scale %ux, D3D12 full-rate %s)\n",
+        "texture scale %ux, D3D12 full-rate %s, anti-aliasing %s)\n",
         s_config_path, renderer, config->internal_resolution,
         config->texture_scale,
-        config->d3d12_full_rate ? "on" : "off");
+        config->d3d12_full_rate ? "on" : "off",
+        anti_aliasing);
     return 1;
 }
 

@@ -37,6 +37,9 @@ int main(void) {
     check_u32("default internal resolution", config.internal_resolution, 2);
     check_u32("default texture scale", config.texture_scale, 1);
     check_u32("default D3D12 full-rate", config.d3d12_full_rate, 0);
+    check_u32(
+        "default anti-aliasing", (uint32_t)config.anti_aliasing,
+        SR_GRAPHICS_ANTI_ALIASING_OFF);
 
     check_true(
         "parse graphics config",
@@ -45,7 +48,8 @@ int main(void) {
             "renderer = software\n"
             "internal_resolution = 8\n"
             "texture_scale = 4\n"
-            "d3d12_full_rate = 1\n",
+            "d3d12_full_rate = 1\n"
+            "anti_aliasing = smaa\n",
             error, sizeof(error)));
     check_u32(
         "parsed renderer", (uint32_t)config.renderer,
@@ -53,6 +57,9 @@ int main(void) {
     check_u32("parsed internal resolution", config.internal_resolution, 8);
     check_u32("parsed texture scale", config.texture_scale, 4);
     check_u32("parsed D3D12 full-rate", config.d3d12_full_rate, 1);
+    check_u32(
+        "parsed anti-aliasing", (uint32_t)config.anti_aliasing,
+        SR_GRAPHICS_ANTI_ALIASING_SMAA);
 
     sr_graphics_config_defaults(&config);
     check_true(
@@ -64,6 +71,9 @@ int main(void) {
             error, sizeof(error)));
     check_u32("v1 texture scale default", config.texture_scale, 1);
     check_u32("v1 D3D12 full-rate default", config.d3d12_full_rate, 0);
+    check_u32(
+        "v1 anti-aliasing default", (uint32_t)config.anti_aliasing,
+        SR_GRAPHICS_ANTI_ALIASING_OFF);
 
     sr_graphics_config_defaults(&config);
     check_true(
@@ -95,9 +105,15 @@ int main(void) {
             error, sizeof(error)));
     sr_graphics_config_defaults(&config);
     check_true(
+        "reject invalid anti-aliasing",
+        !sr_graphics_config_parse(
+            &config, "anti_aliasing=msaa\n",
+            error, sizeof(error)));
+    sr_graphics_config_defaults(&config);
+    check_true(
         "reject unknown setting",
         !sr_graphics_config_parse(
-            &config, "antialiasing=msaa\n",
+            &config, "anisotropic_filtering=16\n",
             error, sizeof(error)));
 
     temp_length = GetTempPathA(
@@ -122,6 +138,7 @@ int main(void) {
     config.internal_resolution = 6;
     config.texture_scale = 3;
     config.d3d12_full_rate = 1;
+    config.anti_aliasing = SR_GRAPHICS_ANTI_ALIASING_SMAA;
     check_true(
         "save graphics config",
         sr_graphics_config_save(&config, error, sizeof(error)));
@@ -139,6 +156,10 @@ int main(void) {
     check_u32(
         "saved D3D12 full-rate",
         sr_graphics_config_get()->d3d12_full_rate, 1);
+    check_u32(
+        "saved anti-aliasing",
+        (uint32_t)sr_graphics_config_get()->anti_aliasing,
+        SR_GRAPHICS_ANTI_ALIASING_SMAA);
     {
         FILE *file = fopen(config_path, "rb");
         char text[256] = {0};
@@ -159,6 +180,9 @@ int main(void) {
             check_true(
                 "saved D3D12 full-rate text",
                 strstr(text, "d3d12_full_rate = 1") != NULL);
+            check_true(
+                "saved anti-aliasing text",
+                strstr(text, "anti_aliasing = smaa") != NULL);
         }
     }
     _putenv_s("SR_D3D12_SCALE", "7");
