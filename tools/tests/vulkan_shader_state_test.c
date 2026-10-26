@@ -145,7 +145,7 @@ static void test_state_packing(void) {
     source.ztest = 7;
     source.zwrite_disable = 0;
 
-    ge_vk_shader_state_build(&source, 1, 0, &state);
+    ge_vk_shader_state_build(&source, 1, 0, 4, &state);
     check_u32("push constant size", sizeof(state), 112);
     check_u32("shader flags", shader_flags(&state), expected_flags);
     check_u32("texture function", (uint32_t)state.config[0] & 7u, 3);
@@ -175,7 +175,7 @@ static void test_state_packing(void) {
     check_u32("logic state", (uint32_t)state.fragment[1], 1u | (6u << 8));
     check_u32(
         "depth state", (uint32_t)state.fragment[3],
-        1u | (7u << 8) | (1u << 16));
+        1u | (7u << 8) | (1u << 16) | (4u << 24));
 }
 
 static void test_clear_packing(void) {
@@ -192,7 +192,7 @@ static void test_clear_packing(void) {
     source.blend_enable = 1;
     source.logic_op_enable = 1;
 
-    ge_vk_shader_state_build(&source, 1, 1, &state);
+    ge_vk_shader_state_build(&source, 1, 1, 8, &state);
     check_u32(
         "clear flags", shader_flags(&state), GE_VK_SHADER_CLEAR);
     check_u32("clear alpha test", (uint32_t)state.config[1], 1);
@@ -201,6 +201,18 @@ static void test_clear_packing(void) {
     check_u32("clear blend", (uint32_t)state.blend[0], 0);
     check_u32("clear logic", (uint32_t)state.fragment[1] & 1u, 0);
     check_u32("clear mode", (uint32_t)state.fragment[2], 0x500);
+    check_u32(
+        "clear render scale", (uint32_t)state.fragment[3] >> 24, 8);
+}
+
+static void test_invalid_render_scale(void) {
+    GeState source;
+    GeVkShaderState state;
+    memset(&source, 0, sizeof(source));
+    ge_vk_shader_state_build(&source, 0, 0, 0, &state);
+    check_u32(
+        "invalid render scale defaults to one",
+        (uint32_t)state.fragment[3] >> 24, 1);
 }
 
 int main(void) {
@@ -208,6 +220,7 @@ int main(void) {
     test_stencil_classification();
     test_state_packing();
     test_clear_packing();
+    test_invalid_render_scale();
     if (s_failures) {
         fprintf(stderr, "%d Vulkan shader-state test(s) failed\n", s_failures);
         return 1;

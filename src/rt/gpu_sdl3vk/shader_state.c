@@ -95,7 +95,7 @@ static uint32_t pack_dimensions(int width, int height) {
 
 void ge_vk_shader_state_build(
     const GeState *state, int perspective, int sprite_semantics,
-    GeVkShaderState *out) {
+    uint32_t render_scale, GeVkShaderState *out) {
     uint32_t flags = 0;
     uint32_t row;
     int clear;
@@ -103,6 +103,8 @@ void ge_vk_shader_state_build(
     (void)sprite_semantics;
     memset(out, 0, sizeof(*out));
     if (!state) return;
+    if (render_scale < 1u || render_scale > 8u)
+        render_scale = 1u;
 
     clear = state->clear != 0;
     textured = state->tex_enable && !clear && state->tex_addr != 0;
@@ -188,5 +190,6 @@ void ge_vk_shader_state_build(
     out->fragment[3] =
         (state->ztest_enable ? 1u : 0u) |
         ((state->ztest & 7u) << 8) |
-        ((!state->zwrite_disable ? 1u : 0u) << 16);
+        ((!state->zwrite_disable ? 1u : 0u) << 16) |
+        (render_scale << 24);
 }

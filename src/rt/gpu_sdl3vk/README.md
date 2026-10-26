@@ -16,8 +16,8 @@ rasterization, persistent render targets, texture caching, and presentation.
 
 Enable the backend with `SR_GPU=vk`. The renderer uses:
 
-- a 512x512 RGBA8 color envelope for each PSP framebuffer, with a 512x272
-  writable/presented region;
+- a 512x512 logical RGBA8 color envelope for each PSP framebuffer, with a
+  512x272 logical writable region, scaled physically from 1x through 8x;
 - D16 depth images keyed by depth address and stride;
 - persistent GPU ownership, with watched guest-VRAM reads/writes providing
   explicit materialization and invalidation;
@@ -27,9 +27,11 @@ Enable the backend with `SR_GPU=vk`. The renderer uses:
   Vulkan texture cache and optional xBRZ upload scaling; and
 - direct swapchain presentation of GPU-resident targets.
 
-The 512x512 color envelope is intentional. PSP titles commonly render to a
-512x272 region and later sample the same address as a 512x512 texture. Only
-the visible 480x272 area is copied to the swapchain.
+The 512x512 logical color envelope is intentional. PSP titles commonly render
+to a 512x272 region and later sample the same address as a 512x512 texture.
+Color, depth, destination snapshots, framebuffer feedback, block transfers,
+scissors, and presentation use the same configured internal-resolution scale.
+Only the visible scaled 480x272 area is copied to the swapchain.
 
 ## Exact fragment ordering
 
@@ -111,7 +113,10 @@ It captures the Dead Cell cinematic at presentation 28000 and Arena gameplay
 at presentation 38000, then compares whole frames plus character, stage,
 map-preview, and card-UI regions against the software renderer. The fixed
 thresholds are calibrated against the native-resolution D3D12 cross-check;
-Vulkan does not receive a wider error budget.
+Vulkan does not receive a wider error budget. The gate sets `SR_VK_SCALE=1`
+so exact native-resolution comparisons are independent of the user's quality
+setting. Separate 4x scene and 8x boot runs validate high-resolution resource
+scaling with the Khronos validation layer.
 
 ## Files
 
@@ -131,6 +136,8 @@ Vulkan does not receive a wider error budget.
 - `SR_GPU_LOG=1`: log each Vulkan GE submit.
 - `SR_GPU_SAFE=1`: materialize a presented target into guest VRAM; intended
   for guest-frame captures and diagnostics.
+- `SR_VK_SCALE=1` through `8`: override the configured internal resolution
+  for diagnostics and native-resolution pixel gates.
 - `SR_GPU_NORTT=1`: force framebuffer textures through materialization and
   software decode for alias diagnostics.
 - `SR_GPU_PSP_SAMPLER=0`: disable integer-quantized PSP texture filtering.
@@ -139,9 +146,6 @@ Vulkan does not receive a wider error budget.
 
 ## Remaining renderer work
 
-The backend still renders the offscreen GE target at native resolution.
-High-resolution Vulkan parity requires scaling color, depth, feedback,
-copies, raster coordinates, and presentation together. CPU-side GE
-transformation also remains shared with the software reference; moving T&L
-into a Vulkan vertex shader is a separate optimization, not a correctness
+CPU-side GE transformation remains shared with the software reference; moving
+T&L into a Vulkan vertex shader is a separate optimization, not a correctness
 requirement.

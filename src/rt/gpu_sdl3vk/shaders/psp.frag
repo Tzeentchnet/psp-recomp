@@ -139,6 +139,10 @@ ivec2 texture_offset_psp() {
         int(pc.texture_state.w >> 16));
 }
 
+int render_scale_psp() {
+    return max((pc.fragment_state.w >> 24) & 255, 1);
+}
+
 int wrap_coordinate(int value, int size, bool clamp_value) {
     if (clamp_value) return clamp(value, 0, size - 1);
     int wrapped = value % size;
@@ -147,11 +151,14 @@ int wrap_coordinate(int value, int size, bool clamp_value) {
 
 ivec4 texture_texel(ivec2 coordinate, int flags) {
     ivec2 dimensions = texture_dimensions_psp();
+    int scale = (flags & FLAG_FRAMEBUFFER) != 0
+        ? render_scale_psp() : 1;
+    dimensions *= scale;
     coordinate.x = wrap_coordinate(
         coordinate.x, dimensions.x, (flags & FLAG_CLAMP_U) != 0);
     coordinate.y = wrap_coordinate(
         coordinate.y, dimensions.y, (flags & FLAG_CLAMP_V) != 0);
-    coordinate += texture_offset_psp();
+    coordinate += texture_offset_psp() * scale;
     return ivec4(
         texelFetch(u_texture, coordinate, 0) * 255.0 + 0.5);
 }
@@ -161,6 +168,8 @@ ivec4 psp_lerp(ivec4 first, ivec4 second, int weight) {
 }
 
 vec4 sample_texture_psp(vec2 uv, bool nearest, int flags) {
+    if ((flags & FLAG_FRAMEBUFFER) != 0)
+        uv *= float(render_scale_psp());
     if (nearest)
         return vec4(texture_texel(ivec2(floor(uv)), flags));
     vec2 position = uv - 0.5;
@@ -455,7 +464,8 @@ void main() {
     int source_depth;
     int flags;
     ivec4 source = shade_source(source_depth, flags);
-    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    ivec2 render_pixel = ivec2(gl_FragCoord.xy);
+    ivec2 pixel = render_pixel / render_scale_psp();
     int format = pc.stencil_state.w & 3;
 
     if ((flags & FLAG_DIRECT) != 0) {
@@ -477,11 +487,12 @@ void main() {
     }
 
     ivec4 old_storage = ivec4(
-        texelFetch(u_destination_color, pixel, 0) * 255.0 + 0.5);
+        texelFetch(u_destination_color, render_pixel, 0) *
+        255.0 + 0.5);
     ivec4 destination = old_storage;
     if (format == 0) destination.a = 0;
     int old_depth = int(
-        texelFetch(u_destination_depth, pixel, 0).r *
+        texelFetch(u_destination_depth, render_pixel, 0).r *
         65535.0 + 0.5);
 
     ivec4 result = source;

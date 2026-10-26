@@ -37,6 +37,6 @@ int ge_vk_shader_direct_compatible(const GeState *state);
 int ge_vk_shader_direct_stencil_write(const GeState *state);
 void ge_vk_shader_state_build(
     const GeState *state, int perspective, int sprite_semantics,
-    GeVkShaderState *out);
+    uint32_t render_scale, GeVkShaderState *out);
 
 #endif

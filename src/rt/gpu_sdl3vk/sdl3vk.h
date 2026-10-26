@@ -28,9 +28,11 @@ void sdl3vk_set_title(const char *title);
 int  sdl3vk_present_rgba(const uint32_t *px);
 
 /* Present directly from a VkImage owned by the GPU rasterizer (ge_gpu.c). The image
- * must be 512x272 RGBA8 in TRANSFER_SRC_OPTIMAL layout; the visible 480x272 region is
- * blitted with the same letterboxing as sdl3vk_present_rgba. Same return semantics. */
-int  sdl3vk_present_image(void *vk_image);
+ * must be RGBA8 in TRANSFER_SRC_OPTIMAL layout; source_width/source_height identify its
+ * visible region. The region is blitted with the same letterboxing as
+ * sdl3vk_present_rgba. Same return semantics. */
+int  sdl3vk_present_image(
+    void *vk_image, uint32_t source_width, uint32_t source_height);
 
 /* Input state captured by the last present (PSP sceCtrl button mask / analog stick). */
 uint32_t sdl3vk_buttons(void);

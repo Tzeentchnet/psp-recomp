@@ -9,9 +9,9 @@
  * backend through the GeBackend seam. Every primitive renders on the GPU — there is no
  * software-rasterizer fallback. Provably compatible states use fixed-function Vulkan;
  * all destination-dependent states use ordered color/depth snapshots and exact shader
- * evaluation. GE framebuffers are persistent 512x512 RGBA8 sampling envelopes with
- * 512x272 D16 render regions. Guest VRAM is read when a target is created or invalidated
- * and written only when a CPU consumer needs GPU-newer content.
+ * evaluation. GE framebuffers are persistent scaled 512x512 RGBA8 sampling envelopes
+ * with scaled 512x272 D16 render regions. Guest VRAM is read when a target is created or
+ * invalidated and written only when a CPU consumer needs GPU-newer content.
  *
  * Batches accumulate across GE lists and are submitted only when something consumes the
  * target: a retarget, a present, self-sampling (render-to-texture feedback), buffer
@@ -45,6 +45,7 @@
 #include "../ge_shared.h"
 
 #include <vulkan/vulkan.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -192,12 +193,57 @@ static unsigned long s_cnt_direct = 0, s_cnt_manual = 0, s_cnt_dst_snap = 0;
 static uint32_t s_texscratch[512 * 512];
 static uint32_t *s_texscaled;
 static uint32_t s_texture_scale = 1u;
+static uint32_t s_render_scale = 1u;
 static uint32_t s_pxscratch[FB_W * FB_TEX_H];
+static uint32_t s_scaled_color_row[FB_W * SR_GRAPHICS_SCALE_MAX];
+static uint16_t s_scaled_depth_row[FB_W * SR_GRAPHICS_SCALE_MAX];
 
 #define VKC(expr) do { VkResult vr_ = (expr); if (vr_ != VK_SUCCESS) { \
     fprintf(stderr, "gegpu: %s failed: %d\n", #expr, (int)vr_); return 0; } } while (0)
 
 /* ---- small helpers -------------------------------------------------------------------- */
+
+static uint32_t render_width(void) {
+    return FB_W * s_render_scale;
+}
+
+static uint32_t render_height(void) {
+    return FB_H * s_render_scale;
+}
+
+static uint32_t texture_height(void) {
+    return FB_TEX_H * s_render_scale;
+}
+
+static int configure_render_scale(const SrGraphicsConfig *config) {
+    const char *override = getenv("SR_VK_SCALE");
+    uint32_t scale = config ? config->internal_resolution : 1u;
+    if (override && override[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long parsed = strtoul(override, &end, 10);
+        if (errno || !end || *end ||
+            parsed < SR_GRAPHICS_SCALE_MIN ||
+            parsed > SR_GRAPHICS_SCALE_MAX) {
+            fprintf(
+                stderr,
+                "gegpu: SR_VK_SCALE must be an integer from %u to %u\n",
+                SR_GRAPHICS_SCALE_MIN, SR_GRAPHICS_SCALE_MAX);
+            return 0;
+        }
+        scale = (uint32_t)parsed;
+    }
+    if (scale < SR_GRAPHICS_SCALE_MIN ||
+        scale > SR_GRAPHICS_SCALE_MAX) {
+        fprintf(
+            stderr,
+            "gegpu: internal resolution must be from %u to %u\n",
+            SR_GRAPHICS_SCALE_MIN, SR_GRAPHICS_SCALE_MAX);
+        return 0;
+    }
+    s_render_scale = scale;
+    return 1;
+}
 
 static uint32_t find_mem(uint32_t bits, VkMemoryPropertyFlags want) {
     VkPhysicalDeviceMemoryProperties mp;
@@ -450,15 +496,18 @@ static void batches_reset(void) {
 }
 
 static void render_pass_begin(Target *t) {
+    uint32_t width = render_width();
+    uint32_t height = render_height();
     to_layout(s_cmd, t->img, VK_IMAGE_ASPECT_COLOR_BIT, &t->layout,
               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     to_layout(s_cmd, t->dep->img, VK_IMAGE_ASPECT_DEPTH_BIT, &t->dep->layout,
               VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     VkRenderPassBeginInfo rbi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rbi.renderPass = s_rp; rbi.framebuffer = t->fb;
-    rbi.renderArea.extent.width = FB_W; rbi.renderArea.extent.height = FB_H;
+    rbi.renderArea.extent.width = width;
+    rbi.renderArea.extent.height = height;
     vkCmdBeginRenderPass(s_cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport vp = { 0, 0, FB_W, FB_H, 0.0f, 1.0f };
+    VkViewport vp = { 0, 0, (float)width, (float)height, 0.0f, 1.0f };
     vkCmdSetViewport(s_cmd, 0, 1, &vp);
 }
 
@@ -480,8 +529,8 @@ static void snapshot_destination(Target *t) {
     copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy.srcSubresource.layerCount = 1;
     copy.dstSubresource = copy.srcSubresource;
-    copy.extent.width = FB_W;
-    copy.extent.height = FB_H;
+    copy.extent.width = render_width();
+    copy.extent.height = render_height();
     copy.extent.depth = 1;
     vkCmdCopyImage(
         s_cmd, t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -571,6 +620,8 @@ static void stats_tick(void) {
 
 /* Write the target's GPU contents back to guest VRAM (eviction, CLUT-from-VRAM). */
 static int target_readback(Target *t) {
+    uint32_t physical_width = render_width();
+    uint32_t sample_offset = s_render_scale / 2u;
     if (!t->gpu_valid) return 1;
     if (t == s_cur && s_nbatch) submit_pending();
     if (t->clean_gen == t->render_gen) return 1;   /* VRAM already current */
@@ -580,18 +631,32 @@ static int target_readback(Target *t) {
     VkBufferImageCopy c = {0};
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     c.imageSubresource.layerCount = 1;
-    c.imageExtent.width = FB_W; c.imageExtent.height = FB_H; c.imageExtent.depth = 1;
+    c.imageExtent.width = physical_width;
+    c.imageExtent.height = render_height();
+    c.imageExtent.depth = 1;
     vkCmdCopyImageToBuffer(s_cmd, t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s_xfer, 1, &c);
     if (!cmd_submit_wait()) return 0;
     const uint32_t *src = (const uint32_t *)s_xfer_map;
     uint32_t wb = t->stride < DRAW_W ? t->stride : DRAW_W;
     for (uint32_t y = 0; y < FB_H; y++) {
+        const uint32_t *row =
+            src +
+            (y * s_render_scale + sample_offset) * physical_width +
+            sample_offset;
         if (t->fmt == 3) {
-            memcpy((uint32_t *)SR_HOST((0x04000000u | t->fba) + y * t->stride * 4),
-                   src + y * FB_W, wb * 4);
+            uint32_t *dst = (uint32_t *)SR_HOST(
+                (0x04000000u | t->fba) + y * t->stride * 4);
+            if (s_render_scale == 1u) {
+                memcpy(dst, row, wb * 4);
+            } else {
+                for (uint32_t x = 0; x < wb; x++)
+                    dst[x] = row[x * s_render_scale];
+            }
         } else {
             uint16_t *dst = (uint16_t *)SR_HOST((0x04000000u | t->fba) + y * t->stride * 2);
-            for (uint32_t x = 0; x < wb; x++) dst[x] = (uint16_t)fb_pack(src[y * FB_W + x], t->fmt);
+            for (uint32_t x = 0; x < wb; x++)
+                dst[x] = (uint16_t)fb_pack(
+                    row[x * s_render_scale], t->fmt);
         }
     }
     t->clean_gen = t->render_gen;
@@ -624,6 +689,8 @@ static void target_materialize_upload_aliases(Target *target) {
 
 static int target_upload(Target *t) {
     uint32_t *dst = s_pxscratch;
+    uint32_t *physical = (uint32_t *)s_xfer_map;
+    uint32_t physical_width = render_width();
     uint32_t bpp = t->fmt == 3 ? 4u : 2u;
     target_materialize_upload_aliases(t);
     for (uint32_t y = 0; y < FB_TEX_H; y++) {
@@ -649,14 +716,28 @@ static int target_upload(Target *t) {
         }
         for (uint32_t x = t->stride; x < FB_W; x++) dst[y * FB_W + x] = 0;
     }
-    memcpy(s_xfer_map, s_pxscratch, FB_W * FB_TEX_H * 4);
+    for (uint32_t y = 0; y < FB_TEX_H; y++) {
+        const uint32_t *source_row = dst + y * FB_W;
+        for (uint32_t x = 0; x < FB_W; x++)
+            for (uint32_t sx = 0; sx < s_render_scale; sx++)
+                s_scaled_color_row[x * s_render_scale + sx] =
+                    source_row[x];
+        for (uint32_t sy = 0; sy < s_render_scale; sy++)
+            memcpy(
+                physical +
+                    (y * s_render_scale + sy) * physical_width,
+                s_scaled_color_row,
+                physical_width * sizeof(*physical));
+    }
     if (!cmd_begin()) return 0;
     to_layout(s_cmd, t->img, VK_IMAGE_ASPECT_COLOR_BIT, &t->layout,
               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy c = {0};
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     c.imageSubresource.layerCount = 1;
-    c.imageExtent.width = FB_W; c.imageExtent.height = FB_TEX_H; c.imageExtent.depth = 1;
+    c.imageExtent.width = physical_width;
+    c.imageExtent.height = texture_height();
+    c.imageExtent.depth = 1;
     vkCmdCopyBufferToImage(s_cmd, s_xfer, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     to_layout(s_cmd, t->img, VK_IMAGE_ASPECT_COLOR_BIT, &t->layout,
               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -700,7 +781,7 @@ static DepthEnt *depth_acquire(uint32_t zba, uint32_t zstride) {
             }
         memset(d, 0, sizeof(*d));
     }
-    if (!make_image(FB_W, FB_H, VK_FORMAT_D16_UNORM,
+    if (!make_image(render_width(), render_height(), VK_FORMAT_D16_UNORM,
                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                     VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -710,14 +791,32 @@ static DepthEnt *depth_acquire(uint32_t zba, uint32_t zstride) {
     d->zba = zba; d->zstride = zstride; d->used = 1;
     /* initialize from the (CPU) software z-buffer once — games clear depth before use,
      * this just avoids garbage on the very first frame */
-    memcpy(s_xfer_map, s_zbuf, FB_W * FB_H * 2);
+    {
+        uint16_t *physical = (uint16_t *)s_xfer_map;
+        uint32_t physical_width = render_width();
+        for (uint32_t y = 0; y < FB_H; y++) {
+            const uint16_t *source_row = s_zbuf + y * FB_W;
+            for (uint32_t x = 0; x < FB_W; x++)
+                for (uint32_t sx = 0; sx < s_render_scale; sx++)
+                    s_scaled_depth_row[x * s_render_scale + sx] =
+                        source_row[x];
+            for (uint32_t sy = 0; sy < s_render_scale; sy++)
+                memcpy(
+                    physical +
+                        (y * s_render_scale + sy) * physical_width,
+                    s_scaled_depth_row,
+                    physical_width * sizeof(*physical));
+        }
+    }
     if (cmd_begin()) {
         to_layout(s_cmd, d->img, VK_IMAGE_ASPECT_DEPTH_BIT, &d->layout,
                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy c = {0};
         c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
         c.imageSubresource.layerCount = 1;
-        c.imageExtent.width = FB_W; c.imageExtent.height = FB_H; c.imageExtent.depth = 1;
+        c.imageExtent.width = render_width();
+        c.imageExtent.height = render_height();
+        c.imageExtent.depth = 1;
         vkCmdCopyBufferToImage(s_cmd, s_xfer, d->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
         to_layout(s_cmd, d->img, VK_IMAGE_ASPECT_DEPTH_BIT, &d->layout,
                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
@@ -762,7 +861,8 @@ static Target *target_acquire(void) {
         memset(t, 0, sizeof(*t));
         t->fba = fba; t->stride = stride; t->fmt = fmt; t->used = 1;
         t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (!make_image(FB_W, FB_TEX_H, VK_FORMAT_R8G8B8A8_UNORM,
+        if (!make_image(render_width(), texture_height(),
+                        VK_FORMAT_R8G8B8A8_UNORM,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                         &t->img, &t->mem)) { t->used = 0; return NULL; }
@@ -781,7 +881,9 @@ static Target *target_acquire(void) {
         VkImageView views[2] = { t->view, d->view };
         VkFramebufferCreateInfo fbc = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
         fbc.renderPass = s_rp; fbc.attachmentCount = 2; fbc.pAttachments = views;
-        fbc.width = FB_W; fbc.height = FB_H; fbc.layers = 1;
+        fbc.width = render_width();
+        fbc.height = render_height();
+        fbc.layers = 1;
         if (vkCreateFramebuffer(s_dev, &fbc, NULL, &t->fb) != VK_SUCCESS) return NULL;
         t->dep = d;
     }
@@ -1007,7 +1109,8 @@ static void build_state(int persp, int sprite, Batch *b) {
     int direct;
     int textured;
     memset(b, 0, sizeof(*b));
-    ge_vk_shader_state_build(g, persp, sprite, &b->pc);
+    ge_vk_shader_state_build(
+        g, persp, sprite, s_render_scale, &b->pc);
     flags = (uint32_t)b->pc.config[0] >> 8;
     direct = (flags & GE_VK_SHADER_DIRECT) != 0;
     textured = (flags & GE_VK_SHADER_TEXTURE) != 0;
@@ -1017,7 +1120,10 @@ static void build_state(int persp, int sprite, Batch *b) {
     int sx2 = g->scis_x2 < DRAW_W - 1 ? g->scis_x2 : DRAW_W - 1;
     int sy2 = g->scis_y2 < FB_H - 1 ? g->scis_y2 : FB_H - 1;
     if (sx1 > sx2 || sy1 > sy2) { b->sw = 0; return; }   /* nothing drawable */
-    b->sx = sx1; b->sy = sy1; b->sw = sx2 - sx1 + 1; b->sh = sy2 - sy1 + 1;
+    b->sx = sx1 * (int32_t)s_render_scale;
+    b->sy = sy1 * (int32_t)s_render_scale;
+    b->sw = (sx2 - sx1 + 1) * (int32_t)s_render_scale;
+    b->sh = (sy2 - sy1 + 1) * (int32_t)s_render_scale;
 
     k->manual = direct ? 0 : 1;
     if (!direct) {
@@ -1127,8 +1233,8 @@ static void build_state(int persp, int sprite, Batch *b) {
                             ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                             ic.srcSubresource.layerCount = 1;
                             ic.dstSubresource = ic.srcSubresource;
-                            ic.extent.width = FB_W;
-                            ic.extent.height = FB_TEX_H;
+                            ic.extent.width = render_width();
+                            ic.extent.height = texture_height();
                             ic.extent.depth = 1;
                             vkCmdCopyImage(s_cmd, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                            s_snapimg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
@@ -1480,9 +1586,13 @@ static int hook_xfer(uint32_t startdata) {
     ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     ic.srcSubresource.layerCount = 1;
     ic.dstSubresource = ic.srcSubresource;
-    ic.srcOffset.x = (int32_t)sx; ic.srcOffset.y = (int32_t)sy;
-    ic.dstOffset.x = (int32_t)dx; ic.dstOffset.y = (int32_t)dy;
-    ic.extent.width = w; ic.extent.height = h; ic.extent.depth = 1;
+    ic.srcOffset.x = (int32_t)(sx * s_render_scale);
+    ic.srcOffset.y = (int32_t)(sy * s_render_scale);
+    ic.dstOffset.x = (int32_t)(dx * s_render_scale);
+    ic.dstOffset.y = (int32_t)(dy * s_render_scale);
+    ic.extent.width = w * s_render_scale;
+    ic.extent.height = h * s_render_scale;
+    ic.extent.depth = 1;
     vkCmdCopyImage(s_cmd, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
     to_layout(s_cmd, dst->img, VK_IMAGE_ASPECT_COLOR_BIT, &dst->layout,
@@ -1562,7 +1672,10 @@ int gegpu_present(uint32_t fbaddr, int fmt, uint32_t stride) {
     }
     s_cnt_present_gpu++;
     stats_tick();
-    return sdl3vk_present_image((void *)t->img);
+    return sdl3vk_present_image(
+        (void *)t->img,
+        DRAW_W * s_render_scale,
+        FB_H * s_render_scale);
 }
 
 /* ---- init ----------------------------------------------------------------------------------- */
@@ -1593,6 +1706,8 @@ static int gegpu_init(void) {
     {
         const SrGraphicsConfig *config = sr_graphics_config_get();
         uint64_t pixels;
+        uint32_t transfer_scale;
+        if (!configure_render_scale(config)) return 0;
         s_texture_scale = config ? config->texture_scale : 1u;
         pixels =
             (uint64_t)512u * 512u *
@@ -1608,6 +1723,15 @@ static int gegpu_init(void) {
                 fprintf(stderr, "gegpu: cannot allocate texture scaler buffer\n");
                 return 0;
             }
+        }
+        transfer_scale = s_render_scale > s_texture_scale
+            ? s_render_scale : s_texture_scale;
+        pixels =
+            (uint64_t)512u * 512u *
+            transfer_scale * transfer_scale;
+        if (pixels > SIZE_MAX / sizeof(uint32_t)) {
+            fprintf(stderr, "gegpu: transfer allocation is too large\n");
+            return 0;
         }
     }
 
@@ -1648,11 +1772,16 @@ static int gegpu_init(void) {
 
     if (!make_buffer(MAX_VERTS * sizeof(GpuVert), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                      &s_vbuf, &s_vbuf_m, (void **)&s_vmap)) return 0;
-    if (!make_buffer(
+    {
+        uint32_t transfer_scale =
+            s_render_scale > s_texture_scale
+                ? s_render_scale : s_texture_scale;
+        if (!make_buffer(
             (VkDeviceSize)512u * 512u * 4u *
-                s_texture_scale * s_texture_scale,
+                transfer_scale * transfer_scale,
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                     &s_xfer, &s_xfer_m, &s_xfer_map)) return 0;
+            &s_xfer, &s_xfer_m, &s_xfer_map)) return 0;
+    }
 
     VkDescriptorSetLayoutBinding db = {0};
     db.binding = 0; db.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -1719,7 +1848,8 @@ static int gegpu_init(void) {
     }
 
     /* snapshot image for feedback (self-sampling) draws */
-    if (!make_image(FB_W, FB_TEX_H, VK_FORMAT_R8G8B8A8_UNORM,
+    if (!make_image(render_width(), texture_height(),
+                    VK_FORMAT_R8G8B8A8_UNORM,
                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                     &s_snapimg, &s_snapimg_mem)) return 0;
     if (!make_view(s_snapimg, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &s_snap_view)) return 0;
@@ -1729,14 +1859,16 @@ static int gegpu_init(void) {
     if (!s_snap_n || !s_snap_l) return 0;
 
     if (!make_image(
-            FB_W, FB_H, VK_FORMAT_R8G8B8A8_UNORM,
+            render_width(), render_height(),
+            VK_FORMAT_R8G8B8A8_UNORM,
             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             &s_dst_color, &s_dst_color_mem)) return 0;
     if (!make_view(
             s_dst_color, VK_FORMAT_R8G8B8A8_UNORM,
             VK_IMAGE_ASPECT_COLOR_BIT, &s_dst_color_view)) return 0;
     if (!make_image(
-            FB_W, FB_H, VK_FORMAT_D16_UNORM,
+            render_width(), render_height(),
+            VK_FORMAT_D16_UNORM,
             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             &s_dst_depth, &s_dst_depth_mem)) return 0;
     if (!make_view(
@@ -1761,8 +1893,8 @@ static int gegpu_init(void) {
     fprintf(
         stderr,
         "gegpu: full GPU GE active (persistent targets, no software fallback, "
-        "xBRZ scale %ux)\n",
-        s_texture_scale);
+        "internal resolution %ux, xBRZ scale %ux)\n",
+        s_render_scale, s_texture_scale);
     return 1;
 }
 
@@ -1872,5 +2004,6 @@ static void gegpu_shutdown(void) {
 
     free(s_texscaled);
     s_texscaled = NULL;
+    s_render_scale = 1u;
     s_texture_scale = 1u;
 }

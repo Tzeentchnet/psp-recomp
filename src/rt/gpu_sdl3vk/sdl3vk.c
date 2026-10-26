@@ -580,9 +580,10 @@ int sdl3vk_present_rgba(const uint32_t *px) {
     return present_common(s_fbimg, PSP_W, PSP_H, 1);
 }
 
-int sdl3vk_present_image(void *vk_image) {
-    /* 512x272 GE target: only the visible 480x272 region is shown */
-    return present_common((VkImage)vk_image, PSP_W, PSP_H, 0);
+int sdl3vk_present_image(
+    void *vk_image, uint32_t source_width, uint32_t source_height) {
+    return present_common(
+        (VkImage)vk_image, (int)source_width, (int)source_height, 0);
 }
 
 void sdl3vk_shutdown(void) {
