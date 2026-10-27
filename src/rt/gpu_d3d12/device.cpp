@@ -1731,58 +1731,68 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
             (unsigned long long)vertices.hash, fbaddr, stride, format);
     }
 
-    D3D12_TEXTURE_COPY_LOCATION source = {};
-    D3D12_BOX source_box = {};
-    const D3D12_BOX *source_box_ptr = nullptr;
-    uint32_t source_address = fbaddr;
-    uint32_t source_format = (uint32_t)format;
-    uint32_t source_stride = stride;
-    bool cached_framebuffer = ged3d12_framebuffer_present_source(
-        source_address, source_format, source_stride,
-        &source, &source_box);
-    if (cached_framebuffer) {
-        source_box_ptr = &source_box;
-    } else {
-        const UINT scale = ged3d12_framebuffer_scale();
-        const UINT source_width = PSP_W * scale;
-        const UINT source_height = PSP_H * scale;
-        const UINT row_pitch =
-            (source_width * 4 +
-             D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
-            ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-        const UINT64 upload_size =
-            (UINT64)row_pitch * source_height;
-        GeD3D12UploadSlice upload = {};
-        if (!ged3d12_upload_alloc(
-                upload_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
-                &upload)) {
+    const bool capture_requested = s_capture_path[0] != '\0';
+    const bool suppress_output =
+        sched_fast_forwarding() && !capture_requested;
+    bool cached_framebuffer = false;
+    if (!suppress_output) {
+        D3D12_TEXTURE_COPY_LOCATION source = {};
+        D3D12_BOX source_box = {};
+        const D3D12_BOX *source_box_ptr = nullptr;
+        uint32_t source_address = fbaddr;
+        uint32_t source_format = (uint32_t)format;
+        uint32_t source_stride = stride;
+        cached_framebuffer = ged3d12_framebuffer_present_source(
+            source_address, source_format, source_stride,
+            &source, &source_box);
+        if (cached_framebuffer) {
+            source_box_ptr = &source_box;
+        } else {
+            const UINT scale = ged3d12_framebuffer_scale();
+            const UINT source_width = PSP_W * scale;
+            const UINT source_height = PSP_H * scale;
+            const UINT row_pitch =
+                (source_width * 4 +
+                 D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+                ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+            const UINT64 upload_size =
+                (UINT64)row_pitch * source_height;
+            GeD3D12UploadSlice upload = {};
+            if (!ged3d12_upload_alloc(
+                    upload_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
+                    &upload)) {
+                return -2;
+            }
+            memset(upload.cpu, 0, (size_t)upload_size);
+            convert_framebuffer(
+                static_cast<uint8_t *>(upload.cpu), row_pitch, scale,
+                fbaddr, format, stride);
+            source.pResource = upload.resource;
+            source.Type =
+                D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            source.PlacedFootprint.Offset = upload.offset;
+            source.PlacedFootprint.Footprint.Format =
+                DXGI_FORMAT_B8G8R8A8_UNORM;
+            source.PlacedFootprint.Footprint.Width = source_width;
+            source.PlacedFootprint.Footprint.Height = source_height;
+            source.PlacedFootprint.Footprint.Depth = 1;
+            source.PlacedFootprint.Footprint.RowPitch = row_pitch;
+        }
+
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+            s_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += (SIZE_T)frame_index * s_rtv_stride;
+        if (!ged3d12_present_record(
+                &source, source_box_ptr,
+                s_backbuffers[frame_index], rtv,
+                s_backbuffer_width, s_backbuffer_height)) {
             return -2;
         }
-        memset(upload.cpu, 0, (size_t)upload_size);
-        convert_framebuffer(
-            static_cast<uint8_t *>(upload.cpu), row_pitch, scale,
-            fbaddr, format, stride);
-        source.pResource = upload.resource;
-        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        source.PlacedFootprint.Offset = upload.offset;
-        source.PlacedFootprint.Footprint.Format =
-            DXGI_FORMAT_B8G8R8A8_UNORM;
-        source.PlacedFootprint.Footprint.Width = source_width;
-        source.PlacedFootprint.Footprint.Height = source_height;
-        source.PlacedFootprint.Footprint.Depth = 1;
-        source.PlacedFootprint.Footprint.RowPitch = row_pitch;
+        if (capture_requested &&
+            !ged3d12_present_capture_record()) {
+            return -2;
+        }
     }
-
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv =
-        s_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-    rtv.ptr += (SIZE_T)frame_index * s_rtv_stride;
-    if (!ged3d12_present_record(
-            &source, source_box_ptr, s_backbuffers[frame_index], rtv,
-            s_backbuffer_width, s_backbuffer_height)) {
-        return -2;
-    }
-    const bool capture_requested = s_capture_path[0] != '\0';
-    if (capture_requested && !ged3d12_present_capture_record()) return -2;
     s_command_list->EndQuery(
         s_timestamp_heap, D3D12_QUERY_TYPE_TIMESTAMP,
         frame_index * 2u + 1u);

@@ -147,6 +147,21 @@ class DispatchGenerationTests(unittest.TestCase):
                 {0x08900688: "sr_kzl_twinstick_apply_aim"},
             )
 
+    def test_declares_each_instruction_hook_handler_once(self):
+        self.assertEqual(
+            codegen.instruction_hook_prototypes(
+                {
+                    0x08900688: "sr_target_hook",
+                    0x089006A0: "sr_target_hook",
+                    0x089006B8: "sr_other_hook",
+                }
+            ),
+            [
+                "void sr_other_hook(CpuState *s);",
+                "void sr_target_hook(CpuState *s);",
+            ],
+        )
+
     def test_rejects_invalid_host_function_handler(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = os.path.join(temporary, "overrides.toml")

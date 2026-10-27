@@ -15,6 +15,7 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
+#include "graphics_config.h"
 #include "perf_stats.h"
 
 #include <windows.h>
@@ -195,6 +196,15 @@ static LONGLONG s_qpc0;
 static double s_vbl_next;            /* QPC counts: when the next vblank is due */
 static uint64_t s_vbl_next_us = 0;   /* same deadline on the s_vtime_us scale (cheap compare) */
 
+static uint32_t configured_fast_forward_present(void) {
+#ifdef SR_SKIP_STARTUP_PRESENT
+    const SrGraphicsConfig *config = sr_graphics_config_get();
+    if (config && config->skip_startup)
+        return (uint32_t)SR_SKIP_STARTUP_PRESENT;
+#endif
+    return 0;
+}
+
 static void vbl_next_us_sync(void) {
     s_vbl_next_us = (uint64_t)((s_vbl_next - (double)s_qpc0) * 1000000.0 / (double)s_qfreq.QuadPart);
 }
@@ -214,6 +224,8 @@ static void pace_setup(void) {
             _Exit(2);
         }
         s_fast_forward_present = (uint32_t)parsed;
+    } else {
+        s_fast_forward_present = configured_fast_forward_present();
     }
     s_fast_forwarding =
         !s_permanent_turbo && s_fast_forward_present &&
@@ -265,7 +277,10 @@ int sched_vbl_paced(void) {
 int sched_fast_forwarding(void) {
     if (s_pace_on < 0) {
         const char *fast_forward = getenv("SR_FAST_FORWARD_PRESENT");
-        if (!fast_forward || !fast_forward[0]) return 0;
+        if ((!fast_forward || !fast_forward[0]) &&
+            !configured_fast_forward_present()) {
+            return 0;
+        }
     }
     pace_update_mode();
     return s_fast_forwarding;

@@ -184,6 +184,7 @@ resolution (960x544) are the defaults:
 renderer = d3d12
 internal_resolution = 2
 anti_aliasing = off
+skip_startup = off
 ```
 
 Run `mygame.exe --configure` to reopen the dialog without starting the game.
@@ -195,6 +196,11 @@ coordinates, and captures remain at their original logical resolution.
 `anti_aliasing` accepts `off` or `smaa`. SMAA selects the D3D12-only SMAA 1x
 High post-process, runs at the selected internal resolution, and is included in
 D3D12 captures. The launcher rejects SMAA with software or Vulkan rendering.
+Targets that define a startup-skip presentation expose a default-off
+**Skip startup sequence** checkbox. `skip_startup = on` executes normal guest
+initialization without real-time pacing, invokes the target's guarded startup
+transition hook when provided, and restores real-time pacing at the target
+presentation.
 On Variable Rate Shading hardware, direct draws retain scaled geometry,
 coverage and D16 depth while shading at approximately one fragment per logical
 PSP pixel. Set `SR_D3D12_VRS=0` to force full-rate shading; on the measured RTX

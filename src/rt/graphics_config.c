@@ -73,6 +73,12 @@ static int anti_aliasing_from_name(const char *name) {
     return -1;
 }
 
+static int toggle_from_name(const char *name) {
+    if (text_equal(name, "off")) return 0;
+    if (text_equal(name, "on")) return 1;
+    return -1;
+}
+
 void sr_graphics_config_defaults(SrGraphicsConfig *config) {
     if (!config) return;
     config->renderer = SR_GRAPHICS_RENDERER_D3D12;
@@ -80,6 +86,7 @@ void sr_graphics_config_defaults(SrGraphicsConfig *config) {
     config->texture_scale = 1u;
     config->d3d12_full_rate = 0u;
     config->anti_aliasing = SR_GRAPHICS_ANTI_ALIASING_OFF;
+    config->skip_startup = 0u;
 }
 
 const char *sr_graphics_renderer_name(int renderer) {
@@ -258,6 +265,23 @@ int sr_graphics_config_parse(
             }
             seen |= setting;
             config->anti_aliasing = anti_aliasing;
+        } else if (text_equal(name, "skip_startup")) {
+            int enabled = toggle_from_name(value);
+            setting = 32u;
+            if (enabled < 0) {
+                set_error(
+                    error, error_size, line_number,
+                    "expected off or on", value);
+                return 0;
+            }
+            if (seen & setting) {
+                set_error(
+                    error, error_size, line_number,
+                    "duplicate setting", name);
+                return 0;
+            }
+            seen |= setting;
+            config->skip_startup = (uint32_t)enabled;
         } else {
             set_error(
                 error, error_size, line_number,
@@ -374,11 +398,13 @@ int sr_graphics_config_init(void) {
     fprintf(
         stderr,
         "graphics: loaded %s (renderer %s, internal resolution %ux, "
-        "texture scale %ux, D3D12 full-rate %s, anti-aliasing %s)\n",
+        "texture scale %ux, D3D12 full-rate %s, anti-aliasing %s, "
+        "startup skip %s)\n",
         s_config_path, sr_graphics_renderer_name(s_config.renderer),
         s_config.internal_resolution, s_config.texture_scale,
         s_config.d3d12_full_rate ? "on" : "off",
-        sr_graphics_anti_aliasing_name(s_config.anti_aliasing));
+        sr_graphics_anti_aliasing_name(s_config.anti_aliasing),
+        s_config.skip_startup ? "on" : "off");
     return 1;
 }
 
@@ -418,7 +444,8 @@ int sr_graphics_config_save(
         config->internal_resolution > SR_GRAPHICS_SCALE_MAX ||
         config->texture_scale < SR_TEXTURE_SCALE_MIN ||
         config->texture_scale > SR_TEXTURE_SCALE_MAX ||
-        config->d3d12_full_rate > 1u) {
+        config->d3d12_full_rate > 1u ||
+        config->skip_startup > 1u) {
         set_error(
             error, error_size, 0,
             "graphics config contains invalid values", NULL);
@@ -441,15 +468,16 @@ int sr_graphics_config_save(
     }
     ok = fprintf(
             file,
-        "# PSP recomp graphics config v3\n"
+        "# PSP recomp graphics config v4\n"
         "renderer = %s\n"
         "internal_resolution = %u\n"
         "texture_scale = %u\n"
         "d3d12_full_rate = %u\n"
-        "anti_aliasing = %s\n",
+        "anti_aliasing = %s\n"
+        "skip_startup = %s\n",
         renderer, config->internal_resolution,
         config->texture_scale, config->d3d12_full_rate,
-        anti_aliasing) > 0 &&
+        anti_aliasing, config->skip_startup ? "on" : "off") > 0 &&
          fflush(file) == 0 &&
          _commit(_fileno(file)) == 0;
     if (fclose(file) != 0) ok = 0;
@@ -478,11 +506,12 @@ int sr_graphics_config_save(
     fprintf(
         stderr,
         "graphics: saved %s (renderer %s, internal resolution %ux, "
-        "texture scale %ux, D3D12 full-rate %s, anti-aliasing %s)\n",
+        "texture scale %ux, D3D12 full-rate %s, anti-aliasing %s, "
+        "startup skip %s)\n",
         s_config_path, renderer, config->internal_resolution,
         config->texture_scale,
         config->d3d12_full_rate ? "on" : "off",
-        anti_aliasing);
+        anti_aliasing, config->skip_startup ? "on" : "off");
     return 1;
 }
 

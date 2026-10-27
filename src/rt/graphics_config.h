@@ -31,6 +31,7 @@ typedef struct SrGraphicsConfig {
     uint32_t texture_scale;
     uint32_t d3d12_full_rate;
     int anti_aliasing;
+    uint32_t skip_startup;
 } SrGraphicsConfig;
 
 void sr_graphics_config_defaults(SrGraphicsConfig *config);

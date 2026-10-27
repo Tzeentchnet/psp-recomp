@@ -40,6 +40,7 @@ int main(void) {
     check_u32(
         "default anti-aliasing", (uint32_t)config.anti_aliasing,
         SR_GRAPHICS_ANTI_ALIASING_OFF);
+    check_u32("default startup skip", config.skip_startup, 0);
 
     check_true(
         "parse graphics config",
@@ -49,7 +50,8 @@ int main(void) {
             "internal_resolution = 8\n"
             "texture_scale = 4\n"
             "d3d12_full_rate = 1\n"
-            "anti_aliasing = smaa\n",
+            "anti_aliasing = smaa\n"
+            "skip_startup = on\n",
             error, sizeof(error)));
     check_u32(
         "parsed renderer", (uint32_t)config.renderer,
@@ -60,6 +62,7 @@ int main(void) {
     check_u32(
         "parsed anti-aliasing", (uint32_t)config.anti_aliasing,
         SR_GRAPHICS_ANTI_ALIASING_SMAA);
+    check_u32("parsed startup skip", config.skip_startup, 1);
 
     sr_graphics_config_defaults(&config);
     check_true(
@@ -74,6 +77,7 @@ int main(void) {
     check_u32(
         "v1 anti-aliasing default", (uint32_t)config.anti_aliasing,
         SR_GRAPHICS_ANTI_ALIASING_OFF);
+    check_u32("v1 startup skip default", config.skip_startup, 0);
 
     sr_graphics_config_defaults(&config);
     check_true(
@@ -111,6 +115,12 @@ int main(void) {
             error, sizeof(error)));
     sr_graphics_config_defaults(&config);
     check_true(
+        "reject invalid startup skip",
+        !sr_graphics_config_parse(
+            &config, "skip_startup=sometimes\n",
+            error, sizeof(error)));
+    sr_graphics_config_defaults(&config);
+    check_true(
         "reject unknown setting",
         !sr_graphics_config_parse(
             &config, "anisotropic_filtering=16\n",
@@ -139,6 +149,7 @@ int main(void) {
     config.texture_scale = 3;
     config.d3d12_full_rate = 1;
     config.anti_aliasing = SR_GRAPHICS_ANTI_ALIASING_SMAA;
+    config.skip_startup = 1;
     check_true(
         "save graphics config",
         sr_graphics_config_save(&config, error, sizeof(error)));
@@ -160,6 +171,9 @@ int main(void) {
         "saved anti-aliasing",
         (uint32_t)sr_graphics_config_get()->anti_aliasing,
         SR_GRAPHICS_ANTI_ALIASING_SMAA);
+    check_u32(
+        "saved startup skip",
+        sr_graphics_config_get()->skip_startup, 1);
     {
         FILE *file = fopen(config_path, "rb");
         char text[256] = {0};
@@ -183,6 +197,9 @@ int main(void) {
             check_true(
                 "saved anti-aliasing text",
                 strstr(text, "anti_aliasing = smaa") != NULL);
+            check_true(
+                "saved startup skip text",
+                strstr(text, "skip_startup = on") != NULL);
         }
     }
     _putenv_s("SR_D3D12_SCALE", "7");

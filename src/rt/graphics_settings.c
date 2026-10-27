@@ -14,6 +14,7 @@
 #define IDC_TEXTURE_SCALE 1003
 #define IDC_D3D12_SHADING 1004
 #define IDC_ANTI_ALIASING 1005
+#define IDC_SKIP_STARTUP 1006
 
 typedef struct GraphicsDialogContext {
     SrGraphicsConfig config;
@@ -87,6 +88,11 @@ static INT_PTR CALLBACK graphics_dialog_proc(
         int selected_texture_scale = 0;
         int selected_anti_aliasing = 0;
         int selected_d3d12_shading = 0;
+        int help_y = 202;
+        int button_y = 252;
+        const char *description =
+            "Internal resolution improves geometry and edges. xBRZ improves game textures "
+            "on hardware renderers. SMAA smooths the final D3D12 image.";
         char label[64];
 
         context = (GraphicsDialogContext *)lparam;
@@ -210,19 +216,36 @@ static INT_PTR CALLBACK graphics_dialog_proc(
             d3d12_shading, CB_SETCURSEL,
             (WPARAM)selected_d3d12_shading, 0);
 
+#ifdef SR_SKIP_STARTUP_PRESENT
+        {
+            HWND skip_startup = add_control(
+                dialog, 0, "BUTTON",
+                "Skip startup sequence (go directly to main menu)",
+                WS_TABSTOP | BS_AUTOCHECKBOX,
+                16, 202, 326, 20, IDC_SKIP_STARTUP);
+            SendMessage(
+                skip_startup, BM_SETCHECK,
+                context->config.skip_startup
+                    ? BST_CHECKED : BST_UNCHECKED,
+                0);
+        }
+        help_y = 230;
+        button_y = 280;
+        description =
+            "Startup skipping runs normal game initialization at turbo speed, then restores "
+            "real-time pacing at the main menu.";
+#endif
         add_control(
-            dialog, 0, "STATIC",
-            "Internal resolution improves geometry and edges. xBRZ improves game textures "
-            "on hardware renderers. SMAA smooths the final D3D12 image.",
-            0, 16, 202, 326, 44, 0);
+            dialog, 0, "STATIC", description,
+            0, 16, help_y, 326, 44, 0);
         add_control(
             dialog, 0, "BUTTON", "Save",
             WS_TABSTOP | BS_DEFPUSHBUTTON,
-            176, 252, 80, 27, IDOK);
+            176, button_y, 80, 27, IDOK);
         add_control(
             dialog, 0, "BUTTON", "Cancel",
             WS_TABSTOP | BS_PUSHBUTTON,
-            262, 252, 80, 27, IDCANCEL);
+            262, button_y, 80, 27, IDCANCEL);
         center_dialog(dialog);
         return TRUE;
     }
@@ -276,6 +299,12 @@ static INT_PTR CALLBACK graphics_dialog_proc(
                 (uint32_t)SendMessage(
                     d3d12_shading, CB_GETITEMDATA,
                     (WPARAM)d3d12_shading_index, 0);
+#ifdef SR_SKIP_STARTUP_PRESENT
+            context->config.skip_startup =
+                SendMessage(
+                    GetDlgItem(dialog, IDC_SKIP_STARTUP),
+                    BM_GETCHECK, 0, 0) == BST_CHECKED;
+#endif
             if (context->config.anti_aliasing ==
                     SR_GRAPHICS_ANTI_ALIASING_SMAA &&
                 context->config.renderer !=
@@ -326,7 +355,11 @@ int sr_graphics_settings_show(const char *title) {
     dialog_template.dialog.style =
         WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER;
     dialog_template.dialog.cx = 236;
+#ifdef SR_SKIP_STARTUP_PRESENT
+    dialog_template.dialog.cy = 218;
+#else
     dialog_template.dialog.cy = 198;
+#endif
     result = DialogBoxIndirectParamW(
         GetModuleHandleW(NULL), &dialog_template.dialog, NULL,
         graphics_dialog_proc, (LPARAM)&context);

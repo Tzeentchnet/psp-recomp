@@ -18,6 +18,7 @@
 #include "audio.h"
 #include "atrac_decode.h"
 #include "display_state.h"
+#include "graphics_config.h"
 #include "input_config.h"
 #include "iso.h"
 #include "kzl_twinstick.h"
@@ -40,6 +41,31 @@
 #include <errno.h>
 #include <time.h>
 #include "sr_env.h"
+
+#ifdef SR_SKIP_STARTUP_INPUT_START
+#ifndef SR_SKIP_STARTUP_INPUT_PERIOD
+#define SR_SKIP_STARTUP_INPUT_PERIOD 60u
+#endif
+#ifndef SR_SKIP_STARTUP_INPUT_WIDTH
+#define SR_SKIP_STARTUP_INPUT_WIDTH 4u
+#endif
+#ifndef SR_SKIP_STARTUP_INPUT_MASK
+#define SR_SKIP_STARTUP_INPUT_MASK 0x0008u
+#endif
+#ifndef SR_SKIP_STARTUP_INPUT_END
+#define SR_SKIP_STARTUP_INPUT_END SR_SKIP_STARTUP_PRESENT
+#endif
+#if SR_SKIP_STARTUP_INPUT_PERIOD == 0
+#error SR_SKIP_STARTUP_INPUT_PERIOD must be greater than zero
+#endif
+#if SR_SKIP_STARTUP_INPUT_END <= SR_SKIP_STARTUP_INPUT_START
+#error SR_SKIP_STARTUP_INPUT_END must be greater than SR_SKIP_STARTUP_INPUT_START
+#endif
+#endif
+
+#ifdef SR_SKIP_STARTUP_HOOK
+void SR_SKIP_STARTUP_HOOK(uint32_t presentation);
+#endif
 
 uint32_t sr_last_nid = 0;
 
@@ -2954,10 +2980,34 @@ static uint32_t h_CtrlButtons(void) {
             return keys | scripted;
         }
     }
-    /* The auto-START pulse below only exists to advance the intro/attract in headless or no-input
-     * runs. When a real controller is connected the player drives input themselves, so suppress the
-     * pulse (otherwise a phantom START every few seconds would keep opening the pause menu). */
-    if (getenv("SR_NOINPUT") || gui_pad_present()) return keys;
+    if (getenv("SR_NOINPUT")) return keys;
+#ifdef SR_SKIP_STARTUP_INPUT_START
+    {
+        const SrGraphicsConfig *config = sr_graphics_config_get();
+        const uint32_t first =
+            (uint32_t)SR_SKIP_STARTUP_INPUT_START;
+        if (config && config->skip_startup &&
+            s_present_count >= first &&
+            s_present_count < (uint32_t)SR_SKIP_STARTUP_INPUT_END &&
+            (s_present_count - first) %
+                    (uint32_t)SR_SKIP_STARTUP_INPUT_PERIOD <
+                (uint32_t)SR_SKIP_STARTUP_INPUT_WIDTH) {
+            static int logged;
+            if (!logged) {
+                fprintf(
+                    stderr,
+                    "input: startup skip button 0x%04x at presentation %u\n",
+                    (unsigned)SR_SKIP_STARTUP_INPUT_MASK,
+                    s_present_count);
+                logged = 1;
+            }
+            return keys | (uint32_t)SR_SKIP_STARTUP_INPUT_MASK;
+        }
+    }
+#endif
+    /* The fallback auto-START pulse only advances the intro/attract in unattended runs. A real
+     * controller suppresses it so a phantom START cannot open the pause menu later. */
+    if (gui_pad_present()) return keys;
     /* Pulse START only, briefly, on a slow cadence to skip the (minutes-long) intro movie and the
      * "press start" prompt. Pressing CROSS/CIRCLE as well drove the menus into bad states (it
      * confirmed things the game was not ready for); START alone advances the intro without that.
@@ -3858,6 +3908,13 @@ static uint32_t h_DisplaySetFrameBuf(CpuState *s) {
     present_perf_init();
     if (A0) {
         s_present_count++;
+#ifdef SR_SKIP_STARTUP_HOOK
+        {
+            const SrGraphicsConfig *config = sr_graphics_config_get();
+            if (config && config->skip_startup)
+                SR_SKIP_STARTUP_HOOK(s_present_count);
+        }
+#endif
         sr_ip_sampler_present(s_present_count);
         sr_perf_alternate_tick(s_present_count);
         capture_requested = frame_capture_path(

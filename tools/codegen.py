@@ -123,6 +123,13 @@ def chunk_functions(functions, byte_limit):
     return parts
 
 
+def instruction_hook_prototypes(instruction_hooks):
+    return [
+        f"void {handler}(CpuState *s);"
+        for handler in sorted(set(instruction_hooks.values()))
+    ]
+
+
 def rs(w): return (w >> 21) & 0x1F
 def rt(w): return (w >> 16) & 0x1F
 def rd(w): return (w >> 11) & 0x1F
@@ -1681,6 +1688,7 @@ def main(argv):
         f"void {function_symbol(a, symbol_prefix)}(CpuState *s);"
         for a in sorted(known)
     ]
+    protos.extend(instruction_hook_prototypes(INSTRUCTION_HOOKS))
     funcs = []     # one list of lines per guest function, in address order
     emitted = []
     stubbed = []
