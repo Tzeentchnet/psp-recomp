@@ -114,8 +114,9 @@ project, not in shared renderer code.
   queue lead.
 - SAS voices and VAG loop markers must honor the title's requested loop mode;
   blindly honoring embedded loop markers caused accumulating menu sounds.
-- The intro and credits use PSMF/MPEG with Media Foundation H.264 and ATRAC
-  audio.
+- The intro and credits use PSMF/MPEG with H.264 and ATRAC audio. Windows uses
+  Media Foundation; macOS uses hardware-accelerated VideoToolbox. The macOS
+  intro was tested on Apple M5; the credits have not yet been validated there.
 - Decoder EOF includes reordered tail frames after ring-buffer exhaustion.
 - Incorrect AU delays and scaled framebuffer upload behavior caused visible
   movie stutter.

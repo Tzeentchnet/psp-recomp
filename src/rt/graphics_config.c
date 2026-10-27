@@ -3,15 +3,14 @@
 #endif
 #include "graphics_config.h"
 
+#include "platform.h"
 #include "settings_path.h"
 
 #include <ctype.h>
 #include <errno.h>
-#include <io.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 static SrGraphicsConfig s_config;
 static char s_config_path[1024];
@@ -75,8 +74,16 @@ static int anti_aliasing_from_name(const char *name) {
 
 void sr_graphics_config_defaults(SrGraphicsConfig *config) {
     if (!config) return;
+#ifdef _WIN32
     config->renderer = SR_GRAPHICS_RENDERER_D3D12;
+#else
+    config->renderer = SR_GRAPHICS_RENDERER_VULKAN;
+#endif
+#ifdef __APPLE__
+    config->internal_resolution = 1u;
+#else
     config->internal_resolution = 2u;
+#endif
     config->texture_scale = 1u;
     config->d3d12_full_rate = 0u;
     config->anti_aliasing = SR_GRAPHICS_ANTI_ALIASING_OFF;
@@ -450,24 +457,21 @@ int sr_graphics_config_save(
         renderer, config->internal_resolution,
         config->texture_scale, config->d3d12_full_rate,
         anti_aliasing) > 0 &&
-         fflush(file) == 0 &&
-         _commit(_fileno(file)) == 0;
+         sr_file_commit(file);
     if (fclose(file) != 0) ok = 0;
     if (!ok) {
-        DeleteFileA(temporary);
+        sr_file_remove(temporary);
         set_error(
             error, error_size, 0,
             "cannot write temporary graphics config", temporary);
         return 0;
     }
-    if (!MoveFileExA(
-            temporary, s_config_path,
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (!sr_file_replace(temporary, s_config_path)) {
         char detail[256];
         snprintf(
-            detail, sizeof(detail), "%s (error %lu)",
-            s_config_path, (unsigned long)GetLastError());
-        DeleteFileA(temporary);
+            detail, sizeof(detail), "%s (%s)",
+            s_config_path, strerror(errno));
+        sr_file_remove(temporary);
         set_error(
             error, error_size, 0,
             "cannot publish graphics config", detail);

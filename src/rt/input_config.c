@@ -2,16 +2,15 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 #include "input_config.h"
+#include "platform.h"
 #include "settings_path.h"
 
 #include <ctype.h>
 #include <errno.h>
-#include <io.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 #ifndef SR_ENABLE_KZL_TWIN_STICK
 #define SR_ENABLE_KZL_TWIN_STICK 1
@@ -104,9 +103,9 @@ static SrInputConfig s_config;
 static SrInputTwinStickState s_twin_stick_state;
 static int s_initialized;
 static char s_config_path[1024];
-static HANDLE s_reload_thread;
-static HANDLE s_reload_stop_event;
-static volatile LONG s_reload_requested;
+static int s_reload_active;
+static uint64_t s_reload_next_check;
+static SrFileVersion s_reload_observed;
 
 static void apply_build_features(SrInputConfig *config) {
 #if SR_ENABLE_KZL_TWIN_STICK
@@ -869,22 +868,6 @@ static char *read_config(const char *path, char *error, size_t error_size) {
     return text;
 }
 
-static int read_file_attributes(
-    const char *path, WIN32_FILE_ATTRIBUTE_DATA *attributes) {
-    return GetFileAttributesExA(
-        path, GetFileExInfoStandard, attributes) != 0;
-}
-
-static int same_file_version(
-    const WIN32_FILE_ATTRIBUTE_DATA *left,
-    const WIN32_FILE_ATTRIBUTE_DATA *right) {
-    return CompareFileTime(
-               &left->ftLastWriteTime,
-               &right->ftLastWriteTime) == 0 &&
-           left->nFileSizeHigh == right->nFileSizeHigh &&
-           left->nFileSizeLow == right->nFileSizeLow;
-}
-
 static int binding_equal(
     const SrInputBinding *left, const SrInputBinding *right) {
     if (left->count != right->count) return 0;
@@ -1144,12 +1127,10 @@ int sr_input_config_save(
             temporary);
         return 0;
     }
-    ok = write_config(file, &saved) &&
-         fflush(file) == 0 &&
-         _commit(_fileno(file)) == 0;
+    ok = write_config(file, &saved) && sr_file_commit(file);
     if (fclose(file) != 0) ok = 0;
     if (!ok) {
-        DeleteFileA(temporary);
+        sr_file_remove(temporary);
         set_error(
             error,
             error_size,
@@ -1158,18 +1139,15 @@ int sr_input_config_save(
             temporary);
         return 0;
     }
-    if (!MoveFileExA(
-            temporary,
-            s_config_path,
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (!sr_file_replace(temporary, s_config_path)) {
         char detail[256];
         snprintf(
             detail,
             sizeof(detail),
-            "%s (error %lu)",
+            "%s (%s)",
             s_config_path,
-            (unsigned long)GetLastError());
-        DeleteFileA(temporary);
+            strerror(errno));
+        sr_file_remove(temporary);
         set_error(
             error,
             error_size,
@@ -1212,40 +1190,6 @@ int sr_input_config_reload(char *error, size_t error_size) {
     return 1;
 }
 
-static DWORD WINAPI input_reload_thread(void *context) {
-    WIN32_FILE_ATTRIBUTE_DATA observed;
-    WIN32_FILE_ATTRIBUTE_DATA current;
-    int observed_valid;
-    (void)context;
-
-    observed_valid =
-        read_file_attributes(s_config_path, &observed);
-    for (;;) {
-        DWORD wait = WaitForSingleObject(
-            s_reload_stop_event, 250u);
-        int current_valid;
-        int changed;
-        if (wait == WAIT_OBJECT_0) return 0;
-        if (wait == WAIT_FAILED) {
-            fprintf(
-                stderr,
-                "input: hot reload watcher wait failed (error %lu)\n",
-                (unsigned long)GetLastError());
-            return 1;
-        }
-        current_valid =
-            read_file_attributes(s_config_path, &current);
-        changed =
-            current_valid != observed_valid ||
-            (current_valid &&
-             !same_file_version(&current, &observed));
-        if (!changed) continue;
-        observed_valid = current_valid;
-        if (current_valid) observed = current;
-        InterlockedExchange(&s_reload_requested, 1);
-    }
-}
-
 int sr_input_start_hot_reload(void) {
     const char *override;
     if (!s_initialized) {
@@ -1261,51 +1205,44 @@ int sr_input_start_hot_reload(void) {
             "input: hot reload disabled by SR_INPUT_HOT_RELOAD=0\n");
         return 1;
     }
-    if (!s_config_path[0] || s_reload_thread) return 1;
-    s_reload_stop_event = CreateEventA(
-        NULL, TRUE, FALSE, NULL);
-    if (!s_reload_stop_event) {
+    if (!s_config_path[0] || s_reload_active) return 1;
+    if (!sr_file_version(s_config_path, &s_reload_observed)) {
         fprintf(
             stderr,
-            "input: cannot create hot reload stop event (error %lu)\n",
-            (unsigned long)GetLastError());
+            "input: cannot inspect %s for hot reload: %s\n",
+            s_config_path, strerror(errno));
         return 0;
     }
-    s_reload_thread = CreateThread(
-        NULL, 0, input_reload_thread, NULL, 0, NULL);
-    if (!s_reload_thread) {
-        fprintf(
-            stderr,
-            "input: cannot start hot reload watcher (error %lu)\n",
-            (unsigned long)GetLastError());
-        CloseHandle(s_reload_stop_event);
-        s_reload_stop_event = NULL;
-        return 0;
-    }
+    s_reload_active = 1;
+    s_reload_next_check = sr_time_now();
     atexit(sr_input_stop_hot_reload);
-    fprintf(stderr, "input: hot reload watcher active\n");
+    fprintf(stderr, "input: hot reload polling active\n");
     return 1;
 }
 
 void sr_input_stop_hot_reload(void) {
-    if (!s_reload_thread) return;
-    SetEvent(s_reload_stop_event);
-    WaitForSingleObject(s_reload_thread, INFINITE);
-    CloseHandle(s_reload_thread);
-    CloseHandle(s_reload_stop_event);
-    s_reload_thread = NULL;
-    s_reload_stop_event = NULL;
-    InterlockedExchange(&s_reload_requested, 0);
+    s_reload_active = 0;
+    s_reload_next_check = 0;
+    memset(&s_reload_observed, 0, sizeof(s_reload_observed));
 }
 
 void sr_input_poll_reload(void) {
     char error[512];
+    SrFileVersion current;
 
-    if (!s_initialized ||
-        !s_config_path[0] ||
-        InterlockedExchange(&s_reload_requested, 0) == 0) {
+    if (!s_initialized || !s_config_path[0] || !s_reload_active) return;
+    uint64_t now = sr_time_now();
+    if (now < s_reload_next_check) return;
+    s_reload_next_check = now + sr_time_frequency() / 4u;
+    if (!sr_file_version(s_config_path, &current)) {
+        fprintf(
+            stderr, "input: cannot inspect %s for hot reload: %s\n",
+            s_config_path, strerror(errno));
         return;
     }
+    if (sr_file_version_equal(&current, &s_reload_observed)) return;
+    s_reload_observed = current;
+    if (!current.exists) return;
     if (!sr_input_config_reload(error, sizeof(error))) {
         fprintf(
             stderr,

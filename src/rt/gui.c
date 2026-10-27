@@ -689,6 +689,14 @@ void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
         if (shown == -1) {
             convert_fb(fbaddr, fmt, stride);
             shown = sdl3vk_present_rgba(s_px);
+            if (shown < 0) {
+                fprintf(stderr, "gui_present: Vulkan presenter failed\n");
+                if (s_ge_backend && s_ge_backend->shutdown) s_ge_backend->shutdown();
+                ge_set_backend(NULL);
+                s_ge_backend = NULL;
+                sdl3vk_shutdown();
+                _Exit(2);
+            }
         }
         if (shown == 0) {
             if (s_ge_backend && s_ge_backend->shutdown) s_ge_backend->shutdown();

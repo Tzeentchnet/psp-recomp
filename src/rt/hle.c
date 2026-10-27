@@ -27,15 +27,13 @@
 #include "sas_reverb.h"
 #include "settings_path.h"
 #include "nid_names.h"   /* sr_nid_name(): names unknown NIDs in the trap below */
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 #include <wchar.h>
 #include <setjmp.h>
-#include <direct.h>
-#include <io.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
@@ -420,7 +418,7 @@ static void font_load(void) {
     if (!s_pgf_ltn) {
         char error[256];
         if (sr_settings_path(
-                "font\\ltn0.pgf", path, sizeof(path), error, sizeof(error)))
+                "font/ltn0.pgf", path, sizeof(path), error, sizeof(error)))
             s_pgf_ltn = pgf_open(path);
     }
     if (!s_pgf_ltn) s_pgf_ltn = pgf_open("font/ltn0.pgf");
@@ -429,7 +427,7 @@ static void font_load(void) {
     if (!s_pgf_jpn) {
         char error[256];
         if (sr_settings_path(
-                "font\\jpn0.pgf", path, sizeof(path), error, sizeof(error)))
+                "font/jpn0.pgf", path, sizeof(path), error, sizeof(error)))
             s_pgf_jpn = pgf_open(path);
     }
     if (!s_pgf_jpn) s_pgf_jpn = pgf_open("font/jpn0.pgf");
@@ -587,8 +585,8 @@ static uint32_t h_FontFindOptimumFont(CpuState *s) {
  * These thin wrappers marshal MIPS args to the ported mpeg_* functions. The port implements the
  * real PSMF analysis, ring-buffer accounting, handle/context creation, stream registration, and
  * AU getters with timestamp progression + end-of-stream, so the movie playback loop runs and
- * completes exactly as on PPSSPP. The SDL3 build decodes AVC video through Windows Media
- * Foundation (h264_mf.c); ATRAC movie audio is still modelled as silence. */
+ * completes exactly as on PPSSPP. Supported builds use native H.264 decoding and standalone
+ * ATRAC movie audio. */
 uint32_t mpeg_init(void);
 uint32_t mpeg_finish(void);
 uint32_t mpeg_query_mem_size(uint32_t outAddr);
@@ -1663,13 +1661,16 @@ static int host_root(char *out, int max) {
     if (override && override[0]) {
         n = snprintf(out, (size_t)max, "%s", override);
     } else {
-        const char *local = getenv("LOCALAPPDATA");
-        if (!local || !local[0]) {
+        if (!sr_user_data_path("KZLRecomp", out, (size_t)max)) {
             static int warned;
-            if (!warned++) fprintf(stderr, "VFS: LOCALAPPDATA is unset; set SR_FSDIR to override the writable root\n");
+            if (!warned++)
+                fprintf(
+                    stderr,
+                    "VFS: cannot locate the user data directory; "
+                    "set SR_FSDIR to override the writable root\n");
             return -1;
         }
-        n = snprintf(out, (size_t)max, "%s\\KZLRecomp", local);
+        n = (int)strlen(out);
     }
     if (n < 0 || n >= max) {
         fprintf(stderr, "VFS: writable root path is too long\n");
@@ -1706,7 +1707,7 @@ static int host_path(const char *guest, char *out, int max) {
         p = colon + 1;
     }
     if (n + 1 + (int)strlen(device) >= max) return -1;
-    out[n++] = '\\';
+    out[n++] = '/';
     for (int i = 0; device[i]; i++) out[n++] = device[i];
 
     while (*p) {
@@ -1718,7 +1719,7 @@ static int host_path(const char *guest, char *out, int max) {
         if (len == 1 && p[0] == '.') { p = end; continue; }
         if (len == 2 && p[0] == '.' && p[1] == '.') return -1;
         if (n + 1 + len >= max) return -1;
-        out[n++] = '\\';
+        out[n++] = '/';
         for (int i = 0; i < len; i++) {
             unsigned char c = (unsigned char)p[i];
             out[n++] = (char)(c < 0x20 || strchr("<>:\"|?*", c) ? '_' : c);
@@ -1733,7 +1734,7 @@ static int host_path(const char *guest, char *out, int max) {
 static int legacy_host_path(const char *guest, char *out, int max) {
     char root[512];
     if (host_root(root, sizeof(root)) != 0) return -1;
-    int n = snprintf(out, (size_t)max, "%s\\", root);
+    int n = snprintf(out, (size_t)max, "%s/", root);
     if (n < 0 || n >= max) return -1;
     for (int i = 0; guest[i] && n < max - 1; i++) {
         char c = guest[i];
@@ -2379,12 +2380,13 @@ static int load_legacy_host_dir(const char *path, DirHandle *dir) {
     char mapped[512], pattern[512], root[512];
     if (legacy_host_path(path, mapped, sizeof(mapped)) != 0) return -1;
     if (host_root(root, sizeof(root)) != 0) return -1;
-    char *base = strrchr(mapped, '\\');
+    char *base = strrchr(mapped, '/');
+    if (!base) base = strrchr(mapped, '\\');
     base = base ? base + 1 : mapped;
     char prefix[300];
     int prefix_len = snprintf(prefix, sizeof(prefix), "%s_", base);
     if (prefix_len <= 1 || prefix_len >= (int)sizeof(prefix)) return -1;
-    if (snprintf(pattern, sizeof(pattern), "%s\\*", root) >= (int)sizeof(pattern)) return -1;
+    if (snprintf(pattern, sizeof(pattern), "%s/*", root) >= (int)sizeof(pattern)) return -1;
 
     struct _finddata_t data;
     intptr_t find = _findfirst(pattern, &data);
@@ -2418,7 +2420,7 @@ static int load_host_dir(const char *path, DirHandle *dir) {
     struct _stat64 st;
     if (_stat64(hp, &st) != 0) return load_legacy_host_dir(path, dir);
     if (!(st.st_mode & _S_IFDIR)) return -1;
-    if (snprintf(pattern, sizeof(pattern), "%s\\*", hp) >= (int)sizeof(pattern)) return -1;
+    if (snprintf(pattern, sizeof(pattern), "%s/*", hp) >= (int)sizeof(pattern)) return -1;
 
     struct _finddata_t data;
     intptr_t find = _findfirst(pattern, &data);
@@ -3178,7 +3180,7 @@ static int frame_capture_path(char *path, size_t path_size) {
     if (s_present_count < request->present) return 0;
     if (s_present_count != request->present)
         frame_capture_fail("runtime skipped a requested presented frame", request->name);
-    n = snprintf(path, path_size, "%s\\%s", s_frame_capture_dir, request->name);
+    n = snprintf(path, path_size, "%s/%s", s_frame_capture_dir, request->name);
     if (n < 0 || (size_t)n >= path_size)
         frame_capture_fail("capture output path is too long", request->name);
     return 1;
@@ -3200,7 +3202,7 @@ static void frame_capture_complete(
     if (s_frame_capture_next != FRAME_CAPTURE_COUNT) return;
 
     n = snprintf(complete_path, sizeof(complete_path),
-                 "%s\\capture.complete", s_frame_capture_dir);
+                 "%s/capture.complete", s_frame_capture_dir);
     if (n < 0 || (size_t)n >= sizeof(complete_path))
         frame_capture_fail("completion path is too long", s_frame_capture_dir);
     done = fopen(complete_path, "wb");

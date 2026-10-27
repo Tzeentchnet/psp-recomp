@@ -1,9 +1,9 @@
 #include "startup_check.h"
+#include "test_platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 static int failures;
 
@@ -15,19 +15,15 @@ static void check(const char *name, int value, int expected) {
 }
 
 int main(void) {
-    char temp[MAX_PATH];
-    char path[MAX_PATH];
-    DWORD length = GetTempPathA(sizeof(temp), temp);
-    if (!length || length >= sizeof(temp)) return 2;
-    snprintf(
-        path, sizeof(path), "%skzl-startup-%lu.iso",
-        temp, (unsigned long)GetCurrentProcessId());
+    char path[SR_TEST_PATH_MAX];
+    if (!sr_test_temp_path(path, sizeof(path), "kzl-startup", ".iso"))
+        return 2;
 
     FILE *file = fopen(path, "wb");
     if (!file) return 2;
     fwrite("abc", 1, 3, file);
     fclose(file);
-    _putenv_s("PSP_ISO", path);
+    if (!sr_test_set_env("PSP_ISO", path)) return 2;
     check("valid hash", sr_startup_validate(), 1);
 
     file = fopen(path, "wb");
@@ -38,7 +34,7 @@ int main(void) {
 
     remove(path);
     check("missing file", sr_startup_validate(), 0);
-    _putenv_s("PSP_ISO", "");
+    if (!sr_test_set_env("PSP_ISO", NULL)) return 2;
     check("missing setting", sr_startup_validate(), 0);
 
     if (failures) {

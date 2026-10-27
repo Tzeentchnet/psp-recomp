@@ -16,8 +16,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
 #include "perf_stats.h"
-
-#include <windows.h>
+#include "platform.h"
 
 #ifndef SR_MODULE_START_PRIORITY
 #define SR_MODULE_START_PRIORITY 32u

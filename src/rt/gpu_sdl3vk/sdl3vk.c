@@ -13,8 +13,12 @@
  * GPLv2+: it consumes ge.c, whose GE semantics are derived from PPSSPP. */
 
 #include "sdl3vk.h"
+#include "present_cache.h"
 #include "../input_sdl.h"
 
+#ifdef __APPLE__
+#define VK_ENABLE_BETA_EXTENSIONS
+#endif
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
@@ -55,6 +59,9 @@ static VkDeviceMemory  s_fbimg_mem;
 static uint32_t s_buttons;
 static uint8_t  s_lx = 128, s_ly = 128;
 static int      s_pad_present;
+static SrVkPresentCache s_present_cache;
+static uint64_t s_present_reused;
+static int s_present_repeats;
 
 #define VK_TRY(expr) do { VkResult vr_ = (expr); if (vr_ != VK_SUCCESS) { \
     fprintf(stderr, "sdl3vk: %s failed: %d\n", #expr, (int)vr_); return 0; } } while (0)
@@ -90,6 +97,53 @@ static int validation_layer_available(void) {
             if (strcmp(
                     properties[i].layerName,
                     "VK_LAYER_KHRONOS_validation") == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    free(properties);
+    return found;
+}
+
+static int instance_extension_available(const char *name) {
+    uint32_t count = 0;
+    if (vkEnumerateInstanceExtensionProperties(NULL, &count, NULL) !=
+        VK_SUCCESS) {
+        return 0;
+    }
+    VkExtensionProperties *properties =
+        (VkExtensionProperties *)malloc(count * sizeof(*properties));
+    if (!properties) return 0;
+    int found = 0;
+    if (vkEnumerateInstanceExtensionProperties(
+            NULL, &count, properties) == VK_SUCCESS) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (strcmp(properties[i].extensionName, name) == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    free(properties);
+    return found;
+}
+
+static int device_extension_available(
+    VkPhysicalDevice device, const char *name) {
+    uint32_t count = 0;
+    if (vkEnumerateDeviceExtensionProperties(
+            device, NULL, &count, NULL) != VK_SUCCESS) {
+        return 0;
+    }
+    VkExtensionProperties *properties =
+        (VkExtensionProperties *)malloc(count * sizeof(*properties));
+    if (!properties) return 0;
+    int found = 0;
+    if (vkEnumerateDeviceExtensionProperties(
+            device, NULL, &count, properties) == VK_SUCCESS) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (strcmp(properties[i].extensionName, name) == 0) {
                 found = 1;
                 break;
             }
@@ -135,11 +189,34 @@ static int create_swapchain(void) {
 
     /* Prefer BGRA8 UNORM (matches the framebuffer byte order); fall back to whatever the
      * surface offers first. */
-    VkSurfaceFormatKHR fmts[32]; uint32_t nf = 32;
-    VK_TRY(vkGetPhysicalDeviceSurfaceFormatsKHR(s_pdev, s_surf, &nf, fmts));
+    uint32_t nf = 0;
+    VK_TRY(vkGetPhysicalDeviceSurfaceFormatsKHR(
+        s_pdev, s_surf, &nf, NULL));
+    if (!nf) {
+        fprintf(stderr, "sdl3vk: surface exposes no formats\n");
+        return 0;
+    }
+    VkSurfaceFormatKHR *fmts =
+        (VkSurfaceFormatKHR *)malloc(nf * sizeof(*fmts));
+    if (!fmts) {
+        fprintf(stderr, "sdl3vk: cannot allocate surface formats\n");
+        return 0;
+    }
+    VkResult format_result =
+        vkGetPhysicalDeviceSurfaceFormatsKHR(
+            s_pdev, s_surf, &nf, fmts);
+    if (format_result != VK_SUCCESS) {
+        fprintf(
+            stderr,
+            "sdl3vk: vkGetPhysicalDeviceSurfaceFormatsKHR failed: %d\n",
+            (int)format_result);
+        free(fmts);
+        return 0;
+    }
     VkSurfaceFormatKHR pick = fmts[0];
     for (uint32_t i = 0; i < nf; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM) { pick = fmts[i]; break; }
+    free(fmts);
     s_swap_fmt = pick.format;
 
     VkExtent2D ext = caps.currentExtent;
@@ -193,6 +270,10 @@ static int create_swapchain(void) {
 /* ---- init --------------------------------------------------------------------------- */
 
 int sdl3vk_init(const char *title) {
+    const char *repeats = getenv("SR_GPU_PRESENT_REPEATS");
+    s_present_repeats = repeats && repeats[0] && strcmp(repeats, "0") != 0;
+    s_present_reused = 0;
+    sr_vk_present_invalidate(&s_present_cache);
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "sdl3vk: SDL_Init failed: %s\n", SDL_GetError());
         return 0;
@@ -221,6 +302,20 @@ int sdl3vk_init(const char *title) {
     }
     for (Uint32 i = 0; i < next; i++)
         instance_extensions[i] = sdl_ext[i];
+    int portability =
+        instance_extension_available(
+            VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    if (portability) {
+        int included = 0;
+        for (Uint32 i = 0; i < next; i++)
+            if (strcmp(
+                    instance_extensions[i],
+                    VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0)
+                included = 1;
+        if (!included)
+            instance_extensions[next++] =
+                VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+    }
     if (validation) {
         if (!validation_layer_available()) {
             fprintf(
@@ -246,6 +341,8 @@ int sdl3vk_init(const char *title) {
     VkDebugUtilsMessengerCreateInfoEXT debug_info =
         validation_create_info();
     ici.pApplicationInfo = &ai;
+    if (portability)
+        ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     ici.enabledExtensionCount = next;
     ici.ppEnabledExtensionNames = instance_extensions;
     if (validation) {
@@ -302,11 +399,17 @@ int sdl3vk_init(const char *title) {
     qci.queueFamilyIndex = s_qfam;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
-    const char *dev_ext[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    const char *dev_ext[2] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    uint32_t dev_ext_count = 1;
+    if (device_extension_available(
+            s_pdev, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        dev_ext[dev_ext_count++] =
+            VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME;
+    }
     VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
+    dci.enabledExtensionCount = dev_ext_count;
     dci.ppEnabledExtensionNames = dev_ext;
     VK_TRY(vkCreateDevice(s_pdev, &dci, NULL, &s_dev));
     vkGetDeviceQueue(s_dev, s_qfam, 0, &s_queue);
@@ -389,15 +492,20 @@ static void toggle_fullscreen(void) {
     }
 }
 
-static void poll_input(int *quit) {
+static void poll_input(int *quit, int *redraw) {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
+        if ((ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST) ||
+            (ev.type >= SDL_EVENT_DISPLAY_FIRST && ev.type <= SDL_EVENT_DISPLAY_LAST))
+            *redraw = 1;
         switch (ev.type) {
         case SDL_EVENT_QUIT: *quit = 1; break;
         case SDL_EVENT_KEY_DOWN:
             if (ev.key.key == SDLK_ESCAPE) *quit = 1;
-            if (ev.key.key == SDLK_F11 && !ev.key.repeat)
+            if (ev.key.key == SDLK_F11 && !ev.key.repeat) {
                 toggle_fullscreen();
+                *redraw = 1;
+            }
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
             if (!s_pad) s_pad = SDL_OpenGamepad(ev.gdevice.which);
@@ -474,29 +582,51 @@ static void barrier(VkCommandBuffer cmd, VkImage img,
     vkCmdPipelineBarrier(cmd, src_st, dst_st, 0, 0, NULL, 0, NULL, 1, &mb);
 }
 
-/* Common present: blit `src` (already TRANSFER_SRC_OPTIMAL; srcw x srch source region)
- * onto the swapchain with aspect-correct letterboxing. upload!=NULL additionally
- * records the staging->s_fbimg copy first (the CPU framebuffer path). */
-static int present_common(VkImage src, int srcw, int srch, int do_upload) {
+/* Blit the source region to the swapchain; the CPU path uploads it first. */
+static int present_common(
+    VkImage src, int srcw, int srch, int do_upload, uint64_t generation,
+    VkImageLayout source_layout, int *transitioned) {
     int quit = 0;
-    poll_input(&quit);
+    int redraw = s_present_repeats;
+    poll_input(&quit, &redraw);
     if (quit) return 0;
+    if (sr_vk_present_can_reuse(&s_present_cache, generation, redraw)) {
+        sr_vk_present_reused(&s_present_cache);
+        s_present_reused++;
+        return 1;
+    }
+    sr_vk_present_invalidate(&s_present_cache);
 
     for (int attempt = 0; attempt < 2; attempt++) {
         uint32_t idx = 0;
         VkResult ar = vkAcquireNextImageKHR(s_dev, s_swap, UINT64_MAX, s_sem_acq,
                                             VK_NULL_HANDLE, &idx);
-        if (ar == VK_ERROR_OUT_OF_DATE_KHR || ar == VK_SUBOPTIMAL_KHR) {
-            vkDeviceWaitIdle(s_dev);
+        if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
+            VkResult idle = vkDeviceWaitIdle(s_dev);
+            if (idle != VK_SUCCESS) {
+                fprintf(stderr, "sdl3vk: vkDeviceWaitIdle failed: %d\n", (int)idle);
+                return -2;
+            }
             if (!create_swapchain()) return 1;   /* minimized: drop the frame, stay alive */
             continue;
         }
-        if (ar != VK_SUCCESS) return 1;
+        if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+            fprintf(stderr, "sdl3vk: vkAcquireNextImageKHR failed: %d\n", (int)ar);
+            return -2;
+        }
 
         VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkResetCommandBuffer(s_cmd, 0);
-        vkBeginCommandBuffer(s_cmd, &bi);
+        VkResult result = vkResetCommandBuffer(s_cmd, 0);
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "sdl3vk: vkResetCommandBuffer failed: %d\n", (int)result);
+            return -2;
+        }
+        result = vkBeginCommandBuffer(s_cmd, &bi);
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "sdl3vk: vkBeginCommandBuffer failed: %d\n", (int)result);
+            return -2;
+        }
 
         if (do_upload) {
             /* staging buffer -> fb image */
@@ -512,18 +642,27 @@ static int present_common(VkImage src, int srcw, int srch, int do_upload) {
             barrier(s_cmd, s_fbimg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        } else if (source_layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+            barrier(s_cmd, src, source_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         }
 
         /* fb image -> swapchain, aspect-correct letterbox blit */
         barrier(s_cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         {
             VkClearColorValue black = {{0, 0, 0, 1}};
             VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             vkCmdClearColorImage(s_cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  &black, 1, &rng);
         }
+        barrier(s_cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         int dw = (int)s_swap_ext.width, dh = (int)s_swap_ext.height;
         int vw = dw, vh = dw * PSP_H / PSP_W;
         if (vh > dh) { vh = dh; vw = dh * PSP_W / PSP_H; }
@@ -542,7 +681,11 @@ static int present_common(VkImage src, int srcw, int srch, int do_upload) {
         barrier(s_cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-        vkEndCommandBuffer(s_cmd);
+        result = vkEndCommandBuffer(s_cmd);
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "sdl3vk: vkEndCommandBuffer failed: %d\n", (int)result);
+            return -2;
+        }
 
         VkPipelineStageFlags wait_st = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -553,7 +696,13 @@ static int present_common(VkImage src, int srcw, int srch, int do_upload) {
         si.pCommandBuffers = &s_cmd;
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &s_sem_done[idx];
-        vkQueueSubmit(s_queue, 1, &si, s_fence);
+        result = vkQueueSubmit(s_queue, 1, &si, s_fence);
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "sdl3vk: vkQueueSubmit failed: %d\n", (int)result);
+            return -2;
+        }
+        if (transitioned && source_layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+            *transitioned = 1;
 
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         pi.waitSemaphoreCount = 1;
@@ -563,12 +712,30 @@ static int present_common(VkImage src, int srcw, int srch, int do_upload) {
         pi.pImageIndices = &idx;
         VkResult pr = vkQueuePresentKHR(s_queue, &pi);
 
-        vkWaitForFences(s_dev, 1, &s_fence, VK_TRUE, UINT64_MAX);
-        vkResetFences(s_dev, 1, &s_fence);
+        result = vkWaitForFences(s_dev, 1, &s_fence, VK_TRUE, UINT64_MAX);
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "sdl3vk: vkWaitForFences failed: %d\n", (int)result);
+            return -2;
+        }
+        result = vkResetFences(s_dev, 1, &s_fence);
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "sdl3vk: vkResetFences failed: %d\n", (int)result);
+            return -2;
+        }
 
-        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
-            vkDeviceWaitIdle(s_dev);
+        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR ||
+            (pr == VK_SUCCESS && ar == VK_SUBOPTIMAL_KHR)) {
+            result = vkDeviceWaitIdle(s_dev);
+            if (result != VK_SUCCESS) {
+                fprintf(stderr, "sdl3vk: vkDeviceWaitIdle failed: %d\n", (int)result);
+                return -2;
+            }
             create_swapchain();
+        } else if (pr == VK_SUCCESS) {
+            sr_vk_present_record(&s_present_cache, generation);
+        } else {
+            fprintf(stderr, "sdl3vk: vkQueuePresentKHR failed: %d\n", (int)pr);
+            return -2;
         }
         break;
     }
@@ -577,16 +744,25 @@ static int present_common(VkImage src, int srcw, int srch, int do_upload) {
 
 int sdl3vk_present_rgba(const uint32_t *px) {
     memcpy(s_staging_map, px, PSP_W * PSP_H * 4);
-    return present_common(s_fbimg, PSP_W, PSP_H, 1);
+    return present_common(
+        s_fbimg, PSP_W, PSP_H, 1, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, NULL);
 }
 
 int sdl3vk_present_image(
-    void *vk_image, uint32_t source_width, uint32_t source_height) {
+    void *vk_image, uint32_t source_width, uint32_t source_height,
+    uint64_t generation, uint32_t source_layout, int *transitioned) {
+    *transitioned = 0;
     return present_common(
-        (VkImage)vk_image, (int)source_width, (int)source_height, 0);
+        (VkImage)vk_image, (int)source_width, (int)source_height, 0, generation,
+        (VkImageLayout)source_layout, transitioned);
 }
 
 void sdl3vk_shutdown(void) {
+    if (s_present_reused)
+        fprintf(stderr, "sdl3vk: reused %llu unchanged presentations\n",
+                (unsigned long long)s_present_reused);
+    s_present_reused = 0;
+    sr_vk_present_invalidate(&s_present_cache);
     if (s_dev) vkDeviceWaitIdle(s_dev);
     destroy_swapchain();
     if (s_fbimg)       vkDestroyImage(s_dev, s_fbimg, NULL);

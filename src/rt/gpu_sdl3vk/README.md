@@ -22,7 +22,8 @@ Enable the backend with `SR_GPU=vk`. The renderer uses:
 - persistent GPU ownership, with watched guest-VRAM reads/writes providing
   explicit materialization and invalidation;
 - direct GPU aliases for compatible sibling framebuffer textures and ordered
-  snapshots for self-feedback;
+  snapshots for self-feedback, including compatible CLUT32 textures sourced
+  from RGBA8888 framebuffers;
 - the software decoder for ordinary RAM textures, followed by a bounded
   Vulkan texture cache and optional xBRZ upload scaling; and
 - direct swapchain presentation of GPU-resident targets.
@@ -67,11 +68,23 @@ reinterpretations are materialized before software decode. CPU/DMA writes
 invalidate every overlapping 512-row texture envelope after first
 materializing GPU-newer render rows.
 
-Destination-aware draws use portable core Vulkan image copies and barriers;
-no framebuffer-feedback-loop extension is required. Presentation uses one
-render-finished semaphore per swapchain image so a semaphore is not reused
-while the presentation engine still owns it. All Vulkan objects are destroyed
-before the SDL device shuts down.
+Framebuffer reads consider the 272 writable rows, while CPU writes also
+invalidate the 512-row sampling envelope. Indexed texture cache keys include
+the palette, and GPU-direct CLUT32 framebuffer reads use a separate palette
+image. GE texture flushes invalidate cached state without forcing an
+immediate submission; mutable texture uploads and cache eviction still wait
+for pending draws that reference them.
+
+Destination-aware and self-feedback draws use portable core Vulkan image
+copies and barriers; no framebuffer-feedback-loop extension is required.
+The first feedback snapshot in a submission copies the full texture envelope.
+Later snapshots copy conservative accumulated color-write bounds, or reuse the
+snapshot when the sampled region is unchanged. Presentation reuses an unchanged
+GPU frame while still polling input; window and display events force a redraw,
+as does a periodic swapchain revalidation. One
+render-finished semaphore is used per swapchain image so a semaphore is not
+reused while the presentation engine still owns it. All Vulkan objects are
+destroyed before the SDL device shuts down.
 
 ## Build and shader checks
 
@@ -92,7 +105,7 @@ mingw32-make test-vulkan-shader-state
 ```
 
 Title CMake builds can run the corresponding
-`mga2_vulkan_shader_state` CTest.
+`mga2_vulkan_shader_state` or `kzl_vulkan_shader_state` CTest.
 
 ## Validation
 
@@ -136,6 +149,10 @@ scaling with the Khronos validation layer.
 - `SR_GPU_LOG=1`: log each Vulkan GE submit.
 - `SR_GPU_SAFE=1`: materialize a presented target into guest VRAM; intended
   for guest-frame captures and diagnostics.
+- `SR_GPU_FULL_FEEDBACK=1`: copy the complete feedback image on every
+  self-feedback draw for differential diagnostics.
+- `SR_GPU_PRESENT_REPEATS=1`: present unchanged GPU frames instead of reusing
+  the last display for differential diagnostics.
 - `SR_VK_SCALE=1` through `8`: override the configured internal resolution
   for diagnostics and native-resolution pixel gates.
 - `SR_GPU_NORTT=1`: force framebuffer textures through materialization and

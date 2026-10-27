@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "h264_psmf.h"
 
 /* GUIDs defined locally (avoids depending on which GUIDs this mingw's mfuuid.a carries). */
 static const GUID L_CLSID_CMSH264Decoder = {0x62CE7E72,0x4C71,0x4D20,{0xB1,0x5D,0x45,0x28,0x31,0xA8,0x7D,0x9D}};
@@ -46,8 +47,6 @@ static const GUID L_MF_MT_DEFAULT_STRIDE= {0x644b4e48,0x1e02,0x4516,{0xb0,0xeb,0
 #define MF_E_NOTACCEPTING ((HRESULT)0xC00D36B5L)
 #endif
 
-typedef struct { uint32_t off, len; int64_t pts; } EsChunk;
-
 typedef struct {
     int used;
     IMFTransform *xf;
@@ -56,13 +55,7 @@ typedef struct {
     uint64_t submittedFrames, returnedFrames;
     int failed;
     int drained;
-    /* MPEG-PS input accumulation (unparsed tail) */
-    uint8_t *ps; uint32_t psLen, psCap, psPos;
-    /* demuxed H.264 ES byte fifo + chunk table (one chunk per video PES payload) */
-    uint8_t *es; uint32_t esLen, esCap;
-    EsChunk *ck; uint32_t nCk, capCk, esPos;
-    uint8_t *audio; uint32_t audioLen, audioCap, audioPos;
-    EsChunk *audioCk; uint32_t nAudioCk, capAudioCk;
+    SrPsmfDemux demux;
     LONGLONG fakeTime;             /* monotonic 100 ns timestamp for frame-aligned NAL samples */
 } Dec;
 
@@ -71,127 +64,6 @@ static Dec s_dec[MAX_DEC];
 static int s_mf_state = 0;         /* 0 = not tried, 1 = up, -1 = failed */
 
 static int mflog(void) { static int v = -1; if (v < 0) v = getenv("SR_MPEGLOG") ? 1 : 0; return v; }
-
-/* ---- buffers -------------------------------------------------------------------------- */
-static int buf_reserve(uint8_t **d, uint32_t *cap, uint32_t need) {
-    if (need <= *cap) return 1;
-    uint32_t n = *cap ? *cap : 65536;
-    while (n < need) n *= 2;
-    uint8_t *p = (uint8_t *)realloc(*d, n);
-    if (!p) return 0;
-    *d = p; *cap = n;
-    return 1;
-}
-
-static void es_append(Dec *d, const uint8_t *p, uint32_t n, int64_t pts) {
-    if (!buf_reserve(&d->es, &d->esCap, d->esLen + n)) return;
-    if (d->nCk == d->capCk) {
-        uint32_t c = d->capCk ? d->capCk * 2 : 256;
-        EsChunk *t = (EsChunk *)realloc(d->ck, c * sizeof(EsChunk));
-        if (!t) return;
-        d->ck = t; d->capCk = c;
-    }
-    memcpy(d->es + d->esLen, p, n);
-    d->ck[d->nCk].off = d->esLen;
-    d->ck[d->nCk].len = n;
-    d->ck[d->nCk].pts = pts;
-    d->nCk++;
-    d->esLen += n;
-}
-
-static void audio_append(Dec *d, const uint8_t *p, uint32_t n, int64_t pts) {
-    if (!buf_reserve(&d->audio, &d->audioCap, d->audioLen + n)) return;
-    if (d->nAudioCk == d->capAudioCk) {
-        uint32_t capacity = d->capAudioCk ? d->capAudioCk * 2u : 256u;
-        EsChunk *chunks =
-            (EsChunk *)realloc(d->audioCk, capacity * sizeof(EsChunk));
-        if (!chunks) return;
-        d->audioCk = chunks;
-        d->capAudioCk = capacity;
-    }
-    memcpy(d->audio + d->audioLen, p, n);
-    d->audioCk[d->nAudioCk].off = d->audioLen;
-    d->audioCk[d->nAudioCk].len = n;
-    d->audioCk[d->nAudioCk].pts = pts;
-    d->nAudioCk++;
-    d->audioLen += n;
-}
-
-/* Drop consumed bytes so the fifos stay small (the ring is ~1.2MB; the game feeds as we drain). */
-static void es_compact(Dec *d) {
-    if (!d->esPos || d->esPos < (1u << 20)) return;
-    uint32_t base = d->esPos;
-    memmove(d->es, d->es + base, d->esLen - base);
-    d->esLen -= base;
-    uint32_t live = 0;
-    for (uint32_t i = 0; i < d->nCk; i++) {
-        uint32_t end = d->ck[i].off + d->ck[i].len;
-        if (end <= base) continue;
-        uint32_t start = d->ck[i].off > base ? d->ck[i].off : base;
-        d->ck[live] = d->ck[i];
-        d->ck[live].off = start - base;
-        d->ck[live].len = end - start;
-        live++;
-    }
-    d->nCk = live;
-    d->esPos = 0;
-}
-
-/* ---- MPEG program-stream demux --------------------------------------------------------- */
-/* Parse one syntactic element at psPos. Returns 1 if it consumed something, 0 if it needs
- * more bytes. Video PES payloads (stream id 0xE0-0xEF) are appended to the ES fifo with the
- * PES PTS (90 kHz) when present, -1 otherwise. */
-static int ps_parse_one(Dec *d) {
-    const uint8_t *p = d->ps + d->psPos;
-    uint32_t n = d->psLen - d->psPos;
-    if (n < 4) return 0;
-    /* resync to a start code */
-    if (!(p[0] == 0 && p[1] == 0 && p[2] == 1)) {
-        uint32_t i = 1;
-        while (i + 3 <= n && !(p[i] == 0 && p[i+1] == 0 && p[i+2] == 1)) i++;
-        d->psPos += i;
-        return (d->psLen - d->psPos) >= 4;
-    }
-    uint8_t code = p[3];
-    if (code == 0xBA) {                          /* pack header: 14 bytes + stuffing */
-        if (n < 14) return 0;
-        uint32_t skip = 14 + (p[13] & 7);
-        if (n < skip) return 0;
-        d->psPos += skip;
-        return 1;
-    }
-    if (code == 0xB9) { d->psPos += 4; return 1; }   /* program end */
-    if (code < 0xBB) { d->psPos += 4; return 1; }    /* unexpected: skip the start code */
-    if (n < 6) return 0;
-    uint32_t len = ((uint32_t)p[4] << 8) | p[5];
-    uint32_t tot = 6 + len;
-    if (n < tot) return 0;
-    if (((code >= 0xE0 && code <= 0xEF) || code == 0xBD) &&
-        len >= 3 && (p[6] & 0xC0) == 0x80) {
-        uint32_t hdr = 9 + p[8];
-        int64_t pts = -1;
-        if ((p[7] & 0x80) && p[8] >= 5 && len >= 8) {
-            pts = ((int64_t)(p[9]  >> 1 & 7) << 30) |
-                  ((int64_t) p[10]          << 22) |
-                  ((int64_t)(p[11] >> 1)    << 15) |
-                  ((int64_t) p[12]          << 7)  |
-                  ((int64_t)(p[13] >> 1));
-        }
-        if (tot > hdr && code >= 0xE0 && code <= 0xEF) {
-            es_append(d, p + hdr, tot - hdr, pts);
-        } else if (tot > hdr + 4 && code == 0xBD) {
-            uint8_t channel = p[hdr];
-            uint32_t audio_header =
-                channel >= 0xB0 && channel <= 0xBF ? 5u : 4u;
-            if (tot > hdr + audio_header)
-                audio_append(
-                    d, p + hdr + audio_header,
-                    tot - hdr - audio_header, pts);
-        }
-    }
-    d->psPos += tot;
-    return 1;
-}
 
 /* ---- Media Foundation ------------------------------------------------------------------- */
 static int mf_up(void) {
@@ -259,50 +131,31 @@ static int dec_open(Dec *d) {
     return 1;
 }
 
-static int find_nal_start(
-    const uint8_t *data, uint32_t length, uint32_t from,
-    uint32_t *offset, uint32_t *header) {
-    for (uint32_t i = from; i + 3u < length; i++) {
-        if (data[i] != 0 || data[i + 1] != 0) continue;
-        if (data[i + 2] == 1) {
-            *offset = i;
-            *header = i + 3u;
-            return 1;
-        }
-        if (i + 4u < length && data[i + 2] == 0 && data[i + 3] == 1) {
-            *offset = i;
-            *header = i + 4u;
-            return 1;
-        }
-    }
-    return 0;
-}
-
 /* Feed one Annex-B NAL per sample. The Microsoft decoder establishes SPS/PPS state from
  * parameter-set samples before accepting IDR/P slices; combining all of them behind one
  * AUD made it negotiate dimensions but conceal the pictures. */
 static int feed_one(Dec *d, int eos) {
     uint32_t begin = 0, header = 0;
-    if (!find_nal_start(
-            d->es, d->esLen, d->esPos, &begin, &header)) {
+    if (!sr_h264_find_nal(
+            d->demux.es, d->demux.esLen, d->demux.esPos, &begin, &header)) {
         return 0;
     }
     uint32_t end = 0, next_header = 0;
-    if (!find_nal_start(
-            d->es, d->esLen, header + 1u, &end, &next_header)) {
+    if (!sr_h264_find_nal(
+            d->demux.es, d->demux.esLen, header + 1u, &end, &next_header)) {
         if (!eos) return 0;
-        end = d->esLen;
+        end = d->demux.esLen;
     }
     if (end <= begin) return -1;
     uint32_t length = end - begin;
-    uint8_t nal_type = d->es[header] & 31u;
+    uint8_t nal_type = d->demux.es[header] & 31u;
     int vcl = nal_type == 1u || nal_type == 5u;
     if (nal_type == 9u ||
         (nal_type == 8u && !d->spsSet) ||
         ((nal_type != 7u && nal_type != 8u) &&
          (!d->spsSet || !d->ppsSet))) {
-        d->esPos = end;
-        es_compact(d);
+        d->demux.esPos = end;
+        sr_psmf_compact_video(&d->demux);
         return 1;
     }
     IMFSample *smp = NULL; IMFMediaBuffer *mb = NULL;
@@ -310,7 +163,7 @@ static int feed_one(Dec *d, int eos) {
     int ret = -1;
     if (FAILED(MFCreateMemoryBuffer(length, &mb))) return -1;
     if (SUCCEEDED(IMFMediaBuffer_Lock(mb, &base, NULL, NULL))) {
-        memcpy(base, d->es + begin, length);
+        memcpy(base, d->demux.es + begin, length);
         IMFMediaBuffer_Unlock(mb);
         IMFMediaBuffer_SetCurrentLength(mb, length);
         if (SUCCEEDED(MFCreateSample(&smp))) {
@@ -323,14 +176,14 @@ static int feed_one(Dec *d, int eos) {
                     smp, &MFSampleExtension_CleanPoint, TRUE);
             HRESULT hr = IMFTransform_ProcessInput(d->xf, 0, smp, 0);
             if (SUCCEEDED(hr)) {
-                d->esPos = end;
+                d->demux.esPos = end;
                 if (nal_type == 7u) d->spsSet = 1;
                 if (nal_type == 8u) d->ppsSet = 1;
                 if (vcl) {
                     d->fakeTime += 333667;
                     d->submittedFrames++;
                 }
-                es_compact(d);
+                sr_psmf_compact_video(&d->demux);
                 ret = 1;
             }
             else ret = (hr == MF_E_NOTACCEPTING) ? 0 : -1;
@@ -530,8 +383,7 @@ void sr_h264_destroy(int id) {
     if (id < 0 || id >= MAX_DEC || !s_dec[id].used) return;
     Dec *d = &s_dec[id];
     if (d->xf) IMFTransform_Release(d->xf);
-    free(d->ps); free(d->es); free(d->ck);
-    free(d->audio); free(d->audioCk);
+    sr_psmf_destroy(&d->demux);
     memset(d, 0, sizeof(*d));
 }
 
@@ -539,35 +391,15 @@ void sr_h264_feed(int id, const uint8_t *data, uint32_t len) {
     if (id < 0 || id >= MAX_DEC || !s_dec[id].used || !data || !len) return;
     Dec *d = &s_dec[id];
     if (d->failed) return;
-    if (!buf_reserve(&d->ps, &d->psCap, d->psLen + len)) return;
-    memcpy(d->ps + d->psLen, data, len);
-    d->psLen += len;
-    while (ps_parse_one(d)) {}
-    if (d->psPos > (1u << 20)) {            /* drop the parsed prefix */
-        memmove(d->ps, d->ps + d->psPos, d->psLen - d->psPos);
-        d->psLen -= d->psPos;
-        d->psPos = 0;
+    if (!sr_psmf_feed(&d->demux, data, len)) {
+        fprintf(stderr, "h264: invalid PSMF stream or demux allocation failed\n");
+        d->failed = 1;
     }
-}
-
-static int audio_frame_size(Dec *d) {
-    while (d->audioPos + 2 <= d->audioLen &&
-           !(d->audio[d->audioPos] == 0x0F &&
-             d->audio[d->audioPos + 1] == 0xD0))
-        d->audioPos++;
-    if (d->audioLen - d->audioPos < 4) return 0;
-    uint8_t code1 = d->audio[d->audioPos + 2];
-    uint8_t code2 = d->audio[d->audioPos + 3];
-    uint32_t frame_size =
-        (((uint32_t)code1 & 3u) << 8) | ((uint32_t)code2 << 3);
-    frame_size += 0x10u;
-    if (frame_size < 8 || d->audioLen - d->audioPos < frame_size) return 0;
-    return (int)frame_size;
 }
 
 int sr_h264_audio_available(int id) {
     if (id < 0 || id >= MAX_DEC || !s_dec[id].used) return 0;
-    return audio_frame_size(&s_dec[id]) > 0;
+    return sr_psmf_audio_available(&s_dec[id].demux);
 }
 
 /* Return one demuxed PSP ATRAC3+ frame, without its 8-byte 0F D0 frame header. */
@@ -575,27 +407,7 @@ int sr_h264_audio_frame(
     int id, uint8_t *dst, int capacity, int *channels, int64_t *pts) {
     if (id < 0 || id >= MAX_DEC || !s_dec[id].used || !dst || capacity <= 0)
         return -1;
-    Dec *d = &s_dec[id];
-    int frame_size_int = audio_frame_size(d);
-    if (frame_size_int <= 0) return frame_size_int;
-    uint32_t frame_size = (uint32_t)frame_size_int;
-    uint8_t code1 = d->audio[d->audioPos + 2];
-    uint32_t payload = frame_size - 8u;
-    if (payload > (uint32_t)capacity) return -1;
-
-    memcpy(dst, d->audio + d->audioPos + 8u, payload);
-    if (pts) {
-        *pts = -1;
-        for (uint32_t i = 0; i < d->nAudioCk; i++) {
-            if (d->audioCk[i].off > d->audioPos) break;
-            if (d->audioPos < d->audioCk[i].off + d->audioCk[i].len &&
-                d->audioCk[i].pts >= 0)
-                *pts = d->audioCk[i].pts;
-        }
-    }
-    d->audioPos += frame_size;
-    if (channels) *channels = code1 == 0x24 ? 1 : 2;
-    return (int)payload;
+    return sr_psmf_audio_frame(&s_dec[id].demux, dst, capacity, channels, pts);
 }
 
 /* Decode the next frame into dst (host pointer to the guest video buffer). eos != 0 once the
@@ -609,11 +421,16 @@ int sr_h264_frame(int id, int eos, uint8_t *dst, int frameWidth, int pixelMode) 
         int r = pump_out(d, dst, frameWidth, pixelMode);
         if (r > 0) return 1;
         if (r < 0) { d->failed = 1; return -1; }
-        if (d->esPos < d->esLen) {
+        if (d->demux.esPos < d->demux.esLen) {
             int f = feed_one(d, eos);
             if (f < 0) { d->failed = 1; return -1; }
             if (f == 0) return 0;           /* MFT full but no output: shouldn't happen */
         } else if (eos && !d->drained) {
+            if (!sr_psmf_finish(&d->demux)) {
+                fprintf(stderr, "h264: truncated PSMF packet at end of stream\n");
+                d->failed = 1;
+                return -1;
+            }
             d->drained = 1;
             IMFTransform_ProcessMessage(d->xf, MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
             IMFTransform_ProcessMessage(d->xf, MFT_MESSAGE_COMMAND_DRAIN, 0);

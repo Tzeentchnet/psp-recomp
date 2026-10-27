@@ -1,9 +1,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include "perf_stats.h"
+#include "test_platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <windows.h>
 
 static void require(int condition, const char *message) {
     if (condition) return;
@@ -13,14 +13,14 @@ static void require(int condition, const char *message) {
 
 int main(void) {
     SrPerfFrame frame;
-    _putenv_s("SR_PERF_LOG", "1");
+    require(sr_test_set_env("SR_PERF_LOG", "1"), "could not set profiler");
     require(sr_perf_enabled(), "profiler did not enable");
     require(sr_perf_current() == SR_PERF_NATIVE, "unexpected initial category");
 
-    Sleep(2);
+    sr_test_sleep_ms(2);
     SrPerfCategory previous = sr_perf_switch(SR_PERF_HLE);
     require(previous == SR_PERF_NATIVE, "category switch did not return native");
-    Sleep(2);
+    sr_test_sleep_ms(2);
     sr_perf_counter_add(SR_PERF_HLE_CALLS, 3);
     sr_perf_counter_add(SR_PERF_GE_COMMANDS, 7);
     sr_perf_switch(previous);
@@ -35,8 +35,12 @@ int main(void) {
     require(frame.counters[SR_PERF_HLE_CALLS] == 0, "counters did not reset");
 
     /* A/B alternation: ten presentations per half, two paths. */
-    _putenv_s("SR_PERF_ALTERNATE", "merge,memo");
-    _putenv_s("SR_PERF_ALTERNATE_PRESENTS", "10");
+    require(
+        sr_test_set_env("SR_PERF_ALTERNATE", "merge,memo"),
+        "could not set alternating paths");
+    require(
+        sr_test_set_env("SR_PERF_ALTERNATE_PRESENTS", "10"),
+        "could not set alternation interval");
     sr_perf_alternate_tick(0);
     require(sr_perf_alternate_mask == 0, "alternation starts with paths on");
     require(!sr_perf_path_off(SR_PATH_DRAW_MERGE), "merge should start on");

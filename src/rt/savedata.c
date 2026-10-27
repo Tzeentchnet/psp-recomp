@@ -17,8 +17,8 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include "recomp.h"
+#include "platform.h"
 #include "savedata_crypto.h"
-#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,17 +95,22 @@ static const char *ms_root(void) {
 }
 
 static void mkdirs(const char *path) {
-    char tmp[MAX_PATH];
+    char tmp[SR_PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s", path);
     for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/' || *p == '\\') { *p = 0; CreateDirectoryA(tmp, NULL); *p = '\\'; }
+        if (*p == '/' || *p == '\\') {
+            char separator = *p;
+            *p = 0;
+            _mkdir(tmp);
+            *p = separator;
+        }
     }
-    CreateDirectoryA(tmp, NULL);
+    _mkdir(tmp);
 }
 
 /* memstick/PSP/SAVEDATA/<gameName><saveName> */
 static void save_dir(char *out, int cap, const char *game, const char *save) {
-    snprintf(out, cap, "%s\\PSP\\SAVEDATA\\%s%s", ms_root(), game, save);
+    snprintf(out, cap, "%s/PSP/SAVEDATA/%s%s", ms_root(), game, save);
 }
 
 static int sdlog(void) { static int v = -1; if (v < 0) v = getenv("SR_DLGLOG") ? 1 : 0; return v; }
@@ -129,8 +134,8 @@ static int savedata_crypto_mode(uint32_t param, int has_key) {
 }
 
 static int write_file(const char *dir, const char *name, const uint8_t *data, uint32_t n) {
-    char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\%s", dir, name);
+    char path[SR_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
     FILE *f = fopen(path, "wb");
     if (!f) return 0;
     int ok = !n || fwrite(data, 1, n, f) == n;
@@ -214,14 +219,16 @@ static int sfo_write(const char *dir, const char *title, const char *saveTitle,
     return ok;
 }
 
-/* ---- ScePspDateTime (16 bytes) from a Windows FILETIME ------------------------------------ */
-static void put_psp_time(uint32_t addr, const FILETIME *ft) {
-    SYSTEMTIME st;
-    memset(&st, 0, sizeof(st));
-    if (ft) { FILETIME lt; FileTimeToLocalFileTime(ft, &lt); FileTimeToSystemTime(&lt, &st); }
-    MEM_W16(addr + 0, st.wYear); MEM_W16(addr + 2, st.wMonth); MEM_W16(addr + 4, st.wDay);
-    MEM_W16(addr + 6, st.wHour); MEM_W16(addr + 8, st.wMinute); MEM_W16(addr + 10, st.wSecond);
-    MEM_W32(addr + 12, (uint32_t)st.wMilliseconds * 1000u);
+/* ---- ScePspDateTime (16 bytes) ------------------------------------------------------------- */
+static void put_psp_time(uint32_t addr, time_t value) {
+    struct tm *time = value ? localtime(&value) : NULL;
+    MEM_W16(addr + 0, time ? (uint16_t)(time->tm_year + 1900) : 0);
+    MEM_W16(addr + 2, time ? (uint16_t)(time->tm_mon + 1) : 0);
+    MEM_W16(addr + 4, time ? (uint16_t)time->tm_mday : 0);
+    MEM_W16(addr + 6, time ? (uint16_t)time->tm_hour : 0);
+    MEM_W16(addr + 8, time ? (uint16_t)time->tm_min : 0);
+    MEM_W16(addr + 10, time ? (uint16_t)time->tm_sec : 0);
+    MEM_W32(addr + 12, 0);
 }
 
 static void wr_fixed(uint32_t addr, const char *s, int n) {
@@ -239,8 +246,8 @@ static void wr_guest_bytes(uint32_t addr, const uint8_t *v, uint32_t len, uint32
 }
 
 static void load_sfo_param(uint32_t param, const char *dir) {
-    char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\PARAM.SFO", dir);
+    char path[SR_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/PARAM.SFO", dir);
     FILE *f = fopen(path, "rb");
     if (!f) return;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
@@ -277,8 +284,8 @@ static int load_sfo_crypto(
     const char *dir, const char *file_name,
     uint8_t expected_hash[16], int *has_hash) {
     *has_hash = 0;
-    char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\PARAM.SFO", dir);
+    char path[SR_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/PARAM.SFO", dir);
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     fseek(f, 0, SEEK_END);
@@ -349,7 +356,7 @@ static int load_sfo_crypto(
 
 static uint32_t do_save(
     uint32_t param, const char *game, const char *save, int secure) {
-    char dir[MAX_PATH], fileName[16], title[129], saveTitle[129], detail[1025], saveDir[64];
+    char dir[SR_PATH_MAX], fileName[16], title[129], saveTitle[129], detail[1025], saveDir[64];
     save_dir(dir, sizeof(dir), game, save);
     mkdirs(dir);
     rd_cstr(param + SDP_fileName, fileName, sizeof(fileName));
@@ -397,13 +404,14 @@ static uint32_t do_save(
     write_filedata(dir, "ICON1.PMF", param + SDP_icon1);
     write_filedata(dir, "PIC1.PNG", param + SDP_pic1);
     write_filedata(dir, "SND0.AT3", param + SDP_snd0);
-    if (sdlog()) fprintf(stderr, "savedata: SAVE %s\\%s (%u bytes)\n", dir, fileName, dataSize);
+    if (sdlog()) fprintf(stderr, "savedata: SAVE %s/%s (%u bytes)\n", dir, fileName, dataSize);
     return 0;
 }
 
 static int dir_exists(const char *dir) {
-    DWORD a = GetFileAttributesA(dir);
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+    struct _stat64 status;
+    return _stat64(dir, &status) == 0 &&
+           (status.st_mode & _S_IFDIR) != 0;
 }
 
 /* Read a host file into a guest PspUtilitySavedataFileData block {buf, bufSize, size, unk}.
@@ -411,8 +419,8 @@ static int dir_exists(const char *dir) {
 static void load_filedata(const char *dir, const char *name, uint32_t fd) {
     uint32_t buf = MEM_R32(fd + 0), cap = MEM_R32(fd + 4);
     if (!buf || !cap) return;
-    char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\%s", dir, name);
+    char path[SR_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
     FILE *f = fopen(path, "rb");
     if (!f) return;
     size_t rd = fread(SR_HOST(buf), 1, cap, f);
@@ -422,7 +430,7 @@ static void load_filedata(const char *dir, const char *name, uint32_t fd) {
 
 static uint32_t do_load(
     uint32_t param, const char *game, const char *save, int secure) {
-    char dir[MAX_PATH], fileName[16], path[MAX_PATH];
+    char dir[SR_PATH_MAX], fileName[16], path[SR_PATH_MAX];
     save_dir(dir, sizeof(dir), game, save);
     rd_cstr(param + SDP_fileName, fileName, sizeof(fileName));
     if (!dir_exists(dir)) {
@@ -433,7 +441,7 @@ static uint32_t do_load(
     /* Blank fileName means success without reading data (PPSSPP LoadSaveData); the SFO and
      * icon blobs are still handed back. */
     if (fileName[0]) {
-        snprintf(path, sizeof(path), "%s\\%s", dir, fileName);
+        snprintf(path, sizeof(path), "%s/%s", dir, fileName);
         FILE *f = fopen(path, "rb");
         if (!f) {
             if (sdlog()) fprintf(stderr, "savedata: LOAD %s -> file not found\n", path);
@@ -520,32 +528,32 @@ static uint32_t do_load(
 }
 
 static uint32_t do_delete(const char *game, const char *save) {
-    char dir[MAX_PATH], path[MAX_PATH];
+    char dir[SR_PATH_MAX], path[SR_PATH_MAX];
     save_dir(dir, sizeof(dir), game, save);
-    WIN32_FIND_DATAA fd;
-    snprintf(path, sizeof(path), "%s\\*", dir);
-    HANDLE h = FindFirstFileA(path, &fd);
-    if (h == INVALID_HANDLE_VALUE) return ERR_DELETE_NO_DATA;
+    struct _finddata_t data;
+    snprintf(path, sizeof(path), "%s/*", dir);
+    intptr_t find = _findfirst(path, &data);
+    if (find == -1) return ERR_DELETE_NO_DATA;
     do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
-            DeleteFileA(path);
+        if (!(data.attrib & _A_SUBDIR)) {
+            snprintf(path, sizeof(path), "%s/%s", dir, data.name);
+            remove(path);
         }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-    RemoveDirectoryA(dir);
+    } while (_findnext(find, &data) == 0);
+    _findclose(find);
+    _rmdir(dir);
     return 0;
 }
 
 /* ERASE/ERASESECURE: remove just the named data file inside the save dir (PPSSPP DeleteData). */
 static uint32_t do_erase(uint32_t param, const char *game, const char *save) {
-    char dir[MAX_PATH], fileName[16], path[MAX_PATH];
+    char dir[SR_PATH_MAX], fileName[16], path[SR_PATH_MAX];
     save_dir(dir, sizeof(dir), game, save);
     rd_cstr(param + SDP_fileName, fileName, sizeof(fileName));
     if (!fileName[0]) return ERR_RW_NO_DATA;
-    snprintf(path, sizeof(path), "%s\\%s", dir, fileName);
+    snprintf(path, sizeof(path), "%s/%s", dir, fileName);
     if (sdlog()) fprintf(stderr, "savedata: ERASE %s\n", path);
-    return DeleteFileA(path) ? 0 : ERR_RW_NO_DATA;
+    return remove(path) == 0 ? 0 : ERR_RW_NO_DATA;
 }
 
 /* LIST (11): fill idList with this game's save directories. */
@@ -555,26 +563,28 @@ static uint32_t do_list(uint32_t param, const char *game) {
     uint32_t maxCount = MEM_R32(idList + 0);
     uint32_t entries = MEM_R32(idList + 8);
     uint32_t count = 0;
-    char pat[MAX_PATH];
-    snprintf(pat, sizeof(pat), "%s\\PSP\\SAVEDATA\\%s*", ms_root(), game);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
+    char pattern[SR_PATH_MAX];
+    snprintf(
+        pattern, sizeof(pattern), "%s/PSP/SAVEDATA/%s*",
+        ms_root(), game);
+    struct _finddata_t data;
+    intptr_t find = _findfirst(pattern, &data);
+    if (find != -1) {
         size_t gl = strlen(game);
         do {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-            if (fd.cFileName[0] == '.') continue;
+            if (!(data.attrib & _A_SUBDIR)) continue;
+            if (data.name[0] == '.') continue;
             if (entries && count < maxCount) {
                 uint32_t e = entries + count * 72u;       /* SceUtilitySavedataIdListEntry */
                 MEM_W32(e + 0, 0x11FF);                   /* st_mode (directory) */
-                put_psp_time(e + 4, &fd.ftCreationTime);
-                put_psp_time(e + 20, &fd.ftLastAccessTime);
-                put_psp_time(e + 36, &fd.ftLastWriteTime);
-                wr_fixed(e + 52, fd.cFileName + gl, 20);  /* saveName part only */
+                put_psp_time(e + 4, data.time_create);
+                put_psp_time(e + 20, data.time_access);
+                put_psp_time(e + 36, data.time_write);
+                wr_fixed(e + 52, data.name + gl, 20);  /* saveName part only */
             }
             count++;
-        } while (FindNextFileA(h, &fd));
-        FindClose(h);
+        } while (_findnext(find, &data) == 0);
+        _findclose(find);
     }
     if (count > maxCount) count = maxCount;
     MEM_W32(idList + 4, count);                           /* resultCount */
@@ -594,18 +604,18 @@ static uint32_t do_files(uint32_t param, const char *game, const char *save) {
     uint32_t maxSec = MEM_R32(fl + 0), maxNorm = MEM_R32(fl + 4), maxSys = MEM_R32(fl + 8);
     uint32_t pSec = MEM_R32(fl + 24), pNorm = MEM_R32(fl + 28), pSys = MEM_R32(fl + 32);
     uint32_t nSec = 0, nNorm = 0, nSys = 0;
-    char pat[MAX_PATH], dir[MAX_PATH];
+    char pattern[SR_PATH_MAX], dir[SR_PATH_MAX];
     save_dir(dir, sizeof(dir), game, save);
-    snprintf(pat, sizeof(pat), "%s\\*", dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) {
+    snprintf(pattern, sizeof(pattern), "%s/*", dir);
+    struct _finddata_t data;
+    intptr_t find = _findfirst(pattern, &data);
+    if (find == -1) {
         MEM_W32(fl + 12, 0); MEM_W32(fl + 16, 0); MEM_W32(fl + 20, 0);
         return ERR_LOAD_NO_DATA;                  /* no such save: FILES_NO_DATA semantics */
     }
     do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        int sys = is_system_file(fd.cFileName);
+        if (data.attrib & _A_SUBDIR) continue;
+        int sys = is_system_file(data.name);
         uint32_t *cnt = sys ? &nSys : &nNorm;
         uint32_t base = sys ? pSys : pNorm, cap = sys ? maxSys : maxNorm;
         for (int pass = 0; pass < (sys ? 1 : 2); pass++) {
@@ -614,17 +624,17 @@ static uint32_t do_files(uint32_t param, const char *game, const char *save) {
                 uint32_t e = base + *cnt * 80u;            /* SceUtilitySavedataFileListEntry */
                 MEM_W32(e + 0, 0x21FF);                    /* st_mode (file) */
                 MEM_W32(e + 4, 0);
-                MEM_W32(e + 8, fd.nFileSizeLow);
+                MEM_W32(e + 8, (uint32_t)data.size);
                 MEM_W32(e + 12, 0);
-                put_psp_time(e + 16, &fd.ftCreationTime);
-                put_psp_time(e + 32, &fd.ftLastAccessTime);
-                put_psp_time(e + 48, &fd.ftLastWriteTime);
-                wr_fixed(e + 64, fd.cFileName, 16);
+                put_psp_time(e + 16, data.time_create);
+                put_psp_time(e + 32, data.time_access);
+                put_psp_time(e + 48, data.time_write);
+                wr_fixed(e + 64, data.name, 16);
             }
             (*cnt)++;
         }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+    } while (_findnext(find, &data) == 0);
+    _findclose(find);
     if (nSec > maxSec) nSec = maxSec;
     if (nNorm > maxNorm) nNorm = maxNorm;
     if (nSys > maxSys) nSys = maxSys;
@@ -644,21 +654,23 @@ static uint32_t do_sizes(uint32_t param, const char *game) {
     uint32_t msData = MEM_R32(param + SDP_msData);
     if (msData) {
         /* info block at +36: used clusters/KB of the named save (0 if absent) */
-        char game2[16], save2[24], dir[MAX_PATH], pat[MAX_PATH];
+        char game2[16], save2[24], dir[SR_PATH_MAX], pattern[SR_PATH_MAX];
         rd_cstr(msData + 0, game2, 14);
         rd_cstr(msData + 16, save2, 21);
         save_dir(dir, sizeof(dir), game2[0] ? game2 : game, save2);
         if (dir_exists(dir)) {
             uint64_t used = 0;
-            snprintf(pat, sizeof(pat), "%s\\*", dir);
-            WIN32_FIND_DATAA fd;
-            HANDLE h = FindFirstFileA(pat, &fd);
-            if (h != INVALID_HANDLE_VALUE) {
+            snprintf(pattern, sizeof(pattern), "%s/*", dir);
+            struct _finddata_t data;
+            intptr_t find = _findfirst(pattern, &data);
+            if (find != -1) {
                 do {
-                    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-                        used += ((uint64_t)fd.nFileSizeLow + CLUSTER - 1) / CLUSTER * CLUSTER;
-                } while (FindNextFileA(h, &fd));
-                FindClose(h);
+                    if (!(data.attrib & _A_SUBDIR))
+                        used +=
+                            ((uint64_t)data.size + CLUSTER - 1) /
+                            CLUSTER * CLUSTER;
+                } while (_findnext(find, &data) == 0);
+                _findclose(find);
             }
             MEM_W32(msData + 36, (uint32_t)(used / CLUSTER));
             MEM_W32(msData + 40, (uint32_t)(used / 0x400));
@@ -734,7 +746,7 @@ static void resolve_save(uint32_t param, uint32_t mode, const char *game, char *
     int isList = (mode == SD_LISTLOAD || mode == SD_LISTSAVE || mode == SD_LISTDELETE);
     uint32_t list = MEM_R32(param + SDP_saveNameList);
     if ((isList || wild) && list) {
-        char ent[24], first[24] = "", dir[MAX_PATH];
+        char ent[24], first[24] = "", dir[SR_PATH_MAX];
         for (int i = 0; i < 99; i++) {
             rd_cstr(list + (uint32_t)i * 20, ent, 21);
             if (!ent[0]) break;
@@ -747,19 +759,23 @@ static void resolve_save(uint32_t param, uint32_t mode, const char *game, char *
     }
     if (wild) {
         /* no list (or none existed): first existing dir matching <game>* */
-        char pat[MAX_PATH];
-        WIN32_FIND_DATAA fd;
-        snprintf(pat, sizeof(pat), "%s\\PSP\\SAVEDATA\\%s*", ms_root(), game);
-        HANDLE h = FindFirstFileA(pat, &fd);
+        char pattern[SR_PATH_MAX];
+        struct _finddata_t data;
+        snprintf(
+            pattern, sizeof(pattern), "%s/PSP/SAVEDATA/%s*",
+            ms_root(), game);
+        intptr_t find = _findfirst(pattern, &data);
         save[0] = 0;
-        if (h != INVALID_HANDLE_VALUE) {
+        if (find != -1) {
             do {
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                    snprintf(save, (size_t)cap, "%s", fd.cFileName + strlen(game));
+                if (data.attrib & _A_SUBDIR) {
+                    snprintf(
+                        save, (size_t)cap, "%s",
+                        data.name + strlen(game));
                     break;
                 }
-            } while (FindNextFileA(h, &fd));
-            FindClose(h);
+            } while (_findnext(find, &data) == 0);
+            _findclose(find);
         }
     }
 }

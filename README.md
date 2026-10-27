@@ -1,6 +1,9 @@
 # PSP Static Recompiler Toolkit and Runtime
 
-This toolkit lets you translate a PSP game's relocatable executable (PRX/ELF) into C, link it with a native runtime (scheduler, HLE kernel, audio/video decoder, GPU renderer), and compile it into a native Windows executable.
+This toolkit lets you translate a PSP game's relocatable executable (PRX/ELF)
+into C, link it with a native runtime (scheduler, HLE kernel, audio/video
+decoder, GPU renderer), and compile it into a native Windows or Apple Silicon
+executable.
 
 ## Maintained branch and integrations
 
@@ -33,7 +36,8 @@ To be clear about what is and is not this project's own work:
 
 - **Rendering uses this project's own backends.** The primary Windows path is
   the D3D12 backend in `src/rt/gpu_d3d12/`; the SDL3 + Vulkan backend in
-  `src/rt/gpu_sdl3vk/` remains available as a reference and alternate path.
+  `src/rt/gpu_sdl3vk/` is the Apple Silicon path and runs over Metal through
+  MoltenVK.
   Neither reuses PPSSPP's GPU. (An earlier experiment, `src/rt/gpu_vk/`, *did*
   wrap PPSSPP's `GPU_Vulkan` behind a C ABI, but it was never activated and has
   been removed.) Their GE semantics were validated against PPSSPP's software
@@ -81,16 +85,40 @@ requirements.
 
 ## Prerequisites
 
-- **OS**: Windows 10/11 x64 with a Vulkan 1.1- or D3D12-capable GPU.
-- **Python 3**: For running the offline compilation scripts.
-- **DirectX Shader Compiler**: `dxc.exe` from the Windows SDK when regenerating the
-  checked-in D3D12 shader includes.
-- **MSYS2 (UCRT64)**:
+- **Python 3.11 or newer**: For the offline compilation scripts.
+- A decrypted game ELF (obtained from `EBOOT.PBP` using PPSSPP or
+  PSDecrypter).
+
+### Windows
+
+- Windows 10/11 x64 with a Vulkan 1.1- or D3D12-capable GPU.
+- DirectX Shader Compiler (`dxc.exe`) from the Windows SDK when regenerating
+  the checked-in D3D12 shader includes.
+- MSYS2 (UCRT64):
   - GCC: `pacman -S mingw-w64-ucrt-x86_64-gcc`
   - SDL3: `pacman -S mingw-w64-ucrt-x86_64-sdl3`
   - Vulkan Loader: `pacman -S mingw-w64-ucrt-x86_64-vulkan-loader`
   - LLD Linker (Recommended; prevents MinGW's ld from crashing on huge generated files): `pacman -S mingw-w64-ucrt-x86_64-lld`
-- **Game Executable**: A decrypted ELF file of the game (obtained from `EBOOT.PBP` using PPSSPP or PSDecrypter).
+
+### Apple Silicon
+
+- macOS on arm64 with Xcode Command Line Tools and Homebrew.
+- SDL3, the Vulkan loader and headers, MoltenVK, pkg-config, and a current
+  Python:
+
+```bash
+brew install python@3.13 pkg-config sdl3 vulkan-loader vulkan-headers molten-vk
+```
+
+The Vulkan renderer uses MoltenVK's portability driver, so rendering is backed
+by Metal without a separate native Metal renderer. Homebrew's Vulkan loader
+normally discovers the MoltenVK ICD automatically. New macOS graphics
+configurations default to 1x internal resolution; existing configurations are
+preserved. If the loader does not find MoltenVK, set:
+
+```bash
+export VK_ICD_FILENAMES="$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json"
+```
 
 ## Recompiling a Game
 
@@ -130,11 +158,33 @@ Set `PSP_RECOMP_FUNCTION_CATALOG` to a private provenance catalog that should
 be used by default across local projects.
 
 ### 4. Compile the Runtime & Game
-Build the game and compile the runtime objects:
+On Windows, build the game and runtime objects with:
+
 ```bash
 mingw32-make GAME_NAME=mygame GAME_ELF=<path_to_eboot.elf> GAME_BASE=0x08804000 GAME_ENTRY=<entry_point_address>
 ```
-*Note: Make sure `GAME_ENTRY` matches the entry point address of your specific game ELF.*
+
+On Apple Silicon, use the same Makefile with the Homebrew Python:
+
+```bash
+make \
+  PYTHON=/opt/homebrew/opt/python@3.13/bin/python3.13 \
+  GAME_NAME=mygame \
+  GAME_ELF=<path_to_eboot.elf> \
+  GAME_BASE=0x08804000 \
+  GAME_ENTRY=<entry_point_address>
+```
+
+The macOS output is `build/mygame/mygame`; Windows produces
+`build/mygame/mygame.exe`. Make sure `GAME_ENTRY` matches the entry point of
+the specific ELF.
+
+On macOS SDK versions whose text stubs contain an unsupported
+`arm64e.x1` architecture, select an installed older SDK for the build:
+
+```bash
+export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+```
 
 The output executable will land at `build/mygame/mygame.exe`.
 
@@ -153,10 +203,16 @@ tracing. Title builds can define `SR_EXPECTED_ISO_SIZE` and
 allocated; omitting them retains game-agnostic behavior.
 
 ### 5. Setup Game Assets & Run
-1. Place your dumped game UMD ISO in the directory containing `mygame.exe` (name it `game.iso`, or set the `PSP_ISO` environment variable to point to the ISO path).
-2. Run the game from a command prompt:
+1. Place your dumped game UMD ISO beside the executable as `game.iso`, or set
+   `PSP_ISO` to its full path.
+2. Run the game:
+
 ```bash
+# Windows
 build/mygame/mygame.exe --image build/mygame/mygame_image.bin 0x08804000 <entry_point_address> none none --gui
+
+# macOS
+build/mygame/mygame --image build/mygame/mygame_image.bin 0x08804000 <entry_point_address> none none --gui
 ```
 
 ## Runtime Controls
@@ -176,17 +232,20 @@ input can be mixed at any time. The default PC mappings are:
 Gamepads use the left stick, D-pad, standard south/east/west/north face
 buttons, and either shoulder or trigger for L/R.
 
-On first windowed launch, the runtime opens a native graphics settings dialog
-and writes `graphics.ini` beside the executable. D3D12 and 2x internal
-resolution (960x544) are the defaults:
+On first windowed launch, the runtime writes `graphics.ini` beside the
+executable. Windows opens its native settings dialog and defaults to D3D12;
+macOS defaults to Vulkan over MoltenVK. Both default to 2x internal resolution:
 
 ```ini
+# Windows
 renderer = d3d12
 internal_resolution = 2
 anti_aliasing = off
 ```
 
-Run `mygame.exe --configure` to reopen the dialog without starting the game.
+Use `renderer = vk` on macOS. Run `mygame.exe --configure` to reopen the
+Windows dialog without starting the game. macOS currently prints the config
+path instead; edit `graphics.ini` and `input.ini` directly.
 `renderer` accepts `auto`, `d3d12`, `sw`, or `vk`; unavailable backends fail
 explicitly at startup. `internal_resolution` accepts every integer from 1
 through 8 and applies to D3D12 color/depth targets, feedback snapshots,
@@ -284,11 +343,20 @@ opening the first-run launcher or reading/writing a file.
 ## Environment Settings
 
 Set these environment variables before running the game to control runtime features:
-- Audio uses the native Windows XAudio2 2.9 backend at 44.1 kHz stereo. Eight
-  256-frame source-buffer slots provide up to 46.44 ms of device coverage.
+- Audio uses XAudio2 2.9 on Windows and an SDL3 output stream on macOS, both at
+  44.1 kHz stereo. The Windows backend's eight 256-frame source-buffer slots
+  provide up to 46.44 ms of device coverage.
   The feeder submits only available guest PCM instead of pre-rendering silence,
   and Output2 preserves the PSP's two-buffer completion contract. PSP channels
   still mix through the shared saturation ring before submission.
+- Windows decodes H.264 movie video with Media Foundation. macOS uses
+  VideoToolbox and requires a verified hardware-accelerated H.264 decoder;
+  it reports an error if one is unavailable instead of falling back to
+  software. Both paths demultiplex ATRAC movie audio for the shared decoder.
+  Movie audio timestamps advance for each ATRAC frame, including when a PES
+  packet contains multiple frames.
+  Other portable platforms currently report H.264 as unavailable. Terminal
+  text entry is used as the portable OSK fallback.
 - `SR_AUDIO_LOG=1`: Print device-buffer lead, guest queue/resync/drop counters,
   played time, and host-clock drift every three seconds and at shutdown.
 - `SR_NOAUDIO=1`: Disable host playback. Blocking PSP audio calls retain their
@@ -307,6 +375,10 @@ Set these environment variables before running the game to control runtime featu
   D3D12 in a D3D12-enabled build and otherwise retains the build's default.
 - `SR_GPU=vk`: Use the Vulkan GE backend (SDL3/Vulkan build).
 - `SR_GPU=sw`: Explicitly use the reference software rasterizer.
+- `SR_GPU_FULL_FEEDBACK=1`: Force full Vulkan feedback snapshots for
+  differential diagnostics.
+- `SR_GPU_PRESENT_REPEATS=1`: Force Vulkan presentation of unchanged GPU
+  frames for differential diagnostics.
 - `SR_GPU=d3d12`: Use the SDL3/D3D12 device backend when compiled with `SR_D3D12`.
   Successful primitive hooks suppress CPU rasterization and submit native draws into GPU-owned targets. Each batch
   captures a 160-byte fragment block. Clear, opaque, source-alpha, additive, subtractive, min/max, and compatible
@@ -363,7 +435,8 @@ Set these environment variables before running the game to control runtime featu
 - `SR_INPUT_LOG=1`: Print live logical button/analog edges and whether a
   gamepad is connected.
 - `SR_FPS_COUNTER=1`: Update the GDI, Vulkan, or D3D12 window title every
-  500 ms with rolling presentation FPS and average frame time.
+  500 ms with the rolling host display-update rate and average interval.
+  This is not the game's presentation rate.
 - `SR_FBSNAP_PRESENT=<interval>`: Write an eight-file rotating set of software
   framebuffer snapshots at the requested presentation interval.
 - `SR_FBCAPTURE_PRESENTS=<p1,p2,...>`: Write software framebuffer snapshots at
@@ -373,9 +446,10 @@ Set these environment variables before running the game to control runtime featu
   allows until the requested presentation, keep host audio dormant during that phase, then align
   virtual time to the host clock and start real-time XAudio2 playback. This is intended for
   deterministic in-game testing rather than normal play.
-- `SR_PERF_LOG=1`: Record performance samples at actual host display flips and split each sample
+- `SR_PERF_LOG=1`: Record performance samples at host display update cycles and split each sample
   between frontend and graphics-backend time. `SR_PERF_START=<present>` selects the first sample by
   `sceDisplaySetFrameBuf` call count, while `SR_PERF_WINDOW=<1..600>` selects the reporting window.
+  The Vulkan presenter may reuse an unchanged frame without submitting a new swapchain presentation.
   `SR_PERF_MIN_FPS=<fps>` terminates with failure when a completed flip window falls below the
   required average. `SR_EXIT_AFTER_PRESENT=<present>` exits after the specified
   `sceDisplaySetFrameBuf` call count with final audio synchronization statistics.

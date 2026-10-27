@@ -14,13 +14,16 @@
 #include "graphics_settings.h"
 #include "input_config.h"
 #include "input_settings.h"
+#include "platform.h"
 #include "recomp.h"
 #include "startup_check.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #ifndef SR_GAME_TITLE
 #define SR_GAME_TITLE "PSP Recomp"
@@ -44,6 +47,7 @@ void SR_MODULE_POLICY_INIT(void);
 /* Last-resort crash reporter: a silent host fault (access violation etc.) otherwise kills
  * the process with nothing in the log. Maps a faulting address inside the guest arena back
  * to its guest address. */
+#ifdef _WIN32
 static LONG WINAPI sr_crash_filter(EXCEPTION_POINTERS *ep) {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
     fprintf(stderr, "HOST CRASH: exception 0x%08lx at host %p\n",
@@ -58,6 +62,7 @@ static LONG WINAPI sr_crash_filter(EXCEPTION_POINTERS *ep) {
     fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;   /* still crash (after reporting) */
 }
+#endif
 
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
@@ -156,15 +161,12 @@ static void seed_from_init(const char *trace_path, CpuState *s) {
 #ifdef SR_CONFIG_BOOT_IMAGE
 static int executable_sibling_path(
     const char *name, char *path, size_t path_size) {
-    DWORD length;
     char *slash;
     char *forward_slash;
     size_t prefix_length;
     size_t name_length;
 
-    if (!path_size || path_size > MAXDWORD) return 0;
-    length = GetModuleFileNameA(NULL, path, (DWORD)path_size);
-    if (!length || length >= path_size) return 0;
+    if (!sr_executable_path(path, path_size)) return 0;
     slash = strrchr(path, '\\');
     forward_slash = strrchr(path, '/');
     if (!slash || (forward_slash && forward_slash > slash))
@@ -178,6 +180,16 @@ static int executable_sibling_path(
 }
 #endif
 
+static void launch_error(const char *message) {
+#ifdef _WIN32
+    MessageBoxA(
+        NULL, message, "Cannot Launch Game",
+        MB_OK | MB_ICONERROR);
+#else
+    fprintf(stderr, "Cannot Launch Game: %s\n", message);
+#endif
+}
+
 int main(int argc, char **argv) {
     uint32_t entry;
     uint32_t boot_arglen = 0, boot_argp = 0;
@@ -185,7 +197,9 @@ int main(int argc, char **argv) {
     int standalone = 0;
     int launch_from_config = 0;
 
+#ifdef _WIN32
     SetUnhandledExceptionFilter(sr_crash_filter);
+#endif
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--configure-input") == 0) {
@@ -213,20 +227,14 @@ int main(int argc, char **argv) {
                     SR_CONFIG_BOOT_IMAGE,
                     image_path,
                     sizeof(image_path))) {
-                MessageBoxA(
-                    NULL,
-                    "Cannot locate the game image beside the executable.",
-                    "Cannot Launch Game",
-                    MB_OK | MB_ICONERROR);
+                launch_error(
+                    "Cannot locate the game image beside the executable.");
                 return 2;
             }
             if (!sr_startup_validate()) {
-                MessageBoxA(
-                    NULL,
+                launch_error(
                     "The supported game ISO could not be validated. "
-                    "Set PSP_ISO to your disc image and try again.",
-                    "Cannot Launch Game",
-                    MB_OK | MB_ICONERROR);
+                    "Set PSP_ISO to your disc image and try again.");
                 return 2;
             }
             img = read_file(image_path, &len);
@@ -238,11 +246,8 @@ int main(int argc, char **argv) {
             sr_load_segment(SR_CONFIG_BOOT_BASE, img, (uint32_t)len);
             goto have_image;
 #else
-            MessageBoxA(
-                NULL,
-                "This build does not define a game image for the launcher.",
-                "Cannot Launch Game",
-                MB_OK | MB_ICONERROR);
+            launch_error(
+                "This build does not define a game image for the launcher.");
             return 2;
 #endif
         }

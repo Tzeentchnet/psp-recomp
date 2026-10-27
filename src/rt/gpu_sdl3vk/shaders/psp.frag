@@ -10,6 +10,7 @@ layout(location = 0) out vec4 o_color;
 layout(set = 0, binding = 0) uniform sampler2D u_texture;
 layout(set = 1, binding = 0) uniform sampler2D u_destination_color;
 layout(set = 1, binding = 1) uniform sampler2D u_destination_depth;
+layout(set = 2, binding = 0) uniform sampler2D u_palette;
 
 layout(push_constant) uniform PC {
     ivec4 config;
@@ -36,6 +37,7 @@ const int FLAG_PSP_SAMPLER = 32768;
 const int FLAG_FRAMEBUFFER = 65536;
 const int FLAG_CLAMP_U = 131072;
 const int FLAG_CLAMP_V = 262144;
+const int FLAG_INDEXED_FRAMEBUFFER = 524288;
 
 bool compare_value(int function, int value, int reference) {
     if (function == 0) return false;
@@ -159,8 +161,19 @@ ivec4 texture_texel(ivec2 coordinate, int flags) {
     coordinate.y = wrap_coordinate(
         coordinate.y, dimensions.y, (flags & FLAG_CLAMP_V) != 0);
     coordinate += texture_offset_psp() * scale;
-    return ivec4(
+    ivec4 texel = ivec4(
         texelFetch(u_texture, coordinate, 0) * 255.0 + 0.5);
+    if ((flags & FLAG_INDEXED_FRAMEBUFFER) != 0) {
+        uint index = pack_native(texel, 3);
+        uint state = uint(pc.color_test_state.w);
+        uint shift = (state >> 2) & 31u;
+        uint mask = (state >> 8) & 255u;
+        uint start = ((state >> 16) & 31u) << 4;
+        uint start_mask = (state & 3u) == 3u ? 255u : 511u;
+        index = ((index >> shift) & mask) | (start & start_mask);
+        texel = ivec4(texelFetch(u_palette, ivec2(int(index), 0), 0) * 255.0 + 0.5);
+    }
+    return texel;
 }
 
 ivec4 psp_lerp(ivec4 first, ivec4 second, int weight) {

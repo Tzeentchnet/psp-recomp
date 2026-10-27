@@ -1,4 +1,6 @@
 #include "gpu_sdl3vk/shader_state.h"
+#include "gpu_sdl3vk/feedback_region.h"
+#include "gpu_sdl3vk/present_cache.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -215,12 +217,166 @@ static void test_invalid_render_scale(void) {
         (uint32_t)state.fragment[3] >> 24, 1);
 }
 
+static void test_indexed_framebuffer(void) {
+    GeState state;
+    memset(&state, 0, sizeof(state));
+    state.tex_fmt = 7;
+    state.tex_bufw = 512;
+    if (!ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 16))
+        fail("compatible indexed framebuffer rejected");
+    if (!ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 0))
+        fail("indexed framebuffer base rejected");
+    if (ge_vk_indexed_framebuffer_compatible(&state, 1, 512, 0))
+        fail("16-bit framebuffer admitted for 32-bit indices");
+    if (ge_vk_indexed_framebuffer_compatible(&state, 3, 256, 0))
+        fail("mismatched framebuffer stride admitted");
+    if (ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 2))
+        fail("unaligned framebuffer offset admitted");
+    state.tex_swizzle = 1;
+    if (ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 0))
+        fail("swizzled indexed framebuffer admitted");
+    state.tex_swizzle = 0;
+    state.tex_fmt = 6;
+    if (ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 0))
+        fail("16-bit indices admitted");
+    state.tex_fmt = 7;
+    state.tex_bufw = 0;
+    if (ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 0))
+        fail("mismatched default indexed stride admitted");
+    if (!ge_vk_indexed_framebuffer_compatible(&state, 3, 4, 0))
+        fail("matching default indexed stride rejected");
+}
+
+static void test_indexed_palette_keys(void) {
+    GeState state;
+    memset(&state, 0, sizeof(state));
+    for (uint32_t format = 4; format <= 7; format++) {
+        state.tex_fmt = format;
+        uint64_t original = ge_vk_texture_palette_key(&state);
+        state.clutram[0] ^= 0x80u;
+        if (ge_vk_texture_palette_key(&state) == original)
+            fail("indexed palette data omitted from texture key");
+        state.clutram[0] ^= 0x80u;
+        state.clut_fmt ^= 0x100u;
+        if (ge_vk_texture_palette_key(&state) == original)
+            fail("indexed palette format omitted from texture key");
+        state.clut_fmt ^= 0x100u;
+        if (ge_vk_texture_palette_key(&state) != original)
+            fail("unchanged indexed palette key not stable");
+    }
+    state.tex_fmt = 3;
+    if (ge_vk_texture_palette_key(&state) != 0)
+        fail("direct-color texture depends on palette");
+    state.tex_fmt = 8;
+    if (ge_vk_texture_palette_key(&state) != 0)
+        fail("compressed texture depends on palette");
+}
+
+static void test_present_cache(void) {
+    SrVkPresentCache cache = {0};
+    if (sr_vk_present_can_reuse(&cache, 1, 0))
+        fail("uninitialized presentation cache reused a frame");
+    sr_vk_present_record(&cache, 1);
+    if (!sr_vk_present_can_reuse(&cache, 1, 0))
+        fail("unchanged presentation not reused");
+    if (sr_vk_present_can_reuse(&cache, 2, 0) ||
+        sr_vk_present_can_reuse(&cache, 1, 1) ||
+        sr_vk_present_can_reuse(&cache, 0, 0))
+        fail("changed, exposed, or software presentation reused");
+    for (unsigned i = 0; i < SR_VK_PRESENT_MAX_REUSES; i++) {
+        if (!sr_vk_present_can_reuse(&cache, 1, 0))
+            fail("presentation revalidation triggered too early");
+        sr_vk_present_reused(&cache);
+    }
+    if (sr_vk_present_can_reuse(&cache, 1, 0))
+        fail("unchanged presentation not periodically revalidated");
+    sr_vk_present_record(&cache, 1);
+    if (!sr_vk_present_can_reuse(&cache, 1, 0))
+        fail("presentation reuse not restored after revalidation");
+    sr_vk_present_invalidate(&cache);
+    if (sr_vk_present_can_reuse(&cache, 1, 0))
+        fail("invalidated presentation reused");
+    sr_vk_present_record(&cache, 0);
+    if (sr_vk_present_can_reuse(&cache, 0, 0))
+        fail("software frame entered presentation cache");
+}
+
+static void test_feedback_regions(void) {
+    GeVkRegion whole = {0, 0, 16, 16};
+    GeVkRegion copy, left = {0, 0, 4, 4}, right = {12, 12, 16, 16};
+    GeVkFeedbackRegion snapshot = {0};
+    if (!ge_vk_feedback_copy_region(&snapshot, whole, left, &copy) ||
+        memcmp(&copy, &whole, sizeof(copy)) != 0)
+        fail("initial feedback snapshot must copy the full image");
+    ge_vk_feedback_record(&snapshot, left);
+    if (ge_vk_feedback_copy_region(&snapshot, whole, right, &copy))
+        fail("disjoint feedback read unnecessarily copied");
+    ge_vk_feedback_record(&snapshot, right);
+    if (!ge_vk_feedback_copy_region(&snapshot, whole, right, &copy) ||
+        memcmp(&copy, &whole, sizeof(copy)) != 0)
+        fail("feedback copy did not preserve all pending damage");
+    if (ge_vk_feedback_copy_region(&snapshot, whole, left, &copy))
+        fail("unchanged feedback snapshot was not reused");
+
+    GeVkRegion scissor = {5, 6, 40, 45};
+    GeVkRegion bounds = ge_vk_draw_damage(2.5f, 3.5f, 7.25f, 8.25f, 4, scissor);
+    GeVkRegion expected = {9, 13, 31, 35};
+    if (memcmp(&bounds, &expected, sizeof(bounds)) != 0)
+        fail("scaled feedback damage bounds");
+    bounds = ge_vk_draw_damage(NAN, 1.0f, 2.0f, 3.0f, 4, scissor);
+    if (memcmp(&bounds, &scissor, sizeof(bounds)) != 0)
+        fail("non-finite feedback bounds must use the scissor");
+
+    uint32_t target[16][16] = {{0}}, image[16][16] = {{0}};
+    uint32_t random = 0x12345678u;
+    memset(&snapshot, 0, sizeof(snapshot));
+    for (uint32_t iteration = 1; iteration <= 1000; iteration++) {
+        GeVkRegion damage, sample;
+        random = random * 1664525u + 1013904223u;
+        damage.x0 = (int32_t)(random % 16u);
+        random = random * 1664525u + 1013904223u;
+        damage.y0 = (int32_t)(random % 16u);
+        random = random * 1664525u + 1013904223u;
+        damage.x1 = damage.x0 + 1 + (int32_t)(random % (uint32_t)(16 - damage.x0));
+        random = random * 1664525u + 1013904223u;
+        damage.y1 = damage.y0 + 1 + (int32_t)(random % (uint32_t)(16 - damage.y0));
+        for (int y = damage.y0; y < damage.y1; y++)
+            for (int x = damage.x0; x < damage.x1; x++)
+                target[y][x] = iteration;
+        ge_vk_feedback_record(&snapshot, damage);
+
+        random = random * 1664525u + 1013904223u;
+        sample.x0 = (int32_t)(random % 16u);
+        random = random * 1664525u + 1013904223u;
+        sample.y0 = (int32_t)(random % 16u);
+        random = random * 1664525u + 1013904223u;
+        sample.x1 = sample.x0 + 1 + (int32_t)(random % (uint32_t)(16 - sample.x0));
+        random = random * 1664525u + 1013904223u;
+        sample.y1 = sample.y0 + 1 + (int32_t)(random % (uint32_t)(16 - sample.y0));
+        if (ge_vk_feedback_copy_region(&snapshot, whole, sample, &copy)) {
+            for (int y = copy.y0; y < copy.y1; y++)
+                for (int x = copy.x0; x < copy.x1; x++)
+                    image[y][x] = target[y][x];
+        }
+        for (int y = sample.y0; y < sample.y1; y++)
+            for (int x = sample.x0; x < sample.x1; x++)
+                if (image[y][x] != target[y][x]) {
+                    fail("feedback snapshot differs from full-copy reference");
+                    return;
+                }
+    }
+}
+
 int main(void) {
     test_direct_classification();
     test_stencil_classification();
     test_state_packing();
     test_clear_packing();
     test_invalid_render_scale();
+    test_indexed_framebuffer();
+    test_indexed_palette_keys();
+    test_present_cache();
+    test_feedback_regions();
     if (s_failures) {
         fprintf(stderr, "%d Vulkan shader-state test(s) failed\n", s_failures);
         return 1;

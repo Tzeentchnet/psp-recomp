@@ -2,11 +2,11 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 #include "settings_path.h"
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 static void set_error(char *error, size_t error_size, const char *message) {
     if (error && error_size)
@@ -36,20 +36,11 @@ int sr_settings_path(
         }
         memcpy(directory, override, directory_length + 1u);
     } else {
-        DWORD result = GetModuleFileNameA(
-            NULL, directory, (DWORD)sizeof(directory));
         char *separator;
-        if (!result) {
-            char message[128];
-            snprintf(
-                message, sizeof(message),
-                "cannot locate executable directory (error %lu)",
-                (unsigned long)GetLastError());
-            set_error(error, error_size, message);
-            return 0;
-        }
-        if (result >= sizeof(directory)) {
-            set_error(error, error_size, "executable path is too long");
+        if (!sr_executable_path(directory, sizeof(directory))) {
+            set_error(
+                error, error_size,
+                "cannot locate executable directory");
             return 0;
         }
         separator = strrchr(directory, '\\');
@@ -69,7 +60,7 @@ int sr_settings_path(
         directory_length &&
                 directory[directory_length - 1u] != '\\' &&
                 directory[directory_length - 1u] != '/'
-            ? "\\" : "",
+            ? "/" : "",
         filename);
     if (length < 0 || (size_t)length >= path_size) {
         set_error(error, error_size, "settings path is too long");

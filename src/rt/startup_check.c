@@ -3,9 +3,9 @@
 #endif
 
 #include "startup_check.h"
+#include "platform.h"
 
-#include <windows.h>
-#include <bcrypt.h>
+#include "../../third_party/ppsspp_savedata/SHA1.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,86 +27,32 @@ int sr_startup_validate(void) {
 #error SR_EXPECTED_ISO_SHA1 must accompany SR_EXPECTED_ISO_SIZE
 #endif
 
-#ifndef NT_SUCCESS
-#define NT_SUCCESS(status) ((NTSTATUS)(status) >= 0)
-#endif
-
 static int hash_file_sha1(
-    HANDLE file, uint8_t output[20], char *error, size_t error_size) {
-    BCRYPT_ALG_HANDLE algorithm = NULL;
-    BCRYPT_HASH_HANDLE hash = NULL;
-    PUCHAR object = NULL;
-    uint8_t *buffer = NULL;
-    DWORD object_size = 0;
-    DWORD hash_size = 0;
-    DWORD result_size = 0;
+    FILE *file, uint8_t output[20], char *error, size_t error_size) {
+    SHA_CTX hash;
+    uint8_t *buffer = (uint8_t *)malloc(1u << 20);
     int ok = 0;
 
-    NTSTATUS status = BCryptOpenAlgorithmProvider(
-        &algorithm, BCRYPT_SHA1_ALGORITHM, NULL, 0);
-    if (!NT_SUCCESS(status)) {
-        snprintf(error, error_size, "BCryptOpenAlgorithmProvider failed (0x%08lx)",
-                 (unsigned long)status);
-        goto done;
-    }
-    status = BCryptGetProperty(
-        algorithm, BCRYPT_OBJECT_LENGTH,
-        (PUCHAR)&object_size, sizeof(object_size), &result_size, 0);
-    if (!NT_SUCCESS(status) || result_size != sizeof(object_size)) {
-        snprintf(error, error_size, "cannot query SHA-1 object size (0x%08lx)",
-                 (unsigned long)status);
-        goto done;
-    }
-    status = BCryptGetProperty(
-        algorithm, BCRYPT_HASH_LENGTH,
-        (PUCHAR)&hash_size, sizeof(hash_size), &result_size, 0);
-    if (!NT_SUCCESS(status) || hash_size != 20) {
-        snprintf(error, error_size, "unexpected SHA-1 length (0x%08lx)",
-                 (unsigned long)status);
-        goto done;
-    }
-    object = (PUCHAR)HeapAlloc(GetProcessHeap(), 0, object_size);
-    buffer = (uint8_t *)HeapAlloc(GetProcessHeap(), 0, 1u << 20);
-    if (!object || !buffer) {
+    if (!buffer) {
         snprintf(error, error_size, "out of memory while hashing");
         goto done;
     }
-    status = BCryptCreateHash(
-        algorithm, &hash, object, object_size, NULL, 0, 0);
-    if (!NT_SUCCESS(status)) {
-        snprintf(error, error_size, "BCryptCreateHash failed (0x%08lx)",
-                 (unsigned long)status);
-        goto done;
-    }
-
+    rewind(file);
+    SHAInit(&hash);
     for (;;) {
-        DWORD bytes = 0;
-        if (!ReadFile(file, buffer, 1u << 20, &bytes, NULL)) {
-            snprintf(error, error_size, "read failed (error %lu)",
-                     (unsigned long)GetLastError());
+        size_t bytes = fread(buffer, 1, 1u << 20, file);
+        if (bytes) SHAUpdate(&hash, buffer, (int)bytes);
+        if (bytes < (1u << 20) && ferror(file)) {
+            snprintf(error, error_size, "read failed");
             goto done;
         }
         if (!bytes) break;
-        status = BCryptHashData(hash, buffer, bytes, 0);
-        if (!NT_SUCCESS(status)) {
-            snprintf(error, error_size, "BCryptHashData failed (0x%08lx)",
-                     (unsigned long)status);
-            goto done;
-        }
     }
-    status = BCryptFinishHash(hash, output, 20, 0);
-    if (!NT_SUCCESS(status)) {
-        snprintf(error, error_size, "BCryptFinishHash failed (0x%08lx)",
-                 (unsigned long)status);
-        goto done;
-    }
+    SHAFinal(output, &hash);
     ok = 1;
 
 done:
-    if (hash) BCryptDestroyHash(hash);
-    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
-    if (buffer) HeapFree(GetProcessHeap(), 0, buffer);
-    if (object) HeapFree(GetProcessHeap(), 0, object);
+    free(buffer);
     return ok;
 }
 
@@ -121,32 +67,30 @@ int sr_startup_validate(void) {
         return 0;
     }
 
-    HANDLE file = CreateFileA(
-        path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (file == INVALID_HANDLE_VALUE) {
+    FILE *file = fopen(path, "rb");
+    if (!file) {
         fprintf(
-            stderr, "%s startup: cannot open PSP_ISO \"%s\" (error %lu).\n",
-            SR_GAME_TITLE, path, (unsigned long)GetLastError());
+            stderr, "%s startup: cannot open PSP_ISO \"%s\".\n",
+            SR_GAME_TITLE, path);
         return 0;
     }
 
-    LARGE_INTEGER size;
-    if (!GetFileSizeEx(file, &size)) {
+    if (fseek(file, 0, SEEK_END) != 0) {
         fprintf(
-            stderr, "%s startup: cannot read PSP_ISO size (error %lu).\n",
-            SR_GAME_TITLE, (unsigned long)GetLastError());
-        CloseHandle(file);
+            stderr, "%s startup: cannot read PSP_ISO size.\n",
+            SR_GAME_TITLE);
+        fclose(file);
         return 0;
     }
-    if ((uint64_t)size.QuadPart != (uint64_t)SR_EXPECTED_ISO_SIZE) {
+    long size = ftell(file);
+    if (size < 0 || (uint64_t)size != (uint64_t)SR_EXPECTED_ISO_SIZE) {
         fprintf(
             stderr,
             "%s startup: unsupported ISO size %llu bytes; expected %llu.\n",
             SR_GAME_TITLE,
-            (unsigned long long)size.QuadPart,
+            size < 0 ? 0ull : (unsigned long long)size,
             (unsigned long long)SR_EXPECTED_ISO_SIZE);
-        CloseHandle(file);
+        fclose(file);
         return 0;
     }
 
@@ -156,10 +100,10 @@ int sr_startup_validate(void) {
         fprintf(
             stderr, "%s startup: cannot hash PSP_ISO: %s.\n",
             SR_GAME_TITLE, error);
-        CloseHandle(file);
+        fclose(file);
         return 0;
     }
-    CloseHandle(file);
+    fclose(file);
 
     char actual[41];
     for (int i = 0; i < 20; i++)

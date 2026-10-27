@@ -3,11 +3,11 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include "perf_stats.h"
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 typedef struct SrPerfState {
     LARGE_INTEGER frequency;
@@ -152,6 +152,7 @@ void sr_perf_alternate_tick(uint32_t present) {
 /* Diagnostic instruction-pointer sampler (SR_SAMPLE_START=<present>, SR_SAMPLE_WINDOW=<presents>,
  * SR_SAMPLE_FILE=<path>). A helper thread suspends the main thread, copies only RIP, and
  * resumes it. Samples are bucketed by module RVA after the window; resolve against a linker map. */
+#ifdef _WIN32
 #define SR_SAMPLE_CAPACITY (1u << 20)
 
 static struct {
@@ -272,3 +273,16 @@ void sr_ip_sampler_present(uint32_t present) {
         sampler_finish();
     }
 }
+#else
+void sr_ip_sampler_present(uint32_t present) {
+    static int warned;
+    (void)present;
+    if (!warned && getenv("SR_SAMPLE_START")) {
+        warned = 1;
+        fprintf(
+            stderr,
+            "SR_SAMPLE_START: instruction-pointer sampling is only "
+            "available on Windows\n");
+    }
+}
+#endif

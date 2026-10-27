@@ -24,15 +24,17 @@ void sdl3vk_set_title(const char *title);
 /* Present one 480x272 frame. px points to 480*272 little-endian BGRA words (the same
  * packing gui.c already produces for StretchDIBits: (r<<16)|(g<<8)|b). Pumps the SDL
  * event loop and samples input. Returns 0 when the user closed the window / pressed ESC,
- * 1 otherwise. */
+ * 1 otherwise, or -2 on a Vulkan failure. */
 int  sdl3vk_present_rgba(const uint32_t *px);
 
-/* Present directly from a VkImage owned by the GPU rasterizer (ge_gpu.c). The image
- * must be RGBA8 in TRANSFER_SRC_OPTIMAL layout; source_width/source_height identify its
- * visible region. The region is blitted with the same letterboxing as
- * sdl3vk_present_rgba. Same return semantics. */
+/* Present an RGBA8 VkImage owned by the GPU rasterizer (ge_gpu.c). The image's
+ * current Vulkan layout is supplied as its numeric value; transitioned is set
+ * if a submitted command changed it to TRANSFER_SRC_OPTIMAL. A nonzero
+ * generation identifies the contents and permits reuse of an unchanged frame.
+ * Returns -2 on a Vulkan failure, 0 on close, or 1 otherwise. */
 int  sdl3vk_present_image(
-    void *vk_image, uint32_t source_width, uint32_t source_height);
+    void *vk_image, uint32_t source_width, uint32_t source_height,
+    uint64_t generation, uint32_t source_layout, int *transitioned);
 
 /* Input state captured by the last present (PSP sceCtrl button mask / analog stick). */
 uint32_t sdl3vk_buttons(void);

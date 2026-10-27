@@ -1,11 +1,11 @@
 #include "input_config.h"
+#include "test_platform.h"
 
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 static int failures;
 
@@ -261,28 +261,25 @@ int main(void) {
         !sr_input_config_parse(
             &config, "keyboard.cross=none,X\n", error, sizeof(error)));
 
-    char temp_dir[MAX_PATH];
-    char config_dir[MAX_PATH];
-    char config_path[MAX_PATH];
-    DWORD temp_length = GetTempPathA(sizeof(temp_dir), temp_dir);
+    char input_root[SR_TEST_PATH_MAX];
+    char config_dir[SR_TEST_PATH_MAX];
+    char config_path[SR_TEST_PATH_MAX];
     check_true(
-        "temporary config directory",
-        temp_length > 0 && temp_length < sizeof(temp_dir));
-    snprintf(
-        config_dir, sizeof(config_dir), "%skzl-input-%lu",
-        temp_dir, (unsigned long)GetCurrentProcessId());
+        "temporary input root path",
+        sr_test_temp_path(
+            input_root, sizeof(input_root), "kzl-input", ""));
     check_true(
         "create temporary input root",
-        CreateDirectoryA(config_dir, NULL) ||
-            GetLastError() == ERROR_ALREADY_EXISTS);
-    strncat(config_dir, "\\KZLRecomp",
-            sizeof(config_dir) - strlen(config_dir) - 1);
+        sr_test_mkdir(input_root));
+    snprintf(
+        config_dir, sizeof(config_dir), "%s%sKZLRecomp",
+        input_root, SR_TEST_PATH_SEPARATOR);
     check_true(
         "create temporary input config directory",
-        CreateDirectoryA(config_dir, NULL) ||
-            GetLastError() == ERROR_ALREADY_EXISTS);
+        sr_test_mkdir(config_dir));
     snprintf(
-        config_path, sizeof(config_path), "%s\\input.ini", config_dir);
+        config_path, sizeof(config_path), "%s%sinput.ini",
+        config_dir, SR_TEST_PATH_SEPARATOR);
     FILE *file = fopen(config_path, "wb");
     check_true("create temporary config", file != NULL);
     if (file) {
@@ -301,8 +298,12 @@ int main(void) {
             "write temporary config",
             fwrite(legacy, 1, sizeof(legacy) - 1, file) == sizeof(legacy) - 1);
         check_true("close temporary config", fclose(file) == 0);
-        _putenv_s("SR_INPUT_CONFIG", "");
-        _putenv_s("SR_SETTINGS_DIR", config_dir);
+        check_true(
+            "clear explicit input config",
+            sr_test_set_env("SR_INPUT_CONFIG", NULL));
+        check_true(
+            "set input settings directory",
+            sr_test_set_env("SR_SETTINGS_DIR", config_dir));
         check_true("initialize input config", sr_input_init());
         check_true(
             "loaded config path",
@@ -454,7 +455,7 @@ int main(void) {
             check_true(
                 "start hot reload watcher",
                 sr_input_start_hot_reload());
-            Sleep(50);
+            sr_test_sleep_ms(50);
             file = fopen(config_path, "wb");
             check_true("open watched reload config", file != NULL);
             if (file) {
@@ -473,7 +474,7 @@ int main(void) {
                     "close watched reload config",
                     fclose(file) == 0);
             }
-            Sleep(350);
+            sr_test_sleep_ms(350);
             sr_input_poll_reload();
             check_true(
                 "watched reload applied",
@@ -485,16 +486,10 @@ int main(void) {
         check_true("remove temporary config", remove(config_path) == 0);
         check_true(
             "remove temporary config directory",
-            RemoveDirectoryA(config_dir) != 0);
-        {
-            char local_root[MAX_PATH];
-            snprintf(
-                local_root, sizeof(local_root), "%skzl-input-%lu",
-                temp_dir, (unsigned long)GetCurrentProcessId());
-            check_true(
-                "remove temporary input root",
-                RemoveDirectoryA(local_root) != 0);
-        }
+            sr_test_rmdir(config_dir));
+        check_true(
+            "remove temporary input root",
+            sr_test_rmdir(input_root));
     }
 
     if (failures) {
