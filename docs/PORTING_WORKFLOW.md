@@ -212,6 +212,8 @@ either eliminated or classified with bounded acceptance thresholds.
 ### Input
 
 - Begin with deterministic pad scripts.
+- Use presentation-timed analog scripts for unattended movement paths that must
+  remain stable across paced and turbo runs.
 - Validate gameplay state transitions, not just host input events.
 - Keep generic PSP bindings separate from title-specific hidden controls.
 

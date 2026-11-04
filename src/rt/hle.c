@@ -19,6 +19,7 @@
 #include "atrac_decode.h"
 #include "display_state.h"
 #include "input_config.h"
+#include "input_script.h"
 #include "iso.h"
 #include "kzl_twinstick.h"
 #include "memstick_state.h"
@@ -417,7 +418,7 @@ static void font_load(void) {
     if (dir) { snprintf(path, sizeof path, "%s/ltn0.pgf", dir); s_pgf_ltn = pgf_open(path); }
     if (!s_pgf_ltn) {
         char error[256];
-        if (sr_settings_path(
+        if (sr_resource_path(
                 "font/ltn0.pgf", path, sizeof(path), error, sizeof(error)))
             s_pgf_ltn = pgf_open(path);
     }
@@ -426,7 +427,7 @@ static void font_load(void) {
     if (dir) { snprintf(path, sizeof path, "%s/jpn0.pgf", dir); s_pgf_jpn = pgf_open(path); }
     if (!s_pgf_jpn) {
         char error[256];
-        if (sr_settings_path(
+        if (sr_resource_path(
                 "font/jpn0.pgf", path, sizeof(path), error, sizeof(error)))
             s_pgf_jpn = pgf_open(path);
     }
@@ -1661,13 +1662,15 @@ static int host_root(char *out, int max) {
     if (override && override[0]) {
         n = snprintf(out, (size_t)max, "%s", override);
     } else {
-        if (!sr_user_data_path("KZLRecomp", out, (size_t)max)) {
+        char error[256];
+        if (!sr_data_root(
+                out, (size_t)max, error, sizeof(error))) {
             static int warned;
             if (!warned++)
                 fprintf(
                     stderr,
-                    "VFS: cannot locate the user data directory; "
-                    "set SR_FSDIR to override the writable root\n");
+                    "VFS: %s; set SR_FSDIR to override the writable root\n",
+                    error);
             return -1;
         }
         n = (int)strlen(out);
@@ -1685,7 +1688,7 @@ static int is_disc_path(const char *path) {
 }
 
 /* Writable devices preserve their directory hierarchy below SR_FSDIR when set, otherwise below
- * %LOCALAPPDATA%\KZLRecomp. fatms0: and cache: alias ms0:, matching KZL's PSP device setup. */
+ * the application data root. fatms0: and cache: alias ms0:, matching KZL's PSP device setup. */
 static int host_path(const char *guest, char *out, int max) {
     char root[512];
     if (host_root(root, sizeof(root)) != 0) return -1;
@@ -2986,13 +2989,36 @@ void sr_ctrl_sample(void) {
     if (gui_on()) gui_analog(&lx, &ly);
     {
         static int initialized;
-        static int enabled;
+        static int fixed_enabled;
+        static int script_enabled;
+        static int log_enabled;
         static uint8_t scripted_lx, scripted_ly;
         static uint32_t start, end = UINT32_MAX;
+        static SrAnalogScript script;
         if (!initialized) {
+            char error[512];
             initialized = 1;
             const char *value = getenv("SR_ANALOG");
-            if (value && value[0]) {
+            const char *script_path = getenv("SR_ANALOG_SCRIPT");
+            log_enabled = getenv("SR_PADLOG") ? 1 : 0;
+            if (value && value[0] && script_path && script_path[0]) {
+                fprintf(
+                    stderr,
+                    "SR_ANALOG and SR_ANALOG_SCRIPT cannot be used together\n");
+                _Exit(2);
+            }
+            if (script_path && script_path[0]) {
+                if (!sr_analog_script_load(
+                        &script, script_path, error, sizeof(error))) {
+                    fprintf(stderr, "SR_ANALOG_SCRIPT: %s\n", error);
+                    _Exit(2);
+                }
+                script_enabled = 1;
+                fprintf(
+                    stderr,
+                    "SR_ANALOG_SCRIPT: loaded %u events from %s\n",
+                    script.count, script_path);
+            } else if (value && value[0]) {
                 unsigned x, y;
                 char extra;
                 if (sscanf(value, "%u,%u%c", &x, &y, &extra) != 2 ||
@@ -3009,10 +3035,39 @@ void sr_ctrl_sample(void) {
                 const char *end_text = getenv("SR_ANALOG_END");
                 if (start_text) start = (uint32_t)strtoul(start_text, NULL, 10);
                 if (end_text) end = (uint32_t)strtoul(end_text, NULL, 10);
-                enabled = 1;
+                fixed_enabled = 1;
             }
         }
-        if (enabled && s_present_count >= start && s_present_count <= end) {
+        if (script_enabled) {
+            uint8_t event_lx = 128;
+            uint8_t event_ly = 128;
+            int active = sr_analog_script_sample(
+                &script, s_present_count, &event_lx, &event_ly);
+            if (active) {
+                lx = event_lx;
+                ly = event_ly;
+            }
+            if (log_enabled) {
+                static int last_active = -1;
+                static uint8_t last_lx;
+                static uint8_t last_ly;
+                if (active != last_active ||
+                    (active &&
+                     (event_lx != last_lx || event_ly != last_ly))) {
+                    fprintf(
+                        stderr,
+                        "ANALOGSCRIPT present=%u active=%d analog=%u,%u\n",
+                        s_present_count, active,
+                        active ? event_lx : 128u,
+                        active ? event_ly : 128u);
+                    last_active = active;
+                    last_lx = event_lx;
+                    last_ly = event_ly;
+                }
+            }
+        } else if (
+            fixed_enabled &&
+            s_present_count >= start && s_present_count <= end) {
             lx = scripted_lx;
             ly = scripted_ly;
         }
@@ -3238,6 +3293,7 @@ typedef struct PresentPerf {
     double minimum_fps;
     double slow_frame_ms;
     uint32_t previous_alt_mask;
+    int thermal_state_max;
     int initialized;
     int enabled;
     int trace_stalls;
@@ -3304,6 +3360,16 @@ static int compare_double(const void *left, const void *right) {
     return (a > b) - (a < b);
 }
 
+static const char *thermal_state_name(int state) {
+    switch (state) {
+        case 0: return "nominal";
+        case 1: return "fair";
+        case 2: return "serious";
+        case 3: return "critical";
+        default: return "unavailable";
+    }
+}
+
 static uint32_t env_present_value(
     const char *name, uint32_t fallback) {
     const char *value = (getenv)(name);
@@ -3320,6 +3386,7 @@ static uint32_t env_present_value(
 static void present_perf_init(void) {
     if (s_present_perf.initialized) return;
     s_present_perf.initialized = 1;
+    s_present_perf.thermal_state_max = -1;
     const char *file_path = getenv("SR_PERF_FILE");
     s_present_perf.enabled =
         getenv("SR_PERF_LOG") ||
@@ -3381,7 +3448,7 @@ static void present_perf_init(void) {
         if (!s_present_perf.file ||
             fprintf(
                 s_present_perf.file,
-                "# psp-recomp display performance v4\n"
+                "# psp-recomp display performance v5\n"
                 "flip,present,frame_ms,frontend_ms,backend_ms,gpu_ms,"
                 "over_budget,gpu_source_flip,scheduler_ms,native_ms,"
                 "interpreter_ms,hle_ms,ge_ms,vertex_ms,sync_ms,"
@@ -3400,6 +3467,11 @@ static void present_perf_init(void) {
                 "feedback_snapshot_pixels,feedback_reuses,"
                 "capture_ms,texture_capture_ms,state_capture_ms,"
                 "texture_misses,texture_decode_wait_us,pso_fallbacks,"
+                "pipeline_key_hits,pipelines_created,pipeline_create_us,"
+                "renderer_texture_cache_hits,"
+                "renderer_texture_cache_misses,renderer_texture_uploads,"
+                "renderer_texture_decode_us,renderer_texture_scale_us,"
+                "host_upload_bytes,host_readback_bytes,thermal_state,"
                 "alt_off\n") < 0) {
             if (s_present_perf.file)
                 fclose(s_present_perf.file);
@@ -3532,6 +3604,16 @@ static void present_perf_finish(
         uint64_t feedback_snapshots = 0;
         uint64_t feedback_snapshot_pixels = 0;
         uint64_t feedback_reuses = 0;
+        uint64_t pipeline_key_hits = 0;
+        uint64_t pipelines_created = 0;
+        uint64_t pipeline_create_us = 0;
+        uint64_t renderer_texture_cache_hits = 0;
+        uint64_t renderer_texture_cache_misses = 0;
+        uint64_t renderer_texture_uploads = 0;
+        uint64_t renderer_texture_decode_us = 0;
+        uint64_t renderer_texture_scale_us = 0;
+        uint64_t host_upload_bytes = 0;
+        uint64_t host_readback_bytes = 0;
         if (current_framebuffer_stats_valid &&
             s_present_perf.previous_framebuffer_stats_valid) {
             framebuffer_readbacks =
@@ -3550,7 +3632,40 @@ static void present_perf_finish(
             feedback_reuses =
                 current_framebuffer_stats->feedback_reuses -
                 s_present_perf.previous_framebuffer_stats.feedback_reuses;
+            pipeline_key_hits =
+                current_framebuffer_stats->pipeline_key_hits -
+                s_present_perf.previous_framebuffer_stats.pipeline_key_hits;
+            pipelines_created =
+                current_framebuffer_stats->pipelines_created -
+                s_present_perf.previous_framebuffer_stats.pipelines_created;
+            pipeline_create_us =
+                current_framebuffer_stats->pipeline_create_us -
+                s_present_perf.previous_framebuffer_stats.pipeline_create_us;
+            renderer_texture_cache_hits =
+                current_framebuffer_stats->texture_cache_hits -
+                s_present_perf.previous_framebuffer_stats.texture_cache_hits;
+            renderer_texture_cache_misses =
+                current_framebuffer_stats->texture_cache_misses -
+                s_present_perf.previous_framebuffer_stats.texture_cache_misses;
+            renderer_texture_uploads =
+                current_framebuffer_stats->texture_uploads -
+                s_present_perf.previous_framebuffer_stats.texture_uploads;
+            renderer_texture_decode_us =
+                current_framebuffer_stats->texture_decode_us -
+                s_present_perf.previous_framebuffer_stats.texture_decode_us;
+            renderer_texture_scale_us =
+                current_framebuffer_stats->texture_scale_us -
+                s_present_perf.previous_framebuffer_stats.texture_scale_us;
+            host_upload_bytes =
+                current_framebuffer_stats->host_upload_bytes -
+                s_present_perf.previous_framebuffer_stats.host_upload_bytes;
+            host_readback_bytes =
+                current_framebuffer_stats->host_readback_bytes -
+                s_present_perf.previous_framebuffer_stats.host_readback_bytes;
         }
+        int thermal_state = gui_thermal_state();
+        if (thermal_state > s_present_perf.thermal_state_max)
+            s_present_perf.thermal_state_max = thermal_state;
         if (over_budget) s_present_perf.over_budget++;
         double vertex_ms =
             phases->category_ms[SR_PERF_VERTEX] +
@@ -3573,7 +3688,9 @@ static void present_perf_finish(
                 "%llu,"
                 "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%u,"
                 "%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,"
-                "%llu,%llu,%llu,%u\n",
+                "%llu,%llu,%llu,"
+                "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+                "%d,%u\n",
                 flip, present, frame_ms,
                 s_present_perf.frontend_ms[index],
                 s_present_perf.previous_backend_ms,
@@ -3647,6 +3764,17 @@ static void present_perf_finish(
                     phases->counters[SR_PERF_TEXTURE_DECODE_WAIT_US],
                 (unsigned long long)
                     phases->counters[SR_PERF_PSO_FALLBACKS],
+                (unsigned long long)pipeline_key_hits,
+                (unsigned long long)pipelines_created,
+                (unsigned long long)pipeline_create_us,
+                (unsigned long long)renderer_texture_cache_hits,
+                (unsigned long long)renderer_texture_cache_misses,
+                (unsigned long long)renderer_texture_uploads,
+                (unsigned long long)renderer_texture_decode_us,
+                (unsigned long long)renderer_texture_scale_us,
+                (unsigned long long)host_upload_bytes,
+                (unsigned long long)host_readback_bytes,
+                thermal_state,
                 alt_off) < 0) {
             fprintf(stderr, "SR_PERF_FILE: write failed\n");
             runtime_exit_cleanly(2);
@@ -3694,7 +3822,7 @@ static void present_perf_finish(
                 "frame_ms avg=%.2f p50=%.2f p95=%.2f p99=%.2f "
                 "max=%.2f over_budget=%u "
                 "frontend_ms avg=%.2f backend_ms avg=%.2f max=%.2f "
-                "gpu_ms avg=%.2f max=%.2f samples=%u\n",
+                "gpu_ms avg=%.2f max=%.2f samples=%u thermal=%s\n",
                 flip - s_present_perf.samples + 1u, flip,
                 s_present_perf.window_first_present, present,
                 s_present_perf.samples, fps,
@@ -3705,7 +3833,8 @@ static void present_perf_finish(
                 backend_sum / s_present_perf.samples, backend_max,
                 gpu_samples ? gpu_sum / gpu_samples : -1.0,
                 gpu_samples ? gpu_max : -1.0,
-                gpu_samples);
+                gpu_samples,
+                thermal_state_name(s_present_perf.thermal_state_max));
             if (s_present_perf.file &&
                 fflush(s_present_perf.file) != 0) {
                 fprintf(stderr, "SR_PERF_FILE: flush failed\n");
@@ -3721,6 +3850,7 @@ static void present_perf_finish(
             }
             s_present_perf.samples = 0;
             s_present_perf.over_budget = 0;
+            s_present_perf.thermal_state_max = -1;
         }
     }
     s_present_perf.previous_entry = entry;

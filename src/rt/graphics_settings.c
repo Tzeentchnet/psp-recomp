@@ -260,6 +260,8 @@ static INT_PTR CALLBACK graphics_dialog_proc(
             context->config.renderer = (int)SendMessage(
                 renderer, CB_GETITEMDATA,
                 (WPARAM)renderer_index, 0);
+            context->config.quality_mode =
+                SR_GRAPHICS_QUALITY_MANUAL;
             context->config.internal_resolution =
                 (uint32_t)SendMessage(
                     resolution, CB_GETITEMDATA,

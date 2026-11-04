@@ -113,8 +113,9 @@ brew install python@3.13 pkg-config sdl3 vulkan-loader vulkan-headers molten-vk
 The Vulkan renderer uses MoltenVK's portability driver, so rendering is backed
 by Metal without a separate native Metal renderer. Homebrew's Vulkan loader
 normally discovers the MoltenVK ICD automatically. New macOS graphics
-configurations default to 1x internal resolution; existing configurations are
-preserved. If the loader does not find MoltenVK, set:
+configurations use deterministic Automatic quality; legacy configurations
+migrate to Manual and retain their exact resolution, texture, and
+anti-aliasing values. If the loader does not find MoltenVK, set:
 
 ```bash
 export VK_ICD_FILENAMES="$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json"
@@ -199,12 +200,13 @@ PPSSPP trace:
 thread, and supplies the compile-time `SR_BOOT_ARG` value (`"modulename"` by
 default). Keep using `--image` with a PPSSPP reference trace for differential
 tracing. Title builds can define `SR_EXPECTED_ISO_SIZE` and
-`SR_EXPECTED_ISO_SHA1` together to validate `PSP_ISO` before guest memory is
-allocated; omitting them retains game-agnostic behavior.
+`SR_EXPECTED_ISO_SHA1` together to validate the `PSP_ISO` override or a
+persisted native-launcher selection before guest memory is allocated; omitting
+them retains game-agnostic behavior.
 
 ### 5. Setup Game Assets & Run
-1. Place your dumped game UMD ISO beside the executable as `game.iso`, or set
-   `PSP_ISO` to its full path.
+1. Set `PSP_ISO` to the full path of your dumped game UMD ISO. A title-specific
+   native launcher may persist a verified path instead.
 2. Run the game:
 
 ```bash
@@ -232,28 +234,37 @@ input can be mixed at any time. The default PC mappings are:
 Gamepads use the left stick, D-pad, standard south/east/west/north face
 buttons, and either shoulder or trigger for L/R.
 
-On first windowed launch, the runtime writes `graphics.ini` beside the
-executable. Windows opens its native settings dialog and defaults to D3D12;
-macOS defaults to Vulkan over MoltenVK. Both default to 2x internal resolution:
+On first windowed launch, Windows writes `graphics.ini` beside the executable;
+the macOS app stores it under Application Support. Windows opens its native
+settings dialog and defaults to D3D12; macOS defaults to Vulkan over MoltenVK
+with Automatic quality:
 
 ```ini
 # Windows
 renderer = d3d12
+quality = manual
 internal_resolution = 2
 anti_aliasing = off
 ```
 
 Use `renderer = vk` on macOS. Run `mygame.exe --configure` to reopen the
-Windows dialog without starting the game. macOS currently prints the config
-path instead; edit `graphics.ini` and `input.ini` directly.
+Windows dialog without starting the game. The macOS app provides native
+graphics and controller settings.
 `renderer` accepts `auto`, `d3d12`, `sw`, or `vk`; unavailable backends fail
-explicitly at startup. `internal_resolution` accepts every integer from 1
-through 8 and applies to D3D12 color/depth targets, feedback snapshots,
-copies, readback, and presentation. PSP-visible framebuffer addresses,
-coordinates, and captures remain at their original logical resolution.
-`anti_aliasing` accepts `off` or `smaa`. SMAA selects the D3D12-only SMAA 1x
-High post-process, runs at the selected internal resolution, and is included in
-D3D12 captures. The launcher rejects SMAA with software or Vulkan rendering.
+explicitly at startup. `quality` accepts `auto` or `manual`. On Apple Silicon,
+Auto chooses a deterministic conservative GPU/display profile without
+overwriting the retained manual values; legacy files without `quality` migrate
+to Manual. M1/M2 start at 2x, their Pro/Max/Ultra variants and base M3/M4 at
+3x, M3/M4 Pro/Max/Ultra and M5 at 4x, and unknown devices at 2x; drawable and
+Vulkan limits can lower the scale. Auto keeps xBRZ off and enables SMAA only
+for the measured M5 profile. `internal_resolution` accepts every integer from 1
+through 8 and applies to D3D12 and Vulkan color/depth targets, feedback
+snapshots, copies, readback, and presentation. PSP-visible framebuffer
+addresses and coordinates remain at their original logical resolution.
+`anti_aliasing` accepts `off` or `smaa`. SMAA selects the three-pass SMAA 1x
+High post-process on D3D12 or Vulkan, runs at the selected internal resolution,
+and is included in GPU captures. The launcher rejects SMAA with software
+rendering.
 On Variable Rate Shading hardware, direct draws retain scaled geometry,
 coverage and D16 depth while shading at approximately one fragment per logical
 PSP pixel. Set `SR_D3D12_VRS=0` to force full-rate shading; on the measured RTX
@@ -339,6 +350,11 @@ twin-stick defaults.
 Set `SR_GRAPHICS_CONFIG=<path>` or `SR_SETTINGS_DIR=<directory>` for isolated
 automation. `SR_GRAPHICS_CONFIG=0` uses the built-in graphics defaults without
 opening the first-run launcher or reading/writing a file.
+On macOS, default mutable settings are stored in the title's Application
+Support directory rather than beside the executable. `SR_RESOURCE_DIR`
+overrides immutable app/developer resources such as fonts and VFPU tables.
+Title-specific launchers may persist an ISO path in `launcher.ini`; `PSP_ISO`
+always takes precedence.
 
 ## Environment Settings
 
@@ -379,6 +395,16 @@ Set these environment variables before running the game to control runtime featu
   differential diagnostics.
 - `SR_GPU_PRESENT_REPEATS=1`: Force Vulkan presentation of unchanged GPU
   frames for differential diagnostics.
+- `SR_VULKAN_PIPELINE_CACHE=0`: Disable Vulkan GE/SMAA pipeline-cache loading
+  and persistence for cold-cache A/B diagnostics. By default the cache is
+  stored at `cache/vulkan-pipelines.bin` below the settings directory, keyed
+  by device, driver, pipeline-cache UUID, shader set, and cache schema, and
+  published atomically at clean shutdown. Incompatible or corrupt files are
+  reported and rebuilt.
+- `SR_VULKAN_GPU_UPLOAD_SCALE=0`: Disable the capability-gated nearest GPU
+  blit used to expand logical framebuffer uploads at scaled internal
+  resolutions. The diagnostic fallback performs the same expansion on the
+  CPU before transfer.
 - `SR_GPU=d3d12`: Use the SDL3/D3D12 device backend when compiled with `SR_D3D12`.
   Successful primitive hooks suppress CPU rasterization and submit native draws into GPU-owned targets. Each batch
   captures a 160-byte fragment block. Clear, opaque, source-alpha, additive, subtractive, min/max, and compatible
@@ -430,8 +456,13 @@ Set these environment variables before running the game to control runtime featu
   backend-specific widths; the runtime consumes presentation-timed values so turbo scheduler
   variance cannot consume inputs before a menu appears. Legacy three-column and v2 scripts retain
   runtime-vblank timing.
+- `SR_ANALOG_SCRIPT=<path>`: Inject deterministic presentation-timed analog movement. The file
+  begins with `# psp-recomp analog script v1`; each event is
+  `<first-present> <duration> <lx> <ly>`, with both stick coordinates in `0..255`. Events are
+  half-open, ordered, and non-overlapping. `SR_ANALOG` and `SR_ANALOG_SCRIPT` are mutually
+  exclusive.
 - `SR_PADLOG=1`: Print scripted button-mask edges with both presentation and
-  vblank counters.
+  vblank counters, plus analog-script transitions.
 - `SR_INPUT_LOG=1`: Print live logical button/analog edges and whether a
   gamepad is connected.
 - `SR_FPS_COUNTER=1`: Update the GDI, Vulkan, or D3D12 window title every
@@ -439,9 +470,13 @@ Set these environment variables before running the game to control runtime featu
   This is not the game's presentation rate.
 - `SR_FBSNAP_PRESENT=<interval>`: Write an eight-file rotating set of software
   framebuffer snapshots at the requested presentation interval.
-- `SR_FBCAPTURE_PRESENTS=<p1,p2,...>`: Write software framebuffer snapshots at
-  up to 32 exact positive presentation numbers. Duplicate or malformed values
-  fail startup.
+- `SR_FBCAPTURE_PRESENTS=<p1,p2,...>`: Write rendered framebuffer snapshots at
+  up to 32 exact positive presentation numbers. D3D12 and Vulkan capture their
+  GPU display target; other presenters use the authoritative guest framebuffer.
+  GPU captures default to the logical 480x272 display size for golden-frame
+  compatibility. Duplicate or malformed values fail startup.
+- `SR_VULKAN_CAPTURE_INTERNAL=1`: Keep Vulkan captures at the selected full
+  internal resolution instead of center-sampling them to 480x272.
 - `SR_FAST_FORWARD_PRESENT=<present>`: Run scheduler and presentation pacing as fast as the host
   allows until the requested presentation, keep host audio dormant during that phase, then align
   virtual time to the host clock and start real-time XAudio2 playback. This is intended for
@@ -449,6 +484,7 @@ Set these environment variables before running the game to control runtime featu
 - `SR_PERF_LOG=1`: Record performance samples at host display update cycles and split each sample
   between frontend and graphics-backend time. `SR_PERF_START=<present>` selects the first sample by
   `sceDisplaySetFrameBuf` call count, while `SR_PERF_WINDOW=<1..600>` selects the reporting window.
+  D3D12 and Vulkan report GPU timestamp samples when they submit rendered work.
   The Vulkan presenter may reuse an unchanged frame without submitting a new swapchain presentation.
   `SR_PERF_MIN_FPS=<fps>` terminates with failure when a completed flip window falls below the
   required average. `SR_EXIT_AFTER_PRESENT=<present>` exits after the specified
@@ -456,8 +492,18 @@ Set these environment variables before running the game to control runtime featu
   `SR_PERF_FILE=<path>` writes CSV v2 columns
   `flip,present,frame_ms,frontend_ms,backend_ms,gpu_ms,over_budget`;
   `SR_PERF_FRAME_BUDGET_MS=<milliseconds>` overrides the over-budget threshold.
-  The CSV is now v4: it appends `texture_misses`, `texture_decode_wait_us`, `pso_fallbacks` and
-  `alt_off` to the v3 columns.
+  The CSV is now v5. In addition to the v4 guest-work and framebuffer fields,
+  it records Vulkan pipeline-key hits/creation time, renderer texture-cache
+  hits/misses/uploads, texture decode/xBRZ time, host upload/readback bytes,
+  and the macOS thermal state (`0` nominal, `1` fair, `2` serious,
+  `3` critical, or `-1` unavailable). Window summaries report the highest
+  thermal state observed during that interval.
+- `SR_VULKAN_STAGE_LOG=1`: Populate Vulkan GE/presenter stage timing and
+  framebuffer-statistics columns in performance reports. Timestamp-based
+  `gpu_ms` samples do not require this switch. Vulkan GE stages accumulate
+  incrementally while the guest runs, so their sum can exceed the narrow
+  `backend_ms` interval around final presentation; `begin_ms` is zero because
+  Vulkan does not use a D3D12-style frame-allocator begin stage.
 - `SR_TRACE_STALLS=1`: Print a `[slow-frame]` line for every host flip longer than
   `SR_SLOW_FRAME_MS` (default 1.25 x the frame budget) naming the three largest phases, scheduler
   idle time, texture misses and decode wait, PSO fallback binds, and the previous flip's backend

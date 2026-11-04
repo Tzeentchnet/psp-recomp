@@ -1,3 +1,6 @@
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
 #ifndef _WIN32
 #define _XOPEN_SOURCE 700
 #endif
@@ -81,19 +84,33 @@ int sr_file_remove(const char *path) {
 #include <glob.h>
 #include <limits.h>
 #include <sys/types.h>
+#if !defined(__APPLE__) || !defined(__aarch64__)
 #include <ucontext.h>
+#endif
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #include <mach/mach_time.h>
+#if defined(__aarch64__)
+#include "fiber_arm64.h"
+#include <sys/mman.h>
+#endif
 #endif
 
 typedef struct SrFiber {
+#if defined(__APPLE__) && defined(__aarch64__)
+    SrArm64FiberContext context;
+    void *stack_mapping;
+    size_t stack_mapping_size;
+#else
     ucontext_t context;
+#endif
     void *stack;
     size_t stack_size;
     SrFiberProc proc;
     void *parameter;
+    const void *owner;
+    int is_thread;
 } SrFiber;
 
 typedef struct SrFindHandle {
@@ -101,7 +118,7 @@ typedef struct SrFindHandle {
     size_t index;
 } SrFindHandle;
 
-static SrFiber *s_current_fiber;
+static _Thread_local SrFiber *s_current_fiber;
 
 uint64_t sr_time_now(void) {
 #ifdef __APPLE__
@@ -270,25 +287,100 @@ int sr_findclose(intptr_t value) {
 
 static void fiber_entry(void) {
     SrFiber *fiber = s_current_fiber;
+    if (!fiber || !fiber->proc) {
+        fprintf(stderr, "fiber: entered without a procedure\n");
+        abort();
+    }
     fiber->proc(fiber->parameter);
+    fprintf(stderr, "fiber: procedure returned unexpectedly\n");
     abort();
 }
 
 void *sr_fiber_convert_thread(void) {
     if (s_current_fiber) return s_current_fiber;
     SrFiber *fiber = (SrFiber *)calloc(1, sizeof(*fiber));
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (!fiber) return NULL;
+#else
     if (!fiber || getcontext(&fiber->context) != 0) {
         free(fiber);
         return NULL;
     }
+#endif
+    fiber->owner = &s_current_fiber;
+    fiber->is_thread = 1;
     s_current_fiber = fiber;
     return fiber;
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+static int fiber_allocate_stack(SrFiber *fiber, size_t stack_size) {
+    long page_value = sysconf(_SC_PAGESIZE);
+    if (page_value <= 0) {
+        errno = EINVAL;
+        return 0;
+    }
+    size_t page_size = (size_t)page_value;
+    if (stack_size > SIZE_MAX - (page_size - 1u)) {
+        errno = EOVERFLOW;
+        return 0;
+    }
+    size_t usable_size =
+        ((stack_size + page_size - 1u) / page_size) * page_size;
+    if (usable_size > SIZE_MAX - 2u * page_size) {
+        errno = EOVERFLOW;
+        return 0;
+    }
+    size_t mapping_size = usable_size + 2u * page_size;
+    void *mapping = mmap(
+        NULL, mapping_size, PROT_NONE,
+        MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mapping == MAP_FAILED) return 0;
+    void *stack = (unsigned char *)mapping + page_size;
+    if (mprotect(stack, usable_size, PROT_READ | PROT_WRITE) != 0) {
+        int saved_errno = errno;
+        munmap(mapping, mapping_size);
+        errno = saved_errno;
+        return 0;
+    }
+    fiber->stack_mapping = mapping;
+    fiber->stack_mapping_size = mapping_size;
+    fiber->stack = stack;
+    fiber->stack_size = usable_size;
+    return 1;
+}
+
+static uint64_t fiber_read_fpcr(void) {
+    uint64_t value;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(value));
+    return value;
+}
+
+static uint64_t fiber_read_fpsr(void) {
+    uint64_t value;
+    __asm__ volatile("mrs %0, fpsr" : "=r"(value));
+    return value;
+}
+#endif
+
 void *sr_fiber_create(
     size_t stack_size, SrFiberProc proc, void *parameter) {
+    if (!s_current_fiber) {
+        errno = EPERM;
+        return NULL;
+    }
+    if (!proc || stack_size < 16u * 1024u) {
+        errno = EINVAL;
+        return NULL;
+    }
     SrFiber *fiber = (SrFiber *)calloc(1, sizeof(*fiber));
     if (!fiber) return NULL;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (!fiber_allocate_stack(fiber, stack_size)) {
+        free(fiber);
+        return NULL;
+    }
+#else
     fiber->stack = malloc(stack_size);
     if (!fiber->stack || getcontext(&fiber->context) != 0) {
         free(fiber->stack);
@@ -296,28 +388,71 @@ void *sr_fiber_create(
         return NULL;
     }
     fiber->stack_size = stack_size;
+#endif
     fiber->proc = proc;
     fiber->parameter = parameter;
+    fiber->owner = &s_current_fiber;
+#if defined(__APPLE__) && defined(__aarch64__)
+    uintptr_t stack_top =
+        (uintptr_t)fiber->stack + fiber->stack_size;
+    stack_top &= ~(uintptr_t)15u;
+    fiber->context.sp = (uint64_t)stack_top;
+    fiber->context.x30 = (uint64_t)(uintptr_t)fiber_entry;
+    fiber->context.fpcr = fiber_read_fpcr();
+    fiber->context.fpsr = fiber_read_fpsr();
+#else
     fiber->context.uc_stack.ss_sp = fiber->stack;
     fiber->context.uc_stack.ss_size = stack_size;
     fiber->context.uc_link = NULL;
     makecontext(&fiber->context, fiber_entry, 0);
+#endif
     return fiber;
 }
 
 void sr_fiber_switch(void *value) {
     SrFiber *target = (SrFiber *)value;
     SrFiber *source = s_current_fiber;
-    if (!source || !target || source == target) return;
+    if (!source || !target) {
+        fprintf(stderr, "fiber: switch requires valid source and target\n");
+        abort();
+    }
+    if (source == target) return;
+    if (source->owner != &s_current_fiber ||
+        target->owner != &s_current_fiber) {
+        fprintf(stderr, "fiber: cross-thread switch is not supported\n");
+        abort();
+    }
     s_current_fiber = target;
+#if defined(__APPLE__) && defined(__aarch64__)
+    sr_fiber_swap_context(&source->context, &target->context);
+#else
     if (swapcontext(&source->context, &target->context) != 0)
         abort();
+#endif
 }
 
 void sr_fiber_destroy(void *value) {
     SrFiber *fiber = (SrFiber *)value;
-    if (!fiber || fiber == s_current_fiber) return;
+    if (!fiber) return;
+    if (fiber == s_current_fiber || fiber->is_thread) {
+        fprintf(stderr, "fiber: cannot destroy the active thread fiber\n");
+        abort();
+    }
+    if (fiber->owner != &s_current_fiber) {
+        fprintf(stderr, "fiber: cross-thread destruction is not supported\n");
+        abort();
+    }
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (fiber->stack_mapping &&
+        munmap(
+            fiber->stack_mapping,
+            fiber->stack_mapping_size) != 0) {
+        fprintf(stderr, "fiber: failed to release stack: %s\n", strerror(errno));
+        abort();
+    }
+#else
     free(fiber->stack);
+#endif
     free(fiber);
 }
 

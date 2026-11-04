@@ -1,6 +1,7 @@
 #include "gpu_sdl3vk/shader_state.h"
 #include "gpu_sdl3vk/feedback_region.h"
 #include "gpu_sdl3vk/present_cache.h"
+#include "gpu_sdl3vk/present_layout.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -367,6 +368,57 @@ static void test_feedback_regions(void) {
     }
 }
 
+static void test_present_layout(void) {
+    SrVkPresentRect rect;
+    if (!sr_vk_present_rect(1920, 1088, &rect) ||
+        rect.x != 0 || rect.y != 0 ||
+        rect.width != 1920 || rect.height != 1088) {
+        fail("native-aspect Retina presentation rectangle");
+    }
+    if (!sr_vk_present_rect(1920, 1200, &rect) ||
+        rect.x != 0 || rect.y != 56 ||
+        rect.width != 1920 || rect.height != 1088) {
+        fail("letterboxed presentation rectangle");
+    }
+    if (!sr_vk_present_rect(1000, 300, &rect) ||
+        rect.x != 235 || rect.y != 0 ||
+        rect.width != 529 || rect.height != 300) {
+        fail("pillarboxed presentation rectangle");
+    }
+    if (!sr_vk_present_rect(1, 1, &rect) ||
+        rect.width != 1 || rect.height != 1) {
+        fail("minimum presentation rectangle");
+    }
+    if (sr_vk_present_rect(0, 1088, &rect))
+        fail("zero-width presentation rectangle accepted");
+
+    SrVkCaptureLayout capture;
+    if (!sr_vk_capture_layout(960, 544, 0, &capture) ||
+        capture.width != 480 || capture.height != 272 ||
+        capture.source_step != 2 || capture.sample_offset != 1) {
+        fail("logical-resolution Vulkan capture layout");
+    }
+    if (!sr_vk_capture_layout(960, 544, 1, &capture) ||
+        capture.width != 960 || capture.height != 544 ||
+        capture.source_step != 1 || capture.sample_offset != 0) {
+        fail("internal-resolution Vulkan capture layout");
+    }
+    if (sr_vk_capture_layout(960, 545, 0, &capture))
+        fail("non-integral Vulkan capture layout accepted");
+
+    SrVkExtent extent;
+    if (!sr_vk_internal_extent(2, &extent) ||
+        extent.width != 960 || extent.height != 544) {
+        fail("2x Vulkan internal extent");
+    }
+    if (!sr_vk_internal_extent(8, &extent) ||
+        extent.width != 3840 || extent.height != 2176) {
+        fail("8x Vulkan internal extent");
+    }
+    if (sr_vk_internal_extent(0, &extent))
+        fail("zero Vulkan internal resolution accepted");
+}
+
 int main(void) {
     test_direct_classification();
     test_stencil_classification();
@@ -377,6 +429,7 @@ int main(void) {
     test_indexed_palette_keys();
     test_present_cache();
     test_feedback_regions();
+    test_present_layout();
     if (s_failures) {
         fprintf(stderr, "%d Vulkan shader-state test(s) failed\n", s_failures);
         return 1;

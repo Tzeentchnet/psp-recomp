@@ -577,6 +577,9 @@ int gui_last_gpu_sample(uint64_t *flip, double *milliseconds) {
 #endif
     return 0;
 }
+int gui_thermal_state(void) {
+    return -1;
+}
 int gui_last_backend_timing(SrBackendTiming *timing) {
 #ifdef SR_D3D12
     if (s_on && s_d3d12 && timing) {
@@ -604,6 +607,7 @@ int gui_framebuffer_stats(SrFramebufferStats *stats) {
     if (s_on && s_d3d12 && stats) {
         GeD3D12FramebufferStats source;
         if (!ged3d12_framebuffer_stats(&source)) return 0;
+        memset(stats, 0, sizeof(*stats));
         stats->readbacks = source.readbacks;
         stats->aliases = source.aliases;
         stats->feedback_snapshots = source.feedback_snapshots;

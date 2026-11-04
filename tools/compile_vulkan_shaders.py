@@ -20,6 +20,14 @@ SHADER_DIR = BACKEND_DIR / "shaders"
 SHADERS = (
     ("psp.vert", "vert", "psp_vert.inc"),
     ("psp.frag", "frag", "psp_frag.inc"),
+    ("smaa.vert", "vert", "smaa_vert.inc"),
+    ("smaa_edge.frag", "frag", "smaa_edge_frag.inc"),
+    ("smaa_blend.frag", "frag", "smaa_blend_frag.inc"),
+    (
+        "smaa_neighborhood.frag",
+        "frag",
+        "smaa_neighborhood_frag.inc",
+    ),
 )
 
 
@@ -160,9 +168,10 @@ def main(argv: list[str]) -> int:
                 ):
                     stale.append(output)
             else:
-                output.write_text(
-                    rendered, encoding="ascii", newline="\n"
-                )
+                with output.open(
+                    "w", encoding="ascii", newline="\n"
+                ) as file:
+                    file.write(rendered)
                 print(f"wrote {output.relative_to(ROOT)}")
         if stale:
             for output in stale:

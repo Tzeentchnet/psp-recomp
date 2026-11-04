@@ -9,13 +9,16 @@
  *        driver --boot <image.bin> <base-hex> <entry-hex> <out-trace>
  */
 
+#ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
+#endif
 #include "graphics_config.h"
 #include "graphics_settings.h"
 #include "input_config.h"
 #include "input_settings.h"
 #include "platform.h"
 #include "recomp.h"
+#include "settings_path.h"
 #include "startup_check.h"
 
 #include <stdio.h>
@@ -23,6 +26,8 @@
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include "macos_app.h"
 #endif
 
 #ifndef SR_GAME_TITLE
@@ -158,33 +163,13 @@ static void seed_from_init(const char *trace_path, CpuState *s) {
     if (mem_lines) fprintf(stderr, "seed: %d memory lines from %s\n", mem_lines, trace_path);
 }
 
-#ifdef SR_CONFIG_BOOT_IMAGE
-static int executable_sibling_path(
-    const char *name, char *path, size_t path_size) {
-    char *slash;
-    char *forward_slash;
-    size_t prefix_length;
-    size_t name_length;
-
-    if (!sr_executable_path(path, path_size)) return 0;
-    slash = strrchr(path, '\\');
-    forward_slash = strrchr(path, '/');
-    if (!slash || (forward_slash && forward_slash > slash))
-        slash = forward_slash;
-    if (!slash) return 0;
-    prefix_length = (size_t)(slash - path) + 1;
-    name_length = strlen(name);
-    if (prefix_length + name_length >= path_size) return 0;
-    memcpy(path + prefix_length, name, name_length + 1);
-    return 1;
-}
-#endif
-
 static void launch_error(const char *message) {
 #ifdef _WIN32
     MessageBoxA(
         NULL, message, "Cannot Launch Game",
         MB_OK | MB_ICONERROR);
+#elif defined(__APPLE__)
+    sr_macos_show_error("Cannot Launch Game", message);
 #else
     fprintf(stderr, "Cannot Launch Game: %s\n", message);
 #endif
@@ -196,9 +181,33 @@ int main(int argc, char **argv) {
     const char *ref_trace = NULL, *out;
     int standalone = 0;
     int launch_from_config = 0;
+    int configured_launch = 0;
+    int iso_ready = 0;
 
 #ifdef _WIN32
     SetUnhandledExceptionFilter(sr_crash_filter);
+#elif defined(__APPLE__)
+    sr_macos_prepare_runtime();
+#endif
+
+#ifdef __APPLE__
+    if (argc == 1) {
+        int result;
+        if (!sr_graphics_config_init() || !sr_input_init()) return 2;
+        result = sr_macos_ensure_iso(SR_GAME_TITLE);
+        if (result <= 0) return result < 0 ? 2 : 0;
+        iso_ready = 1;
+        if (sr_graphics_config_first_run()) {
+            result = sr_graphics_settings_show(
+                SR_GAME_TITLE " Graphics");
+            if (result <= 0) return result < 0 ? 2 : 0;
+            result = sr_input_settings_show(
+                SR_GAME_TITLE " Controller", 1);
+            if (result < 0) return 2;
+            if (result != SR_INPUT_SETTINGS_LAUNCH) return 0;
+        }
+        configured_launch = 1;
+    }
 #endif
 
     for (int i = 1; i < argc; i++) {
@@ -219,22 +228,37 @@ int main(int argc, char **argv) {
                 SR_GAME_TITLE " Controller", 1);
             if (result < 0) return 2;
             if (result != SR_INPUT_SETTINGS_LAUNCH) return 0;
+            configured_launch = 1;
+#ifdef __APPLE__
+            result = sr_macos_ensure_iso(SR_GAME_TITLE);
+            if (result <= 0) return result < 0 ? 2 : 0;
+            iso_ready = 1;
+#endif
+            break;
+        }
+    }
+
+    if (configured_launch) {
 #ifdef SR_CONFIG_BOOT_IMAGE
             char image_path[MAX_PATH];
+            char path_error[256];
             long len;
             uint8_t *img;
-            if (!executable_sibling_path(
+            if (!sr_resource_path(
                     SR_CONFIG_BOOT_IMAGE,
                     image_path,
-                    sizeof(image_path))) {
+                    sizeof(image_path),
+                    path_error,
+                    sizeof(path_error))) {
+                fprintf(stderr, "launcher: %s\n", path_error);
                 launch_error(
-                    "Cannot locate the game image beside the executable.");
+                    "Cannot locate the game image in the application resources.");
                 return 2;
             }
-            if (!sr_startup_validate()) {
+            if (!iso_ready && !sr_startup_validate()) {
                 launch_error(
                     "The supported game ISO could not be validated. "
-                    "Set PSP_ISO to your disc image and try again.");
+                    "Choose it in the launcher or set PSP_ISO and try again.");
                 return 2;
             }
             img = read_file(image_path, &len);
@@ -250,7 +274,6 @@ int main(int argc, char **argv) {
                 "This build does not define a game image for the launcher.");
             return 2;
 #endif
-        }
     }
 
     /* Normal runtime path: the generated image is already rebased and relocated by prxload.py. */

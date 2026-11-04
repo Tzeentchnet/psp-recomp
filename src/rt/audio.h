@@ -15,6 +15,7 @@ void sr_audio_push(
 int sr_audio_queued(int channel);
 int sr_audio_device_latency_frames(void);
 const char *sr_audio_backend_name(void);
+void sr_audio_set_suspended(int suspended);
 
 #ifdef __cplusplus
 }

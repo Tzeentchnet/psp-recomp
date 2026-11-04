@@ -17,7 +17,7 @@ ifeq ($(OS),Windows_NT)
 HOST_WINDOWS := 1
 EXEEXT       := .exe
 DEFAULT_PYTHON := python
-PLATFORM_DEFINES := -DSR_SDL3VK -DSR_D3D12
+PLATFORM_DEFINES := -DSR_SDL3VK -DSR_SDL3VK_SMAA -DSR_D3D12
 PLATFORM_RT_SRCS := src/rt/gui.c \
                     src/rt/graphics_settings.c \
                     src/rt/input_settings.c \
@@ -32,7 +32,7 @@ HOST_WINDOWS := 0
 EXEEXT       :=
 DEFAULT_PYTHON := python3
 PKG_CONFIG   ?= pkg-config
-PLATFORM_DEFINES := -DSR_SDL3VK
+PLATFORM_DEFINES := -DSR_SDL3VK -DSR_SDL3VK_SMAA
 PLATFORM_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl3 vulkan 2>/dev/null)
 PLATFORM_RT_SRCS := src/rt/gui_sdl.c \
                     src/rt/settings_portable.c \
@@ -42,9 +42,16 @@ PLATFORM_LIBS := $(shell $(PKG_CONFIG) --libs sdl3 vulkan 2>/dev/null)
 ifeq ($(shell uname -s),Darwin)
 HOST_APPLE := 1
 CXX_RUNTIME_LIB := -lc++
-PLATFORM_RT_SRCS += src/rt/h264_vt.c src/rt/h264_psmf.c
+PLATFORM_RT_SRCS := $(filter-out src/rt/settings_portable.c src/rt/osk_posix.c,$(PLATFORM_RT_SRCS))
+PLATFORM_RT_SRCS += src/rt/macos_app.mm src/rt/settings_macos.mm \
+                    src/rt/osk_macos.mm src/rt/h264_vt.c src/rt/h264_psmf.c
+ifeq ($(shell uname -m),arm64)
+PLATFORM_RT_SRCS += src/rt/fiber_arm64.S
+FIBER_ASM_SRCS := src/rt/fiber_arm64.S tools/tests/fiber_arm64_test.S
+endif
 PLATFORM_LIBS += -framework VideoToolbox -framework CoreMedia \
-                 -framework CoreVideo -framework CoreFoundation
+                 -framework CoreVideo -framework CoreFoundation \
+                 -framework AppKit
 else
 CXX_RUNTIME_LIB := -lstdc++
 PLATFORM_RT_SRCS += src/rt/h264_stub.c
@@ -102,6 +109,7 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/platform.c \
               src/rt/perf_stats.c \
               src/rt/display_state.c \
+              src/rt/host_lifecycle.c \
               src/rt/interp_runtime.cpp \
               src/ref/interp.cpp \
               src/rt/module.c \
@@ -120,7 +128,9 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/pgf.c \
               src/rt/settings_path.c \
               src/rt/graphics_config.c \
+              src/rt/graphics_auto.c \
               src/rt/input_config.c \
+              src/rt/input_script.c \
               src/rt/kzl_twinstick.c \
               src/rt/startup_check.c \
               src/rt/audio_mixer.c \
@@ -136,6 +146,9 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/driver.c \
               src/rt/gpu_sdl3vk/sdl3vk.c \
               src/rt/gpu_sdl3vk/ge_gpu.c \
+              src/rt/gpu_sdl3vk/pipeline_cache_vk.c \
+              src/rt/gpu_sdl3vk/present_layout.c \
+              src/rt/gpu_sdl3vk/smaa_vk.c \
               src/rt/gpu_sdl3vk/shader_state.c \
               $(PLATFORM_RT_SRCS)
 AT3_NAMES  := atrac atrac3 atrac3plus atrac3plusdec atrac3plusdsp get_bits compat fft mem
@@ -151,9 +164,11 @@ GLSLANG_VALIDATOR ?= glslangValidator
         shaders-vulkan check-shaders-vulkan \
         test-d3d12-vertex test-dispatch-table test-fps-counter \
         test-perf-stats test-ge-patch-math \
-        test-input-config test-module-loader test-memstick-state \
+        test-input-config test-input-script test-settings-path \
+        test-module-loader test-memstick-state \
         test-interpreter test-texture-scaler \
-        test-vulkan-shader-state test-h264-psmf test-h264-vt test-runtime
+        test-vulkan-shader-state test-h264-psmf test-h264-vt test-fiber \
+        test-host-lifecycle test-audio-sdl-lifecycle test-runtime
 
 all: pipeline compile
 
@@ -338,6 +353,7 @@ test-vulkan-shader-state:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O2 -Isrc/rt -Wall -Wextra \
 		tools/tests/vulkan_shader_state_test.c \
+		src/rt/gpu_sdl3vk/present_layout.c \
 		src/rt/gpu_sdl3vk/shader_state.c \
 		-o build/tests/vulkan_shader_state_test.exe
 	./build/tests/vulkan_shader_state_test.exe
@@ -392,10 +408,26 @@ test-input-config:
 		-o build/tests/input_config_test.exe -lm
 	./build/tests/input_config_test.exe
 
+test-input-script:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O0 -Isrc/rt -Itools/tests -Wall -Wextra \
+		tools/tests/input_script_test.c src/rt/input_script.c \
+		-o build/tests/input_script_test.exe
+	./build/tests/input_script_test.exe
+
+test-settings-path:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O0 -Isrc/rt -Itools/tests -Wall -Wextra \
+		-DSR_APPLICATION_DATA_NAME=\"KZLRecomp\" \
+		tools/tests/settings_path_test.c src/rt/settings_path.c \
+		src/rt/platform.c -o build/tests/settings_path_test.exe
+	./build/tests/settings_path_test.exe
+
 test-graphics-config:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
 		tools/tests/graphics_config_test.c src/rt/graphics_config.c \
+		src/rt/graphics_auto.c \
 		src/rt/settings_path.c src/rt/platform.c \
 		-o build/tests/graphics_config_test.exe
 	./build/tests/graphics_config_test.exe
@@ -455,10 +487,44 @@ test-h264-vt:
 	@exit 2
 endif
 
+ifeq ($(HOST_WINDOWS),0)
+test-fiber:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt -Wall -Wextra \
+		tools/tests/fiber_test.c src/rt/platform.c $(FIBER_ASM_SRCS) \
+		-o build/tests/fiber_test
+	./build/tests/fiber_test
+
+test-audio-sdl-lifecycle:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt $(PLATFORM_CFLAGS) -Wall -Wextra \
+		tools/tests/audio_sdl_lifecycle_test.c \
+		src/rt/audio_sdl.c src/rt/audio_mixer.c \
+		$(PLATFORM_LIBS) -o build/tests/audio_sdl_lifecycle_test
+	./build/tests/audio_sdl_lifecycle_test
+
+test-runtime: test-fiber test-audio-sdl-lifecycle
+else
+test-fiber:
+	@echo "Portable fiber tests require a POSIX host."
+	@exit 2
+test-audio-sdl-lifecycle:
+	@echo "SDL audio lifecycle tests require a POSIX host."
+	@exit 2
+endif
+
+test-host-lifecycle:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt -Wall -Wextra \
+		tools/tests/host_lifecycle_test.c src/rt/host_lifecycle.c \
+		-o build/tests/host_lifecycle_test
+	./build/tests/host_lifecycle_test
+
 test-runtime: test-dispatch-table test-fps-counter test-perf-stats test-h264-psmf \
-	test-ge-patch-math test-input-config test-graphics-config \
+	test-ge-patch-math test-input-config test-input-script test-settings-path \
+	test-graphics-config \
 	test-module-loader test-memstick-state test-interpreter \
-	test-texture-scaler test-vulkan-shader-state
+	test-texture-scaler test-vulkan-shader-state test-host-lifecycle
 
 # Generated C code gets huge. Cache the compiled object to avoid rebuilding it on runtime changes.
 $(BUILD_DIR)/$(GAME_NAME)_recomp.o: $(BUILD_DIR)/$(GAME_NAME)_recomp.c src/rt/recomp.h

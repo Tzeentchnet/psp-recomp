@@ -19,6 +19,8 @@ static int s_initialized;
 static int s_ok;
 static int s_failed;
 static int s_log;
+static int s_suspend_requested;
+static int s_suspended;
 
 static void SDLCALL audio_callback(
     void *userdata, SDL_AudioStream *stream,
@@ -75,16 +77,22 @@ int sr_audio_init(void) {
                 SDL_GetError());
         return 0;
     }
-    if (!SDL_ResumeAudioStreamDevice(s_stream)) {
+    s_suspended = 1;
+    if (!s_suspend_requested &&
+        !SDL_ResumeAudioStreamDevice(s_stream)) {
         fprintf(stderr, "audio: cannot start SDL audio stream: %s\n",
                 SDL_GetError());
         SDL_DestroyAudioStream(s_stream);
         s_stream = NULL;
+        s_suspended = 0;
         return 0;
     }
+    if (!s_suspend_requested) s_suspended = 0;
     atexit(sr_audio_shutdown);
     s_ok = 1;
-    fprintf(stderr, "audio: SDL 44.1 kHz stereo\n");
+    fprintf(
+        stderr, "audio: SDL 44.1 kHz stereo%s\n",
+        s_suspended ? " (suspended)" : "");
     return 1;
 }
 
@@ -92,7 +100,9 @@ void sr_audio_push(
     int channel, const int16_t *stereo, int frames,
     int volume_left, int volume_right) {
     if (sched_fast_forwarding()) return;
-    if (!sr_audio_init() || frames <= 0 || s_failed) return;
+    if (!sr_audio_init() || frames <= 0 || s_failed ||
+        s_suspend_requested)
+        return;
     if (!SDL_LockAudioStream(s_stream)) {
         fprintf(stderr, "audio: cannot lock SDL audio stream: %s\n",
                 SDL_GetError());
@@ -107,7 +117,7 @@ void sr_audio_push(
 
 int sr_audio_queued(int channel) {
     if (sched_fast_forwarding()) return -1;
-    if (!s_ok || s_failed) return -1;
+    if (!s_ok || s_failed || s_suspend_requested) return -1;
     if (!SDL_LockAudioStream(s_stream)) return -1;
     int queued = sr_audio_mixer_queued(&s_mixer, channel);
     SDL_UnlockAudioStream(s_stream);
@@ -115,12 +125,39 @@ int sr_audio_queued(int channel) {
 }
 
 int sr_audio_device_latency_frames(void) {
-    if (sched_fast_forwarding() || !s_ok || s_failed) return -1;
+    if (sched_fast_forwarding() || !s_ok || s_failed ||
+        s_suspend_requested)
+        return -1;
     return BLOCK_FRAMES * 2;
 }
 
 const char *sr_audio_backend_name(void) {
     return "SDL";
+}
+
+void sr_audio_set_suspended(int suspended) {
+    suspended = suspended != 0;
+    s_suspend_requested = suspended;
+    if (!s_stream || !s_ok || s_failed ||
+        s_suspended == suspended)
+        return;
+    int ok = suspended
+        ? SDL_PauseAudioStreamDevice(s_stream)
+        : SDL_ResumeAudioStreamDevice(s_stream);
+    if (!ok) {
+        fprintf(
+            stderr,
+            "audio: cannot %s SDL audio stream: %s\n",
+            suspended ? "pause" : "resume",
+            SDL_GetError());
+        s_failed = 1;
+        return;
+    }
+    s_suspended = suspended;
+    if (s_log)
+        fprintf(
+            stderr, "audio: host lifecycle %s\n",
+            suspended ? "suspended" : "resumed");
 }
 
 void sr_audio_shutdown(void) {
@@ -147,5 +184,6 @@ void sr_audio_shutdown(void) {
     s_stream = NULL;
     s_ok = 0;
     s_failed = 0;
+    s_suspended = 0;
     s_initialized = 0;
 }

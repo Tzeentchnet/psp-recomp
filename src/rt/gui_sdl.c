@@ -7,6 +7,9 @@
 #include "gpu_sdl3vk/ge_gpu.h"
 #include "gpu_sdl3vk/sdl3vk.h"
 #include "platform.h"
+#ifdef __APPLE__
+#include "macos_app.h"
+#endif
 
 #include <SDL3/SDL.h>
 
@@ -95,6 +98,17 @@ int gui_init(const char *title) {
             stderr,
             "gui_init: D3D12 is unavailable on this platform; "
             "select renderer = vk or sw in graphics.ini\n");
+        return 0;
+    }
+    if (sr_graphics_config_get()->quality_mode ==
+            SR_GRAPHICS_QUALITY_MANUAL &&
+        sr_graphics_config_get()->anti_aliasing ==
+            SR_GRAPHICS_ANTI_ALIASING_SMAA &&
+        renderer != SR_GRAPHICS_RENDERER_VULKAN) {
+        fprintf(
+            stderr,
+            "gui_init: SMAA 1x High requires renderer = vk "
+            "on this platform\n");
         return 0;
     }
     snprintf(
@@ -219,27 +233,84 @@ int gui_message(
 }
 
 int gui_capture_next(const char *path) {
-    (void)path;
-    return 0;
+    return s_on ? sdl3vk_capture_next(path) : 0;
 }
 
 double gui_last_gpu_ms(void) {
-    return -1.0;
+    return s_on ? sdl3vk_last_gpu_ms() : -1.0;
 }
 
 int gui_last_gpu_sample(uint64_t *flip, double *milliseconds) {
-    (void)flip;
-    (void)milliseconds;
-    return 0;
+    return s_on
+        ? sdl3vk_last_gpu_sample(flip, milliseconds)
+        : 0;
+}
+
+int gui_thermal_state(void) {
+#ifdef __APPLE__
+    static uint64_t last_check;
+    static int state = -1;
+    uint64_t now = sr_time_now();
+    uint64_t frequency = sr_time_frequency();
+    if (!last_check || !frequency || now - last_check >= frequency) {
+        state = sr_macos_thermal_state();
+        last_check = now;
+    }
+    return state;
+#else
+    return -1;
+#endif
 }
 
 int gui_last_backend_timing(SrBackendTiming *timing) {
-    (void)timing;
+    if (s_on && timing) {
+        GeVkBackendTiming source;
+        if (!gegpu_last_backend_timing(&source))
+            return 0;
+        timing->flip = source.flip;
+        timing->begin_ms = source.begin_ms;
+        timing->vertices_ms = source.vertices_ms;
+        timing->framebuffer_ms = source.framebuffer_ms;
+        timing->textures_ms = source.textures_ms;
+        timing->draws_ms = source.draws_ms;
+        timing->present_ms = source.present_ms;
+        timing->submit_ms = source.submit_ms;
+        timing->vertices = source.vertices;
+        timing->batches = source.batches;
+        return 1;
+    }
     return 0;
 }
 
 int gui_framebuffer_stats(SrFramebufferStats *stats) {
-    (void)stats;
+    if (s_on && stats) {
+        GeVkFramebufferStats source;
+        Sdl3VkTransferStats presenter;
+        if (!gegpu_framebuffer_stats(&source))
+            return 0;
+        memset(stats, 0, sizeof(*stats));
+        stats->readbacks = source.readbacks;
+        stats->aliases = source.aliases;
+        stats->feedback_snapshots = source.feedback_snapshots;
+        stats->feedback_snapshot_pixels =
+            source.feedback_snapshot_pixels;
+        stats->feedback_reuses = source.feedback_reuses;
+        stats->pipeline_key_hits = source.pipeline_key_hits;
+        stats->pipelines_created = source.pipelines_created;
+        stats->pipeline_create_us = source.pipeline_create_us;
+        stats->texture_cache_hits = source.texture_cache_hits;
+        stats->texture_cache_misses = source.texture_cache_misses;
+        stats->texture_uploads = source.texture_uploads;
+        stats->texture_decode_us = source.texture_decode_us;
+        stats->texture_scale_us = source.texture_scale_us;
+        stats->host_upload_bytes = source.host_upload_bytes;
+        stats->host_readback_bytes = source.host_readback_bytes;
+        if (sdl3vk_transfer_stats(&presenter)) {
+            stats->host_upload_bytes += presenter.host_upload_bytes;
+            stats->host_readback_bytes += presenter.host_readback_bytes;
+        }
+        return 1;
+    }
     return 0;
 }
 

@@ -36,9 +36,11 @@
  */
 #include "ge_gpu.h"
 #include "feedback_region.h"
+#include "pipeline_cache_vk.h"
 #include "sdl3vk.h"
 #include "shader_state.h"
 #include "../graphics_config.h"
+#include "../platform.h"
 #include "../texture_scaler.h"
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -166,12 +168,17 @@ static VkBuffer s_vbuf, s_xfer;            /* vertices; pixel transfer staging (
 static VkDeviceMemory s_vbuf_m, s_xfer_m;
 static GpuVert *s_vmap;
 static void    *s_xfer_map;
+static VkImage s_upload_scale_image;
+static VkDeviceMemory s_upload_scale_memory;
+static VkImageLayout s_upload_scale_layout;
+static int s_gpu_upload_scale;
 
 static VkDescriptorSetLayout s_dlayout;
 static VkDescriptorSetLayout s_dst_dlayout;
 static VkDescriptorPool s_dpool_tex, s_dpool_fix;
 static VkPipelineLayout s_playout;
 static VkShaderModule s_vs, s_fs;
+static VkPipelineCache s_pipeline_cache;
 
 static TexEnt  s_tex[MAX_TEX];
 static int     s_tex_n = 0;
@@ -212,8 +219,31 @@ static unsigned long s_cnt_present_gpu = 0, s_cnt_present_cpu = 0, s_cnt_rtt = 0
 static unsigned long s_cnt_readback = 0, s_cnt_upload = 0, s_cnt_dirty = 0;
 static unsigned long s_cnt_snap = 0, s_cnt_texup = 0, s_cnt_xferblit = 0;
 static unsigned long s_cnt_snap_reuse = 0;
+static unsigned long s_cnt_aliases = 0;
 static uint64_t s_snap_pixels = 0;
 static unsigned long s_cnt_direct = 0, s_cnt_manual = 0, s_cnt_dst_snap = 0;
+static uint64_t s_pipeline_key_hits;
+static uint64_t s_pipelines_created;
+static uint64_t s_pipeline_create_ticks;
+static uint64_t s_texture_cache_hits;
+static uint64_t s_texture_cache_misses;
+static uint64_t s_texture_decode_ticks;
+static uint64_t s_texture_scale_ticks;
+static uint64_t s_host_upload_bytes;
+static uint64_t s_host_readback_bytes;
+static uint32_t s_host_memory_type = UINT32_MAX;
+static uint32_t s_device_memory_type = UINT32_MAX;
+
+static int s_stage_log;
+static uint64_t s_stage_flip;
+static uint64_t s_stage_vertices_ticks;
+static uint64_t s_stage_framebuffer_ticks;
+static uint64_t s_stage_textures_ticks;
+static uint64_t s_stage_draws_ticks;
+static uint64_t s_stage_submit_ticks;
+static uint32_t s_stage_vertices;
+static uint32_t s_stage_batches;
+static GeVkBackendTiming s_last_backend_timing;
 
 static uint32_t s_texscratch[512 * 512];
 static uint32_t *s_texscaled;
@@ -227,6 +257,75 @@ static uint16_t s_scaled_depth_row[FB_W * SR_GRAPHICS_SCALE_MAX];
     fprintf(stderr, "gegpu: %s failed: %d\n", #expr, (int)vr_); return 0; } } while (0)
 
 /* ---- small helpers -------------------------------------------------------------------- */
+
+static uint64_t stage_counter(void) {
+    return s_stage_log ? sr_time_now() : 0;
+}
+
+static uint64_t stage_children(void) {
+    return
+        s_stage_vertices_ticks +
+        s_stage_framebuffer_ticks +
+        s_stage_textures_ticks +
+        s_stage_draws_ticks +
+        s_stage_submit_ticks;
+}
+
+static void stage_add_exclusive(
+    uint64_t *ticks, uint64_t start, uint64_t children_before) {
+    if (!start)
+        return;
+    uint64_t elapsed = sr_time_now() - start;
+    uint64_t children = stage_children() - children_before;
+    *ticks += elapsed > children ? elapsed - children : 0;
+}
+
+static double stage_milliseconds(uint64_t ticks) {
+    uint64_t frequency = sr_time_frequency();
+    return frequency
+        ? (double)ticks * 1000.0 / (double)frequency
+        : 0.0;
+}
+
+static uint64_t stage_microseconds(uint64_t ticks) {
+    uint64_t frequency = sr_time_frequency();
+    return frequency
+        ? (uint64_t)(
+            (double)ticks * 1000000.0 / (double)frequency)
+        : 0;
+}
+
+static void stage_reset(void) {
+    s_stage_vertices_ticks = 0;
+    s_stage_framebuffer_ticks = 0;
+    s_stage_textures_ticks = 0;
+    s_stage_draws_ticks = 0;
+    s_stage_submit_ticks = 0;
+    s_stage_vertices = 0;
+    s_stage_batches = 0;
+}
+
+static void stage_publish(uint64_t present_ticks) {
+    if (!s_stage_log)
+        return;
+    memset(&s_last_backend_timing, 0, sizeof(s_last_backend_timing));
+    s_last_backend_timing.flip = ++s_stage_flip;
+    s_last_backend_timing.vertices_ms =
+        stage_milliseconds(s_stage_vertices_ticks);
+    s_last_backend_timing.framebuffer_ms =
+        stage_milliseconds(s_stage_framebuffer_ticks);
+    s_last_backend_timing.textures_ms =
+        stage_milliseconds(s_stage_textures_ticks);
+    s_last_backend_timing.draws_ms =
+        stage_milliseconds(s_stage_draws_ticks);
+    s_last_backend_timing.present_ms =
+        stage_milliseconds(present_ticks);
+    s_last_backend_timing.submit_ms =
+        stage_milliseconds(s_stage_submit_ticks);
+    s_last_backend_timing.vertices = s_stage_vertices;
+    s_last_backend_timing.batches = s_stage_batches;
+    stage_reset();
+}
 
 static uint32_t render_width(void) {
     return FB_W * s_render_scale;
@@ -270,6 +369,19 @@ static int configure_render_scale(const SrGraphicsConfig *config) {
     return 1;
 }
 
+static int upload_scale_supported(void) {
+    VkFormatProperties properties;
+    VkFormatFeatureFlags required =
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+        VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+        VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    vkGetPhysicalDeviceFormatProperties(
+        s_pdev, VK_FORMAT_R8G8B8A8_UNORM, &properties);
+    return
+        (properties.optimalTilingFeatures & required) == required;
+}
+
 static uint32_t find_mem(uint32_t bits, VkMemoryPropertyFlags want) {
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(s_pdev, &mp);
@@ -289,6 +401,14 @@ static int make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *bu
     mai.allocationSize = mr.size;
     mai.memoryTypeIndex = find_mem(mr.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mai.memoryTypeIndex == UINT32_MAX) {
+        fprintf(stderr, "gegpu: no coherent host-visible Vulkan memory type\n");
+        vkDestroyBuffer(s_dev, *buf, NULL);
+        *buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    if (s_host_memory_type == UINT32_MAX)
+        s_host_memory_type = mai.memoryTypeIndex;
     VKC(vkAllocateMemory(s_dev, &mai, NULL, mem));
     VKC(vkBindBufferMemory(s_dev, *buf, *mem, 0));
     if (map) VKC(vkMapMemory(s_dev, *mem, 0, VK_WHOLE_SIZE, 0, map));
@@ -308,6 +428,14 @@ static int make_image(uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags us
     VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     mai.allocationSize = mr.size;
     mai.memoryTypeIndex = find_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mai.memoryTypeIndex == UINT32_MAX) {
+        fprintf(stderr, "gegpu: no device-local Vulkan image memory type\n");
+        vkDestroyImage(s_dev, *img, NULL);
+        *img = VK_NULL_HANDLE;
+        return 0;
+    }
+    if (s_device_memory_type == UINT32_MAX)
+        s_device_memory_type = mai.memoryTypeIndex;
     VKC(vkAllocateMemory(s_dev, &mai, NULL, mem));
     VKC(vkBindImageMemory(s_dev, *img, *mem, 0));
     return 1;
@@ -351,12 +479,15 @@ static int cmd_begin(void) {
     return 1;
 }
 static int cmd_submit_wait(void) {
+    uint64_t start = stage_counter();
     VKC(vkEndCommandBuffer(s_cmd));
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1; si.pCommandBuffers = &s_cmd;
     VKC(vkQueueSubmit(s_queue, 1, &si, s_fence));
     VKC(vkWaitForFences(s_dev, 1, &s_fence, VK_TRUE, UINT64_MAX));
     VKC(vkResetFences(s_dev, 1, &s_fence));
+    if (start)
+        s_stage_submit_ticks += sr_time_now() - start;
     return 1;
 }
 
@@ -452,14 +583,22 @@ static VkPipeline pipe_create(const PipeKey *k) {
     pci.layout = s_playout; pci.renderPass = s_rp;
 
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &pci, NULL, &p);
+    uint64_t start = s_stage_log ? sr_time_now() : 0;
+    VkResult r = vkCreateGraphicsPipelines(
+        s_dev, s_pipeline_cache, 1, &pci, NULL, &p);
+    if (start)
+        s_pipeline_create_ticks += sr_time_now() - start;
     if (r != VK_SUCCESS) fprintf(stderr, "gegpu: pipeline create failed: %d\n", (int)r);
+    else s_pipelines_created++;
     return p;
 }
 
 static VkPipeline pipe_get(const PipeKey *k) {
     for (int i = 0; i < s_pipe_n; i++)
-        if (!memcmp(&s_pipes[i].key, k, sizeof(*k))) return s_pipes[i].pipe;
+        if (!memcmp(&s_pipes[i].key, k, sizeof(*k))) {
+            s_pipeline_key_hits++;
+            return s_pipes[i].pipe;
+        }
     if (s_pipe_n >= MAX_PIPES) return VK_NULL_HANDLE;
     VkPipeline p = pipe_create(k);
     if (!p) return VK_NULL_HANDLE;
@@ -633,7 +772,7 @@ static GeVkRegion batch_damage(const Batch *batch, GeVkRegion scissor) {
 }
 
 /* Render all pending batches into s_cur. Leaves the color image SHADER_READ_ONLY. */
-static int submit_pending(void) {
+static int submit_pending_impl(void) {
     int pass_open = 0;
     if (!s_nbatch || !s_cur) { if (s_nbatch == 0) batches_reset(); return 1; }
     Target *t = s_cur;
@@ -725,6 +864,15 @@ static int submit_pending(void) {
     return ok;
 }
 
+static int submit_pending(void) {
+    uint64_t start = stage_counter();
+    uint64_t children_before = stage_children();
+    int result = submit_pending_impl();
+    stage_add_exclusive(
+        &s_stage_draws_ticks, start, children_before);
+    return result;
+}
+
 static void stats_tick(void) {
     static unsigned long last_ms = 0;
     unsigned long now = (unsigned long)(clock() * 1000ull / CLOCKS_PER_SEC);
@@ -732,12 +880,14 @@ static void stats_tick(void) {
     last_ms = now;
     fprintf(stderr, "GEGPU stats: submits=%lu tris=%lu spr=%lu lines=%lu "
             "batches[direct=%lu manual=%lu] rtt=%lu snap[feedback=%lu reused=%lu pixels=%llu destination=%lu] "
-            "present[gpu=%lu cpu=%lu] upload=%lu readback=%lu texup=%lu dirty=%lu xferblit=%lu pipes=%d texs=%d\n",
+            "present[gpu=%lu cpu=%lu] upload=%lu readback=%lu aliases=%lu "
+            "texup=%lu dirty=%lu xferblit=%lu pipes=%d texs=%d\n",
             s_cnt_submit, s_cnt_tri, s_cnt_spr, s_cnt_line,
             s_cnt_direct, s_cnt_manual, s_cnt_rtt, s_cnt_snap, s_cnt_snap_reuse,
             (unsigned long long)s_snap_pixels, s_cnt_dst_snap,
-            s_cnt_present_gpu, s_cnt_present_cpu, s_cnt_upload, s_cnt_readback, s_cnt_texup,
-            s_cnt_dirty, s_cnt_xferblit, s_pipe_n, s_tex_n);
+            s_cnt_present_gpu, s_cnt_present_cpu, s_cnt_upload,
+            s_cnt_readback, s_cnt_aliases, s_cnt_texup, s_cnt_dirty,
+            s_cnt_xferblit, s_pipe_n, s_tex_n);
 }
 
 /* ---- targets ----------------------------------------------------------------------------- */
@@ -760,6 +910,8 @@ static int target_readback(Target *t) {
     c.imageExtent.depth = 1;
     vkCmdCopyImageToBuffer(s_cmd, t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s_xfer, 1, &c);
     if (!cmd_submit_wait()) return 0;
+    s_host_readback_bytes +=
+        (uint64_t)physical_width * render_height() * 4u;
     const uint32_t *src = (const uint32_t *)s_xfer_map;
     uint32_t wb = t->stride < DRAW_W ? t->stride : DRAW_W;
     for (uint32_t y = 0; y < FB_H; y++) {
@@ -789,7 +941,7 @@ static int target_readback(Target *t) {
 }
 
 /* Fill the target's color image from guest VRAM (creation / CPU-dirty reacquire). */
-static void target_materialize_upload_aliases(Target *target) {
+static int target_materialize_upload_aliases(Target *target) {
     uint32_t target_bpp = target->fmt == 3 ? 4u : 2u;
     uint64_t target_begin = target->fba;
     uint64_t target_end =
@@ -806,17 +958,23 @@ static void target_materialize_upload_aliases(Target *target) {
         uint64_t other_end =
             other_begin +
             (uint64_t)other->stride * FB_H * other_bpp;
-        if (target_begin < other_end && other_begin < target_end)
-            target_readback(other);
+        if (target_begin < other_end && other_begin < target_end) {
+            if (!target_readback(other))
+                return 0;
+            s_cnt_aliases++;
+        }
     }
+    return 1;
 }
 
 static int target_upload(Target *t) {
-    uint32_t *dst = s_pxscratch;
     uint32_t *physical = (uint32_t *)s_xfer_map;
+    uint32_t *dst =
+        s_gpu_upload_scale ? physical : s_pxscratch;
     uint32_t physical_width = render_width();
     uint32_t bpp = t->fmt == 3 ? 4u : 2u;
-    target_materialize_upload_aliases(t);
+    if (!target_materialize_upload_aliases(t))
+        return 0;
     for (uint32_t y = 0; y < FB_TEX_H; y++) {
         uint64_t row_address =
             (uint64_t)(0x04000000u | t->fba) +
@@ -840,32 +998,82 @@ static int target_upload(Target *t) {
         }
         for (uint32_t x = t->stride; x < FB_W; x++) dst[y * FB_W + x] = 0;
     }
-    for (uint32_t y = 0; y < FB_TEX_H; y++) {
-        const uint32_t *source_row = dst + y * FB_W;
-        for (uint32_t x = 0; x < FB_W; x++)
-            for (uint32_t sx = 0; sx < s_render_scale; sx++)
-                s_scaled_color_row[x * s_render_scale + sx] =
-                    source_row[x];
-        for (uint32_t sy = 0; sy < s_render_scale; sy++)
-            memcpy(
-                physical +
-                    (y * s_render_scale + sy) * physical_width,
-                s_scaled_color_row,
-                physical_width * sizeof(*physical));
+    if (!s_gpu_upload_scale) {
+        for (uint32_t y = 0; y < FB_TEX_H; y++) {
+            const uint32_t *source_row = dst + y * FB_W;
+            for (uint32_t x = 0; x < FB_W; x++)
+                for (uint32_t sx = 0; sx < s_render_scale; sx++)
+                    s_scaled_color_row[x * s_render_scale + sx] =
+                        source_row[x];
+            for (uint32_t sy = 0; sy < s_render_scale; sy++)
+                memcpy(
+                    physical +
+                        (y * s_render_scale + sy) * physical_width,
+                    s_scaled_color_row,
+                    physical_width * sizeof(*physical));
+        }
     }
     if (!cmd_begin()) return 0;
+    if (s_gpu_upload_scale) {
+        to_layout(
+            s_cmd, s_upload_scale_image,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            &s_upload_scale_layout,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy upload = {0};
+        upload.imageSubresource.aspectMask =
+            VK_IMAGE_ASPECT_COLOR_BIT;
+        upload.imageSubresource.layerCount = 1;
+        upload.imageExtent.width = FB_W;
+        upload.imageExtent.height = FB_TEX_H;
+        upload.imageExtent.depth = 1;
+        vkCmdCopyBufferToImage(
+            s_cmd, s_xfer, s_upload_scale_image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &upload);
+        to_layout(
+            s_cmd, s_upload_scale_image,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            &s_upload_scale_layout,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    }
     to_layout(s_cmd, t->img, VK_IMAGE_ASPECT_COLOR_BIT, &t->layout,
               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy c = {0};
-    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    c.imageSubresource.layerCount = 1;
-    c.imageExtent.width = physical_width;
-    c.imageExtent.height = texture_height();
-    c.imageExtent.depth = 1;
-    vkCmdCopyBufferToImage(s_cmd, s_xfer, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    if (s_gpu_upload_scale) {
+        VkImageBlit blit = {0};
+        blit.srcSubresource.aspectMask =
+            VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.layerCount = 1;
+        blit.srcOffsets[1].x = FB_W;
+        blit.srcOffsets[1].y = FB_TEX_H;
+        blit.srcOffsets[1].z = 1;
+        blit.dstSubresource = blit.srcSubresource;
+        blit.dstOffsets[1].x = (int32_t)physical_width;
+        blit.dstOffsets[1].y = (int32_t)texture_height();
+        blit.dstOffsets[1].z = 1;
+        vkCmdBlitImage(
+            s_cmd, s_upload_scale_image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &blit, VK_FILTER_NEAREST);
+    } else {
+        VkBufferImageCopy copy = {0};
+        copy.imageSubresource.aspectMask =
+            VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent.width = physical_width;
+        copy.imageExtent.height = texture_height();
+        copy.imageExtent.depth = 1;
+        vkCmdCopyBufferToImage(
+            s_cmd, s_xfer, t->img,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    }
     to_layout(s_cmd, t->img, VK_IMAGE_ASPECT_COLOR_BIT, &t->layout,
               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (!cmd_submit_wait()) return 0;
+    s_host_upload_bytes +=
+        s_gpu_upload_scale
+            ? (uint64_t)FB_W * FB_TEX_H * 4u
+            : (uint64_t)physical_width * texture_height() * 4u;
     t->gpu_valid = 1;
     target_changed(t);
     t->clean_gen = t->render_gen;          /* VRAM is the source: in sync by definition */
@@ -943,7 +1151,10 @@ static DepthEnt *depth_acquire(uint32_t zba, uint32_t zstride) {
         vkCmdCopyBufferToImage(s_cmd, s_xfer, d->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
         to_layout(s_cmd, d->img, VK_IMAGE_ASPECT_DEPTH_BIT, &d->layout,
                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-        cmd_submit_wait();
+        if (!cmd_submit_wait())
+            return NULL;
+        s_host_upload_bytes +=
+            (uint64_t)render_width() * render_height() * 2u;
     }
     return d;
 }
@@ -1014,7 +1225,7 @@ static Target *target_acquire(void) {
 }
 
 /* Ensure s_cur points at the GE's current target, submitting pending work on a switch. */
-static int begin_target(void) {
+static int begin_target_impl(void) {
     uint32_t fba = s_ge->fbp & 0x001FFFFFu;
     uint32_t stride = s_ge->fbw ? s_ge->fbw : 512;
     uint32_t zba = s_ge->zbp & 0x001FFFFFu;
@@ -1032,6 +1243,15 @@ static int begin_target(void) {
     if (s_nbatch && !submit_pending()) return 0;
     s_cur = target_acquire();
     return s_cur != NULL;
+}
+
+static int begin_target(void) {
+    uint64_t start = stage_counter();
+    uint64_t children_before = stage_children();
+    int result = begin_target_impl();
+    stage_add_exclusive(
+        &s_stage_framebuffer_ticks, start, children_before);
+    return result;
 }
 
 /* ---- texture cache (RAM textures, decoded by ge.c's reference sampler) ------------------- */
@@ -1092,18 +1312,27 @@ static int tex_upload(VkImage img, const uint32_t *px, int w, int h) {
     bic.imageExtent.width = (uint32_t)w; bic.imageExtent.height = (uint32_t)h; bic.imageExtent.depth = 1;
     vkCmdCopyBufferToImage(s_cmd, s_xfer, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     to_layout(s_cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, &lay, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    return cmd_submit_wait();
+    if (!cmd_submit_wait())
+        return 0;
+    s_host_upload_bytes += (uint64_t)(uint32_t)w * (uint32_t)h * 4u;
+    return 1;
 }
 
 static const uint32_t *tex_decode_scaled(int w, int h) {
+    uint64_t start = s_stage_log ? sr_time_now() : 0;
     ge_decode_tex_rgba(s_texscratch);
+    if (start)
+        s_texture_decode_ticks += sr_time_now() - start;
     if (s_texture_scale == 1u) return s_texscratch;
+    start = s_stage_log ? sr_time_now() : 0;
     if (!s_texscaled || !sr_texture_scale_rgba(
             s_texscratch, (uint32_t)w, (uint32_t)h,
             s_texture_scale, s_texscaled)) {
         fprintf(stderr, "gegpu: xBRZ texture scaling failed\n");
         return NULL;
     }
+    if (start)
+        s_texture_scale_ticks += sr_time_now() - start;
     return s_texscaled;
 }
 
@@ -1200,7 +1429,7 @@ fail:
     return VK_NULL_HANDLE;
 }
 
-static VkDescriptorSet tex_get(void) {
+static VkDescriptorSet tex_get_impl(void) {
     int w = s_ge->tex_w, h = s_ge->tex_h;
     if (w <= 0 || h <= 0 || w > 512 || h > 512) {
         fprintf(stderr, "gegpu: invalid texture dimensions %dx%d\n", w, h);
@@ -1226,8 +1455,13 @@ static VkDescriptorSet tex_get(void) {
         TexEnt *e = &s_tex[i];
         if (memcmp(&e->key, &key, sizeof(key)) != 0) continue;
         e->lru = s_texlru++;
-        if (e->hash == hash) { e->pending = 1; return e->set; }
+        if (e->hash == hash) {
+            s_texture_cache_hits++;
+            e->pending = 1;
+            return e->set;
+        }
         /* same texture state, new contents: update in place (cache stays bounded) */
+        s_texture_cache_misses++;
         if (e->pending && !submit_pending()) return VK_NULL_HANDLE;
         const uint32_t *pixels = tex_decode_scaled(w, h);
         if (!pixels || !tex_upload(e->img, pixels, e->w, e->h))
@@ -1242,6 +1476,7 @@ static VkDescriptorSet tex_get(void) {
         if (!submit_pending()) return VK_NULL_HANDLE;
         tex_evict_lru();
     }
+    s_texture_cache_misses++;
     const uint32_t *pixels = tex_decode_scaled(w, h);
     if (!pixels) return VK_NULL_HANDLE;
     TexEnt *e = &s_tex[s_tex_n];
@@ -1264,6 +1499,15 @@ static VkDescriptorSet tex_get(void) {
     s_cnt_texup++;
     s_tex_n++;
     return e->set;
+}
+
+static VkDescriptorSet tex_get(void) {
+    uint64_t start = stage_counter();
+    uint64_t children_before = stage_children();
+    VkDescriptorSet result = tex_get_impl();
+    stage_add_exclusive(
+        &s_stage_textures_ticks, start, children_before);
+    return result;
 }
 
 /* ---- capture --------------------------------------------------------------------------- */
@@ -1553,6 +1797,8 @@ static int state_get(int persp, int sprite, Batch *out) {
 
 static void append(Batch *b, uint32_t first, uint32_t count) {
     if (b->sw <= 0 || count == 0) return;
+    if (s_stage_log)
+        s_stage_vertices += count;
     b->draw_serial = ge_debug_context().draw_serial;
     if (s_nbatch) {
         Batch *last = &s_batch[s_nbatch - 1];
@@ -1570,6 +1816,8 @@ static void append(Batch *b, uint32_t first, uint32_t count) {
     }
     b->first = first; b->count = count;
     s_batch[s_nbatch++] = *b;
+    if (s_stage_log)
+        s_stage_batches++;
 }
 
 static int ensure_room(uint32_t verts) {
@@ -1581,7 +1829,8 @@ static int ensure_room(uint32_t verts) {
 
 /* ---- primitive hooks ---------------------------------------------------------------------- */
 
-static int hook_tri(const GeVtx *A, const GeVtx *B, const GeVtx *C, int persp) {
+static int hook_tri_impl(
+    const GeVtx *A, const GeVtx *B, const GeVtx *C, int persp) {
     if (!s_ready) return 0;
     if (!ensure_room(3)) return 1;
     static int nocull = -1;
@@ -1604,7 +1853,8 @@ static int hook_tri(const GeVtx *A, const GeVtx *B, const GeVtx *C, int persp) {
     return 1;
 }
 
-static int hook_sprite(const GeVtx *p0, const GeVtx *p1, int persp) {
+static int hook_sprite_impl(
+    const GeVtx *p0, const GeVtx *p1, int persp) {
     if (!s_ready) return 0;
     if (!ensure_room(6)) return 1;
     Batch b;
@@ -1647,7 +1897,8 @@ static int hook_sprite(const GeVtx *p0, const GeVtx *p1, int persp) {
 }
 
 /* Lines as 1-pixel-wide quads (the software DDA's pixel set, approximately). */
-static int hook_line(const GeVtx *A, const GeVtx *B, int persp) {
+static int hook_line_impl(
+    const GeVtx *A, const GeVtx *B, int persp) {
     if (!s_ready) return 0;
     if (!ensure_room(6)) return 1;
     Batch b;
@@ -1678,7 +1929,7 @@ static int hook_line(const GeVtx *A, const GeVtx *B, int persp) {
     return 1;
 }
 
-static int hook_point(const GeVtx *A, int persp) {
+static int hook_point_impl(const GeVtx *A, int persp) {
     if (!s_ready) return 0;
     if (!ensure_room(6)) return 1;
     Batch b;
@@ -1695,6 +1946,45 @@ static int hook_point(const GeVtx *A, int persp) {
     append(&b, first, 6);
     s_cnt_line++;
     return 1;
+}
+
+static int hook_tri(
+    const GeVtx *a, const GeVtx *b, const GeVtx *c, int persp) {
+    uint64_t start = stage_counter();
+    uint64_t children_before = stage_children();
+    int result = hook_tri_impl(a, b, c, persp);
+    stage_add_exclusive(
+        &s_stage_vertices_ticks, start, children_before);
+    return result;
+}
+
+static int hook_sprite(
+    const GeVtx *a, const GeVtx *b, int persp) {
+    uint64_t start = stage_counter();
+    uint64_t children_before = stage_children();
+    int result = hook_sprite_impl(a, b, persp);
+    stage_add_exclusive(
+        &s_stage_vertices_ticks, start, children_before);
+    return result;
+}
+
+static int hook_line(
+    const GeVtx *a, const GeVtx *b, int persp) {
+    uint64_t start = stage_counter();
+    uint64_t children_before = stage_children();
+    int result = hook_line_impl(a, b, persp);
+    stage_add_exclusive(
+        &s_stage_vertices_ticks, start, children_before);
+    return result;
+}
+
+static int hook_point(const GeVtx *a, int persp) {
+    uint64_t start = stage_counter();
+    uint64_t children_before = stage_children();
+    int result = hook_point_impl(a, persp);
+    stage_add_exclusive(
+        &s_stage_vertices_ticks, start, children_before);
+    return result;
 }
 
 /* ---- CPU writes to VRAM (movie decode, DMA): invalidate overlapping targets --------------- */
@@ -1870,7 +2160,11 @@ int gegpu_present(uint32_t fbaddr, int fmt, uint32_t stride) {
     Target *t = NULL;
     for (int i = 0; i < MAX_TGT; i++)
         if (s_tgts[i].used && s_tgts[i].fba == fba) { t = &s_tgts[i]; break; }
-    if (!t || !t->gpu_valid || (int)t->fmt != (fmt & 3)) { s_cnt_present_cpu++; return -1; }
+    if (!t || !t->gpu_valid || (int)t->fmt != (fmt & 3)) {
+        s_cnt_present_cpu++;
+        stage_publish(0);
+        return -1;
+    }
     if (t == s_cur && s_nbatch && !submit_pending()) return -2;
 
     static int safe = -1;
@@ -1883,12 +2177,16 @@ int gegpu_present(uint32_t fbaddr, int fmt, uint32_t stride) {
     s_cnt_present_gpu++;
     stats_tick();
     int transitioned;
+    uint64_t present_start = stage_counter();
     int result = sdl3vk_present_image(
         (void *)t->img,
         DRAW_W * s_render_scale,
         FB_H * s_render_scale,
         t->present_gen, (uint32_t)t->layout, &transitioned);
+    uint64_t present_ticks =
+        present_start ? sr_time_now() - present_start : 0;
     if (transitioned) t->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    stage_publish(present_ticks);
     return result;
 }
 
@@ -1905,9 +2203,76 @@ static const GeBackend k_backend = {
 
 const GeBackend *gegpu_backend(void) { return &k_backend; }
 
+uint64_t gegpu_shader_hash(uint64_t hash) {
+    hash = sr_vk_pipeline_cache_hash(
+        hash, k_vert_spv, sizeof(k_vert_spv));
+    return sr_vk_pipeline_cache_hash(
+        hash, k_frag_spv, sizeof(k_frag_spv));
+}
+
+int gegpu_last_backend_timing(GeVkBackendTiming *timing) {
+    if (!timing || !s_last_backend_timing.flip)
+        return 0;
+    *timing = s_last_backend_timing;
+    return 1;
+}
+
+int gegpu_framebuffer_stats(GeVkFramebufferStats *stats) {
+    if (!stats || !s_ready)
+        return 0;
+    stats->readbacks = s_cnt_readback;
+    stats->aliases = s_cnt_aliases;
+    stats->feedback_snapshots = s_cnt_snap;
+    stats->feedback_snapshot_pixels = s_snap_pixels;
+    stats->feedback_reuses = s_cnt_snap_reuse;
+    stats->pipeline_key_hits = s_pipeline_key_hits;
+    stats->pipelines_created = s_pipelines_created;
+    stats->pipeline_create_us =
+        stage_microseconds(s_pipeline_create_ticks);
+    stats->texture_cache_hits = s_texture_cache_hits;
+    stats->texture_cache_misses = s_texture_cache_misses;
+    stats->texture_uploads = s_cnt_texup;
+    stats->texture_decode_us =
+        stage_microseconds(s_texture_decode_ticks);
+    stats->texture_scale_us =
+        stage_microseconds(s_texture_scale_ticks);
+    stats->host_upload_bytes = s_host_upload_bytes;
+    stats->host_readback_bytes = s_host_readback_bytes;
+    return 1;
+}
+
 static int gegpu_init(void) {
     s_error = 0;
     s_tmpl_ok = 0;
+    const char *stage_log = getenv("SR_VULKAN_STAGE_LOG");
+    s_stage_log =
+        stage_log && stage_log[0] && strcmp(stage_log, "0") != 0;
+    s_stage_flip = 0;
+    memset(&s_last_backend_timing, 0, sizeof(s_last_backend_timing));
+    stage_reset();
+    s_cnt_readback = 0;
+    s_cnt_upload = 0;
+    s_cnt_texup = 0;
+    s_cnt_aliases = 0;
+    s_cnt_snap = 0;
+    s_cnt_snap_reuse = 0;
+    s_snap_pixels = 0;
+    s_pipeline_key_hits = 0;
+    s_pipelines_created = 0;
+    s_pipeline_create_ticks = 0;
+    s_texture_cache_hits = 0;
+    s_texture_cache_misses = 0;
+    s_texture_decode_ticks = 0;
+    s_texture_scale_ticks = 0;
+    s_host_upload_bytes = 0;
+    s_host_readback_bytes = 0;
+    s_host_memory_type = UINT32_MAX;
+    s_device_memory_type = UINT32_MAX;
+    s_pipeline_cache = VK_NULL_HANDLE;
+    s_upload_scale_image = VK_NULL_HANDLE;
+    s_upload_scale_memory = VK_NULL_HANDLE;
+    s_upload_scale_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    s_gpu_upload_scale = 0;
     const char *full_feedback = getenv("SR_GPU_FULL_FEEDBACK");
     s_full_feedback = full_feedback && full_feedback[0] &&
                       strcmp(full_feedback, "0") != 0;
@@ -1916,6 +2281,7 @@ static int gegpu_init(void) {
     s_pdev  = (VkPhysicalDevice)vi.physical;
     s_dev   = (VkDevice)vi.device;
     s_queue = (VkQueue)vi.queue;
+    s_pipeline_cache = (VkPipelineCache)vi.pipeline_cache;
     s_ge    = ge_state_ptr();
     s_zbuf  = ge_zbuf_ptr();
     {
@@ -1927,6 +2293,21 @@ static int gegpu_init(void) {
         uint64_t pixels;
         uint32_t transfer_scale;
         if (!configure_render_scale(config)) return 0;
+        const char *gpu_upload_scale =
+            getenv("SR_VULKAN_GPU_UPLOAD_SCALE");
+        int gpu_upload_scale_requested =
+            !gpu_upload_scale || !gpu_upload_scale[0] ||
+            strcmp(gpu_upload_scale, "0") != 0;
+        if (s_render_scale > 1u && gpu_upload_scale_requested) {
+            if (upload_scale_supported()) {
+                s_gpu_upload_scale = 1;
+            } else {
+                fprintf(
+                    stderr,
+                    "gegpu: scaled upload blits unsupported; "
+                    "using CPU expansion\n");
+            }
+        }
         s_texture_scale = config ? config->texture_scale : 1u;
         pixels =
             (uint64_t)512u * 512u *
@@ -2000,6 +2381,27 @@ static int gegpu_init(void) {
                 transfer_scale * transfer_scale,
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             &s_xfer, &s_xfer_m, &s_xfer_map)) return 0;
+    }
+    if (s_gpu_upload_scale &&
+        !make_image(
+            FB_W, FB_TEX_H, VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            &s_upload_scale_image,
+            &s_upload_scale_memory)) {
+        if (s_upload_scale_image)
+            vkDestroyImage(
+                s_dev, s_upload_scale_image, NULL);
+        if (s_upload_scale_memory)
+            vkFreeMemory(
+                s_dev, s_upload_scale_memory, NULL);
+        s_upload_scale_image = VK_NULL_HANDLE;
+        s_upload_scale_memory = VK_NULL_HANDLE;
+        s_gpu_upload_scale = 0;
+        fprintf(
+            stderr,
+            "gegpu: scaled upload image unavailable; "
+            "using CPU expansion\n");
     }
 
     VkDescriptorSetLayoutBinding db = {0};
@@ -2112,8 +2514,27 @@ static int gegpu_init(void) {
     fprintf(
         stderr,
         "gegpu: full GPU GE active (persistent targets, no software fallback, "
-        "internal resolution %ux, xBRZ scale %ux)\n",
-        s_render_scale, s_texture_scale);
+        "internal resolution %ux, xBRZ scale %ux, upload scaling %s, "
+        "stage timing %s)\n",
+        s_render_scale, s_texture_scale,
+        s_gpu_upload_scale ? "gpu" : "cpu",
+        s_stage_log ? "enabled" : "disabled");
+    {
+        VkPhysicalDeviceMemoryProperties memory;
+        vkGetPhysicalDeviceMemoryProperties(s_pdev, &memory);
+        VkMemoryPropertyFlags host_flags =
+            memory.memoryTypes[s_host_memory_type].propertyFlags;
+        VkMemoryPropertyFlags device_flags =
+            memory.memoryTypes[s_device_memory_type].propertyFlags;
+        fprintf(
+            stderr,
+            "gegpu: memory host_type=%u flags=0x%x unified=%s "
+            "image_type=%u flags=0x%x\n",
+            s_host_memory_type, host_flags,
+            (host_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                ? "yes" : "no",
+            s_device_memory_type, device_flags);
+    }
     return 1;
 }
 
@@ -2124,6 +2545,16 @@ static void gegpu_shutdown(void) {
     sr_gpu_vram_watch_reads(0);
     sr_gpu_vram_watch_writes(0);
     vkDeviceWaitIdle(s_dev);
+    if (s_stage_log) {
+        fprintf(
+            stderr,
+            "gegpu: pipeline summary created=%llu key_hits=%llu "
+            "create_us=%llu\n",
+            (unsigned long long)s_pipelines_created,
+            (unsigned long long)s_pipeline_key_hits,
+            (unsigned long long)stage_microseconds(
+                s_pipeline_create_ticks));
+    }
 
     for (int i = 0; i < MAX_TGT; i++)
         target_destroy(&s_tgts[i]);
@@ -2221,10 +2652,16 @@ static void gegpu_shutdown(void) {
         vkDestroyBuffer(s_dev, s_vbuf, NULL);
     if (s_xfer)
         vkDestroyBuffer(s_dev, s_xfer, NULL);
+    if (s_upload_scale_image)
+        vkDestroyImage(
+            s_dev, s_upload_scale_image, NULL);
     if (s_vbuf_m)
         vkFreeMemory(s_dev, s_vbuf_m, NULL);
     if (s_xfer_m)
         vkFreeMemory(s_dev, s_xfer_m, NULL);
+    if (s_upload_scale_memory)
+        vkFreeMemory(
+            s_dev, s_upload_scale_memory, NULL);
     if (s_fence)
         vkDestroyFence(s_dev, s_fence, NULL);
     if (s_pool)
@@ -2234,4 +2671,5 @@ static void gegpu_shutdown(void) {
     s_texscaled = NULL;
     s_render_scale = 1u;
     s_texture_scale = 1u;
+    s_gpu_upload_scale = 0;
 }

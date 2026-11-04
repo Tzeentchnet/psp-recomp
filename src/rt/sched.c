@@ -2,11 +2,11 @@
  *
  * PSP threads are priority-scheduled and a busy-waiting thread is preempted by its timeslice
  * so a sibling can run. The recompiled code is straight C, so to suspend a thread mid-call-
- * stack we run each guest thread on its own Windows fiber and switch between them. All threads
- * share one CpuState; on a switch its contents are saved into the outgoing thread's control
- * block and the incoming thread's are loaded, so the single register file follows whichever
- * thread is running. SR_YIELD (emitted by codegen at function entry and loop back-edges) burns
- * the timeslice and switches when it reaches zero, giving preemption without a real timer.
+ * stack we run each guest thread on its own host fiber and switch between them. All threads share
+ * one CpuState; on a switch its contents are saved into the outgoing thread's control block and
+ * the incoming thread's are loaded, so the single register file follows whichever thread is
+ * running. SR_YIELD (emitted by codegen at function entry and loop back-edges) burns the
+ * timeslice and switches when it reaches zero, giving preemption without a real timer.
  *
  * This is a simplified model: highest-priority ready thread runs; equal priority round-robins;
  * sceKernelDelayThread blocks until enough yields have elapsed. It is enough to interleave the
@@ -27,6 +27,7 @@
 #ifndef SR_MODULE_START_ATTR
 #define SR_MODULE_START_ATTR 0x80000000u
 #endif
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,6 +100,10 @@ void sched_init(CpuState *cpu) {
     s_cpu = cpu;
     s_gp = cpu->r[28];           /* the driver seeded gp from the module's # init */
     s_sched_fiber = ConvertThreadToFiber(NULL);
+    if (!s_sched_fiber) {
+        fprintf(stderr, "sched: failed to convert the host thread to a fiber\n");
+        abort();
+    }
     sr_sched_on = 1;
     sr_timeslice = TIMESLICE;
     sr_perf_switch(SR_PERF_SCHEDULER);
@@ -268,6 +273,20 @@ int sched_fast_forwarding(void) {
     }
     pace_update_mode();
     return s_fast_forwarding;
+}
+
+void sched_host_resumed(void) {
+    if (s_pace_on <= 0) return;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    s_qpc0 =
+        now.QuadPart -
+        (LONGLONG)(
+            (double)s_vtime_us *
+            (double)s_qfreq.QuadPart / 1000000.0);
+    s_vbl_next = (double)now.QuadPart;
+    vbl_next_us_sync();
+    fprintf(stderr, "scheduler: host clock rebased after resume\n");
 }
 
 static uint64_t qpc_us(void) {
@@ -1042,6 +1061,13 @@ void sched_run(uint32_t entry, uint32_t arglen, uint32_t argp, int create_start_
             /* Guest calls become native C calls, so a deep guest call chain needs a deep host
              * stack. Reserve a large fiber stack (committed on demand) to match. */
             t->fiber = CreateFiberEx((SIZE_T)1 << 18, (SIZE_T)64 << 20, 0, fiber_proc, t);
+            if (!t->fiber) {
+                fprintf(
+                    stderr,
+                    "sched: failed to create host fiber for uid 0x%x: %s\n",
+                    t->uid, strerror(errno));
+                abort();
+            }
         }
         sr_perf_switch(t->perf_category);
         SwitchToFiber(t->fiber);           /* run until it yields/blocks/exits */

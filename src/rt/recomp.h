@@ -280,6 +280,7 @@ void     gui_present(uint32_t fbaddr, int fmt, uint32_t stride);
 int gui_capture_next(const char *path);
 double gui_last_gpu_ms(void);
 int gui_last_gpu_sample(uint64_t *flip, double *milliseconds);
+int gui_thermal_state(void);
 typedef struct SrBackendTiming {
     uint64_t flip;
     double begin_ms;
@@ -299,6 +300,16 @@ typedef struct SrFramebufferStats {
     uint64_t feedback_snapshots;
     uint64_t feedback_snapshot_pixels;
     uint64_t feedback_reuses;
+    uint64_t pipeline_key_hits;
+    uint64_t pipelines_created;
+    uint64_t pipeline_create_us;
+    uint64_t texture_cache_hits;
+    uint64_t texture_cache_misses;
+    uint64_t texture_uploads;
+    uint64_t texture_decode_us;
+    uint64_t texture_scale_us;
+    uint64_t host_upload_bytes;
+    uint64_t host_readback_bytes;
 } SrFramebufferStats;
 int gui_framebuffer_stats(SrFramebufferStats *stats);
 int sr_kzl_patch_offline_menu(uint8_t *data, uint32_t size);
@@ -360,6 +371,7 @@ void     sched_block_on(uint32_t obj);              /* block current thread unti
 void     sched_wait_vblank(void);                   /* block current thread until the next delivered vblank */
 int      sched_vbl_paced(void);
 int      sched_fast_forwarding(void);
+void     sched_host_resumed(void);
 int      sched_block_on_timeout(uint32_t obj, uint32_t usec);  /* returns 1 if timed out */
 int      sched_wake(uint32_t obj);                  /* ready all threads blocked on obj; returns how many */
 void     sched_run_interrupt(CpuState *s, uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2);

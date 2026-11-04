@@ -32,6 +32,8 @@ static HANDLE s_thread;
 static volatile LONG s_run;
 static volatile LONG s_voice_error;
 static volatile LONG s_real_device_buffers;
+static volatile LONG s_suspend_requested;
+static volatile LONG s_suspended;
 static int16_t s_blocks[BUFFER_COUNT][BLOCK_FRAMES * 2];
 static int s_next_block;
 static int s_inited;
@@ -315,9 +317,17 @@ extern "C" int sr_audio_init(void) {
 
     s_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     if (SUCCEEDED(result) && !s_event) result = HRESULT_FROM_WIN32(GetLastError());
-    if (SUCCEEDED(result)) {
+    if (SUCCEEDED(result) &&
+        !InterlockedCompareExchange(
+            &s_suspend_requested, 0, 0)) {
         result = s_source->Start(0);
         QueryPerformanceCounter(&s_start_qpc);
+    }
+    if (SUCCEEDED(result)) {
+        InterlockedExchange(
+            &s_suspended,
+            InterlockedCompareExchange(
+                &s_suspend_requested, 0, 0) ? 1 : 0);
     }
     if (SUCCEEDED(result)) {
         InterlockedExchange(&s_run, 1);
@@ -338,9 +348,12 @@ extern "C" int sr_audio_init(void) {
     s_ok = 1;
     fprintf(
         stderr,
-        "audio: XAudio2 44.1 kHz stereo, %d x %d-frame buffers (%.2f ms)\n",
+        "audio: XAudio2 44.1 kHz stereo, %d x %d-frame buffers "
+        "(%.2f ms)%s\n",
         BUFFER_COUNT, BLOCK_FRAMES,
-        BUFFER_COUNT * BLOCK_FRAMES * 1000.0 / SAMPLE_RATE);
+        BUFFER_COUNT * BLOCK_FRAMES * 1000.0 / SAMPLE_RATE,
+        InterlockedCompareExchange(&s_suspended, 0, 0)
+            ? " (suspended)" : "");
     return 1;
 }
 
@@ -348,7 +361,10 @@ extern "C" void sr_audio_push(
     int channel, const int16_t *stereo, int frames,
     int volume_left, int volume_right) {
     if (sched_fast_forwarding()) return;
-    if (!sr_audio_init() || frames <= 0) return;
+    if (!sr_audio_init() || frames <= 0 ||
+        InterlockedCompareExchange(
+            &s_suspend_requested, 0, 0))
+        return;
     EnterCriticalSection(&s_lock);
     sr_audio_mixer_push(
         &s_mixer, channel, stereo, frames, volume_left, volume_right);
@@ -358,7 +374,10 @@ extern "C" void sr_audio_push(
 
 extern "C" int sr_audio_queued(int channel) {
     if (sched_fast_forwarding()) return -1;
-    if (!s_ok || s_voice_error) return -1;
+    if (!s_ok || s_voice_error ||
+        InterlockedCompareExchange(
+            &s_suspend_requested, 0, 0))
+        return -1;
     EnterCriticalSection(&s_lock);
     int queued = sr_audio_mixer_queued(&s_mixer, channel);
     LeaveCriticalSection(&s_lock);
@@ -367,7 +386,10 @@ extern "C" int sr_audio_queued(int channel) {
 
 extern "C" int sr_audio_device_latency_frames(void) {
     if (sched_fast_forwarding()) return -1;
-    if (!s_ok || !s_source) return -1;
+    if (!s_ok || !s_source ||
+        InterlockedCompareExchange(
+            &s_suspend_requested, 0, 0))
+        return -1;
     XAUDIO2_VOICE_STATE state = {};
     s_source->GetState(&state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
     return (int)state.BuffersQueued * BLOCK_FRAMES;
@@ -375,6 +397,33 @@ extern "C" int sr_audio_device_latency_frames(void) {
 
 extern "C" const char *sr_audio_backend_name(void) {
     return "XAudio2";
+}
+
+extern "C" void sr_audio_set_suspended(int suspended) {
+    suspended = suspended != 0;
+    InterlockedExchange(&s_suspend_requested, suspended);
+    if (!s_ok || !s_source ||
+        InterlockedCompareExchange(
+            &s_suspended, 0, 0) == suspended)
+        return;
+    HRESULT result = suspended
+        ? s_source->Stop(0)
+        : s_source->Start(0);
+    if (FAILED(result)) {
+        fprintf(
+            stderr,
+            "audio: cannot %s XAudio2 source voice (0x%08lx)\n",
+            suspended ? "pause" : "resume",
+            (unsigned long)result);
+        InterlockedExchange(&s_voice_error, 1);
+        return;
+    }
+    InterlockedExchange(&s_suspended, suspended);
+    if (!suspended && s_event) SetEvent(s_event);
+    if (s_log)
+        fprintf(
+            stderr, "audio: host lifecycle %s\n",
+            suspended ? "suspended" : "resumed");
 }
 
 extern "C" void sr_audio_shutdown(void) {
@@ -424,5 +473,6 @@ extern "C" void sr_audio_shutdown(void) {
         s_lock_initialized = 0;
     }
     s_ok = 0;
+    InterlockedExchange(&s_suspended, 0);
     s_inited = 0;
 }
