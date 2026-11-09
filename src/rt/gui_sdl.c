@@ -305,6 +305,17 @@ int gui_framebuffer_stats(SrFramebufferStats *stats) {
         stats->texture_scale_us = source.texture_scale_us;
         stats->host_upload_bytes = source.host_upload_bytes;
         stats->host_readback_bytes = source.host_readback_bytes;
+        stats->framebuffer_upload_logical_bytes =
+            source.framebuffer_upload_logical_bytes;
+        stats->framebuffer_upload_host_bytes =
+            source.framebuffer_upload_host_bytes;
+        stats->framebuffer_upload_expanded_pixels =
+            source.framebuffer_upload_expanded_pixels;
+        stats->framebuffer_uploads = source.framebuffer_uploads;
+        stats->framebuffer_upload_fallbacks =
+            source.framebuffer_upload_fallbacks;
+        stats->framebuffer_upload_sync_us =
+            source.framebuffer_upload_sync_us;
         if (sdl3vk_transfer_stats(&presenter)) {
             stats->host_upload_bytes += presenter.host_upload_bytes;
             stats->host_readback_bytes += presenter.host_readback_bytes;

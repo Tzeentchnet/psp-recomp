@@ -32,6 +32,7 @@ typedef struct GeVkShaderState {
     uint32_t dither[4];
     uint32_t blend[4];
     uint32_t fragment[4];
+    uint32_t tnl[4];
 } GeVkShaderState;
 
 int ge_vk_shader_direct_compatible(const GeState *state);

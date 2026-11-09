@@ -8,7 +8,7 @@
 #include <d3d12.h>
 #include <stdint.h>
 
-#define GE_D3D12_SHADER_CONSTANT_DWORDS 40u
+#define GE_D3D12_SHADER_CONSTANT_DWORDS 44u
 #define GE_D3D12_SHADER_FRAMEBUFFER_FORMAT_SHIFT 28u
 #define GE_D3D12_SHADER_FRAMEBUFFER_FORMAT_MASK \
     (3u << GE_D3D12_SHADER_FRAMEBUFFER_FORMAT_SHIFT)
@@ -44,6 +44,7 @@ struct GeD3D12ShaderConstants {
     uint32_t blend[4];
     uint32_t fragment[4];
     int32_t scissor[4];
+    uint32_t tnl[4];
 };
 
 struct GeD3D12ShaderConstantCache {

@@ -38,6 +38,8 @@ struct DecodeJob {
     uint32_t height[GE_D3D12_TEXTURE_LEVELS];
     uint32_t offset[GE_D3D12_TEXTURE_LEVELS];
     uint32_t pixel_count;
+    uint64_t decode_us;
+    uint64_t scale_us;
     DecodeJob *next;
     bool ok;
     std::atomic<bool> done;
@@ -105,6 +107,9 @@ static bool s_sync_decode;
 static bool s_verify_decode;
 static uint64_t s_async_decodes;
 static uint64_t s_decode_wait_us;
+static uint64_t s_decode_us;
+static uint64_t s_scale_us;
+static LARGE_INTEGER s_metric_frequency;
 
 static CRITICAL_SECTION s_pool_lock;
 static CONDITION_VARIABLE s_pool_wake;
@@ -304,7 +309,7 @@ static TextureEntry *allocate_entry(uint32_t *slot) {
 static bool decode_levels(
     GeTexSnapshot *snapshot, uint32_t level_count, uint32_t scale,
     const uint32_t *width, const uint32_t *height, const uint32_t *offset,
-    uint32_t *pixels) {
+    uint32_t *pixels, uint64_t *decode_us, uint64_t *scale_us) {
     uint32_t *decoded = nullptr;
     if (scale > 1u) {
         uint64_t decoded_bytes =
@@ -320,11 +325,27 @@ static bool decode_levels(
     for (uint32_t level = 0; level < level_count; level++) {
         uint32_t *destination = pixels + offset[level];
         uint32_t *target = scale == 1u ? destination : decoded;
+        LARGE_INTEGER begin, end;
+        if (decode_us) QueryPerformanceCounter(&begin);
         if (snapshot) ge_tex_snapshot_decode_level(snapshot, target, (int)level);
         else ge_decode_tex_rgba_level(target, (int)level);
+        if (decode_us) {
+            QueryPerformanceCounter(&end);
+            *decode_us +=
+                (uint64_t)(end.QuadPart - begin.QuadPart) * 1000000ull /
+                (uint64_t)s_metric_frequency.QuadPart;
+        }
         if (scale == 1u) continue;
-        if (!sr_texture_scale_rgba(
-                decoded, width[level], height[level], scale, destination)) {
+        if (scale_us) QueryPerformanceCounter(&begin);
+        bool scaled = sr_texture_scale_rgba(
+            decoded, width[level], height[level], scale, destination);
+        if (scale_us) {
+            QueryPerformanceCounter(&end);
+            *scale_us +=
+                (uint64_t)(end.QuadPart - begin.QuadPart) * 1000000ull /
+                (uint64_t)s_metric_frequency.QuadPart;
+        }
+        if (!scaled) {
             fprintf(stderr, "ged3d12: xBRZ texture scaling failed\n");
             free(decoded);
             return false;
@@ -337,7 +358,8 @@ static bool decode_levels(
 static void pool_run(DecodeJob *job) {
     job->ok = decode_levels(
         job->snapshot, job->level_count, job->scale,
-        job->width, job->height, job->offset, job->pixels);
+        job->width, job->height, job->offset, job->pixels,
+        &job->decode_us, &job->scale_us);
     job->done.store(true, std::memory_order_release);
 }
 
@@ -497,7 +519,8 @@ static bool decode_entry(TextureEntry *entry) {
                 if (!job->verify ||
                     !decode_levels(
                         nullptr, job->level_count, job->scale, job->width,
-                        job->height, job->offset, job->verify)) {
+                        job->height, job->offset, job->verify,
+                        nullptr, nullptr)) {
                     job_free(job);
                     return fail();
                 }
@@ -511,9 +534,13 @@ static bool decode_entry(TextureEntry *entry) {
         ge_tex_snapshot_free(snapshot);     /* out of memory: decode in line */
     }
 
-    if (!decode_levels(
+    bool decoded = decode_levels(
             nullptr, entry->key.mip_count, s_texture_scale,
-            scratch.width, scratch.height, scratch.offset, entry->pixels)) {
+            scratch.width, scratch.height, scratch.offset, entry->pixels,
+            &scratch.decode_us, &scratch.scale_us);
+    s_decode_us += scratch.decode_us;
+    s_scale_us += scratch.scale_us;
+    if (!decoded) {
         return fail();
     }
     entry->pending = true;
@@ -525,6 +552,8 @@ static bool finish_decode(TextureEntry *entry) {
     DecodeJob *job = entry->job;
     if (!job) return true;
     bool ok = job_wait(job);
+    s_decode_us += job->decode_us;
+    s_scale_us += job->scale_us;
     if (ok && job->verify &&
         memcmp(job->verify, entry->pixels,
                (size_t)job->pixel_count * sizeof(uint32_t)) != 0) {
@@ -726,6 +755,9 @@ bool ged3d12_texture_cache_init(void) {
     s_verify_decode = verify && verify[0] && strcmp(verify, "0") != 0;
     s_async_decodes = 0;
     s_decode_wait_us = 0;
+    s_decode_us = 0;
+    s_scale_us = 0;
+    QueryPerformanceFrequency(&s_metric_frequency);
     s_initialized = true;
     fprintf(
         stderr, "ged3d12: texture cache xBRZ scale %ux\n",
@@ -1006,4 +1038,14 @@ void ged3d12_texture_invalidate_all(void) {
             s_invalidations++;
         }
     }
+}
+
+GeD3D12TextureStats ged3d12_texture_stats(void) {
+    GeD3D12TextureStats stats = {};
+    stats.cache_hits = s_hits;
+    stats.cache_misses = s_misses;
+    stats.uploads = s_uploads;
+    stats.decode_us = s_decode_us;
+    stats.scale_us = s_scale_us;
+    return stats;
 }

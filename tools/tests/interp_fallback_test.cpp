@@ -594,7 +594,7 @@ int main() {
     uint32_t unknown_nid = 0;
     CHECK(!sr_module_syscall_nid(63, &unknown_nid));
 
-    CHECK(sr_interp_profile_write());
+    CHECK(sr_interp_reports_write());
     log = std::fopen(profile_log, "r");
     CHECK(log != nullptr);
     bool found_profile = false;
@@ -616,6 +616,7 @@ int main() {
     CHECK(std::fclose(log) == 0);
     CHECK(found_profile);
     CHECK(std::remove(profile_log) == 0);
+    CHECK(std::remove(miss_log) == 0);
 
     std::puts("interpreter fallback tests passed");
     return 0;

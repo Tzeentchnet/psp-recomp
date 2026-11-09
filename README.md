@@ -307,12 +307,11 @@ D-pad movement profile without marking it dirty and restores the original
 mappings when the controller disconnects. This experiment has not yet passed
 the full gameplay validation matrix, so back up saves before testing it.
 
-Title integrations without the Killzone-specific control extension should
-compile the runtime with `SR_ENABLE_KZL_TWIN_STICK=0`. That build keeps
+Shared builds default `SR_ENABLE_KZL_TWIN_STICK` to `0`. That build keeps
 standard PSP button and analog input, omits twin-stick/reversal controls from
 the native dialog and generated `input.ini`, and ignores stale twin-stick
-settings in an existing configuration. The compatibility default remains
-enabled for Killzone.
+settings in an existing configuration. The Killzone parent build explicitly
+sets `SR_ENABLE_KZL_TWIN_STICK=1`.
 
 Run `mygame.exe --configure-input` to edit all twelve gamepad action bindings and
 the twin-stick/reversal options in the native controller dialog. Each action
@@ -481,6 +480,48 @@ Set these environment variables before running the game to control runtime featu
   allows until the requested presentation, keep host audio dormant during that phase, then align
   virtual time to the host clock and start real-time XAudio2 playback. This is intended for
   deterministic in-game testing rather than normal play.
+- `SR_GPU_TNL=1`: Opt eligible transform-mode triangle lists, strips, and
+  fans into the shared D3D12 or Vulkan model-space transform-and-lighting
+  path. Unsupported draws, devices, allocation failures, and backend declines
+  preserve the CPU transform path. The path remains opt-in until protected
+  title validation is complete. `SR_GPU_TNL_REFERENCE=1` additionally times a
+  shader-equivalent CPU transform for accepted draws while performance
+  collection is enabled; use it for removed-work estimates, not normal play.
+  `SR_GPU_TNL_VALIDATE=1` requires `SR_GPU_TNL=1`, selects a validation-only
+  vertex-shader variant, reads back every submitted transform result, and
+  compares screen position, reciprocal W, UV, fog, and color with the packed
+  CPU reference. It deliberately stalls each affected submission and stops
+  the backend on the first mismatch, so use it only for correctness runs.
+  `SR_GPU_TNL_VALIDATE_EXACT=1` tightens that comparison to numerical equality
+  for every rendered component and is intended for diagnosing image-level
+  differences that remain inside the normal floating-point tolerance.
+  `SR_GPU_TNL_VALIDATE_START=<present>` delays validation writes and
+  submission stalls until that presentation count, allowing a later route
+  segment to be checked without validating the entire startup path.
+- `SR_VULKAN_GPU_TNL_CLASSES=<list>`: Restrict an enabled Vulkan GPU T&L
+  diagnostic run to a comma-separated subset of `direct`, `preprocess`,
+  `points`, and `sprites`. Unselected classes use the exact CPU fallback.
+  The default is all classes; unknown or empty list elements fail startup.
+- `SR_VULKAN_GPU_TNL_DIRECT_COMPUTE=1`: Transform each canonical vertex for
+  direct Vulkan GPU T&L draws once in the existing compute preprocess stage,
+  then render the resulting screen vertices through an indexed pipeline.
+  This diagnostic path targets the cost of strict non-contracted vertex
+  arithmetic. It remains opt-in because the exact Killzone route did not
+  improve complete-frame mean or wall time beyond variance.
+- `SR_VULKAN_GPU_PRIMITIVE_EXPANSION=1`: Opt Vulkan through-mode sprites into
+  a validation-only compact-control path. The CPU still decodes the two PSP
+  controls; the vertex shader expands them to six vertices with exact
+  coordinate flooring, second-control attributes, and texture-filter UV
+  rules. This switch is independent of model-space GPU T&L and remains off by
+  default. Use `SR_PERF_ALTERNATE=gpuprim` for the exact CPU-expansion A/B
+  fallback.
+
+The Phase 7 promotion audit enables no additional experimental GPU path.
+Scaled framebuffer upload expansion remains the reconciled capability-gated
+baseline with `SR_VULKAN_GPU_UPLOAD_SCALE=0` as its forced fallback.
+`SR_GPU_TNL`, Vulkan compute texture decode, and Vulkan through-sprite
+expansion remain opt-in until both protected title gates and repeated
+complete-frame timing pass.
 - `SR_PERF_LOG=1`: Record performance samples at host display update cycles and split each sample
   between frontend and graphics-backend time. `SR_PERF_START=<present>` selects the first sample by
   `sceDisplaySetFrameBuf` call count, while `SR_PERF_WINDOW=<1..600>` selects the reporting window.
@@ -489,15 +530,25 @@ Set these environment variables before running the game to control runtime featu
   `SR_PERF_MIN_FPS=<fps>` terminates with failure when a completed flip window falls below the
   required average. `SR_EXIT_AFTER_PRESENT=<present>` exits after the specified
   `sceDisplaySetFrameBuf` call count with final audio synchronization statistics.
-  `SR_PERF_FILE=<path>` writes CSV v2 columns
-  `flip,present,frame_ms,frontend_ms,backend_ms,gpu_ms,over_budget`;
+  `SR_PERF_FILE=<path>` writes the CSV v10 performance record;
   `SR_PERF_FRAME_BUDGET_MS=<milliseconds>` overrides the over-budget threshold.
-  The CSV is now v5. In addition to the v4 guest-work and framebuffer fields,
-  it records Vulkan pipeline-key hits/creation time, renderer texture-cache
-  hits/misses/uploads, texture decode/xBRZ time, host upload/readback bytes,
-  and the macOS thermal state (`0` nominal, `1` fair, `2` serious,
-  `3` critical, or `-1` unavailable). Window summaries report the highest
-  thermal state observed during that interval.
+  In addition to guest-work and framebuffer fields, D3D12 and Vulkan report
+  pipeline-key hits/creation time, renderer texture-cache
+  hits/misses/uploads, texture decode/xBRZ time, and host upload/readback
+  bytes. GPU T&L fields report eligible, accepted, and backend-declined draws;
+  canonical and submitted vertices; canonical decode and optional CPU
+  reference time; and backend upload bytes. Geometry-workload fields separate
+  point, line, sprite, Bezier, and spline command counts; generated
+  primitives/vertices; and exclusive setup, evaluation, and draw time.
+  CSV v10 also records dynamic native dispatches and actual scheduler yields.
+  Vulkan additionally reports
+  logical framebuffer-upload bytes,
+  framebuffer-specific host bytes, expanded physical pixels, upload and CPU
+  fallback counts, and upload synchronization time. The record also includes
+  the thermal state where the host exposes it
+  (`0` nominal, `1` fair, `2` serious, `3` critical, or `-1` unavailable).
+  Window summaries report the highest thermal state observed during that
+  interval.
 - `SR_VULKAN_STAGE_LOG=1`: Populate Vulkan GE/presenter stage timing and
   framebuffer-statistics columns in performance reports. Timestamp-based
   `gpu_ms` samples do not require this switch. Vulkan GE stages accumulate
@@ -508,11 +559,32 @@ Set these environment variables before running the game to control runtime featu
   `SR_SLOW_FRAME_MS` (default 1.25 x the frame budget) naming the three largest phases, scheduler
   idle time, texture misses and decode wait, PSO fallback binds, and the previous flip's backend
   stages. It works with or without `SR_PERF_FILE`.
+- `SR_SAMPLE_START=<present>` / `SR_SAMPLE_WINDOW=<presents>` /
+  `SR_SAMPLE_FILE=<path>`: On Windows and macOS, sample the main runtime
+  thread's instruction pointer at 4 kHz over the requested guest-presentation
+  window. The primary report buckets executable-relative addresses for symbol
+  resolution; `<path>.categories.txt` retains the exclusive runtime category
+  for every bucket, while `<path>.modules.txt` attributes categorized samples
+  in runtime libraries and drivers. Sampling is diagnostic-only and its
+  reports must not be committed. Resolve a category with
+  `python3 tools/analyze_ip_samples.py <samples> --executable <binary>
+  --category native`.
+- Clean runtime shutdown prints MPEG video/audio completion and maximum A/V
+  drift separately from the display-performance CSV, followed by the audio
+  backend's completed, queued, dropped, resynchronized, and silent-frame
+  summary. These media counters are correctness evidence, not graphics time.
 - `SR_PERF_ALTERNATE=<path>[,<path>...]`: Switch output-identical optimization paths (`texdecode`,
-  `merge`, `memo`, `indexed`) off every other `SR_PERF_ALTERNATE_PRESENTS` (default 60) guest
-  presentations, so one run measures them on and off in the same scene. The `alt_off` column
-  holds the paths currently off; bit 31 marks a flip whose frame straddled a change, which
-  comparisons should discard.
+  `merge`, `memo`, `indexed`, `gpuupload`, `gputnl`, `gputexdecode`, `gpuprim`)
+  off every other `SR_PERF_ALTERNATE_PRESENTS` (default 60) guest
+  presentations, so one run measures them on and off in the same scene.
+  `gpuupload` forces scaled framebuffer expansion through the CPU fallback but
+  cannot override missing GPU capabilities. `gputnl` forces eligible
+  model-space draws through the CPU transform fallback. `gputexdecode` forces
+  opt-in Vulkan compute texture decode through the asynchronous CPU snapshot
+  decoder. `gpuprim` forces the opt-in Vulkan through-sprite path through
+  exact CPU expansion. The `alt_off` column holds the paths currently off; bit
+  31 marks a flip whose frame straddled a change, which comparisons should
+  discard.
 - `PSP_VFPU_TABLES=<directory>`: Override the `assets/vfpu` lookup-table directory. The golden
   harness sets this explicitly so runtime execution does not depend on its working directory.
 - `SR_INTERP_MISS_LOG=<path>`: Write each distinct guest target that missed the generated
@@ -521,9 +593,16 @@ Set these environment variables before running the game to control runtime featu
   supported misses through the reference interpreter, hands nested targets
   back to generated code when they enter the active native table, and reuses
   the tested VFPU instruction engine for supported interpreted VFPU operations.
+  A clean exit writes a header-only report when no target missed, so missing
+  evidence is distinguishable from a measured zero. Gate the miss and profile
+  pair with `python3 tools/check_interp_reports.py <misses> <profile>`;
+  without a policy file, any fallback fails.
 - `SR_INTERP_PROFILE=<path>`: Write aggregate calls, guest instructions,
   syscalls, native handoffs, chunk limits, returns, and failures for every
-  module-qualified fallback target. This does not change the v2 miss log.
+  module-qualified fallback target. A clean exit likewise writes an explicit
+  zero-target profile. An optional `--policy` file can review individual rows
+  as `module target max_calls max_instructions`; step limits, failures, and
+  incomplete returns always fail. This does not change the v2 miss log.
 - `SR_INTERP_MAX_STEPS=<1..100000000>`: Bound one interpreter fallback invocation; the default
   is 1,000,000 instructions. A syscall, unsupported instruction, memory fault, or exhausted
   bound is a fatal error unless the diagnostic-only `SR_DISPATCH_PERMISSIVE=1` escape hatch is set.

@@ -1,0 +1,332 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const uint TEXTURE_RAW_JOB_ABI_VERSION = 1u;
+const uint TEXTURE_RAW_SWIZZLED = 1u;
+const uint TEXTURE_RAW_INDEXED = 2u;
+const uint TEXTURE_RAW_BLOCK_COMPRESSED = 4u;
+
+struct TextureRawJob {
+    uint abi_version;
+    uint flags;
+    uint format;
+    uint mip_level;
+    uint source_byte_offset;
+    uint source_byte_count;
+    uint source_stride;
+    uint source_width;
+    uint source_height;
+    uint clut_byte_offset;
+    uint clut_byte_count;
+    uint clut_format;
+    uint texture_mode;
+    uint destination_pixel_offset;
+    uint destination_width;
+    uint destination_height;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer JobBuffer {
+    TextureRawJob jobs[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer SourceBuffer {
+    uint source_words[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer ClutBuffer {
+    uint clut_words[];
+};
+
+layout(std430, set = 0, binding = 3) writeonly buffer DestinationBuffer {
+    uint destination_pixels[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint job_index;
+} pc;
+
+uint source_byte(uint byte_offset) {
+    uint word = source_words[byte_offset >> 2u];
+    return (word >> ((byte_offset & 3u) * 8u)) & 0xffu;
+}
+
+uint source_u16(uint byte_offset) {
+    return source_byte(byte_offset) |
+        (source_byte(byte_offset + 1u) << 8u);
+}
+
+uint source_u32(uint byte_offset) {
+    return source_u16(byte_offset) |
+        (source_u16(byte_offset + 2u) << 16u);
+}
+
+uint clut_byte(uint byte_offset) {
+    uint word = clut_words[byte_offset >> 2u];
+    return (word >> ((byte_offset & 3u) * 8u)) & 0xffu;
+}
+
+uint clut_u16(uint byte_offset) {
+    return clut_byte(byte_offset) |
+        (clut_byte(byte_offset + 1u) << 8u);
+}
+
+uint clut_u32(uint byte_offset) {
+    return clut_u16(byte_offset) |
+        (clut_u16(byte_offset + 2u) << 16u);
+}
+
+uint texel_byte_offset(
+    uint row_pitch_pixels, uint x, uint y,
+    uint texel_bits, bool swizzled) {
+    if (!swizzled) {
+        return y * ((row_pitch_pixels * texel_bits) >> 3u) +
+            ((x * texel_bits) >> 3u);
+    }
+    const uint tile_bits = 32u;
+    const uint tiles_x = 4u;
+    const uint tiles_y = 8u;
+    uint texels_per_tile = tile_bits / texel_bits;
+    uint tile_x = x / texels_per_tile;
+    uint tile_index =
+        (y % tiles_y) * tiles_x +
+        (y / tiles_y) *
+            ((row_pitch_pixels * texel_bits / tile_bits) * tiles_y) +
+        (tile_x % tiles_x) +
+        (tile_x / tiles_x) * (tiles_x * tiles_y);
+    return tile_index * (tile_bits >> 3u) +
+        (((x % texels_per_tile) * texel_bits) >> 3u);
+}
+
+uint unpack_direct(uint raw, uint format) {
+    if (format == 3u)
+        return raw;
+    uint red;
+    uint green;
+    uint blue;
+    uint alpha;
+    if (format == 0u) {
+        red = (raw & 0x1fu) * 255u / 31u;
+        green = ((raw >> 5u) & 0x3fu) * 255u / 63u;
+        blue = ((raw >> 11u) & 0x1fu) * 255u / 31u;
+        alpha = 255u;
+    } else if (format == 1u) {
+        red = (raw & 0x1fu) * 255u / 31u;
+        green = ((raw >> 5u) & 0x1fu) * 255u / 31u;
+        blue = ((raw >> 10u) & 0x1fu) * 255u / 31u;
+        alpha = (raw & 0x8000u) != 0u ? 255u : 0u;
+    } else {
+        red = (raw & 0x0fu) * 17u;
+        green = ((raw >> 4u) & 0x0fu) * 17u;
+        blue = ((raw >> 8u) & 0x0fu) * 17u;
+        alpha = ((raw >> 12u) & 0x0fu) * 17u;
+    }
+    return red | (green << 8u) | (blue << 16u) | (alpha << 24u);
+}
+
+uint clut_index(
+    uint raw_index, uint texture_format,
+    uint mip_level, uint clut_format,
+    uint texture_mode) {
+    uint shift = (clut_format >> 2u) & 0x1fu;
+    uint mask = (clut_format >> 8u) & 0xffu;
+    uint start = ((clut_format >> 16u) & 0x1fu) << 4u;
+    uint start_mask =
+        (clut_format & 3u) == 3u ? 0xffu : 0x1ffu;
+    uint index =
+        ((raw_index >> shift) & mask) |
+        (start & start_mask);
+    if ((texture_mode & 0x100u) != 0u) {
+        if (texture_format == 4u)
+            index += mip_level * 16u;
+        else if (texture_format == 5u &&
+                 (clut_format & 3u) != 3u)
+            index += (mip_level & 1u) * 256u;
+    }
+    return index;
+}
+
+uint lookup_clut(TextureRawJob job, uint raw_index) {
+    uint palette_format = job.clut_format & 3u;
+    uint entry_bytes = palette_format == 3u ? 4u : 2u;
+    uint index = clut_index(
+        raw_index, job.format, job.mip_level,
+        job.clut_format, job.texture_mode);
+    uint relative_offset =
+        (index * entry_bytes) & 2047u;
+    uint absolute_offset =
+        job.clut_byte_offset + relative_offset;
+    uint raw = entry_bytes == 4u
+        ? clut_u32(absolute_offset)
+        : clut_u16(absolute_offset);
+    return unpack_direct(raw, palette_format);
+}
+
+uint dxt_color(
+    uint block_offset, uint x, uint y, uint alpha) {
+    uint color1 = source_u16(block_offset + 4u);
+    uint color2 = source_u16(block_offset + 6u);
+    uint blue1 = (color1 << 3u) & 0xf8u;
+    uint blue2 = (color2 << 3u) & 0xf8u;
+    uint green1 = (color1 >> 3u) & 0xfcu;
+    uint green2 = (color2 >> 3u) & 0xfcu;
+    uint red1 = (color1 >> 8u) & 0xf8u;
+    uint red2 = (color2 >> 8u) & 0xf8u;
+    uint index =
+        (source_byte(block_offset + (y & 3u)) >>
+         ((x & 3u) * 2u)) & 3u;
+    uint red;
+    uint green;
+    uint blue;
+    if (index == 0u) {
+        red = red1;
+        green = green1;
+        blue = blue1;
+    } else if (index == 1u) {
+        red = red2;
+        green = green2;
+        blue = blue2;
+    } else if (color1 > color2) {
+        if (index == 2u) {
+            red = (red1 * 2u + red2) / 3u;
+            green = (green1 * 2u + green2) / 3u;
+            blue = (blue1 * 2u + blue2) / 3u;
+        } else {
+            red = (red2 * 2u + red1) / 3u;
+            green = (green2 * 2u + green1) / 3u;
+            blue = (blue2 * 2u + blue1) / 3u;
+        }
+    } else if (index == 3u) {
+        red = 0u;
+        green = 0u;
+        blue = 0u;
+        alpha = 0u;
+    } else {
+        red = (red1 + red2) / 2u;
+        green = (green1 + green2) / 2u;
+        blue = (blue1 + blue2) / 2u;
+    }
+    return red | (green << 8u) |
+        (blue << 16u) | (alpha << 24u);
+}
+
+uint dxt_alpha_lerp(
+    uint alpha1, uint alpha2,
+    uint numerator, uint denominator) {
+    uint value1 =
+        (alpha1 * ((denominator - numerator) << 8u)) /
+        denominator;
+    uint value2 =
+        (alpha2 * (numerator << 8u)) / denominator;
+    return (value1 + value2 + 31u) >> 8u;
+}
+
+uint decode_dxt(
+    uint block_offset, uint format,
+    uint x, uint y) {
+    x &= 3u;
+    y &= 3u;
+    if (format == 8u)
+        return dxt_color(block_offset, x, y, 255u);
+    if (format == 9u) {
+        uint alpha_line = source_u16(
+            block_offset + 8u + y * 2u);
+        uint alpha = (alpha_line >> (x * 4u)) & 15u;
+        return dxt_color(block_offset, x, y, 0u) |
+            (alpha << 28u);
+    }
+
+    uint alpha_bit = (y * 4u + x) * 3u;
+    uint alpha_byte = block_offset + 8u +
+        (alpha_bit >> 3u);
+    uint alpha_bits =
+        source_byte(alpha_byte) |
+        (source_byte(alpha_byte + 1u) << 8u);
+    uint alpha_index =
+        (alpha_bits >> (alpha_bit & 7u)) & 7u;
+    uint alpha1 = source_byte(block_offset + 14u);
+    uint alpha2 = source_byte(block_offset + 15u);
+    uint alpha;
+    if (alpha_index == 0u)
+        alpha = alpha1;
+    else if (alpha_index == 1u)
+        alpha = alpha2;
+    else if (alpha1 > alpha2)
+        alpha = dxt_alpha_lerp(
+            alpha1, alpha2, alpha_index - 1u, 7u);
+    else if (alpha_index == 6u)
+        alpha = 0u;
+    else if (alpha_index == 7u)
+        alpha = 255u;
+    else
+        alpha = dxt_alpha_lerp(
+            alpha1, alpha2, alpha_index - 1u, 5u);
+    return dxt_color(block_offset, x, y, 0u) |
+        (alpha << 24u);
+}
+
+void main() {
+    TextureRawJob job = jobs[pc.job_index];
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (job.abi_version != TEXTURE_RAW_JOB_ABI_VERSION ||
+        job.format > 10u ||
+        x >= job.source_width || y >= job.source_height)
+        return;
+
+    bool compressed = job.format >= 8u;
+    bool indexed = job.format >= 4u && !compressed;
+    if (compressed) {
+        if ((job.flags & TEXTURE_RAW_BLOCK_COMPRESSED) == 0u)
+            return;
+        uint blocks_per_row =
+            (job.source_stride + 3u) >> 2u;
+        blocks_per_row = max(1u, blocks_per_row);
+        uint block_size = job.format == 8u ? 8u : 16u;
+        uint block_index =
+            (y >> 2u) * blocks_per_row + (x >> 2u);
+        uint relative_offset = block_index * block_size;
+        if (relative_offset > job.source_byte_count ||
+            block_size >
+                job.source_byte_count - relative_offset)
+            return;
+        uint destination =
+            job.destination_pixel_offset +
+            y * job.destination_width + x;
+        destination_pixels[destination] = decode_dxt(
+            job.source_byte_offset + relative_offset,
+            job.format, x, y);
+        return;
+    }
+    if (indexed &&
+        ((job.flags & TEXTURE_RAW_INDEXED) == 0u ||
+         job.clut_byte_count < 2048u))
+        return;
+    uint bits = job.format == 3u || job.format == 7u
+        ? 32u
+        : job.format == 4u ? 4u
+        : job.format == 5u ? 8u
+        : 16u;
+    uint relative_offset = texel_byte_offset(
+        job.source_stride, x, y, bits,
+        (job.flags & TEXTURE_RAW_SWIZZLED) != 0u);
+    uint texel_bytes = max(1u, bits >> 3u);
+    if (relative_offset > job.source_byte_count ||
+        texel_bytes > job.source_byte_count - relative_offset)
+        return;
+    uint absolute_offset = job.source_byte_offset + relative_offset;
+    uint raw;
+    if (bits == 32u)
+        raw = source_u32(absolute_offset);
+    else if (bits == 16u)
+        raw = source_u16(absolute_offset);
+    else
+        raw = source_byte(absolute_offset);
+    if (job.format == 4u)
+        raw = (x & 1u) != 0u ? raw >> 4u : raw & 0x0fu;
+    uint destination =
+        job.destination_pixel_offset + y * job.destination_width + x;
+    destination_pixels[destination] = indexed
+        ? lookup_clut(job, raw)
+        : unpack_direct(raw, job.format);
+}

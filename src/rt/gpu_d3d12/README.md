@@ -11,10 +11,11 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 - a D3D12 device, direct and copy queues, timeline fences, and a three-buffer
   flip-discard swapchain;
 - shader-visible CBV/SRV/UAV descriptor rings plus RTV and DSV heaps;
-- a 40-DWORD `b0` GE-state root block, `t0` texture, `t1` CLUT, and `t2`/`t3`
-  destination tables, dynamic `s0` sampler table, static clamp-nearest
-  `s1`/clamp-linear `s2` samplers, and a vertex-visible space-1 `t0` raw-buffer
-  root SRV;
+- a 44-DWORD `b0` GE-state root block whose first 40 DWORDs retain the pixel
+  ABI, `t0` texture, `t1` CLUT, and `t2`/`t3` destination tables, dynamic `s0`
+  sampler table, static clamp-nearest `s1`/clamp-linear `s2` samplers,
+  vertex-visible space-1 `t0`/`t1` root SRVs, and a validation-only `u0` root
+  UAV;
 - a shader-visible dynamic sampler ring partitioned by fenced frame;
 - a persistently mapped, three-frame upload ring;
 - capture of `ge.c`'s fully decoded primitive stream into the HLSL shader's exact
@@ -47,7 +48,7 @@ This directory contains the Windows D3D12 implementation of the runtime `GeBacke
 `vertex.cpp` deliberately consumes the existing `GeVtx` backend seam instead of
 duplicating PSP vertex decoding. `ge.c` remains authoritative for all raw attribute
 formats, morph-before-skin decoding, through mode, indices, GE-exact CPU Bezier/B-spline
-tessellation, transform/lighting, clipping, and primitive assembly. Generated patch
+tessellation, eligibility, primitive assembly, and exact transform/clipping fallback. Generated patch
 triangles, lines, and points cross the same `GeBackend` seam as ordinary primitives.
 Captured vertices are copied into the active fenced upload-ring partition during
 presentation. Their diagnostic FNV hash is computed only when vertex/GPU logging
@@ -59,9 +60,9 @@ submit `DrawInstanced` calls into the captured GPU framebuffer.
 
 `pipeline_key.cpp` maps only PSO-static GE fields; shader constants, descriptors,
 scissor, and blend constants remain per-draw state and intentionally do not multiply the
-cache. Each logical draw stores its key and canonical 160-byte shader block before later
+cache. Each logical draw stores its key and canonical 176-byte shader block before later
 GE commands mutate the live state. Command recording compares that block exactly with the
-previous binding and skips an identical 40-DWORD root write while still restoring scissor.
+previous binding and skips an identical 44-DWORD root write while still restoring scissor.
 `pipeline.cpp` creates one no-cull ubershader PSO during device initialization and never
 compiles on the command-recording thread. The pixel shader uses `SV_IsFrontFace` for exact
 fallback culling, while a worker prewarms the hardware-cull variant and promotes later
@@ -214,6 +215,31 @@ through a GPU readback after cached presentation; this is a diagnostic mode and
 intentionally stalls the graphics queue. Set
 `SR_D3D12_DISABLE_FEEDBACK_ALIASES=1` to route format-reinterpreted framebuffer
 textures through the synchronized CPU fallback for differential testing.
+The common `SR_PERF_FILE` CSV includes cumulative-delta D3D12 pipeline, texture,
+upload, and readback metrics using the same columns as Vulkan. Upload bytes
+include requested persistently mapped upload-ring slices; readback bytes count
+framebuffer materialization and requested presentation captures.
+
+`SR_GPU_TNL=1` opts conservatively accepted transform-mode triangle draws into
+the shared canonical model-vertex path. Safe draws use the existing vertex
+shader. Draws requiring PSP primitive rejection or near-plane clipping use two
+compute passes: canonical vertices are transformed once into the shared
+48-byte `GeTnlClipVertex` ABI, then each submitted triangle writes six fixed
+32-byte `GeTnlScreenVertex` slots (real or degenerate) consumed by the ordinary
+screen-space vertex path. Packed vertex decode, morphing, skinning, eligibility
+classification, and the exact oracle remain on the CPU. Invalid indices,
+unsupported primitives/flags, malformed counts, and capacity overflows are
+explicitly declined so `ge.c` performs the unchanged CPU path.
+`SR_PERF_ALTERNATE=gputnl` forces that complete fallback at presentation
+boundaries.
+`SR_GPU_TNL_VALIDATE=1` requires `SR_GPU_TNL=1`, selects a separate DXC
+vertex-shader variant that writes transformed results to a UAV, copies those
+results to a readback buffer, waits for the validation fence, and compares
+screen position, reciprocal W, UV, fog, and color with the packed CPU
+reference. Preprocessed draws additionally read back the clip and fixed
+screen-slot buffers and compare them with the shared exact CPU clipping oracle.
+Normal runs retain the production bytecode and do not issue validation writes
+or readbacks.
 
 Install PIX for Windows with `winget install --id Microsoft.PIX --exact`. The command
 list always carries nested `GE list` and `GE draw` events using D3D12's PIX-compatible

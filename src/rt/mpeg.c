@@ -387,7 +387,28 @@ uint32_t mpeg_ringbuffer_available_size(uint32_t ring) {
     return rb_get(ring, RB_packets) - rb_get(ring, RB_packetsAvail);
 }
 
-unsigned long g_mpeg_put = 0, g_mpeg_getavc = 0, g_mpeg_avcdec = 0, g_mpeg_nodata = 0;
+unsigned long g_mpeg_put = 0;
+unsigned long g_mpeg_getavc = 0;
+unsigned long g_mpeg_avcdec = 0;
+unsigned long g_mpeg_nodata = 0;
+static unsigned long s_mpeg_video_frames;
+static unsigned long s_mpeg_audio_frames;
+static int64_t s_mpeg_max_av_drift;
+
+void mpeg_runtime_shutdown(void) {
+    fprintf(
+        stderr,
+        "media: MPEG shutdown ring_put=%lu get_avc=%lu "
+        "avc_decode=%lu video_frames=%lu audio_frames=%lu "
+        "no_data=%lu max_av_drift_ticks=%lld "
+        "max_av_drift_ms=%.3f\n",
+        g_mpeg_put, g_mpeg_getavc, g_mpeg_avcdec,
+        s_mpeg_video_frames, s_mpeg_audio_frames,
+        g_mpeg_nodata, (long long)s_mpeg_max_av_drift,
+        (double)s_mpeg_max_av_drift * 1000.0 /
+            (double)mpegTimestampPerSecond);
+}
+
 /* RingbufferPut(ring, numPackets, available): call the game's fill callback, then feed the bytes
  * it wrote into PPSSPP's MediaEngine bridge. */
 uint32_t mpeg_ringbuffer_put(CpuState *s, uint32_t ring, uint32_t numPackets, uint32_t available) {
@@ -633,7 +654,10 @@ uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth
             if (initAddr) MEM_W32(initAddr, 0);
             return (uint32_t)-1;
         }
-        if (gotFrame > 0) ctx->h264Frames++;
+        if (gotFrame > 0) {
+            ctx->h264Frames++;
+            s_mpeg_video_frames++;
+        }
     }
 #endif
     /* No decoder (or it hasn't produced its first frame yet): clear the destination instead of
@@ -708,6 +732,7 @@ uint32_t mpeg_atrac_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t bufferAd
                 bytes = MPEG_ATRAC_ES_OUTPUT_SIZE;
             memcpy(SR_HOST(bufferAddr), pcm, bytes);
             ctx->pmfAudioFrames++;
+            s_mpeg_audio_frames++;
         }
     }
 
@@ -718,8 +743,12 @@ uint32_t mpeg_atrac_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t bufferAd
     }
     int64_t drift = ctx->videoPts - ctx->audioPts;
     int64_t abs_drift = drift < 0 ? -drift : drift;
-    if (ctx->h264Frames && ctx->pmfAudioFrames && abs_drift > ctx->maxAvDrift)
-        ctx->maxAvDrift = abs_drift;
+    if (ctx->h264Frames && ctx->pmfAudioFrames) {
+        if (abs_drift > ctx->maxAvDrift)
+            ctx->maxAvDrift = abs_drift;
+        if (abs_drift > s_mpeg_max_av_drift)
+            s_mpeg_max_av_drift = abs_drift;
+    }
     if (auAddr)
         au_write_pts(auAddr, 0, ctx->audioPts + ctx->firstTimestamp);
     if (getenv("SR_MPEGLOG")) {

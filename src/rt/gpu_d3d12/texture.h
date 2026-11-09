@@ -110,6 +110,16 @@ bool ged3d12_texture_bind(const GeD3D12TextureBinding *binding);
 void ged3d12_texture_invalidate(uint32_t address, uint32_t bytes);
 void ged3d12_texture_invalidate_all(void);
 
+struct GeD3D12TextureStats {
+    uint64_t cache_hits;
+    uint64_t cache_misses;
+    uint64_t uploads;
+    uint64_t decode_us;
+    uint64_t scale_us;
+};
+
+GeD3D12TextureStats ged3d12_texture_stats(void);
+
 static_assert(
     sizeof(GeD3D12TextureKey) == 96,
     "D3D12 texture key must remain canonical");

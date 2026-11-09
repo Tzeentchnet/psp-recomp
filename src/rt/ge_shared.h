@@ -97,10 +97,171 @@ typedef struct {
     uint32_t imm[10];
 } GeState;
 
+enum {
+    GE_TEXTURE_RAW_JOB_ABI_VERSION = 1,
+    GE_TEXTURE_RAW_CLUT_BYTES = 2048,
+};
+
+typedef enum GeTextureRawJobFlags {
+    GE_TEXTURE_RAW_SWIZZLED = 1u << 0,
+    GE_TEXTURE_RAW_INDEXED = 1u << 1,
+    GE_TEXTURE_RAW_BLOCK_COMPRESSED = 1u << 2,
+    GE_TEXTURE_RAW_CLUT_SHARED = 1u << 3,
+} GeTextureRawJobFlags;
+
+/* Shader-neutral texture decode descriptor. Source and CLUT offsets are bytes
+ * in their respective backend-owned raw buffers; the destination offset is in
+ * RGBA8 pixels. The destination dimensions also define its row stride and
+ * bounds. */
+typedef struct GeTextureRawJob {
+    uint32_t abi_version;
+    uint32_t flags;
+    uint32_t format;
+    uint32_t mip_level;
+    uint32_t source_byte_offset;
+    uint32_t source_byte_count;
+    uint32_t source_stride;
+    uint32_t source_width;
+    uint32_t source_height;
+    uint32_t clut_byte_offset;
+    uint32_t clut_byte_count;
+    uint32_t clut_format;
+    uint32_t texture_mode;
+    uint32_t destination_pixel_offset;
+    uint32_t destination_width;
+    uint32_t destination_height;
+} GeTextureRawJob;
+
+#if defined(__cplusplus)
+static_assert(
+    sizeof(GeTextureRawJob) == 64,
+    "raw texture job ABI changed");
+#else
+_Static_assert(
+    sizeof(GeTextureRawJob) == 64,
+    "raw texture job ABI changed");
+#endif
+
 /* A rasterized vertex: screen position, reciprocal clip-w (for persp-correct interp), UV,
  * colour, and per-vertex fog factor (1 = no fog). In transform mode u/v are stored
  * pre-multiplied by rw (texel coords over w). */
 typedef struct GeVtx { float x, y, z, rw; float u, v; float fog; int r, g, b, a; } GeVtx;
+
+enum {
+    GE_TNL_ABI_VERSION = 1,
+};
+
+typedef enum GeTnlVertexFlags {
+    GE_TNL_VERTEX_NORMAL = 1u << 0,
+    GE_TNL_VERTEX_TEXCOORD = 1u << 1,
+    GE_TNL_VERTEX_COLOR = 1u << 2,
+    GE_TNL_VERTEX_SKINNED = 1u << 3,
+    GE_TNL_VERTEX_MORPHED = 1u << 4,
+} GeTnlVertexFlags;
+
+typedef enum GeTnlStateFlags {
+    GE_TNL_STATE_TEXTURE = 1u << 0,
+    GE_TNL_STATE_LIGHTING = 1u << 1,
+    GE_TNL_STATE_REVERSE_NORMAL = 1u << 2,
+    GE_TNL_STATE_SEPARATE_SPECULAR = 1u << 3,
+    GE_TNL_STATE_FOG = 1u << 4,
+    GE_TNL_STATE_GOURAUD = 1u << 5,
+    GE_TNL_STATE_DEPTH_CLIP = 1u << 6,
+    GE_TNL_STATE_CULL = 1u << 7,
+    GE_TNL_STATE_CLEAR = 1u << 8,
+    GE_TNL_STATE_MATERIAL_COLOR_SET = 1u << 9,
+    GE_TNL_STATE_MATERIAL_ALPHA_SET = 1u << 10,
+} GeTnlStateFlags;
+
+typedef enum GeTnlPrimitive {
+    GE_TNL_POINTS = 0,
+    GE_TNL_LINES = 1,
+    GE_TNL_LINE_STRIP = 2,
+    GE_TNL_TRIANGLES = 3,
+    GE_TNL_TRIANGLE_STRIP = 4,
+    GE_TNL_TRIANGLE_FAN = 5,
+    GE_TNL_SPRITES = 6,
+} GeTnlPrimitive;
+
+typedef enum GeTnlDrawFlags {
+    GE_TNL_DRAW_PREPROCESS = 1u << 0,
+    GE_TNL_DRAW_SPRITE_LINEAR_FILTER = 1u << 1,
+} GeTnlDrawFlags;
+
+/* CPU-decoded model vertex. Morphing and skinning are applied before this ABI;
+ * color bytes are ordered red, green, blue, alpha. */
+typedef struct GeTnlVertex {
+    float position[3];
+    float normal[3];
+    float texcoord[2];
+    uint8_t color[4];
+} GeTnlVertex;
+
+typedef struct GeTnlLight {
+    uint32_t enabled;
+    uint32_t type;
+    float position[3];
+    float direction[3];
+    float attenuation[3];
+    float spot_exponent;
+    float spot_cutoff;
+    uint32_t ambient_color;
+    uint32_t diffuse_color;
+    uint32_t specular_color;
+} GeTnlLight;
+
+/* Copied transform inputs. This structure owns no pointers, so a const snapshot
+ * remains immutable even when later GE commands change live state. PSP colors
+ * retain their register representation, 0x00BBGGRR. */
+typedef struct GeTnlState {
+    uint32_t abi_version;
+    uint32_t flags;
+    uint32_t vertex_flags;
+    uint32_t source_vtype;
+    float world[12];
+    float view[12];
+    float projection[16];
+    float texture[12];
+    float texture_scale[2];
+    float texture_offset[2];
+    float viewport_scale[3];
+    float viewport_center[3];
+    float viewport_offset[2];
+    int32_t scissor[4];
+    uint32_t texture_width;
+    uint32_t texture_height;
+    uint32_t texture_map_mode;
+    uint32_t texture_shade_lights;
+    uint32_t minimum_depth;
+    uint32_t maximum_depth;
+    uint32_t cull_mode;
+    float fog_end;
+    float fog_slope;
+    uint32_t fog_color;
+    uint32_t material_color;
+    uint32_t material_alpha;
+    uint32_t material_emissive;
+    uint32_t material_diffuse;
+    uint32_t material_specular;
+    uint32_t material_update;
+    uint32_t ambient_color;
+    uint32_t ambient_alpha;
+    float specular_coefficient;
+    GeTnlLight lights[4];
+} GeTnlState;
+
+/* Submission-order indices reference the deduplicated canonical vertex table.
+ * The state and pointed-to arrays are valid only for the duration of a backend
+ * transform hook call unless the backend copies them. */
+typedef struct GeTnlDraw {
+    const GeTnlVertex *vertices;
+    const uint16_t *indices;
+    const GeTnlState *state;
+    uint32_t vertex_count;
+    uint32_t index_count;
+    uint32_t primitive;
+    uint32_t flags;
+} GeTnlDraw;
 
 typedef struct GeRgb { int32_t r, g, b; } GeRgb;
 
@@ -139,6 +300,202 @@ static inline uint32_t ge_texture_buffer_width(
     return width;
 }
 
+static inline uint32_t ge_texture_texel_byte_offset(
+    uint32_t row_pitch_pixels, uint32_t u, uint32_t v,
+    uint32_t texel_bits, int swizzled) {
+    if (!swizzled) {
+        return v * ((row_pitch_pixels * texel_bits) >> 3) +
+            ((u * texel_bits) >> 3);
+    }
+    const uint32_t tile_bits = 32;
+    const uint32_t tiles_x = 4;
+    const uint32_t tiles_y = 8;
+    uint32_t texels_per_tile = tile_bits / texel_bits;
+    uint32_t tile_u = u / texels_per_tile;
+    uint32_t tile_index =
+        (v % tiles_y) * tiles_x +
+        (v / tiles_y) *
+            ((row_pitch_pixels * texel_bits / tile_bits) * tiles_y) +
+        (tile_u % tiles_x) +
+        (tile_u / tiles_x) * (tiles_x * tiles_y);
+    return tile_index * (tile_bits >> 3) +
+        (((u % texels_per_tile) * texel_bits) >> 3);
+}
+
+static inline uint32_t ge_texture_unpack_direct_rgba(
+    uint32_t raw, uint32_t format) {
+    uint32_t red, green, blue, alpha;
+    switch (format & 3u) {
+        case 0:
+            red = (raw & 0x1fu) * 255u / 31u;
+            green = ((raw >> 5) & 0x3fu) * 255u / 63u;
+            blue = ((raw >> 11) & 0x1fu) * 255u / 31u;
+            alpha = 255u;
+            break;
+        case 1:
+            red = (raw & 0x1fu) * 255u / 31u;
+            green = ((raw >> 5) & 0x1fu) * 255u / 31u;
+            blue = ((raw >> 10) & 0x1fu) * 255u / 31u;
+            alpha = (raw & 0x8000u) ? 255u : 0u;
+            break;
+        case 2:
+            red = (raw & 0x0fu) * 17u;
+            green = ((raw >> 4) & 0x0fu) * 17u;
+            blue = ((raw >> 8) & 0x0fu) * 17u;
+            alpha = ((raw >> 12) & 0x0fu) * 17u;
+            break;
+        default:
+            return raw;
+    }
+    return red | (green << 8) | (blue << 16) | (alpha << 24);
+}
+
+static inline uint32_t ge_texture_clut_index(
+    uint32_t raw_index, uint32_t texture_format,
+    uint32_t mip_level, uint32_t clut_format,
+    uint32_t texture_mode) {
+    uint32_t shift = (clut_format >> 2) & 0x1fu;
+    uint32_t mask = (clut_format >> 8) & 0xffu;
+    uint32_t start = ((clut_format >> 16) & 0x1fu) << 4;
+    uint32_t start_mask =
+        (clut_format & 3u) == 3u ? 0xffu : 0x1ffu;
+    uint32_t index =
+        ((raw_index >> shift) & mask) |
+        (start & start_mask);
+    if ((texture_mode & 0x100u) != 0) {
+        if (texture_format == 4u)
+            index += mip_level * 16u;
+        else if (texture_format == 5u &&
+                 (clut_format & 3u) != 3u)
+            index += (mip_level & 1u) * 256u;
+    }
+    return index;
+}
+
+static inline uint32_t ge_texture_clut_rgba(
+    const uint8_t *clut, uint32_t index,
+    uint32_t clut_format) {
+    if (!clut) return 0;
+    uint32_t format = clut_format & 3u;
+    uint32_t entry_bytes = format == 3u ? 4u : 2u;
+    uint32_t offset =
+        (index * entry_bytes) &
+        (GE_TEXTURE_RAW_CLUT_BYTES - 1u);
+    uint32_t raw = clut[offset];
+    raw |= (uint32_t)clut[
+        (offset + 1u) & (GE_TEXTURE_RAW_CLUT_BYTES - 1u)] << 8;
+    if (entry_bytes == 4u) {
+        raw |= (uint32_t)clut[
+            (offset + 2u) &
+                (GE_TEXTURE_RAW_CLUT_BYTES - 1u)] << 16;
+        raw |= (uint32_t)clut[
+            (offset + 3u) &
+                (GE_TEXTURE_RAW_CLUT_BYTES - 1u)] << 24;
+    }
+    return ge_texture_unpack_direct_rgba(raw, format);
+}
+
+static inline uint32_t ge_texture_dxt_color(
+    const uint8_t *block, uint32_t x, uint32_t y,
+    uint32_t alpha) {
+    uint32_t color1 =
+        block[4] | ((uint32_t)block[5] << 8);
+    uint32_t color2 =
+        block[6] | ((uint32_t)block[7] << 8);
+    uint32_t blue1 = (color1 << 3) & 0xf8u;
+    uint32_t blue2 = (color2 << 3) & 0xf8u;
+    uint32_t green1 = (color1 >> 3) & 0xfcu;
+    uint32_t green2 = (color2 >> 3) & 0xfcu;
+    uint32_t red1 = (color1 >> 8) & 0xf8u;
+    uint32_t red2 = (color2 >> 8) & 0xf8u;
+    uint32_t index =
+        (block[y & 3u] >> ((x & 3u) * 2u)) & 3u;
+    uint32_t red, green, blue;
+    if (index == 0u) {
+        red = red1;
+        green = green1;
+        blue = blue1;
+    } else if (index == 1u) {
+        red = red2;
+        green = green2;
+        blue = blue2;
+    } else if (color1 > color2) {
+        if (index == 2u) {
+            red = (red1 * 2u + red2) / 3u;
+            green = (green1 * 2u + green2) / 3u;
+            blue = (blue1 * 2u + blue2) / 3u;
+        } else {
+            red = (red2 * 2u + red1) / 3u;
+            green = (green2 * 2u + green1) / 3u;
+            blue = (blue2 * 2u + blue1) / 3u;
+        }
+    } else if (index == 3u) {
+        red = green = blue = alpha = 0;
+    } else {
+        red = (red1 + red2) / 2u;
+        green = (green1 + green2) / 2u;
+        blue = (blue1 + blue2) / 2u;
+    }
+    return red | (green << 8) | (blue << 16) | (alpha << 24);
+}
+
+static inline uint32_t ge_texture_dxt_alpha_lerp(
+    uint32_t alpha1, uint32_t alpha2,
+    uint32_t numerator, uint32_t denominator) {
+    uint32_t value1 =
+        (alpha1 * ((denominator - numerator) << 8)) /
+        denominator;
+    uint32_t value2 =
+        (alpha2 * (numerator << 8)) / denominator;
+    return (value1 + value2 + 31u) >> 8;
+}
+
+static inline uint32_t ge_texture_dxt_decode(
+    const uint8_t *block, uint32_t format,
+    uint32_t x, uint32_t y) {
+    if (!block || format < 8u || format > 10u) return 0;
+    x &= 3u;
+    y &= 3u;
+    if (format == 8u)
+        return ge_texture_dxt_color(block, x, y, 255u);
+    if (format == 9u) {
+        uint32_t alpha_line =
+            block[8u + y * 2u] |
+            ((uint32_t)block[9u + y * 2u] << 8);
+        uint32_t alpha =
+            (alpha_line >> (x * 4u)) & 15u;
+        return ge_texture_dxt_color(block, x, y, 0) |
+            (alpha << 28);
+    }
+
+    uint32_t alpha_bit = (y * 4u + x) * 3u;
+    uint32_t alpha_byte = 8u + (alpha_bit >> 3);
+    uint32_t alpha_bits =
+        block[alpha_byte] |
+        ((uint32_t)block[alpha_byte + 1u] << 8);
+    uint32_t alpha_index =
+        (alpha_bits >> (alpha_bit & 7u)) & 7u;
+    uint32_t alpha1 = block[14];
+    uint32_t alpha2 = block[15];
+    uint32_t alpha;
+    if (alpha_index == 0u)
+        alpha = alpha1;
+    else if (alpha_index == 1u)
+        alpha = alpha2;
+    else if (alpha1 > alpha2)
+        alpha = ge_texture_dxt_alpha_lerp(
+            alpha1, alpha2, alpha_index - 1u, 7u);
+    else if (alpha_index == 6u)
+        alpha = 0;
+    else if (alpha_index == 7u)
+        alpha = 255u;
+    else
+        alpha = ge_texture_dxt_alpha_lerp(
+            alpha1, alpha2, alpha_index - 1u, 5u);
+    return ge_texture_dxt_color(block, x, y, 0) |
+        (alpha << 24);
+}
+
 /* Rasterizer backend. init/present/shutdown provide the lifecycle seam needed to select
  * Vulkan, D3D12, or the software fallback at runtime. The primitive hooks return 1 when
  * the primitive was taken by
@@ -174,6 +531,9 @@ typedef struct GeBackend {
      * replays the triangles through the ordinary path. */
     int  (*tri_indexed)(const GeVtx *table, uint32_t table_count,
                         const uint16_t *indices, uint32_t index_count, int persp);
+    /* Optional model-space transform draw. Returns 1 after taking ownership;
+     * returning 0 preserves the complete CPU transform and raster path. */
+    int  (*transform_draw)(const GeTnlDraw *draw);
 } GeBackend;
 
 /* Implemented in ge.c. */
@@ -205,6 +565,19 @@ typedef struct GeTexSnapshot GeTexSnapshot;
 GeTexSnapshot *ge_tex_snapshot_capture(uint32_t level_count);
 void      ge_tex_snapshot_decode_level(
               const GeTexSnapshot *snapshot, uint32_t *out, int level);
+const uint8_t *ge_tex_snapshot_source_data(
+              const GeTexSnapshot *snapshot, uint32_t level,
+              uint32_t *byte_count);
+const uint8_t *ge_tex_snapshot_clut_data(
+              const GeTexSnapshot *snapshot, uint32_t *byte_count);
+int       ge_tex_snapshot_build_raw_job(
+              const GeTexSnapshot *snapshot, uint32_t level,
+              uint32_t source_byte_offset,
+              uint32_t clut_byte_offset,
+              uint32_t destination_pixel_offset,
+              uint32_t destination_width,
+              uint32_t destination_height,
+              GeTextureRawJob *out);
 void      ge_tex_snapshot_free(GeTexSnapshot *snapshot);
 int       ge_color_test_pass(
               uint32_t test, uint32_t reference, uint32_t mask,

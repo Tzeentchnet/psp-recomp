@@ -393,24 +393,34 @@ static size_t s_interp_profile_count;
 static size_t s_interp_profile_capacity;
 static int s_interp_profile_enabled = -1;
 static char s_interp_profile_path[1024];
+static SrInterpMiss *s_interp_misses;
+static size_t s_interp_miss_count;
+static size_t s_interp_miss_capacity;
+static int s_interp_miss_enabled = -1;
+static char s_interp_miss_path[1024];
+static FILE *s_interp_miss_file;
+
+static void sr_interp_report_configure(
+    const char *setting, int *enabled,
+    char *path_out, size_t path_capacity) {
+    if (*enabled >= 0) return;
+    const char *path = getenv(setting);
+    *enabled = path && path[0] ? 1 : 0;
+    if (!*enabled) return;
+    size_t length = strlen(path);
+    if (length >= path_capacity) {
+        fprintf(stderr, "%s path is too long\n", setting);
+        abort();
+    }
+    memcpy(path_out, path, length + 1u);
+}
 
 static size_t sr_interp_profile_begin(
     uint32_t target, const char *module) {
     const char *label = module && module[0] ? module : "unknown";
-    if (s_interp_profile_enabled < 0) {
-        const char *path = getenv("SR_INTERP_PROFILE");
-        s_interp_profile_enabled = path && path[0] ? 1 : 0;
-        if (s_interp_profile_enabled) {
-            size_t length = strlen(path);
-            if (length >= sizeof(s_interp_profile_path)) {
-                fprintf(
-                    stderr,
-                    "SR_INTERP_PROFILE path is too long\n");
-                abort();
-            }
-            memcpy(s_interp_profile_path, path, length + 1u);
-        }
-    }
+    sr_interp_report_configure(
+        "SR_INTERP_PROFILE", &s_interp_profile_enabled,
+        s_interp_profile_path, sizeof(s_interp_profile_path));
     if (!s_interp_profile_enabled) return SIZE_MAX;
     for (size_t i = 0; i < s_interp_profile_count; i++) {
         if (s_interp_profiles[i].target == target &&
@@ -447,8 +457,11 @@ static SrInterpProfile *sr_interp_profile_at(size_t index) {
         ? &s_interp_profiles[index] : NULL;
 }
 
-int sr_interp_profile_write(void) {
-    if (s_interp_profile_enabled <= 0) return 1;
+static int sr_interp_profile_write(void) {
+    sr_interp_report_configure(
+        "SR_INTERP_PROFILE", &s_interp_profile_enabled,
+        s_interp_profile_path, sizeof(s_interp_profile_path));
+    if (!s_interp_profile_enabled) return 1;
     FILE *file = fopen(s_interp_profile_path, "wb");
     if (!file) {
         fprintf(
@@ -500,56 +513,99 @@ int sr_interp_profile_write(void) {
     return 1;
 }
 
+static int sr_interp_miss_open(void) {
+    sr_interp_report_configure(
+        "SR_INTERP_MISS_LOG", &s_interp_miss_enabled,
+        s_interp_miss_path, sizeof(s_interp_miss_path));
+    if (!s_interp_miss_enabled || s_interp_miss_file) return 1;
+    s_interp_miss_file = fopen(s_interp_miss_path, "wb");
+    if (!s_interp_miss_file ||
+        fprintf(
+            s_interp_miss_file,
+            "# psp-recomp interpreter misses v2\n") < 0) {
+        if (s_interp_miss_file) fclose(s_interp_miss_file);
+        s_interp_miss_file = NULL;
+        fprintf(
+            stderr,
+            "dispatch: cannot create miss log %s\n",
+            s_interp_miss_path);
+        return 0;
+    }
+    return 1;
+}
+
+static int sr_interp_miss_write(void) {
+    if (!sr_interp_miss_open()) return 0;
+    if (!s_interp_miss_enabled) return 1;
+    int failed = fclose(s_interp_miss_file) != 0;
+    s_interp_miss_file = NULL;
+    if (failed) {
+        fprintf(
+            stderr,
+            "dispatch: cannot write miss log %s\n",
+            s_interp_miss_path);
+        return 0;
+    }
+    fprintf(
+        stderr,
+        "dispatch: interpreter misses targets=%llu -> %s\n",
+        (unsigned long long)s_interp_miss_count,
+        s_interp_miss_path);
+    return 1;
+}
+
+int sr_interp_reports_write(void) {
+    int profile_ok = sr_interp_profile_write();
+    int misses_ok = sr_interp_miss_write();
+    return profile_ok && misses_ok;
+}
+
 static void sr_log_interp_miss(
     uint32_t target, const CpuState *s, const char *module) {
-    static SrInterpMiss *seen;
-    static size_t seen_count;
-    static size_t seen_capacity;
-    static FILE *log_file;
     const char *label = module && module[0] ? module : "unknown";
-    for (size_t i = 0; i < seen_count; i++) {
-        if (seen[i].target == target &&
-            strcmp(seen[i].module, label) == 0)
+    for (size_t i = 0; i < s_interp_miss_count; i++) {
+        if (s_interp_misses[i].target == target &&
+            strcmp(s_interp_misses[i].module, label) == 0)
             return;
     }
-    if (seen_count == seen_capacity) {
-        size_t capacity = seen_capacity ? seen_capacity * 2 : 32;
+    if (s_interp_miss_count == s_interp_miss_capacity) {
+        size_t capacity =
+            s_interp_miss_capacity ? s_interp_miss_capacity * 2 : 32;
         SrInterpMiss *grown =
-            (SrInterpMiss *)realloc(seen, capacity * sizeof(*seen));
+            (SrInterpMiss *)realloc(
+                s_interp_misses, capacity * sizeof(*grown));
         if (!grown) {
             fprintf(stderr, "dispatch: cannot grow interpreter miss log\n");
             abort();
         }
-        seen = grown;
-        seen_capacity = capacity;
+        s_interp_misses = grown;
+        s_interp_miss_capacity = capacity;
     }
-    seen[seen_count].target = target;
-    seen[seen_count].module = label;
-    seen_count++;
+    s_interp_misses[s_interp_miss_count].target = target;
+    s_interp_misses[s_interp_miss_count].module = label;
+    s_interp_miss_count++;
     fprintf(
         stderr,
         "dispatch: interpreter fallback [%s] at 0x%08x "
         "(pc=0x%08x ra=0x%08x)\n",
         label, target, s->pc, s->r[31]);
 
-    const char *path = getenv("SR_INTERP_MISS_LOG");
-    if (!path || !path[0]) return;
-    if (!log_file) {
-        log_file = fopen(path, "w");
-        if (!log_file ||
-            fprintf(log_file, "# psp-recomp interpreter misses v2\n") < 0) {
-            fprintf(stderr, "dispatch: cannot create miss log %s\n", path);
-            abort();
-        }
-    }
-    if (fprintf(log_file, "%s 0x%08x\n", label, target) < 0 ||
-        fflush(log_file) != 0) {
-        fprintf(stderr, "dispatch: cannot write miss log %s\n", path);
+    if (!sr_interp_miss_open()) abort();
+    if (!s_interp_miss_enabled) return;
+    if (fprintf(
+            s_interp_miss_file,
+            "%s 0x%08x\n", label, target) < 0 ||
+        fflush(s_interp_miss_file) != 0) {
+        fprintf(
+            stderr,
+            "dispatch: cannot write miss log %s\n",
+            s_interp_miss_path);
         abort();
     }
 }
 
 void dispatch(CpuState *s, uint32_t target) {
+    sr_perf_counter_add(SR_PERF_NATIVE_DISPATCHES, 1);
     if (getenv("SR_DISPLOG")) {
         /* Log first invocation of boot/state-machine handlers, to see which actually run. */
         static uint32_t seen[256]; static int n = 0; int known = 0;

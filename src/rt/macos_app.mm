@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifndef SR_ISO_PICKER_TITLE
+#define SR_ISO_PICKER_TITLE "Choose Game ISO"
+#endif
+
 static id s_sleep_observer;
 static id s_wake_observer;
 
@@ -121,7 +125,7 @@ int sr_macos_ensure_iso(const char *title) {
 
         for (;;) {
             NSOpenPanel *panel = [NSOpenPanel openPanel];
-            panel.title = @"Choose Killzone: Liberation v1.20";
+            panel.title = sr_string(SR_ISO_PICKER_TITLE);
             panel.message =
                 @"Select your legally dumped supported UMD ISO. "
                  "The game is verified in place and is not copied.";

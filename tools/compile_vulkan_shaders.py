@@ -18,15 +18,77 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND_DIR = ROOT / "src" / "rt" / "gpu_sdl3vk"
 SHADER_DIR = BACKEND_DIR / "shaders"
 SHADERS = (
-    ("psp.vert", "vert", "psp_vert.inc"),
-    ("psp.frag", "frag", "psp_frag.inc"),
-    ("smaa.vert", "vert", "smaa_vert.inc"),
-    ("smaa_edge.frag", "frag", "smaa_edge_frag.inc"),
-    ("smaa_blend.frag", "frag", "smaa_blend_frag.inc"),
+    ("psp.vert", "vert", "psp_vert.inc", ()),
+    ("psp_tnl.vert", "vert", "psp_tnl_vert.inc", ()),
+    (
+        "psp_tnl.vert",
+        "vert",
+        "psp_tnl_validation_vert.inc",
+        ("TNL_VALIDATE=1",),
+    ),
+    (
+        "psp_tnl.vert",
+        "vert",
+        "psp_tnl_points_vert.inc",
+        ("TNL_EXPAND_POINTS=1",),
+    ),
+    (
+        "psp_tnl.vert",
+        "vert",
+        "psp_tnl_points_validation_vert.inc",
+        ("TNL_EXPAND_POINTS=1", "TNL_VALIDATE=1"),
+    ),
+    (
+        "psp_tnl.vert",
+        "vert",
+        "psp_tnl_sprites_vert.inc",
+        ("TNL_EXPAND_SPRITES=1",),
+    ),
+    (
+        "psp_tnl.vert",
+        "vert",
+        "psp_tnl_sprites_validation_vert.inc",
+        ("TNL_EXPAND_SPRITES=1", "TNL_VALIDATE=1"),
+    ),
+    (
+        "psp_tnl.vert",
+        "vert",
+        "psp_tnl_through_sprites_vert.inc",
+        ("TNL_EXPAND_THROUGH_SPRITES=1",),
+    ),
+    (
+        "psp_tnl.vert",
+        "vert",
+        "psp_tnl_through_sprites_validation_vert.inc",
+        ("TNL_EXPAND_THROUGH_SPRITES=1", "TNL_VALIDATE=1"),
+    ),
+    (
+        "psp_tnl_preprocess.comp",
+        "comp",
+        "psp_tnl_transform_comp.inc",
+        ("TNL_TRANSFORM=1",),
+    ),
+    (
+        "psp_tnl_preprocess.comp",
+        "comp",
+        "psp_tnl_triangles_comp.inc",
+        ("TNL_TRIANGLES=1",),
+    ),
+    (
+        "psp_texture_decode.comp",
+        "comp",
+        "psp_texture_decode_comp.inc",
+        (),
+    ),
+    ("psp.frag", "frag", "psp_frag.inc", ()),
+    ("smaa.vert", "vert", "smaa_vert.inc", ()),
+    ("smaa_edge.frag", "frag", "smaa_edge_frag.inc", ()),
+    ("smaa_blend.frag", "frag", "smaa_blend_frag.inc", ()),
     (
         "smaa_neighborhood.frag",
         "frag",
         "smaa_neighborhood_frag.inc",
+        (),
     ),
 )
 
@@ -82,7 +144,8 @@ def find_glslang(requested: str | None) -> Path:
 
 
 def compile_shader(
-    glslang: Path, source: Path, stage: str
+    glslang: Path, source: Path, stage: str,
+    defines: tuple[str, ...] = (),
 ) -> bytes:
     with tempfile.TemporaryDirectory(prefix="psprecomp-spirv-") as directory:
         output = Path(directory) / f"{source.stem}.spv"
@@ -95,8 +158,9 @@ def compile_shader(
             stage,
             "-o",
             str(output),
-            str(source),
         ]
+        command.extend(f"-D{define}" for define in defines)
+        command.append(str(source))
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode:
             if result.stdout:
@@ -119,12 +183,19 @@ def compile_shader(
         return data
 
 
-def render_include(source: Path, stage: str, data: bytes) -> str:
+def render_include(
+    source: Path, stage: str, data: bytes,
+    defines: tuple[str, ...] = (),
+) -> str:
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest().upper()
     spirv_hash = hashlib.sha256(data).hexdigest().upper()
     words = struct.unpack(f"<{len(data) // 4}I", data)
+    variant = (
+        " [" + ", ".join(defines) + "]"
+        if defines else ""
+    )
     lines = [
-        f"/* Generated from {source.name} ({stage}) by "
+        f"/* Generated from {source.name} ({stage}){variant} by "
         "tools/compile_vulkan_shaders.py.",
         f" * source SHA-256: {source_hash}",
         f" * SPIR-V SHA-256: {spirv_hash} */",
@@ -155,11 +226,13 @@ def main(argv: list[str]) -> int:
     try:
         glslang = find_glslang(args.glslang)
         stale: list[Path] = []
-        for source_name, stage, output_name in SHADERS:
+        for source_name, stage, output_name, defines in SHADERS:
             source = SHADER_DIR / source_name
             output = BACKEND_DIR / output_name
             rendered = render_include(
-                source, stage, compile_shader(glslang, source, stage)
+                source, stage,
+                compile_shader(glslang, source, stage, defines),
+                defines,
             )
             if args.check:
                 if (

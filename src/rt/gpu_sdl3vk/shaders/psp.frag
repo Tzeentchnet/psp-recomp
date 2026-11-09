@@ -20,6 +20,7 @@ layout(push_constant) uniform PC {
     ivec4 dither_rows;
     ivec4 blend_state;
     ivec4 fragment_state;
+    uvec4 tnl;
 } pc;
 
 const int FLAG_TEXTURE = 1;

@@ -11,7 +11,7 @@
 #include <windows.h>
 
 #ifndef SR_ENABLE_KZL_TWIN_STICK
-#define SR_ENABLE_KZL_TWIN_STICK 1
+#define SR_ENABLE_KZL_TWIN_STICK 0
 #endif
 
 #define IDC_TWIN_STICK 1200

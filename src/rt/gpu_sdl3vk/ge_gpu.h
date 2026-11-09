@@ -42,6 +42,12 @@ typedef struct GeVkFramebufferStats {
     uint64_t texture_scale_us;
     uint64_t host_upload_bytes;
     uint64_t host_readback_bytes;
+    uint64_t framebuffer_upload_logical_bytes;
+    uint64_t framebuffer_upload_host_bytes;
+    uint64_t framebuffer_upload_expanded_pixels;
+    uint64_t framebuffer_uploads;
+    uint64_t framebuffer_upload_fallbacks;
+    uint64_t framebuffer_upload_sync_us;
 } GeVkFramebufferStats;
 
 int gegpu_framebuffer_stats(GeVkFramebufferStats *stats);

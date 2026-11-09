@@ -2,6 +2,8 @@
 #include "gpu_sdl3vk/feedback_region.h"
 #include "gpu_sdl3vk/present_cache.h"
 #include "gpu_sdl3vk/present_layout.h"
+#include "gpu_sdl3vk/tnl_classes.h"
+#include "gpu_sdl3vk/upload_scale.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -149,7 +151,7 @@ static void test_state_packing(void) {
     source.zwrite_disable = 0;
 
     ge_vk_shader_state_build(&source, 1, 0, 4, &state);
-    check_u32("push constant size", sizeof(state), 112);
+    check_u32("push constant size", sizeof(state), 128);
     check_u32("shader flags", shader_flags(&state), expected_flags);
     check_u32("texture function", (uint32_t)state.config[0] & 7u, 3);
     check_u32("alpha test", (uint32_t)state.config[1], source.atest);
@@ -419,6 +421,71 @@ static void test_present_layout(void) {
         fail("zero Vulkan internal resolution accepted");
 }
 
+static void test_upload_scale(void) {
+    SrVkUploadScalePlan plan;
+    if (!sr_vk_upload_scale_plan(512, 512, 4, 1, 0, &plan))
+        fail("4x GPU upload plan rejected");
+    if (!plan.use_gpu || plan.fallback ||
+        plan.physical_width != 2048 || plan.physical_height != 2048 ||
+        plan.logical_bytes != 512u * 512u * 4u ||
+        plan.host_bytes != 512u * 512u * 4u ||
+        plan.expanded_pixels != 2048u * 2048u) {
+        fail("4x GPU upload plan mismatch");
+    }
+
+    if (!sr_vk_upload_scale_plan(512, 512, 4, 1, 1, &plan) ||
+        plan.use_gpu || !plan.fallback ||
+        plan.host_bytes != 2048u * 2048u * 4u) {
+        fail("forced CPU upload plan mismatch");
+    }
+    if (!sr_vk_upload_scale_plan(512, 512, 2, 0, 0, &plan) ||
+        plan.use_gpu || !plan.fallback ||
+        plan.physical_width != 1024 || plan.physical_height != 1024 ||
+        plan.host_bytes != 1024u * 1024u * 4u) {
+        fail("capability fallback upload plan mismatch");
+    }
+    if (!sr_vk_upload_scale_plan(512, 512, 1, 1, 0, &plan) ||
+        plan.use_gpu || plan.fallback ||
+        plan.logical_bytes != plan.host_bytes ||
+        plan.expanded_pixels != 512u * 512u) {
+        fail("native-resolution upload plan mismatch");
+    }
+    if (sr_vk_upload_scale_plan(UINT32_MAX, 1, 2, 1, 0, &plan))
+        fail("overflowing upload width accepted");
+    if (sr_vk_upload_scale_plan(UINT32_MAX, UINT32_MAX, 1, 1, 0, &plan))
+        fail("overflowing upload byte count accepted");
+    if (sr_vk_upload_scale_plan(512, 512, 0, 1, 0, &plan))
+        fail("zero upload scale accepted");
+}
+
+static void test_tnl_classes(void) {
+    uint32_t mask = 0;
+    if (!ge_vk_tnl_class_mask(NULL, &mask) ||
+        mask != GE_VK_TNL_CLASS_ALL) {
+        fail("default GPU T&L classes");
+    }
+    if (!ge_vk_tnl_class_mask(
+            "direct,sprites", &mask) ||
+        mask !=
+            (GE_VK_TNL_CLASS_DIRECT |
+             GE_VK_TNL_CLASS_SPRITES)) {
+        fail("selected GPU T&L classes");
+    }
+    if (!ge_vk_tnl_class_mask(
+            "preprocess,points,preprocess", &mask) ||
+        mask !=
+            (GE_VK_TNL_CLASS_PREPROCESS |
+             GE_VK_TNL_CLASS_POINTS)) {
+        fail("duplicate GPU T&L classes");
+    }
+    if (ge_vk_tnl_class_mask("triangles", &mask))
+        fail("unknown GPU T&L class accepted");
+    if (ge_vk_tnl_class_mask("direct,", &mask))
+        fail("trailing GPU T&L class delimiter accepted");
+    if (ge_vk_tnl_class_mask("direct", NULL))
+        fail("null GPU T&L class output accepted");
+}
+
 int main(void) {
     test_direct_classification();
     test_stencil_classification();
@@ -430,6 +497,8 @@ int main(void) {
     test_present_cache();
     test_feedback_regions();
     test_present_layout();
+    test_upload_scale();
+    test_tnl_classes();
     if (s_failures) {
         fprintf(stderr, "%d Vulkan shader-state test(s) failed\n", s_failures);
         return 1;

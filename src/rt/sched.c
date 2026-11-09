@@ -621,6 +621,7 @@ static void switch_to_scheduler(void) {
 }
 
 void sr_yield(CpuState *s) {
+    sr_perf_counter_add(SR_PERF_SCHEDULER_YIELDS, 1);
     sr_timeslice = TIMESLICE;
     if (s_cur < 0) return;                 /* not in a thread */
     s_tick++;

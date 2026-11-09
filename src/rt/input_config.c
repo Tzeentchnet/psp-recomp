@@ -13,7 +13,7 @@
 #include <string.h>
 
 #ifndef SR_ENABLE_KZL_TWIN_STICK
-#define SR_ENABLE_KZL_TWIN_STICK 1
+#define SR_ENABLE_KZL_TWIN_STICK 0
 #endif
 
 static const char *const s_action_names[SR_INPUT_ACTIONS] = {

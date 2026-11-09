@@ -29,6 +29,7 @@ struct GeD3D12PipelineStats {
     uint64_t hits;
     uint64_t misses;
     uint64_t fallback_binds;
+    uint64_t create_us;
     uint32_t entries;
     uint32_t pending;
     uint32_t compiled;

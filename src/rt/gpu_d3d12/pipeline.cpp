@@ -47,6 +47,7 @@ struct PipelineLibraryHeader {
 
 struct PipelineBuildResult {
     ID3D12PipelineState *pipeline;
+    uint64_t create_us;
     bool library_hit;
     bool compiled;
     bool cache_write;
@@ -726,8 +727,15 @@ static PipelineBuildResult load_or_create_pipeline(
     if (s_library) {
         wchar_t name[PIPELINE_NAME_CAPACITY];
         pipeline_name(key, name);
+        LARGE_INTEGER begin, end, frequency;
+        QueryPerformanceCounter(&begin);
         HRESULT hr = s_library->LoadGraphicsPipeline(
             name, &desc, IID_PPV_ARGS(&result.pipeline));
+        QueryPerformanceCounter(&end);
+        QueryPerformanceFrequency(&frequency);
+        result.create_us +=
+            (uint64_t)(end.QuadPart - begin.QuadPart) * 1000000ull /
+            (uint64_t)frequency.QuadPart;
         if (SUCCEEDED(hr)) {
             s_library_loaded_from_disk = 0;
             result.library_hit = true;
@@ -751,7 +759,14 @@ static PipelineBuildResult load_or_create_pipeline(
         }
     }
 
+    LARGE_INTEGER begin, end, frequency;
+    QueryPerformanceCounter(&begin);
     result.pipeline = create_pipeline(key, &desc);
+    QueryPerformanceCounter(&end);
+    QueryPerformanceFrequency(&frequency);
+    result.create_us +=
+        (uint64_t)(end.QuadPart - begin.QuadPart) * 1000000ull /
+        (uint64_t)frequency.QuadPart;
     if (!result.pipeline) return result;
     result.compiled = true;
     if (store_pipeline(key, result.pipeline))
@@ -815,6 +830,7 @@ static DWORD WINAPI pipeline_worker(void *) {
             entry->state = PIPELINE_ENTRY_FAILED;
             s_stats.failures++;
         }
+        s_stats.create_us += result.create_us;
         if (s_stats.pending) s_stats.pending--;
         LeaveCriticalSection(&s_lock);
 
@@ -907,6 +923,7 @@ bool ged3d12_pipeline_cache_init(void) {
     if (uber.library_hit) s_stats.library_hits++;
     if (uber.compiled) s_stats.compiled++;
     if (uber.cache_write) s_stats.cache_writes++;
+    s_stats.create_us += uber.create_us;
 
     InitializeCriticalSection(&s_lock);
     s_lock_initialized = 1;
@@ -1043,13 +1060,15 @@ void ged3d12_pipeline_cache_shutdown(void) {
             stderr,
             "ged3d12: PSO cache entries=%u pending=%u "
             "lookups=%llu hits=%llu misses=%llu fallback=%llu "
-            "compiled=%u library_hits=%u writes=%u failures=%u\n",
+            "compiled=%u library_hits=%u create_us=%llu writes=%u "
+            "failures=%u\n",
             s_stats.entries, s_stats.pending,
             (unsigned long long)s_stats.lookups,
             (unsigned long long)s_stats.hits,
             (unsigned long long)s_stats.misses,
             (unsigned long long)s_stats.fallback_binds,
             s_stats.compiled, s_stats.library_hits,
+            (unsigned long long)s_stats.create_us,
             s_stats.cache_writes, s_stats.failures);
     }
     release_pipeline_objects();

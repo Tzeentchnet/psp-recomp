@@ -614,6 +614,16 @@ int gui_framebuffer_stats(SrFramebufferStats *stats) {
         stats->feedback_snapshot_pixels =
             source.feedback_snapshot_pixels;
         stats->feedback_reuses = source.feedback_reuses;
+        stats->pipeline_key_hits = source.pipeline_key_hits;
+        stats->pipelines_created = source.pipelines_created;
+        stats->pipeline_create_us = source.pipeline_create_us;
+        stats->texture_cache_hits = source.texture_cache_hits;
+        stats->texture_cache_misses = source.texture_cache_misses;
+        stats->texture_uploads = source.texture_uploads;
+        stats->texture_decode_us = source.texture_decode_us;
+        stats->texture_scale_us = source.texture_scale_us;
+        stats->host_upload_bytes = source.host_upload_bytes;
+        stats->host_readback_bytes = source.host_readback_bytes;
         return 1;
     }
 #else

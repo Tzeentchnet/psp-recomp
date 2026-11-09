@@ -48,7 +48,23 @@ make test-input-config
 make test-module-loader
 make test-memstick-state
 make test-interpreter
+make test-ge-tnl
+make test-d3d12-vertex
+make check-shaders-vulkan
+make test-vulkan-tnl-validation
 ```
+
+Run `test-d3d12-vertex` in a Windows/MSYS2 environment, or cross-compile it
+and `gpu_d3d12/device.cpp` against MinGW D3D12 headers on another host. A
+cross-compile proves source and ABI compatibility, not DXIL validity or
+runtime behavior. Compile checked-in D3D12 shader artifacts with Microsoft
+DXC and still require a native Windows run with the DXIL validator and D3D12
+debug layer before closing a hardware gate.
+
+`make test-ge-tnl` also verifies the shared 64-byte raw-texture job ABI,
+immutable source/CLUT snapshot payloads, mip descriptors and offset/bounds
+rejection. These tests define compute-decoder inputs but do not by themselves
+claim that the opt-in runtime cache path was exercised.
 
 Also run:
 
@@ -73,6 +89,8 @@ Python tests, and protected runners. Follow their pinned reproduction docs.
 | `tools/gen_microtest.py` | Generate instruction microtests |
 | `tools/function_catalog.py` | Validate, extend, and match reviewed function identities |
 | `tools/compile_d3d12_shaders.py --check` | Verify checked-in D3D12 shader includes |
+| `tools/compile_vulkan_shaders.py --check` | Verify production and validation Vulkan shader includes |
+| `make test-vulkan-tnl-validation` | Execute the real GPU T&L, point/sprite expansion, preprocessing, and direct/indexed/DXT texture decode shaders and compare readback with CPU oracles |
 
 The CPU trace schema and deterministic kernel/GE headers are defined in
 [TRACE_FORMAT.md](../tools/TRACE_FORMAT.md).
@@ -93,6 +111,46 @@ A title harness should pin:
 Use a clean memstick fixture for every stateful route. Do not reuse a
 developer save directory as acceptance evidence.
 
+CSV v10 evidence must retain point, line, sprite, Bezier and spline
+draw/workload fields alongside their exclusive timing columns. Bezier and
+spline evaluation/draw columns must also sum to the aggregate
+`patch_eval_ms` and `patch_draw_ms` values used by the promotion gate.
+`native_dispatches` and `scheduler_yields` must remain independent of HLE,
+interpreter, media, and graphics workload fields.
+
+## CPU/runtime profiling
+
+Configure both `SR_INTERP_MISS_LOG` and `SR_INTERP_PROFILE` on protected
+routes. A clean runtime exit must produce both files, including header-only
+files for a measured zero. Validate them with:
+
+```bash
+python3 tools/check_interp_reports.py <misses> <profile>
+```
+
+The default gate rejects every fallback. If a reviewed overlay must remain
+interpreted, pass `--policy <file>` with one
+`module target max_calls max_instructions` row per allowed target. Step-limit
+stops, interpreter failures, and calls that do not return always fail.
+
+On Windows and macOS, use `SR_SAMPLE_START`, `SR_SAMPLE_WINDOW`, and
+`SR_SAMPLE_FILE` to capture a bounded instruction-pointer window. Resolve
+exclusive native work rather than aggregate renderer/wait samples:
+
+```bash
+python3 tools/analyze_ip_samples.py <samples> \
+  --executable <binary> --category native
+```
+
+Record the 4 kHz sample estimate beside CSV `native_ms`; a large mismatch
+invalidates attribution. For a small nested phase whose per-item clock reads
+would perturb the workload, resolve its containing exclusive category and use
+the phase's symbol or instruction range. Record both the isolated estimate and
+a conservative upper bound that includes the whole containing symbol; do not
+add hot-loop timers merely to obtain a finer CSV column. Keep MPEG completion/
+A/V-drift and audio queue/drop/resynchronization summaries separate from
+graphics timing.
+
 ## Strict versus diagnostic modes
 
 Diagnostic switches are valuable for isolation, but a result obtained with an
@@ -109,8 +167,93 @@ Examples that require explicit labeling:
 - Reduced interpreter step limits
 - Disabled input hot reload or title extensions
 
+For Vulkan texture-decode work,
+`SR_VULKAN_SYNC_TEXTURE_DECODE=1` is the exact synchronous fallback and
+`SR_PERF_ALTERNATE=texdecode` is the supported A/B switch.
+`SR_VULKAN_GPU_TEXTURE_DECODE=1` opts scale-1 ordinary RAM textures into the
+compute decoder, and `SR_PERF_ALTERNATE=gputexdecode` compares it directly
+with asynchronous CPU snapshot decode. `SR_VULKAN_VERIFY_TEXTURE_DECODE=1`
+also decodes every cache miss with the CPU oracle and aborts on a byte
+mismatch. A qualifying runtime capture must show that GPU jobs were scheduled,
+report any CPU fallbacks, and leave GPU decode disabled for the final
+default-path comparison.
+
+For Vulkan through-mode sprite expansion,
+`SR_VULKAN_GPU_PRIMITIVE_EXPANSION=1` selects the compact-control prototype
+without enabling model-space GPU T&L. Pair exact protected-title captures with
+the switch off and on, then use `SR_PERF_ALTERNATE=gpuprim` for timing. Compare
+sprite CPU time, complete-frame median/p95/p99, GPU time, host upload bytes,
+feedback snapshot pixels, and thermal state. Do not treat reduced upload bytes
+alone as a promotion result, and do not use `gputnl` as a proxy because it
+changes a separate transform-and-lighting path.
+
+For Vulkan GPU T&L classification, keep `SR_GPU_TNL=1` and use
+`SR_VULKAN_GPU_TNL_CLASSES` to run `direct`, `preprocess`, `points`, and
+`sprites` independently. Every unselected class takes the CPU fallback.
+Classify a changed frame with these isolated runs before changing eligibility
+or widening an image threshold. If tolerant live shader validation passes but
+an exact capture still differs, add `SR_GPU_TNL_VALIDATE_EXACT=1` to stop on
+the first non-padding component that is not numerically equal to the CPU
+reference. For a late route segment, set
+`SR_GPU_TNL_VALIDATE_START=<present>` just before the target frame so earlier
+submissions retain normal pacing.
+After the direct shader is exact, evaluate
+`SR_VULKAN_GPU_TNL_DIRECT_COMPUTE=1` separately: require the same complete
+frame manifest, then compare canonical versus submitted vertex counts,
+backend submission time, GPU time, host uploads, and complete-frame
+distribution before retaining the transform-once path.
+
+On macOS, select KosmicKrisp with its SDK ICD manifest through
+`VK_DRIVER_FILES`. The validation-layer manifest must resolve to the same
+validation dylib that the active loader actually opens; do not combine an SDK
+manifest with a different Homebrew layer binary. Record the ICD, loader,
+layer, API, driver and conformance versions. Compare CPU and GPU captures
+within one driver because cross-driver CPU rasterization hashes are not an
+exactness oracle. Screen-space and canonical RGBA8 inputs must be fetched as
+integers and normalized explicitly in shaders rather than relying on
+driver-specific UNORM conversion.
+
 The final route must state which switches are part of the supported product
 configuration and leave investigation-only switches unset.
+
+## Performance promotion records
+
+Every default-path change requires a reduced, reviewable record containing:
+
+- shared and title revisions plus generated image/module hashes;
+- named route state, renderer, driver, scale, quality settings and input
+  fixture;
+- presentation bounds, repetition count, thermal state and observed variance;
+- complete-frame median, p95 and p99 plus affected CPU, backend and GPU
+  categories;
+- workload and transfer deltas;
+- logical and full-resolution correctness results; and
+- the resulting default, capability gate and diagnostic fallback.
+
+Name the guest state represented by each window. An opening movie, menu,
+cutscene and gameplay window are different workloads even when they belong to
+one deterministic route. Presentation numbers alone do not prove gameplay.
+Use expected frame manifests, workload counters or another explicit state
+checkpoint, and never publish movie or menu timing as gameplay timing.
+
+For paired forced-path runs, compare the same presentation indices and
+aggregate all host flips belonging to each guest presentation. In-run A/B
+halves are valid only when both halves exercise the same stable workload.
+Reduced transfer traffic alone does not justify promotion when complete-frame
+timing remains within variance.
+
+A performance-changing path can alter the number of guest vblanks reached at
+a fixed presentation. Turbo mode can drift by hundreds of vblanks, and even a
+paced pair can differ by one vblank at an animated checkpoint. If two captures
+land in different simulation states, their pixel delta is not
+path-correctness evidence. Require matching route/state counters or exact
+vblank checkpoints, and use live shader/oracle validation to establish
+transform or decode equality independently.
+
+If no path passes, publish the rejection and keep it opt-in. Do not advance a
+title runtime pin until its public build and affected protected routes pass
+against the exact shared revision; an uncommitted shared worktree is not a
+runtime pin candidate.
 
 ## Graphics evidence
 
@@ -178,6 +321,8 @@ Before moving a shared runtime commit into title projects:
 - [ ] Function catalog and exact-cache tests pass when reuse code is affected.
 - [ ] Consumer public tests and compile targets pass.
 - [ ] No unexpected dispatch misses, permissive returns, or module fallbacks.
+- [ ] Interpreter miss/profile reports pass the zero-or-reviewed policy gate.
+- [ ] Native samples agree with exclusive CPU timing when CPU work is affected.
 - [ ] Deterministic input and frame/call manifests pass.
 - [ ] Save, media, and filesystem routes pass when affected.
 - [ ] Performance thresholds and soak duration pass when affected.

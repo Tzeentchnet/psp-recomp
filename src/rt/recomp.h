@@ -170,7 +170,7 @@ void     sr_interpret_direct(CpuState *s, uint32_t target);
 void     sr_interpret_direct_module(
              CpuState *s, uint32_t target, const char *module);
 void     sr_interpret_entry(CpuState *s);
-int      sr_interp_profile_write(void);
+int      sr_interp_reports_write(void);
 void     dispatch(CpuState *s, uint32_t target);
 
 #if defined(__clang__)
@@ -310,6 +310,12 @@ typedef struct SrFramebufferStats {
     uint64_t texture_scale_us;
     uint64_t host_upload_bytes;
     uint64_t host_readback_bytes;
+    uint64_t framebuffer_upload_logical_bytes;
+    uint64_t framebuffer_upload_host_bytes;
+    uint64_t framebuffer_upload_expanded_pixels;
+    uint64_t framebuffer_uploads;
+    uint64_t framebuffer_upload_fallbacks;
+    uint64_t framebuffer_upload_sync_us;
 } SrFramebufferStats;
 int gui_framebuffer_stats(SrFramebufferStats *stats);
 int sr_kzl_patch_offline_menu(uint8_t *data, uint32_t size);

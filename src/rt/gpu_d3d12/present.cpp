@@ -340,6 +340,7 @@ bool ged3d12_present_capture_record(void) {
     destination.PlacedFootprint.Footprint.RowPitch = s_capture_row_pitch;
     command_list->CopyTextureRegion(
         &destination, 0, 0, 0, &source, nullptr);
+    ged3d12_record_readback_bytes(s_capture_bytes);
 
     transition(command_list, capture_source,
                D3D12_RESOURCE_STATE_COPY_SOURCE,

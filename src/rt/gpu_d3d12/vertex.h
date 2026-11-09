@@ -3,6 +3,7 @@
 #define GE_D3D12_VERTEX_H
 
 #include "../ge_shared.h"
+#include "../ge_tnl.h"
 #include "framebuffer.h"
 #include "pipeline.h"
 #include "shader_state.h"
@@ -28,6 +29,8 @@ enum GeD3D12Primitive : uint8_t {
 };
 
 #define GE_D3D12_BATCH_INDEXED 1u
+#define GE_D3D12_BATCH_GPU_TNL 2u
+#define GE_D3D12_BATCH_TNL_PREPROCESS 4u
 
 /* Indexed batches: `first`/`table_count` locate the vertex table, `index_first`/`count` the
  * 16-bit index list in the frame index buffer. Otherwise `first`/`count` are vertices. */
@@ -50,12 +53,27 @@ struct GeD3D12VertexBatch {
     GeD3D12ShaderConstants shader;
 };
 
+struct GeD3D12TnlJob {
+    uint32_t offsets[4];
+    uint32_t counts[4];
+};
+
 struct GeD3D12VertexFrame {
     D3D12_VERTEX_BUFFER_VIEW buffer;
     D3D12_GPU_VIRTUAL_ADDRESS index_base;
+    D3D12_GPU_VIRTUAL_ADDRESS tnl_vertex_base;
+    D3D12_GPU_VIRTUAL_ADDRESS tnl_state_base;
     const GeD3D12Vertex *vertices;
+    const GeTnlVertex *tnl_vertices;
+    const GeTnlGpuState *tnl_states;
+    const GeTnlState *tnl_reference_states;
+    const uint16_t *indices;
     const GeD3D12VertexBatch *batches;
     uint32_t vertex_count;
+    uint32_t tnl_vertex_count;
+    uint32_t tnl_state_count;
+    uint32_t tnl_screen_vertex_count;
+    uint32_t index_count;
     uint32_t batch_count;
     uint32_t primitive_count[GE_D3D12_PRIMITIVE_COUNT];
     uint64_t hash;
@@ -72,6 +90,7 @@ int ged3d12_vertex_capture_tri_list(
 int ged3d12_vertex_capture_tri_indexed(
     const GeVtx *table, uint32_t table_count,
     const uint16_t *indices, uint32_t index_count, int perspective);
+int ged3d12_vertex_capture_transform(const GeTnlDraw *draw);
 int ged3d12_vertex_capture_sprite(
     const GeVtx *p0, const GeVtx *p1, int perspective);
 int ged3d12_vertex_capture_line(
@@ -79,6 +98,10 @@ int ged3d12_vertex_capture_line(
 int ged3d12_vertex_capture_point(const GeVtx *a, int perspective);
 
 bool ged3d12_vertex_upload_pending(GeD3D12VertexFrame *out);
+bool ged3d12_vertex_tnl_job(
+    const GeD3D12VertexFrame *frame,
+    const GeD3D12VertexBatch *batch,
+    GeD3D12TnlJob *out);
 uint64_t ged3d12_vertex_hash(
     const GeD3D12Vertex *vertices, uint32_t count);
 void ged3d12_vertex_pending_counts(
@@ -95,6 +118,7 @@ static_assert(offsetof(GeD3D12Vertex, rw) == 12, "D3D12 GE position ABI changed"
 static_assert(offsetof(GeD3D12Vertex, u) == 16, "D3D12 GE texture ABI changed");
 static_assert(offsetof(GeD3D12Vertex, fog) == 24, "D3D12 GE fog ABI changed");
 static_assert(offsetof(GeD3D12Vertex, rgba) == 28, "D3D12 GE color ABI changed");
-static_assert(sizeof(GeD3D12VertexBatch) == 272, "D3D12 GE batch ABI changed");
+static_assert(sizeof(GeD3D12TnlJob) == 32, "D3D12 T&L job ABI changed");
+static_assert(sizeof(GeD3D12VertexBatch) == 288, "D3D12 GE batch ABI changed");
 
 #endif

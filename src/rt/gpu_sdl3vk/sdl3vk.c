@@ -754,6 +754,33 @@ int sdl3vk_init(const char *title) {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = dev_ext_count;
     dci.ppEnabledExtensionNames = dev_ext;
+    VkPhysicalDeviceFeatures enabled_features = {0};
+    const char *tnl_validation =
+        getenv("SR_GPU_TNL_VALIDATE");
+    if (tnl_validation && tnl_validation[0] &&
+        strcmp(tnl_validation, "0") != 0) {
+        const char *gpu_tnl = getenv("SR_GPU_TNL");
+        if (!gpu_tnl || !gpu_tnl[0] ||
+            strcmp(gpu_tnl, "0") == 0) {
+            fprintf(
+                stderr,
+                "sdl3vk: SR_GPU_TNL_VALIDATE requires "
+                "SR_GPU_TNL=1\n");
+            return 0;
+        }
+        VkPhysicalDeviceFeatures available_features;
+        vkGetPhysicalDeviceFeatures(
+            s_pdev, &available_features);
+        if (!available_features.vertexPipelineStoresAndAtomics) {
+            fprintf(
+                stderr,
+                "sdl3vk: SR_GPU_TNL_VALIDATE requires "
+                "vertexPipelineStoresAndAtomics\n");
+            return 0;
+        }
+        enabled_features.vertexPipelineStoresAndAtomics = VK_TRUE;
+        dci.pEnabledFeatures = &enabled_features;
+    }
     VK_TRY(vkCreateDevice(s_pdev, &dci, NULL, &s_dev));
     vkGetDeviceQueue(s_dev, s_qfam, 0, &s_queue);
     {

@@ -13,6 +13,9 @@ GAME_ELF   ?= eboot.elf
 GAME_BASE  ?= 0x08804000
 GAME_ENTRY ?= 0x08804000
 
+PLATFORM_FIBER_SRCS :=
+INTERP_FIBER_OBJS :=
+
 ifeq ($(OS),Windows_NT)
 HOST_WINDOWS := 1
 EXEEXT       := .exe
@@ -46,8 +49,10 @@ PLATFORM_RT_SRCS := $(filter-out src/rt/settings_portable.c src/rt/osk_posix.c,$
 PLATFORM_RT_SRCS += src/rt/macos_app.mm src/rt/settings_macos.mm \
                     src/rt/osk_macos.mm src/rt/h264_vt.c src/rt/h264_psmf.c
 ifeq ($(shell uname -m),arm64)
-PLATFORM_RT_SRCS += src/rt/fiber_arm64.S
-FIBER_ASM_SRCS := src/rt/fiber_arm64.S tools/tests/fiber_arm64_test.S
+PLATFORM_FIBER_SRCS := src/rt/fiber_arm64.S
+INTERP_FIBER_OBJS := build/tests/interp_fiber_arm64.o
+PLATFORM_RT_SRCS += $(PLATFORM_FIBER_SRCS)
+FIBER_ASM_SRCS := $(PLATFORM_FIBER_SRCS) tools/tests/fiber_arm64_test.S
 endif
 PLATFORM_LIBS += -framework VideoToolbox -framework CoreMedia \
                  -framework CoreVideo -framework CoreFoundation \
@@ -163,11 +168,12 @@ GLSLANG_VALIDATOR ?= glslangValidator
         shaders-d3d12 check-shaders-d3d12 \
         shaders-vulkan check-shaders-vulkan \
         test-d3d12-vertex test-dispatch-table test-fps-counter \
-        test-perf-stats test-ge-patch-math \
+        test-perf-stats test-ge-patch-math test-ge-tnl \
         test-input-config test-input-script test-settings-path \
         test-module-loader test-memstick-state \
         test-interpreter test-texture-scaler \
-        test-vulkan-shader-state test-h264-psmf test-h264-vt test-fiber \
+        test-vulkan-shader-state test-vulkan-tnl-validation \
+        test-h264-psmf test-h264-vt test-fiber \
         test-host-lifecycle test-audio-sdl-lifecycle test-runtime
 
 all: pipeline compile
@@ -195,7 +201,8 @@ $(BUILD_DIR)/$(GAME_NAME)_imports.toml: $(GAME_ELF) tools/imports.py tools/analy
 	$(PYTHON) tools/imports.py $(GAME_ELF) $(GAME_BASE) --toml=$@
 
 # ge.c is the software rasterizer fallback, compile with -O2
-$(RT_GE_O): src/rt/ge.c src/rt/ge_patch_math.h src/rt/recomp.h
+$(RT_GE_O): src/rt/ge.c src/rt/ge_patch_math.h src/rt/ge_tnl.h \
+            src/rt/ge_shared.h src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) -O2 -fno-math-errno -Wall -Wextra -Isrc/rt -c src/rt/ge.c -o $@
 
@@ -217,9 +224,13 @@ $(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h \
                src/rt/gpu_d3d12/vertex.h \
                src/rt/gpu_d3d12/texture.h \
                src/rt/graphics_config.h \
-               src/rt/gpu_d3d12/shaders/psp_vs.inc src/rt/gpu_d3d12/shaders/psp_ps.inc \
+               src/rt/gpu_d3d12/shaders/psp_vs.inc \
+               src/rt/gpu_d3d12/shaders/psp_vs_validation.inc \
+               src/rt/gpu_d3d12/shaders/psp_tnl_transform_cs.inc \
+               src/rt/gpu_d3d12/shaders/psp_tnl_triangles_cs.inc \
+               src/rt/gpu_d3d12/shaders/psp_ps.inc \
                src/rt/gpu_d3d12/shaders/psp_ps_direct.inc \
-               src/rt/ge_shared.h src/rt/recomp.h
+               src/rt/ge_tnl.h src/rt/ge_shared.h src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/device.cpp -o $@
 
@@ -240,7 +251,7 @@ $(RT_D3D12_FRAMEBUFFER_KEY_O): src/rt/gpu_d3d12/framebuffer_key.cpp \
 $(RT_D3D12_VERTEX_O): src/rt/gpu_d3d12/vertex.cpp src/rt/gpu_d3d12/vertex.h \
                       src/rt/gpu_d3d12/device.h src/rt/gpu_d3d12/pipeline.h \
                       src/rt/gpu_d3d12/texture.h \
-                      src/rt/ge_shared.h
+                      src/rt/ge_tnl.h src/rt/ge_shared.h
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/vertex.cpp -o $@
 
@@ -323,7 +334,8 @@ $(BUILD_DIR)/d3d12_vertex_test.exe: tools/tests/d3d12_vertex_test.cpp \
                                    src/rt/gpu_d3d12/pipeline.h \
                                    src/rt/gpu_d3d12/present.h \
                                    src/rt/gpu_d3d12/framebuffer.h \
-                                   src/rt/gpu_d3d12/device.h src/rt/ge_shared.h
+                                   src/rt/gpu_d3d12/device.h \
+                                   src/rt/ge_tnl.h src/rt/ge_shared.h
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) tools/tests/d3d12_vertex_test.cpp \
 		src/rt/gpu_d3d12/vertex.cpp src/rt/gpu_d3d12/pipeline_key.cpp \
@@ -358,6 +370,30 @@ test-vulkan-shader-state:
 		-o build/tests/vulkan_shader_state_test.exe
 	./build/tests/vulkan_shader_state_test.exe
 
+test-vulkan-tnl-validation: \
+		src/rt/gpu_sdl3vk/psp_tnl_validation_vert.inc \
+		src/rt/gpu_sdl3vk/psp_tnl_points_validation_vert.inc \
+		src/rt/gpu_sdl3vk/psp_tnl_sprites_validation_vert.inc \
+		src/rt/gpu_sdl3vk/psp_tnl_through_sprites_validation_vert.inc \
+		src/rt/gpu_sdl3vk/psp_tnl_transform_comp.inc \
+		src/rt/gpu_sdl3vk/psp_tnl_triangles_comp.inc \
+		src/rt/gpu_sdl3vk/psp_texture_decode_comp.inc
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt $(PLATFORM_CFLAGS) -Wall -Wextra \
+		-Wno-missing-field-initializers \
+		tools/tests/vulkan_tnl_validation_test.c \
+		-o build/tests/vulkan_tnl_validation_test.exe \
+		$(shell $(PKG_CONFIG) --libs vulkan 2>/dev/null) -lm
+	@if [ -f /opt/homebrew/lib/libVkLayer_khronos_validation.dylib ]; then \
+		DYLD_LIBRARY_PATH="/opt/homebrew/lib:$${DYLD_LIBRARY_PATH}" \
+			./build/tests/vulkan_tnl_validation_test.exe; \
+	elif [ -f /usr/local/lib/libVkLayer_khronos_validation.dylib ]; then \
+		DYLD_LIBRARY_PATH="/usr/local/lib:$${DYLD_LIBRARY_PATH}" \
+			./build/tests/vulkan_tnl_validation_test.exe; \
+	else \
+		./build/tests/vulkan_tnl_validation_test.exe; \
+	fi
+
 test-module-loader:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
@@ -383,6 +419,7 @@ test-perf-stats:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
 		tools/tests/perf_stats_test.c src/rt/perf_stats.c src/rt/platform.c \
+		$(PLATFORM_FIBER_SRCS) \
 		-o build/tests/perf_stats_test.exe
 	./build/tests/perf_stats_test.exe
 
@@ -392,6 +429,16 @@ test-ge-patch-math:
 		-Isrc/rt -Wall -Wextra tools/tests/ge_patch_math_test.c \
 		-o build/tests/ge_patch_math_test.exe -lm
 	./build/tests/ge_patch_math_test.exe
+
+test-ge-tnl:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt -Wall -Wextra \
+		tools/tests/ge_tnl_test.c -o build/tests/ge_tnl_test.exe -lm
+	./build/tests/ge_tnl_test.exe
+	$(CC) -std=c11 -O2 -ffp-contract=off -fno-strict-aliasing \
+		-Isrc/rt -Wall -Wextra tools/tests/ge_tnl_decode_test.c \
+		src/rt/ge.c -o build/tests/ge_tnl_decode_test.exe -lm
+	./build/tests/ge_tnl_decode_test.exe
 
 test-memstick-state:
 	@mkdir -p build/tests
@@ -403,8 +450,10 @@ test-memstick-state:
 test-input-config:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
+		-DSR_ENABLE_KZL_TWIN_STICK=1 \
 		tools/tests/input_config_test.c src/rt/input_config.c \
 		src/rt/settings_path.c src/rt/platform.c \
+		$(PLATFORM_FIBER_SRCS) \
 		-o build/tests/input_config_test.exe -lm
 	./build/tests/input_config_test.exe
 
@@ -420,7 +469,8 @@ test-settings-path:
 	$(CC) -std=c11 -O0 -Isrc/rt -Itools/tests -Wall -Wextra \
 		-DSR_APPLICATION_DATA_NAME=\"KZLRecomp\" \
 		tools/tests/settings_path_test.c src/rt/settings_path.c \
-		src/rt/platform.c -o build/tests/settings_path_test.exe
+		src/rt/platform.c $(PLATFORM_FIBER_SRCS) \
+		-o build/tests/settings_path_test.exe
 	./build/tests/settings_path_test.exe
 
 test-graphics-config:
@@ -429,10 +479,17 @@ test-graphics-config:
 		tools/tests/graphics_config_test.c src/rt/graphics_config.c \
 		src/rt/graphics_auto.c \
 		src/rt/settings_path.c src/rt/platform.c \
+		$(PLATFORM_FIBER_SRCS) \
 		-o build/tests/graphics_config_test.exe
 	./build/tests/graphics_config_test.exe
 
-test-interpreter:
+ifneq ($(strip $(PLATFORM_FIBER_SRCS)),)
+$(INTERP_FIBER_OBJS): $(PLATFORM_FIBER_SRCS)
+	@mkdir -p build/tests
+	$(CC) -c $< -o $@
+endif
+
+test-interpreter: $(INTERP_FIBER_OBJS)
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/recomp.c -o build/tests/interp_recomp.o
 	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/dispatch_table.c -o build/tests/interp_dispatch.o
@@ -454,7 +511,7 @@ test-interpreter:
 		build/tests/interp_vfpu.o build/tests/interp_vfpu_asin.o \
 		build/tests/interp_settings.o build/tests/interp_platform.o \
 		build/tests/interp_perf.o build/tests/interp_runtime.o \
-		build/tests/interp_ref.o -lm
+		build/tests/interp_ref.o $(INTERP_FIBER_OBJS) -lm
 	./build/tests/interp_fallback_test.exe
 
 test-texture-scaler:
@@ -521,7 +578,7 @@ test-host-lifecycle:
 	./build/tests/host_lifecycle_test
 
 test-runtime: test-dispatch-table test-fps-counter test-perf-stats test-h264-psmf \
-	test-ge-patch-math test-input-config test-input-script test-settings-path \
+	test-ge-patch-math test-ge-tnl test-input-config test-input-script test-settings-path \
 	test-graphics-config \
 	test-module-loader test-memstick-state test-interpreter \
 	test-texture-scaler test-vulkan-shader-state test-host-lifecycle
