@@ -31,6 +31,7 @@ int sr_file_remove(const char *path);
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <timeapi.h>
 #include <direct.h>
 #include <io.h>
 
