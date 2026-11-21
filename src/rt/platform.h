@@ -34,6 +34,7 @@ int sr_file_remove(const char *path);
 #include <timeapi.h>
 #include <direct.h>
 #include <io.h>
+#include <sys/stat.h>
 
 #else
 
