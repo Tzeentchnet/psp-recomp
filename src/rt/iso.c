@@ -5,11 +5,14 @@
  * (lba,size) extent, then serves bytes from there. Only the plain ISO9660 features a PSP UMD
  * uses are handled (8.3-ish names with ';1' version suffixes, directories, one extent each).
  *
- * The ISO path comes from the PSP_ISO environment variable.
+ * The ISO path comes from the PSP_ISO environment override or the persisted
+ * launcher selection.
  */
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "iso.h"
+#include "platform.h"
+#include "startup_check.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,9 +59,14 @@ static void detect_wrapper(void) {
 }
 
 int iso_init(void) {
+    char path[SR_PATH_MAX];
+    char error[512];
     if (s_iso) return 0;
-    const char *path = getenv("PSP_ISO");
-    if (!path) path = "game.iso";
+    if (!sr_startup_resolve_iso_path(
+            path, sizeof(path), error, sizeof(error))) {
+        fprintf(stderr, "iso: %s\n", error);
+        return -1;
+    }
     s_iso = fopen(path, "rb");
     if (!s_iso) { fprintf(stderr, "iso: cannot open %s\n", path); return -1; }
     detect_wrapper();

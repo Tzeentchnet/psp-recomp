@@ -8,6 +8,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,12 +44,30 @@ extern "C" {
 static const uint8_t k_psp_vs_dxil[] =
 #include "shaders/psp_vs.inc"
 ;
+static const uint8_t k_psp_vs_validation_dxil[] =
+#include "shaders/psp_vs_validation.inc"
+;
+static const uint8_t k_tnl_transform_cs_dxil[] =
+#include "shaders/psp_tnl_transform_cs.inc"
+;
+static const uint8_t k_tnl_triangles_cs_dxil[] =
+#include "shaders/psp_tnl_triangles_cs.inc"
+;
 static const uint8_t k_psp_ps_dxil[] =
 #include "shaders/psp_ps.inc"
 ;
 static const uint8_t k_psp_ps_direct_dxil[] =
 #include "shaders/psp_ps_direct.inc"
 ;
+
+enum GeD3D12TnlRootParameter : UINT {
+    GE_D3D12_TNL_ROOT_JOB = 0,
+    GE_D3D12_TNL_ROOT_VERTICES,
+    GE_D3D12_TNL_ROOT_INDICES,
+    GE_D3D12_TNL_ROOT_STATES,
+    GE_D3D12_TNL_ROOT_CLIP,
+    GE_D3D12_TNL_ROOT_SCREEN,
+};
 
 struct UploadSlab {
     ID3D12Resource *resource;
@@ -99,6 +118,9 @@ static ID3D12DescriptorHeap *s_sampler_heap;
 static ID3D12DescriptorHeap *s_rtv_heap;
 static ID3D12DescriptorHeap *s_dsv_heap;
 static ID3D12RootSignature *s_root_signature;
+static ID3D12RootSignature *s_tnl_compute_root_signature;
+static ID3D12PipelineState *s_tnl_transform_pipeline;
+static ID3D12PipelineState *s_tnl_triangles_pipeline;
 static UINT s_srv_stride;
 static UINT s_sampler_stride;
 static UINT s_rtv_stride;
@@ -124,6 +146,22 @@ static D3D12_SHADING_RATE s_current_shading_rate =
 
 static ID3D12Resource *s_upload;
 static uint8_t *s_upload_map;
+static uint64_t s_host_upload_bytes;
+static uint64_t s_host_readback_bytes;
+static ID3D12Resource *s_tnl_validation_output;
+static ID3D12Resource *s_tnl_validation_readback;
+static UINT s_tnl_validation_capacity;
+static ID3D12Resource *s_tnl_clip_output;
+static ID3D12Resource *s_tnl_screen_output;
+static ID3D12Resource *s_tnl_clip_readback;
+static ID3D12Resource *s_tnl_screen_readback;
+static UINT s_tnl_clip_capacity;
+static UINT s_tnl_screen_capacity;
+static D3D12_RESOURCE_STATES s_tnl_screen_state =
+    D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+static int s_tnl_validation_enabled;
+static uint64_t s_tnl_validation_vertices;
+static uint64_t s_tnl_preprocess_validation_vertices;
 
 static uint32_t s_buttons;
 static uint8_t s_lx = 128, s_ly = 128;
@@ -303,6 +341,184 @@ static int wait_queue_idle(ID3D12CommandQueue *queue, ID3D12Fence *fence,
     return wait_for_fence(fence, value, event_handle, operation);
 }
 
+static int create_tnl_validation_resources(UINT capacity) {
+    if (!capacity)
+        capacity = 1;
+    ID3D12Resource *output = nullptr;
+    ID3D12Resource *readback = nullptr;
+    const UINT64 size =
+        (UINT64)capacity * sizeof(GeTnlValidationVertex);
+    D3D12_RESOURCE_DESC resource = {};
+    resource.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    resource.Width = size;
+    resource.Height = 1;
+    resource.DepthOrArraySize = 1;
+    resource.MipLevels = 1;
+    resource.SampleDesc.Count = 1;
+    resource.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    resource.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+    if (!check_hr(s_device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &resource,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&output)),
+            "create GPU T&L validation output")) {
+        return 0;
+    }
+
+    resource.Flags = D3D12_RESOURCE_FLAG_NONE;
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    if (!check_hr(s_device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &resource,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&readback)),
+            "create GPU T&L validation readback")) {
+        RELEASE_COM(output);
+        return 0;
+    }
+
+    RELEASE_COM(s_tnl_validation_output);
+    RELEASE_COM(s_tnl_validation_readback);
+    s_tnl_validation_output = output;
+    s_tnl_validation_readback = readback;
+    s_tnl_validation_capacity = capacity;
+    return 1;
+}
+
+static int ensure_tnl_validation_capacity(UINT required) {
+    if (required <= s_tnl_validation_capacity)
+        return 1;
+    UINT capacity = s_tnl_validation_capacity;
+    if (capacity < 4096u)
+        capacity = 4096u;
+    while (capacity < required) {
+        if (capacity > UINT32_MAX / 2u) {
+            capacity = required;
+            break;
+        }
+        capacity *= 2u;
+    }
+    if (!wait_queue_idle(
+            s_graphics_queue, s_graphics_fence,
+            &s_next_graphics_fence, s_graphics_event,
+            "wait to grow GPU T&L validation buffers")) {
+        return 0;
+    }
+    return create_tnl_validation_resources(capacity);
+}
+
+static int create_tnl_buffer(
+    UINT64 size, D3D12_HEAP_TYPE heap_type,
+    D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state,
+    const char *operation, ID3D12Resource **out) {
+    D3D12_RESOURCE_DESC resource = {};
+    resource.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    resource.Width = size;
+    resource.Height = 1;
+    resource.DepthOrArraySize = 1;
+    resource.MipLevels = 1;
+    resource.SampleDesc.Count = 1;
+    resource.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    resource.Flags = flags;
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = heap_type;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+    return check_hr(s_device->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &resource, state, nullptr,
+        IID_PPV_ARGS(out)), operation);
+}
+
+static int create_tnl_preprocess_resources(
+    UINT clip_capacity, UINT screen_capacity) {
+    if (!clip_capacity) clip_capacity = 1;
+    if (!screen_capacity) screen_capacity = 1;
+    ID3D12Resource *clip = nullptr;
+    ID3D12Resource *screen = nullptr;
+    ID3D12Resource *clip_readback = nullptr;
+    ID3D12Resource *screen_readback = nullptr;
+    if (!create_tnl_buffer(
+            (UINT64)clip_capacity * sizeof(GeTnlClipVertex),
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            "create GPU T&L clip output", &clip) ||
+        !create_tnl_buffer(
+            (UINT64)screen_capacity * sizeof(GeTnlScreenVertex),
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            "create GPU T&L screen output", &screen)) {
+        RELEASE_COM(clip);
+        RELEASE_COM(screen);
+        return 0;
+    }
+    if (s_tnl_validation_enabled &&
+        (!create_tnl_buffer(
+             (UINT64)clip_capacity * sizeof(GeTnlClipVertex),
+             D3D12_HEAP_TYPE_READBACK,
+             D3D12_RESOURCE_FLAG_NONE,
+             D3D12_RESOURCE_STATE_COPY_DEST,
+             "create GPU T&L clip readback", &clip_readback) ||
+         !create_tnl_buffer(
+             (UINT64)screen_capacity * sizeof(GeTnlScreenVertex),
+             D3D12_HEAP_TYPE_READBACK,
+             D3D12_RESOURCE_FLAG_NONE,
+             D3D12_RESOURCE_STATE_COPY_DEST,
+             "create GPU T&L screen readback", &screen_readback))) {
+        RELEASE_COM(clip);
+        RELEASE_COM(screen);
+        RELEASE_COM(clip_readback);
+        RELEASE_COM(screen_readback);
+        return 0;
+    }
+
+    RELEASE_COM(s_tnl_clip_output);
+    RELEASE_COM(s_tnl_screen_output);
+    RELEASE_COM(s_tnl_clip_readback);
+    RELEASE_COM(s_tnl_screen_readback);
+    s_tnl_clip_output = clip;
+    s_tnl_screen_output = screen;
+    s_tnl_clip_readback = clip_readback;
+    s_tnl_screen_readback = screen_readback;
+    s_tnl_clip_capacity = clip_capacity;
+    s_tnl_screen_capacity = screen_capacity;
+    s_tnl_screen_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    return 1;
+}
+
+static UINT grow_tnl_capacity(UINT capacity, UINT required) {
+    if (capacity < 4096u) capacity = 4096u;
+    while (capacity < required) {
+        if (capacity > UINT32_MAX / 2u) return required;
+        capacity *= 2u;
+    }
+    return capacity;
+}
+
+static int ensure_tnl_preprocess_capacity(
+    UINT clip_required, UINT screen_required) {
+    if (clip_required <= s_tnl_clip_capacity &&
+        screen_required <= s_tnl_screen_capacity) {
+        return 1;
+    }
+    UINT clip_capacity =
+        grow_tnl_capacity(s_tnl_clip_capacity, clip_required);
+    UINT screen_capacity =
+        grow_tnl_capacity(s_tnl_screen_capacity, screen_required);
+    if (!wait_queue_idle(
+            s_graphics_queue, s_graphics_fence,
+            &s_next_graphics_fence, s_graphics_event,
+            "wait to grow GPU T&L preprocess buffers")) {
+        return 0;
+    }
+    return create_tnl_preprocess_resources(
+        clip_capacity, screen_capacity);
+}
+
 static void release_upload_overflow(FrameContext *frame) {
     for (UINT i = 0; i < frame->upload_overflow_count; i++) {
         UploadSlab *slab = &frame->upload_overflow[i];
@@ -346,6 +562,17 @@ static void release_device(void) {
     }
     s_upload_map = nullptr;
     RELEASE_COM(s_upload);
+    RELEASE_COM(s_tnl_validation_output);
+    RELEASE_COM(s_tnl_validation_readback);
+    s_tnl_validation_capacity = 0;
+    RELEASE_COM(s_tnl_clip_output);
+    RELEASE_COM(s_tnl_screen_output);
+    RELEASE_COM(s_tnl_clip_readback);
+    RELEASE_COM(s_tnl_screen_readback);
+    s_tnl_clip_capacity = 0;
+    s_tnl_screen_capacity = 0;
+    s_tnl_screen_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    s_tnl_validation_enabled = 0;
 
     for (UINT i = 0; i < FRAME_COUNT; i++) {
         release_upload_overflow(&s_frames[i]);
@@ -356,6 +583,9 @@ static void release_device(void) {
     RELEASE_COM(s_command_list5);
     RELEASE_COM(s_command_list);
     RELEASE_COM(s_swapchain);
+    RELEASE_COM(s_tnl_transform_pipeline);
+    RELEASE_COM(s_tnl_triangles_pipeline);
+    RELEASE_COM(s_tnl_compute_root_signature);
     RELEASE_COM(s_root_signature);
     RELEASE_COM(s_srv_heap);
     RELEASE_COM(s_sampler_heap);
@@ -607,7 +837,7 @@ static int create_root_signature(void) {
     ranges[2].OffsetInDescriptorsFromTableStart =
         D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER parameters[5] = {};
+    D3D12_ROOT_PARAMETER parameters[7] = {};
     parameters[GE_D3D12_ROOT_GE_STATE].ParameterType =
         D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[GE_D3D12_ROOT_GE_STATE].Constants.ShaderRegister = 0;
@@ -615,7 +845,7 @@ static int create_root_signature(void) {
     parameters[GE_D3D12_ROOT_GE_STATE].Constants.Num32BitValues =
         GE_D3D12_SHADER_CONSTANT_DWORDS;
     parameters[GE_D3D12_ROOT_GE_STATE].ShaderVisibility =
-        D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_SHADER_VISIBILITY_ALL;
     parameters[GE_D3D12_ROOT_TEXTURES].ParameterType =
         D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[GE_D3D12_ROOT_TEXTURES].DescriptorTable.NumDescriptorRanges = 1;
@@ -641,6 +871,20 @@ static int create_root_signature(void) {
     parameters[GE_D3D12_ROOT_VERTICES].Descriptor.ShaderRegister = 0;
     parameters[GE_D3D12_ROOT_VERTICES].Descriptor.RegisterSpace = 1;
     parameters[GE_D3D12_ROOT_VERTICES].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[GE_D3D12_ROOT_TNL_STATES].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[GE_D3D12_ROOT_TNL_STATES].Descriptor.ShaderRegister = 1;
+    parameters[GE_D3D12_ROOT_TNL_STATES].Descriptor.RegisterSpace = 1;
+    parameters[GE_D3D12_ROOT_TNL_STATES].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[GE_D3D12_ROOT_TNL_VALIDATION].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[GE_D3D12_ROOT_TNL_VALIDATION]
+        .Descriptor.ShaderRegister = 0;
+    parameters[GE_D3D12_ROOT_TNL_VALIDATION]
+        .Descriptor.RegisterSpace = 1;
+    parameters[GE_D3D12_ROOT_TNL_VALIDATION].ShaderVisibility =
         D3D12_SHADER_VISIBILITY_VERTEX;
 
     D3D12_STATIC_SAMPLER_DESC static_samplers[2] = {};
@@ -693,6 +937,81 @@ static int create_root_signature(void) {
         IID_PPV_ARGS(&s_root_signature));
     RELEASE_COM(serialized);
     return check_hr(create_hr, "create GE root signature");
+}
+
+static int create_tnl_compute_pipeline(void) {
+    D3D12_ROOT_PARAMETER parameters[6] = {};
+    parameters[GE_D3D12_TNL_ROOT_JOB].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[GE_D3D12_TNL_ROOT_JOB].Constants.ShaderRegister = 0;
+    parameters[GE_D3D12_TNL_ROOT_JOB].Constants.Num32BitValues =
+        sizeof(GeD3D12TnlJob) / sizeof(uint32_t);
+    for (UINT i = GE_D3D12_TNL_ROOT_VERTICES;
+         i <= GE_D3D12_TNL_ROOT_STATES; i++) {
+        parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        parameters[i].Descriptor.ShaderRegister =
+            i - GE_D3D12_TNL_ROOT_VERTICES;
+    }
+    for (UINT i = GE_D3D12_TNL_ROOT_CLIP;
+         i <= GE_D3D12_TNL_ROOT_SCREEN; i++) {
+        parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        parameters[i].Descriptor.ShaderRegister =
+            i - GE_D3D12_TNL_ROOT_CLIP;
+    }
+    for (UINT i = 0; i < 6; i++)
+        parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC root = {};
+    root.NumParameters =
+        (UINT)(sizeof(parameters) / sizeof(parameters[0]));
+    root.pParameters = parameters;
+    root.Flags =
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
+    ID3DBlob *serialized = nullptr;
+    ID3DBlob *errors = nullptr;
+    HRESULT serialize_hr = D3D12SerializeRootSignature(
+        &root, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+    if (errors && errors->GetBufferSize()) {
+        fwrite(
+            errors->GetBufferPointer(), 1,
+            errors->GetBufferSize(), stderr);
+        fputc('\n', stderr);
+    }
+    RELEASE_COM(errors);
+    if (!check_hr(
+            serialize_hr, "serialize GPU T&L compute root signature")) {
+        RELEASE_COM(serialized);
+        return 0;
+    }
+    HRESULT create_hr = s_device->CreateRootSignature(
+        0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+        IID_PPV_ARGS(&s_tnl_compute_root_signature));
+    RELEASE_COM(serialized);
+    if (!check_hr(
+            create_hr, "create GPU T&L compute root signature")) {
+        return 0;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {};
+    pipeline.pRootSignature = s_tnl_compute_root_signature;
+    pipeline.CS = {
+        k_tnl_transform_cs_dxil, sizeof(k_tnl_transform_cs_dxil),
+    };
+    if (!check_hr(s_device->CreateComputePipelineState(
+            &pipeline, IID_PPV_ARGS(&s_tnl_transform_pipeline)),
+            "create GPU T&L transform pipeline")) {
+        return 0;
+    }
+    pipeline.CS = {
+        k_tnl_triangles_cs_dxil, sizeof(k_tnl_triangles_cs_dxil),
+    };
+    return check_hr(s_device->CreateComputePipelineState(
+        &pipeline, IID_PPV_ARGS(&s_tnl_triangles_pipeline)),
+        "create GPU T&L triangles pipeline");
 }
 
 static int create_frame_resources(void) {
@@ -985,6 +1304,9 @@ static int bind_default_root_state(void) {
         GE_D3D12_ROOT_SAMPLER, sampler.gpu);
     s_command_list->SetGraphicsRootDescriptorTable(
         GE_D3D12_ROOT_DESTINATION, destination.gpu);
+    s_command_list->SetGraphicsRootUnorderedAccessView(
+        GE_D3D12_ROOT_TNL_VALIDATION,
+        s_tnl_validation_output->GetGPUVirtualAddress());
     return 1;
 }
 
@@ -999,6 +1321,20 @@ static int device_init(void) {
         fprintf(stderr, "ged3d12: device already initialized\n");
         return 0;
     }
+    s_host_upload_bytes = 0;
+    s_host_readback_bytes = 0;
+    s_tnl_validation_enabled =
+        env_enabled("SR_GPU_TNL_VALIDATE");
+    if (s_tnl_validation_enabled &&
+        !env_enabled("SR_GPU_TNL")) {
+        fprintf(
+            stderr,
+            "ged3d12: SR_GPU_TNL_VALIDATE requires "
+            "SR_GPU_TNL=1\n");
+        return 0;
+    }
+    s_tnl_validation_vertices = 0;
+    s_tnl_preprocess_validation_vertices = 0;
     if (!sr_graphics_config_init()) {
         fprintf(stderr, "ged3d12: graphics configuration failed\n");
         return 0;
@@ -1028,8 +1364,12 @@ static int device_init(void) {
     DXGI_ADAPTER_DESC1 adapter_desc = {};
     int ok = choose_adapter(factory, &adapter_desc) &&
              create_queues_and_fences() &&
+             create_tnl_validation_resources(
+                 s_tnl_validation_enabled ? 4096u : 1u) &&
+             create_tnl_preprocess_resources(4096u, 4096u) &&
              create_descriptor_heaps() &&
              create_root_signature() &&
+             create_tnl_compute_pipeline() &&
              create_frame_resources() &&
              create_swapchain(factory) &&
              ged3d12_present_init();
@@ -1038,6 +1378,10 @@ static int device_init(void) {
         release_device();
         return 0;
     }
+    if (s_tnl_validation_enabled)
+        fprintf(
+            stderr,
+            "ged3d12: GPU T&L shader-output validation enabled\n");
     configure_variable_rate_shading();
     if (!ged3d12_vertex_capture_init()) {
         release_device();
@@ -1181,6 +1525,7 @@ bool ged3d12_upload_alloc(UINT64 size, UINT64 alignment, GeD3D12UploadSlice *out
         out->gpu = s_upload->GetGPUVirtualAddress() + offset;
         out->offset = offset;
         out->size = size;
+        s_host_upload_bytes += size;
         return true;
     }
 
@@ -1245,7 +1590,12 @@ bool ged3d12_upload_alloc(UINT64 size, UINT64 alignment, GeD3D12UploadSlice *out
     out->gpu = slab->resource->GetGPUVirtualAddress() + offset;
     out->offset = offset;
     out->size = size;
+    s_host_upload_bytes += size;
     return true;
+}
+
+void ged3d12_record_readback_bytes(uint64_t bytes) {
+    s_host_readback_bytes += bytes;
 }
 
 bool ged3d12_srv_alloc(UINT count, GeD3D12DescriptorSlice *out) {
@@ -1479,7 +1829,9 @@ static void log_draw_batches(
 static bool can_merge_direct(
     const GeD3D12VertexBatch *first, const GeD3D12VertexBatch *next,
     uint32_t accumulated) {
-    return !(next->flags & GE_D3D12_BATCH_INDEXED) &&
+    return !(first->flags & GE_D3D12_BATCH_GPU_TNL) &&
+           !(next->flags & (GE_D3D12_BATCH_INDEXED |
+                            GE_D3D12_BATCH_GPU_TNL)) &&
            same_list(first, next) &&
            next->first == first->first + accumulated &&
            next->primitive == first->primitive &&
@@ -1491,12 +1843,106 @@ static bool can_merge_direct(
            memcmp(&next->texture, &first->texture, sizeof(first->texture)) == 0;
 }
 
+static bool record_tnl_preprocess(
+    const GeD3D12VertexFrame *frame) {
+    if (!frame->tnl_screen_vertex_count)
+        return true;
+    if (!frame->tnl_vertex_base || !frame->index_base ||
+        !frame->tnl_state_base || !s_tnl_clip_output ||
+        !s_tnl_screen_output ||
+        frame->tnl_vertex_count > s_tnl_clip_capacity ||
+        frame->tnl_screen_vertex_count > s_tnl_screen_capacity) {
+        fprintf(
+            stderr,
+            "ged3d12: incomplete GPU T&L preprocess resources\n");
+        return false;
+    }
+
+    if (s_tnl_screen_state !=
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = s_tnl_screen_output;
+        barrier.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = s_tnl_screen_state;
+        barrier.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        s_command_list->ResourceBarrier(1, &barrier);
+        s_tnl_screen_state =
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+
+    s_command_list->SetComputeRootSignature(
+        s_tnl_compute_root_signature);
+    s_command_list->SetComputeRootShaderResourceView(
+        GE_D3D12_TNL_ROOT_VERTICES, frame->tnl_vertex_base);
+    s_command_list->SetComputeRootShaderResourceView(
+        GE_D3D12_TNL_ROOT_INDICES, frame->index_base);
+    s_command_list->SetComputeRootShaderResourceView(
+        GE_D3D12_TNL_ROOT_STATES, frame->tnl_state_base);
+    s_command_list->SetComputeRootUnorderedAccessView(
+        GE_D3D12_TNL_ROOT_CLIP,
+        s_tnl_clip_output->GetGPUVirtualAddress());
+    s_command_list->SetComputeRootUnorderedAccessView(
+        GE_D3D12_TNL_ROOT_SCREEN,
+        s_tnl_screen_output->GetGPUVirtualAddress());
+
+    for (UINT i = 0; i < frame->batch_count; i++) {
+        const GeD3D12VertexBatch *batch = &frame->batches[i];
+        if (!(batch->flags & GE_D3D12_BATCH_TNL_PREPROCESS))
+            continue;
+        GeD3D12TnlJob job = {};
+        if (!ged3d12_vertex_tnl_job(frame, batch, &job)) {
+            fprintf(
+                stderr,
+                "ged3d12: invalid GPU T&L preprocess batch %u\n", i);
+            return false;
+        }
+        s_command_list->SetComputeRoot32BitConstants(
+            GE_D3D12_TNL_ROOT_JOB,
+            sizeof(job) / sizeof(uint32_t), &job, 0);
+        s_command_list->SetPipelineState(
+            s_tnl_transform_pipeline);
+        s_command_list->Dispatch(
+            (job.counts[0] + 63u) / 64u, 1, 1);
+
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource = s_tnl_clip_output;
+        s_command_list->ResourceBarrier(1, &barrier);
+
+        s_command_list->SetPipelineState(
+            s_tnl_triangles_pipeline);
+        s_command_list->Dispatch(
+            (job.counts[1] + 63u) / 64u, 1, 1);
+    }
+
+    D3D12_RESOURCE_BARRIER barriers[3] = {};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barriers[0].UAV.pResource = s_tnl_clip_output;
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barriers[1].UAV.pResource = s_tnl_screen_output;
+    barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[2].Transition.pResource = s_tnl_screen_output;
+    barriers[2].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[2].Transition.StateBefore =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barriers[2].Transition.StateAfter =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    s_command_list->ResourceBarrier(3, barriers);
+    s_tnl_screen_state =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    return true;
+}
+
 static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
     const GeD3D12VertexBatch *open_list = nullptr;
     const GeD3D12VertexBatch *open_draw = nullptr;
     GeD3D12ShaderConstantCache constant_cache = {};
     bool ok = true;
-    if (frame->vertex_count) {
+    if (frame->batch_count) {
         s_command_list->IASetPrimitiveTopology(
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     }
@@ -1524,13 +1970,20 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
                 batch->draw_serial, batch->draw_pc, batch->draw_op);
             pix_begin_event(label);
             open_draw = batch;
-            if (gpu_log_active(s_vertex_frames + 1))
+            if (gpu_log_active(s_vertex_frames + 1) &&
+                !(batch->flags & GE_D3D12_BATCH_GPU_TNL))
                 log_draw_batches(frame, i);
         }
         bool exact_pipeline = false;
         bool direct_requested =
             (((uint32_t)batch->shader.config[0] >> 8) &
              GE_D3D12_SHADER_DIRECT) != 0;
+        bool gpu_tnl =
+            (batch->flags & GE_D3D12_BATCH_GPU_TNL) != 0;
+        bool preprocess =
+            (batch->flags &
+             GE_D3D12_BATCH_TNL_PREPROCESS) != 0;
+        bool canonical_tnl = gpu_tnl && !preprocess;
         bool direct = false;
         if (!ged3d12_pipeline_bind(
                 &batch->pipeline, &exact_pipeline) ||
@@ -1546,13 +1999,17 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
             ok = false;
             break;
         }
-        GeD3D12ShaderConstants fallback_shader;
+        GeD3D12ShaderConstants adjusted_shader;
         const GeD3D12ShaderConstants *shader = &batch->shader;
-        if (direct_requested && !direct) {
-            fallback_shader = batch->shader;
-            fallback_shader.config[0] &=
-                ~(int32_t)(GE_D3D12_SHADER_DIRECT << 8);
-            shader = &fallback_shader;
+        if ((direct_requested && !direct) ||
+            (s_tnl_validation_enabled && canonical_tnl)) {
+            adjusted_shader = batch->shader;
+            if (direct_requested && !direct)
+                adjusted_shader.config[0] &=
+                    ~(int32_t)(GE_D3D12_SHADER_DIRECT << 8);
+            if (s_tnl_validation_enabled && canonical_tnl)
+                adjusted_shader.tnl[2] = 1u;
+            shader = &adjusted_shader;
         }
         if (ged3d12_shader_constants_bind(
                 &constant_cache, shader)) {
@@ -1584,10 +2041,22 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
                 s_merged_batches++;
             }
         }
+        D3D12_GPU_VIRTUAL_ADDRESS vertex_base =
+            preprocess
+                ? s_tnl_screen_output->GetGPUVirtualAddress()
+                : canonical_tnl
+                    ? frame->tnl_vertex_base
+                    : frame->buffer.BufferLocation;
+        UINT64 vertex_stride =
+            canonical_tnl
+                ? sizeof(GeTnlVertex)
+                : sizeof(GeD3D12Vertex);
         s_command_list->SetGraphicsRootShaderResourceView(
             GE_D3D12_ROOT_VERTICES,
-            frame->buffer.BufferLocation +
-                (UINT64)batch->first * sizeof(GeD3D12Vertex));
+            vertex_base + (UINT64)batch->first * vertex_stride);
+        s_command_list->SetGraphicsRootShaderResourceView(
+            GE_D3D12_ROOT_TNL_STATES,
+            gpu_tnl ? frame->tnl_state_base : vertex_base);
         if (batch->flags & GE_D3D12_BATCH_INDEXED) {
             D3D12_INDEX_BUFFER_VIEW index_view = {};
             index_view.BufferLocation = frame->index_base +
@@ -1611,6 +2080,403 @@ static bool record_vertex_batches(const GeD3D12VertexFrame *frame) {
     if (open_draw) pix_end_event();
     if (open_list) pix_end_event();
     return ok;
+}
+
+static void record_tnl_validation_readback(
+    const GeD3D12VertexFrame *frame) {
+    if (!s_tnl_validation_enabled || !frame->tnl_vertex_count)
+        return;
+    bool direct_pending = false;
+    for (UINT i = 0; i < frame->batch_count; i++) {
+        uint16_t flags = frame->batches[i].flags;
+        if ((flags & GE_D3D12_BATCH_GPU_TNL) &&
+            !(flags & GE_D3D12_BATCH_TNL_PREPROCESS)) {
+            direct_pending = true;
+            break;
+        }
+    }
+    if (direct_pending) {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource = s_tnl_validation_output;
+        s_command_list->ResourceBarrier(1, &barrier);
+
+        barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = s_tnl_validation_output;
+        barrier.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore =
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_COPY_SOURCE;
+        s_command_list->ResourceBarrier(1, &barrier);
+
+        UINT64 size =
+            (UINT64)frame->tnl_vertex_count *
+            sizeof(GeTnlValidationVertex);
+        s_command_list->CopyBufferRegion(
+            s_tnl_validation_readback, 0,
+            s_tnl_validation_output, 0, size);
+
+        D3D12_RESOURCE_STATES previous =
+            barrier.Transition.StateBefore;
+        barrier.Transition.StateBefore =
+            barrier.Transition.StateAfter;
+        barrier.Transition.StateAfter = previous;
+        s_command_list->ResourceBarrier(1, &barrier);
+        s_host_readback_bytes += size;
+    }
+    if (!frame->tnl_screen_vertex_count)
+        return;
+
+    D3D12_RESOURCE_BARRIER clip_barriers[2] = {};
+    clip_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    clip_barriers[0].UAV.pResource = s_tnl_clip_output;
+    clip_barriers[1].Type =
+        D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    clip_barriers[1].Transition.pResource = s_tnl_clip_output;
+    clip_barriers[1].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    clip_barriers[1].Transition.StateBefore =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    clip_barriers[1].Transition.StateAfter =
+        D3D12_RESOURCE_STATE_COPY_SOURCE;
+    s_command_list->ResourceBarrier(2, clip_barriers);
+    UINT64 clip_size =
+        (UINT64)frame->tnl_vertex_count *
+        sizeof(GeTnlClipVertex);
+    s_command_list->CopyBufferRegion(
+        s_tnl_clip_readback, 0,
+        s_tnl_clip_output, 0, clip_size);
+    D3D12_RESOURCE_STATES previous =
+        clip_barriers[1].Transition.StateBefore;
+    clip_barriers[1].Transition.StateBefore =
+        clip_barriers[1].Transition.StateAfter;
+    clip_barriers[1].Transition.StateAfter = previous;
+    s_command_list->ResourceBarrier(1, &clip_barriers[1]);
+
+    D3D12_RESOURCE_BARRIER screen_barrier = {};
+    screen_barrier.Type =
+        D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    screen_barrier.Transition.pResource = s_tnl_screen_output;
+    screen_barrier.Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    screen_barrier.Transition.StateBefore = s_tnl_screen_state;
+    screen_barrier.Transition.StateAfter =
+        D3D12_RESOURCE_STATE_COPY_SOURCE;
+    s_command_list->ResourceBarrier(1, &screen_barrier);
+    UINT64 screen_size =
+        (UINT64)frame->tnl_screen_vertex_count *
+        sizeof(GeTnlScreenVertex);
+    s_command_list->CopyBufferRegion(
+        s_tnl_screen_readback, 0,
+        s_tnl_screen_output, 0, screen_size);
+    previous = screen_barrier.Transition.StateBefore;
+    screen_barrier.Transition.StateBefore =
+        screen_barrier.Transition.StateAfter;
+    screen_barrier.Transition.StateAfter = previous;
+    s_command_list->ResourceBarrier(1, &screen_barrier);
+    s_host_readback_bytes += clip_size + screen_size;
+}
+
+static bool tnl_preprocess_float_matches(
+    float expected, float actual) {
+    return expected == actual ||
+        (isfinite(expected) && isfinite(actual) &&
+         fabsf(expected - actual) <= 2e-5f);
+}
+
+static bool validate_tnl_preprocess_readback(
+    const GeD3D12VertexFrame *frame) {
+    if (!frame->tnl_screen_vertex_count)
+        return true;
+    if (!frame->tnl_reference_states ||
+        !s_tnl_clip_readback || !s_tnl_screen_readback) {
+        fprintf(
+            stderr,
+            "ged3d12: GPU T&L preprocess validation sources missing\n");
+        return false;
+    }
+
+    D3D12_RANGE clip_range = {
+        0,
+        (SIZE_T)frame->tnl_vertex_count *
+            sizeof(GeTnlClipVertex),
+    };
+    D3D12_RANGE screen_range = {
+        0,
+        (SIZE_T)frame->tnl_screen_vertex_count *
+            sizeof(GeTnlScreenVertex),
+    };
+    GeTnlClipVertex *actual_clip = nullptr;
+    GeTnlScreenVertex *actual_screen = nullptr;
+    if (!check_hr(s_tnl_clip_readback->Map(
+            0, &clip_range,
+            reinterpret_cast<void **>(&actual_clip)),
+            "map GPU T&L clip readback")) {
+        return false;
+    }
+    if (!check_hr(s_tnl_screen_readback->Map(
+            0, &screen_range,
+            reinterpret_cast<void **>(&actual_screen)),
+            "map GPU T&L screen readback")) {
+        D3D12_RANGE written = {0, 0};
+        s_tnl_clip_readback->Unmap(0, &written);
+        return false;
+    }
+
+    bool valid = true;
+    for (UINT batch_index = 0;
+         batch_index < frame->batch_count && valid;
+         batch_index++) {
+        const GeD3D12VertexBatch *batch =
+            &frame->batches[batch_index];
+        if (!(batch->flags &
+              GE_D3D12_BATCH_TNL_PREPROCESS)) {
+            continue;
+        }
+        GeD3D12TnlJob job = {};
+        if (!ged3d12_vertex_tnl_job(frame, batch, &job)) {
+            fprintf(
+                stderr,
+                "ged3d12: invalid GPU T&L preprocess validation "
+                "range (batch=%u)\n",
+                batch_index);
+            valid = false;
+            break;
+        }
+        const GeTnlState *state =
+            &frame->tnl_reference_states[job.offsets[2]];
+        for (uint32_t i = 0; i < job.counts[0] && valid; i++) {
+            uint32_t vertex_index = job.offsets[0] + i;
+            GeTnlClipVertex expected = {};
+            if (!ge_tnl_reference_clip_transform(
+                    state, &frame->tnl_vertices[vertex_index],
+                    &expected)) {
+                fprintf(
+                    stderr,
+                    "ged3d12: GPU T&L clip reference rejected "
+                    "batch=%u vertex=%u\n",
+                    batch_index, vertex_index);
+                valid = false;
+                break;
+            }
+            for (uint32_t component = 0; component < 4; component++) {
+                if (!tnl_preprocess_float_matches(
+                        expected.clip[component],
+                        actual_clip[vertex_index].clip[component]) ||
+                    !tnl_preprocess_float_matches(
+                        expected.uv_fog[component],
+                        actual_clip[vertex_index].uv_fog[component]) ||
+                    expected.color[component] !=
+                        actual_clip[vertex_index].color[component]) {
+                    fprintf(
+                        stderr,
+                        "ged3d12: GPU T&L clip validation mismatch "
+                        "batch=%u vertex=%u component=%u\n",
+                        batch_index, vertex_index, component);
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        for (uint32_t triangle = 0;
+             triangle < job.counts[1] && valid; triangle++) {
+            GeTnlClipVertex input[3] = {};
+            for (uint32_t i = 0; i < 3; i++) {
+                uint32_t index =
+                    job.offsets[1] + triangle * 3u + i;
+                uint32_t local_vertex = frame->indices[index];
+                if (local_vertex >= job.counts[0] ||
+                    !ge_tnl_reference_clip_transform(
+                        state,
+                        &frame->tnl_vertices[
+                            job.offsets[0] + local_vertex],
+                        &input[i])) {
+                    fprintf(
+                        stderr,
+                        "ged3d12: GPU T&L triangle reference "
+                        "rejected batch=%u triangle=%u index=%u\n",
+                        batch_index, triangle, local_vertex);
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid) break;
+            GeTnlScreenVertex expected[6] = {};
+            for (uint32_t i = 0; i < 6; i++) {
+                expected[i].position[3] = 1.0f;
+                expected[i].fog = 1.0f;
+            }
+            ge_tnl_reference_preprocess_triangle(
+                state, input, expected);
+            uint32_t output_base =
+                job.offsets[3] + triangle * 6u;
+            for (uint32_t i = 0; i < 6 && valid; i++) {
+                const GeTnlScreenVertex *actual =
+                    &actual_screen[output_base + i];
+                for (uint32_t component = 0;
+                     component < 4; component++) {
+                    if (!tnl_preprocess_float_matches(
+                            expected[i].position[component],
+                            actual->position[component])) {
+                        valid = false;
+                        break;
+                    }
+                }
+                for (uint32_t component = 0;
+                     component < 2 && valid; component++) {
+                    if (!tnl_preprocess_float_matches(
+                            expected[i].texcoord[component],
+                            actual->texcoord[component])) {
+                        valid = false;
+                    }
+                }
+                if (valid &&
+                    (!tnl_preprocess_float_matches(
+                         expected[i].fog, actual->fog) ||
+                     expected[i].color != actual->color)) {
+                    valid = false;
+                }
+                if (!valid) {
+                    fprintf(
+                        stderr,
+                        "ged3d12: GPU T&L screen validation mismatch "
+                        "batch=%u triangle=%u slot=%u\n",
+                        batch_index, triangle, i);
+                }
+            }
+            if (valid)
+                s_tnl_preprocess_validation_vertices += 6u;
+        }
+    }
+    D3D12_RANGE written = {0, 0};
+    s_tnl_screen_readback->Unmap(0, &written);
+    s_tnl_clip_readback->Unmap(0, &written);
+    return valid;
+}
+
+static bool validate_tnl_readback(
+    const GeD3D12VertexFrame *frame) {
+    static const char *const component_names[12] = {
+        "screen.x", "screen.y", "screen.z", "reciprocal_w",
+        "uv.x", "uv.y", "fog", "padding",
+        "color.r", "color.g", "color.b", "color.a",
+    };
+    if (!s_tnl_validation_enabled || !frame->tnl_vertex_count)
+        return true;
+    bool direct_pending = false;
+    for (UINT i = 0; i < frame->batch_count; i++) {
+        uint16_t flags = frame->batches[i].flags;
+        if ((flags & GE_D3D12_BATCH_GPU_TNL) &&
+            !(flags & GE_D3D12_BATCH_TNL_PREPROCESS)) {
+            direct_pending = true;
+            break;
+        }
+    }
+    if (!direct_pending)
+        return validate_tnl_preprocess_readback(frame);
+    D3D12_RANGE read_range = {
+        0,
+        (SIZE_T)frame->tnl_vertex_count *
+            sizeof(GeTnlValidationVertex),
+    };
+    GeTnlValidationVertex *outputs = nullptr;
+    if (!check_hr(s_tnl_validation_readback->Map(
+            0, &read_range,
+            reinterpret_cast<void **>(&outputs)),
+            "map GPU T&L validation readback")) {
+        return false;
+    }
+
+    bool valid = true;
+    for (UINT batch_index = 0;
+         batch_index < frame->batch_count && valid;
+         batch_index++) {
+        const GeD3D12VertexBatch *batch =
+            &frame->batches[batch_index];
+        if (!(batch->flags & GE_D3D12_BATCH_GPU_TNL) ||
+            (batch->flags &
+             GE_D3D12_BATCH_TNL_PREPROCESS))
+            continue;
+        uint32_t state_index = batch->shader.tnl[0];
+        if (state_index >= frame->tnl_state_count ||
+            batch->first > frame->tnl_vertex_count ||
+            batch->table_count >
+                frame->tnl_vertex_count - batch->first ||
+            batch->index_first > frame->index_count ||
+            batch->count >
+                frame->index_count - batch->index_first) {
+            fprintf(
+                stderr,
+                "ged3d12: invalid GPU T&L validation range "
+                "(batch=%u state=%u first=%u count=%u)\n",
+                batch_index, state_index,
+                batch->index_first, batch->count);
+            valid = false;
+            break;
+        }
+        for (uint32_t i = 0; i < batch->count; i++) {
+            uint32_t local_vertex =
+                frame->indices[batch->index_first + i];
+            uint32_t vertex_index =
+                batch->first + local_vertex;
+            if (local_vertex >= batch->table_count ||
+                vertex_index >= frame->tnl_vertex_count) {
+                fprintf(
+                    stderr,
+                    "ged3d12: invalid GPU T&L validation vertex "
+                    "(batch=%u index=%u vertex=%u)\n",
+                    batch_index, i, local_vertex);
+                valid = false;
+                break;
+            }
+            GeTnlReferenceVertex reference;
+            GeTnlValidationVertex expected;
+            if (!ge_tnl_gpu_reference_transform(
+                    &frame->tnl_states[state_index],
+                    &frame->tnl_vertices[vertex_index],
+                    &reference)) {
+                fprintf(
+                    stderr,
+                    "ged3d12: GPU T&L validation reference rejected "
+                    "batch=%u index=%u vertex=%u\n",
+                    batch_index, i, vertex_index);
+                valid = false;
+                break;
+            }
+            ge_tnl_validation_pack(&reference, &expected);
+            uint32_t component = 0;
+            if (!ge_tnl_validation_compare(
+                    &expected, &outputs[vertex_index],
+                    &component)) {
+                float expected_values[12];
+                float actual_values[12];
+                memcpy(
+                    expected_values, &expected,
+                    sizeof(expected_values));
+                memcpy(
+                    actual_values, &outputs[vertex_index],
+                    sizeof(actual_values));
+                fprintf(
+                    stderr,
+                    "ged3d12: GPU T&L validation mismatch "
+                    "batch=%u index=%u vertex=%u component=%s "
+                    "expected=%.9g actual=%.9g\n",
+                    batch_index, i, vertex_index,
+                    component_names[component],
+                    expected_values[component],
+                    actual_values[component]);
+                valid = false;
+                break;
+            }
+            s_tnl_validation_vertices++;
+        }
+    }
+    D3D12_RANGE written = {0, 0};
+    s_tnl_validation_readback->Unmap(0, &written);
+    return valid && validate_tnl_preprocess_readback(frame);
 }
 
 /* The destination is a write-combined upload heap: build each scaled row in cached memory and
@@ -1686,6 +2552,20 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
 
     GeD3D12VertexFrame vertices = {};
     if (!ged3d12_vertex_upload_pending(&vertices)) return -2;
+    if (s_tnl_validation_enabled &&
+        !ensure_tnl_validation_capacity(
+            vertices.tnl_vertex_count)) {
+        return -2;
+    }
+    if (vertices.tnl_screen_vertex_count &&
+        !ensure_tnl_preprocess_capacity(
+            vertices.tnl_vertex_count,
+            vertices.tnl_screen_vertex_count)) {
+        return -2;
+    }
+    s_command_list->SetGraphicsRootUnorderedAccessView(
+        GE_D3D12_ROOT_TNL_VALIDATION,
+        s_tnl_validation_output->GetGPUVirtualAddress());
     UINT64 next_vertex_frame = s_vertex_frames + 1u;
     if ((s_vertex_log &&
          (next_vertex_frame <= 3u ||
@@ -1699,7 +2579,9 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     LONGLONG stage_framebuffer_done = stage_counter();
     if (!ged3d12_texture_prepare_pending()) return -2;
     LONGLONG stage_textures_done = stage_counter();
+    if (!record_tnl_preprocess(&vertices)) return -2;
     if (!record_vertex_batches(&vertices)) return -2;
+    record_tnl_validation_readback(&vertices);
     LONGLONG stage_draws_done = stage_counter();
     s_vertex_frames++;
     s_vertex_total += vertices.vertex_count;
@@ -1816,6 +2698,14 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
     if (!check_hr(signal_hr, "signal frame fence")) return -2;
     s_frames[frame_index].timestamp_valid = true;
     s_frames[frame_index].timestamp_flip = s_vertex_frames;
+    if (s_tnl_validation_enabled &&
+        vertices.tnl_vertex_count &&
+        (!wait_for_fence(
+             s_graphics_fence, fence_value, s_graphics_event,
+             "wait for GPU T&L validation") ||
+         !validate_tnl_readback(&vertices))) {
+        return -2;
+    }
     if (FAILED(present_hr)) {
         check_hr(present_hr, "present swapchain");
         HRESULT removed = s_device->GetDeviceRemovedReason();
@@ -1839,7 +2729,9 @@ static int device_present(uint32_t fbaddr, int format, uint32_t stride) {
         return -2;
     }
     LONGLONG stage_submit_done = stage_counter();
-    s_last_backend_timing.vertices = vertices.vertex_count;
+    s_last_backend_timing.vertices =
+        vertices.vertex_count + vertices.tnl_vertex_count +
+        vertices.tnl_screen_vertex_count;
     s_last_backend_timing.batches = vertices.batch_count;
     record_stage_timings(
         stage_start, stage_begin_done, stage_vertices_done,
@@ -1880,6 +2772,14 @@ static void device_shutdown(void) {
             (unsigned long long)s_constant_updates,
             (unsigned long long)s_constant_reuses);
     }
+    if (s_tnl_validation_enabled)
+        fprintf(
+            stderr,
+            "ged3d12: GPU T&L shader-output validation passed "
+            "%llu indexed vertices and %llu preprocess slots\n",
+            (unsigned long long)s_tnl_validation_vertices,
+            (unsigned long long)
+                s_tnl_preprocess_validation_vertices);
     release_device();
     ged3d12_window_shutdown();
 }
@@ -1922,6 +2822,7 @@ static const GeBackend k_backend = {
     device_flush, device_vram_dirty, device_vram_read,
     device_vram_write, ged3d12_framebuffer_transfer,
     ged3d12_vertex_capture_tri_indexed,
+    ged3d12_vertex_capture_transform,
 };
 
 extern "C" const GeBackend *ged3d12_backend(void) { return &k_backend; }
@@ -1953,10 +2854,24 @@ extern "C" int ged3d12_last_backend_timing(
 extern "C" int ged3d12_framebuffer_stats(
     GeD3D12FramebufferStats *stats) {
     if (!stats) return 0;
+    memset(stats, 0, sizeof(*stats));
     ged3d12_framebuffer_get_stats(
         &stats->readbacks, &stats->aliases,
         &stats->feedback_snapshots, &stats->feedback_snapshot_pixels,
         &stats->feedback_reuses);
+    GeD3D12PipelineStats pipeline = ged3d12_pipeline_stats();
+    stats->pipeline_key_hits = pipeline.hits;
+    stats->pipelines_created =
+        (uint64_t)pipeline.compiled + pipeline.library_hits;
+    stats->pipeline_create_us = pipeline.create_us;
+    GeD3D12TextureStats texture = ged3d12_texture_stats();
+    stats->texture_cache_hits = texture.cache_hits;
+    stats->texture_cache_misses = texture.cache_misses;
+    stats->texture_uploads = texture.uploads;
+    stats->texture_decode_us = texture.decode_us;
+    stats->texture_scale_us = texture.scale_us;
+    stats->host_upload_bytes = s_host_upload_bytes;
+    stats->host_readback_bytes = s_host_readback_bytes;
     return 1;
 }
 extern "C" int ged3d12_capture_next(const char *path) {
@@ -1981,7 +2896,12 @@ ID3D12DescriptorHeap *ged3d12_rtv_heap(void) { return s_rtv_heap; }
 ID3D12DescriptorHeap *ged3d12_dsv_heap(void) { return s_dsv_heap; }
 ID3D12RootSignature *ged3d12_root_signature(void) { return s_root_signature; }
 D3D12_SHADER_BYTECODE ged3d12_vertex_shader(void) {
-    D3D12_SHADER_BYTECODE shader = {k_psp_vs_dxil, sizeof(k_psp_vs_dxil)};
+    D3D12_SHADER_BYTECODE shader = s_tnl_validation_enabled
+        ? D3D12_SHADER_BYTECODE{
+            k_psp_vs_validation_dxil,
+            sizeof(k_psp_vs_validation_dxil)}
+        : D3D12_SHADER_BYTECODE{
+            k_psp_vs_dxil, sizeof(k_psp_vs_dxil)};
     return shader;
 }
 D3D12_SHADER_BYTECODE ged3d12_pixel_shader(void) {

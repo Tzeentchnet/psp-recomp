@@ -20,6 +20,7 @@
 #include "display_state.h"
 #include "graphics_config.h"
 #include "input_config.h"
+#include "input_script.h"
 #include "iso.h"
 #include "kzl_twinstick.h"
 #include "memstick_state.h"
@@ -28,15 +29,13 @@
 #include "sas_reverb.h"
 #include "settings_path.h"
 #include "nid_names.h"   /* sr_nid_name(): names unknown NIDs in the trap below */
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 #include <wchar.h>
 #include <setjmp.h>
-#include <direct.h>
-#include <io.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
@@ -445,8 +444,8 @@ static void font_load(void) {
     if (dir) { snprintf(path, sizeof path, "%s/ltn0.pgf", dir); s_pgf_ltn = pgf_open(path); }
     if (!s_pgf_ltn) {
         char error[256];
-        if (sr_settings_path(
-                "font\\ltn0.pgf", path, sizeof(path), error, sizeof(error)))
+        if (sr_resource_path(
+                "font/ltn0.pgf", path, sizeof(path), error, sizeof(error)))
             s_pgf_ltn = pgf_open(path);
     }
     if (!s_pgf_ltn) s_pgf_ltn = pgf_open("font/ltn0.pgf");
@@ -454,8 +453,8 @@ static void font_load(void) {
     if (dir) { snprintf(path, sizeof path, "%s/jpn0.pgf", dir); s_pgf_jpn = pgf_open(path); }
     if (!s_pgf_jpn) {
         char error[256];
-        if (sr_settings_path(
-                "font\\jpn0.pgf", path, sizeof(path), error, sizeof(error)))
+        if (sr_resource_path(
+                "font/jpn0.pgf", path, sizeof(path), error, sizeof(error)))
             s_pgf_jpn = pgf_open(path);
     }
     if (!s_pgf_jpn) s_pgf_jpn = pgf_open("font/jpn0.pgf");
@@ -613,8 +612,8 @@ static uint32_t h_FontFindOptimumFont(CpuState *s) {
  * These thin wrappers marshal MIPS args to the ported mpeg_* functions. The port implements the
  * real PSMF analysis, ring-buffer accounting, handle/context creation, stream registration, and
  * AU getters with timestamp progression + end-of-stream, so the movie playback loop runs and
- * completes exactly as on PPSSPP. The SDL3 build decodes AVC video through Windows Media
- * Foundation (h264_mf.c); ATRAC movie audio is still modelled as silence. */
+ * completes exactly as on PPSSPP. Supported builds use native H.264 decoding and standalone
+ * ATRAC movie audio. */
 uint32_t mpeg_init(void);
 uint32_t mpeg_finish(void);
 uint32_t mpeg_query_mem_size(uint32_t outAddr);
@@ -630,6 +629,7 @@ uint32_t mpeg_ringbuffer_available_size(uint32_t ring);
 uint32_t mpeg_ringbuffer_put(CpuState *s, uint32_t ring, uint32_t numPackets, uint32_t available);
 uint32_t mpeg_get_avc_au(uint32_t mpegAddr, uint32_t sid, uint32_t auAddr, uint32_t attrAddr);
 uint32_t mpeg_get_atrac_au(uint32_t mpegAddr, uint32_t sid, uint32_t auAddr, uint32_t attrAddr);
+void mpeg_runtime_shutdown(void);
 uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth, uint32_t bufferAddr, uint32_t initAddr);
 uint32_t mpeg_atrac_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t bufferAddr, uint32_t init);
 uint32_t mpeg_avc_decode_stop(uint32_t mpegAddr, uint32_t frameWidth, uint32_t bufferAddr, uint32_t statusAddr);
@@ -1689,13 +1689,18 @@ static int host_root(char *out, int max) {
     if (override && override[0]) {
         n = snprintf(out, (size_t)max, "%s", override);
     } else {
-        const char *local = getenv("LOCALAPPDATA");
-        if (!local || !local[0]) {
+        char error[256];
+        if (!sr_data_root(
+                out, (size_t)max, error, sizeof(error))) {
             static int warned;
-            if (!warned++) fprintf(stderr, "VFS: LOCALAPPDATA is unset; set SR_FSDIR to override the writable root\n");
+            if (!warned++)
+                fprintf(
+                    stderr,
+                    "VFS: %s; set SR_FSDIR to override the writable root\n",
+                    error);
             return -1;
         }
-        n = snprintf(out, (size_t)max, "%s\\KZLRecomp", local);
+        n = (int)strlen(out);
     }
     if (n < 0 || n >= max) {
         fprintf(stderr, "VFS: writable root path is too long\n");
@@ -1710,7 +1715,7 @@ static int is_disc_path(const char *path) {
 }
 
 /* Writable devices preserve their directory hierarchy below SR_FSDIR when set, otherwise below
- * %LOCALAPPDATA%\KZLRecomp. fatms0: and cache: alias ms0:, matching KZL's PSP device setup. */
+ * the application data root. fatms0: and cache: alias ms0:, matching KZL's PSP device setup. */
 static int host_path(const char *guest, char *out, int max) {
     char root[512];
     if (host_root(root, sizeof(root)) != 0) return -1;
@@ -1732,7 +1737,7 @@ static int host_path(const char *guest, char *out, int max) {
         p = colon + 1;
     }
     if (n + 1 + (int)strlen(device) >= max) return -1;
-    out[n++] = '\\';
+    out[n++] = '/';
     for (int i = 0; device[i]; i++) out[n++] = device[i];
 
     while (*p) {
@@ -1744,7 +1749,7 @@ static int host_path(const char *guest, char *out, int max) {
         if (len == 1 && p[0] == '.') { p = end; continue; }
         if (len == 2 && p[0] == '.' && p[1] == '.') return -1;
         if (n + 1 + len >= max) return -1;
-        out[n++] = '\\';
+        out[n++] = '/';
         for (int i = 0; i < len; i++) {
             unsigned char c = (unsigned char)p[i];
             out[n++] = (char)(c < 0x20 || strchr("<>:\"|?*", c) ? '_' : c);
@@ -1759,7 +1764,7 @@ static int host_path(const char *guest, char *out, int max) {
 static int legacy_host_path(const char *guest, char *out, int max) {
     char root[512];
     if (host_root(root, sizeof(root)) != 0) return -1;
-    int n = snprintf(out, (size_t)max, "%s\\", root);
+    int n = snprintf(out, (size_t)max, "%s/", root);
     if (n < 0 || n >= max) return -1;
     for (int i = 0; guest[i] && n < max - 1; i++) {
         char c = guest[i];
@@ -2405,12 +2410,13 @@ static int load_legacy_host_dir(const char *path, DirHandle *dir) {
     char mapped[512], pattern[512], root[512];
     if (legacy_host_path(path, mapped, sizeof(mapped)) != 0) return -1;
     if (host_root(root, sizeof(root)) != 0) return -1;
-    char *base = strrchr(mapped, '\\');
+    char *base = strrchr(mapped, '/');
+    if (!base) base = strrchr(mapped, '\\');
     base = base ? base + 1 : mapped;
     char prefix[300];
     int prefix_len = snprintf(prefix, sizeof(prefix), "%s_", base);
     if (prefix_len <= 1 || prefix_len >= (int)sizeof(prefix)) return -1;
-    if (snprintf(pattern, sizeof(pattern), "%s\\*", root) >= (int)sizeof(pattern)) return -1;
+    if (snprintf(pattern, sizeof(pattern), "%s/*", root) >= (int)sizeof(pattern)) return -1;
 
     struct _finddata_t data;
     intptr_t find = _findfirst(pattern, &data);
@@ -2444,7 +2450,7 @@ static int load_host_dir(const char *path, DirHandle *dir) {
     struct _stat64 st;
     if (_stat64(hp, &st) != 0) return load_legacy_host_dir(path, dir);
     if (!(st.st_mode & _S_IFDIR)) return -1;
-    if (snprintf(pattern, sizeof(pattern), "%s\\*", hp) >= (int)sizeof(pattern)) return -1;
+    if (snprintf(pattern, sizeof(pattern), "%s/*", hp) >= (int)sizeof(pattern)) return -1;
 
     struct _finddata_t data;
     intptr_t find = _findfirst(pattern, &data);
@@ -3034,13 +3040,36 @@ void sr_ctrl_sample(void) {
     if (gui_on()) gui_analog(&lx, &ly);
     {
         static int initialized;
-        static int enabled;
+        static int fixed_enabled;
+        static int script_enabled;
+        static int log_enabled;
         static uint8_t scripted_lx, scripted_ly;
         static uint32_t start, end = UINT32_MAX;
+        static SrAnalogScript script;
         if (!initialized) {
+            char error[512];
             initialized = 1;
             const char *value = getenv("SR_ANALOG");
-            if (value && value[0]) {
+            const char *script_path = getenv("SR_ANALOG_SCRIPT");
+            log_enabled = getenv("SR_PADLOG") ? 1 : 0;
+            if (value && value[0] && script_path && script_path[0]) {
+                fprintf(
+                    stderr,
+                    "SR_ANALOG and SR_ANALOG_SCRIPT cannot be used together\n");
+                _Exit(2);
+            }
+            if (script_path && script_path[0]) {
+                if (!sr_analog_script_load(
+                        &script, script_path, error, sizeof(error))) {
+                    fprintf(stderr, "SR_ANALOG_SCRIPT: %s\n", error);
+                    _Exit(2);
+                }
+                script_enabled = 1;
+                fprintf(
+                    stderr,
+                    "SR_ANALOG_SCRIPT: loaded %u events from %s\n",
+                    script.count, script_path);
+            } else if (value && value[0]) {
                 unsigned x, y;
                 char extra;
                 if (sscanf(value, "%u,%u%c", &x, &y, &extra) != 2 ||
@@ -3057,10 +3086,39 @@ void sr_ctrl_sample(void) {
                 const char *end_text = getenv("SR_ANALOG_END");
                 if (start_text) start = (uint32_t)strtoul(start_text, NULL, 10);
                 if (end_text) end = (uint32_t)strtoul(end_text, NULL, 10);
-                enabled = 1;
+                fixed_enabled = 1;
             }
         }
-        if (enabled && s_present_count >= start && s_present_count <= end) {
+        if (script_enabled) {
+            uint8_t event_lx = 128;
+            uint8_t event_ly = 128;
+            int active = sr_analog_script_sample(
+                &script, s_present_count, &event_lx, &event_ly);
+            if (active) {
+                lx = event_lx;
+                ly = event_ly;
+            }
+            if (log_enabled) {
+                static int last_active = -1;
+                static uint8_t last_lx;
+                static uint8_t last_ly;
+                if (active != last_active ||
+                    (active &&
+                     (event_lx != last_lx || event_ly != last_ly))) {
+                    fprintf(
+                        stderr,
+                        "ANALOGSCRIPT present=%u active=%d analog=%u,%u\n",
+                        s_present_count, active,
+                        active ? event_lx : 128u,
+                        active ? event_ly : 128u);
+                    last_active = active;
+                    last_lx = event_lx;
+                    last_ly = event_ly;
+                }
+            }
+        } else if (
+            fixed_enabled &&
+            s_present_count >= start && s_present_count <= end) {
             lx = scripted_lx;
             ly = scripted_ly;
         }
@@ -3228,7 +3286,7 @@ static int frame_capture_path(char *path, size_t path_size) {
     if (s_present_count < request->present) return 0;
     if (s_present_count != request->present)
         frame_capture_fail("runtime skipped a requested presented frame", request->name);
-    n = snprintf(path, path_size, "%s\\%s", s_frame_capture_dir, request->name);
+    n = snprintf(path, path_size, "%s/%s", s_frame_capture_dir, request->name);
     if (n < 0 || (size_t)n >= path_size)
         frame_capture_fail("capture output path is too long", request->name);
     return 1;
@@ -3250,7 +3308,7 @@ static void frame_capture_complete(
     if (s_frame_capture_next != FRAME_CAPTURE_COUNT) return;
 
     n = snprintf(complete_path, sizeof(complete_path),
-                 "%s\\capture.complete", s_frame_capture_dir);
+                 "%s/capture.complete", s_frame_capture_dir);
     if (n < 0 || (size_t)n >= sizeof(complete_path))
         frame_capture_fail("completion path is too long", s_frame_capture_dir);
     done = fopen(complete_path, "wb");
@@ -3286,6 +3344,7 @@ typedef struct PresentPerf {
     double minimum_fps;
     double slow_frame_ms;
     uint32_t previous_alt_mask;
+    int thermal_state_max;
     int initialized;
     int enabled;
     int trace_stalls;
@@ -3352,6 +3411,16 @@ static int compare_double(const void *left, const void *right) {
     return (a > b) - (a < b);
 }
 
+static const char *thermal_state_name(int state) {
+    switch (state) {
+        case 0: return "nominal";
+        case 1: return "fair";
+        case 2: return "serious";
+        case 3: return "critical";
+        default: return "unavailable";
+    }
+}
+
 static uint32_t env_present_value(
     const char *name, uint32_t fallback) {
     const char *value = (getenv)(name);
@@ -3368,6 +3437,7 @@ static uint32_t env_present_value(
 static void present_perf_init(void) {
     if (s_present_perf.initialized) return;
     s_present_perf.initialized = 1;
+    s_present_perf.thermal_state_max = -1;
     const char *file_path = getenv("SR_PERF_FILE");
     s_present_perf.enabled =
         getenv("SR_PERF_LOG") ||
@@ -3429,16 +3499,29 @@ static void present_perf_init(void) {
         if (!s_present_perf.file ||
             fprintf(
                 s_present_perf.file,
-                "# psp-recomp display performance v4\n"
+                "# psp-recomp display performance v10\n"
                 "flip,present,frame_ms,frontend_ms,backend_ms,gpu_ms,"
                 "over_budget,gpu_source_flip,scheduler_ms,native_ms,"
                 "interpreter_ms,hle_ms,ge_ms,vertex_ms,sync_ms,"
-                "primitive_ms,bezier_ms,spline_ms,patch_eval_ms,"
+                "primitive_ms,point_ms,line_ms,sprite_ms,"
+                "bezier_ms,spline_ms,bezier_eval_ms,bezier_draw_ms,"
+                "spline_eval_ms,spline_draw_ms,patch_eval_ms,"
                 "patch_draw_ms,vertex_decode_ms,"
                 "hle_calls,interp_instructions,ge_lists,ge_commands,"
                 "ge_draws,ge_vertices,ge_through_draws,"
                 "ge_through_vertices,ge_transform_draws,"
                 "ge_transform_vertices,ge_transform_unique_vertices,"
+                "ge_point_draws,ge_points,ge_line_draws,"
+                "ge_line_segments,ge_sprite_draws,ge_sprites,"
+                "ge_bezier_draws,ge_bezier_control_points,"
+                "ge_bezier_evaluated_vertices,ge_spline_draws,"
+                "ge_spline_control_points,"
+                "ge_spline_evaluated_vertices,"
+                "gpu_tnl_eligible_draws,gpu_tnl_accepted_draws,"
+                "gpu_tnl_backend_declined_draws,"
+                "gpu_tnl_canonical_vertices,"
+                "gpu_tnl_submitted_vertices,gpu_tnl_cpu_decode_us,"
+                "gpu_tnl_cpu_reference_us,gpu_tnl_upload_bytes,"
                 "backend_begin_ms,"
                 "backend_vertices_ms,backend_framebuffer_ms,"
                 "backend_textures_ms,backend_draws_ms,"
@@ -3447,7 +3530,21 @@ static void present_perf_init(void) {
                 "framebuffer_aliases,feedback_snapshots,"
                 "feedback_snapshot_pixels,feedback_reuses,"
                 "capture_ms,texture_capture_ms,state_capture_ms,"
-                "texture_misses,texture_decode_wait_us,pso_fallbacks,"
+                "texture_misses,texture_decode_wait_us,"
+                "gpu_texture_decode_jobs,"
+                "gpu_texture_decode_fallbacks,"
+                "gpu_texture_decode_source_bytes,pso_fallbacks,"
+                "pipeline_key_hits,pipelines_created,pipeline_create_us,"
+                "renderer_texture_cache_hits,"
+                "renderer_texture_cache_misses,renderer_texture_uploads,"
+                "renderer_texture_decode_us,renderer_texture_scale_us,"
+                "host_upload_bytes,host_readback_bytes,"
+                "framebuffer_upload_logical_bytes,"
+                "framebuffer_upload_host_bytes,"
+                "framebuffer_upload_expanded_pixels,framebuffer_uploads,"
+                "framebuffer_upload_fallbacks,framebuffer_upload_sync_us,"
+                "native_dispatches,scheduler_yields,"
+                "thermal_state,"
                 "alt_off\n") < 0) {
             if (s_present_perf.file)
                 fclose(s_present_perf.file);
@@ -3480,7 +3577,8 @@ static void present_slow_frame_report(
         "native", "hle", "interpreter", "ge", "vertex", "sync", "backend",
         "scheduler", "primitive", "bezier", "spline", "patch_eval",
         "patch_draw", "vertex_decode", "capture", "texture_capture",
-        "state_capture",
+        "state_capture", "point", "line", "sprite", "bezier_eval",
+        "bezier_draw", "spline_eval", "spline_draw",
     };
     /* The nested vertex-phase categories are exclusive, so the three largest are additive. */
     int top[3] = { -1, -1, -1 };
@@ -3580,6 +3678,22 @@ static void present_perf_finish(
         uint64_t feedback_snapshots = 0;
         uint64_t feedback_snapshot_pixels = 0;
         uint64_t feedback_reuses = 0;
+        uint64_t pipeline_key_hits = 0;
+        uint64_t pipelines_created = 0;
+        uint64_t pipeline_create_us = 0;
+        uint64_t renderer_texture_cache_hits = 0;
+        uint64_t renderer_texture_cache_misses = 0;
+        uint64_t renderer_texture_uploads = 0;
+        uint64_t renderer_texture_decode_us = 0;
+        uint64_t renderer_texture_scale_us = 0;
+        uint64_t host_upload_bytes = 0;
+        uint64_t host_readback_bytes = 0;
+        uint64_t framebuffer_upload_logical_bytes = 0;
+        uint64_t framebuffer_upload_host_bytes = 0;
+        uint64_t framebuffer_upload_expanded_pixels = 0;
+        uint64_t framebuffer_uploads = 0;
+        uint64_t framebuffer_upload_fallbacks = 0;
+        uint64_t framebuffer_upload_sync_us = 0;
         if (current_framebuffer_stats_valid &&
             s_present_perf.previous_framebuffer_stats_valid) {
             framebuffer_readbacks =
@@ -3598,15 +3712,89 @@ static void present_perf_finish(
             feedback_reuses =
                 current_framebuffer_stats->feedback_reuses -
                 s_present_perf.previous_framebuffer_stats.feedback_reuses;
+            pipeline_key_hits =
+                current_framebuffer_stats->pipeline_key_hits -
+                s_present_perf.previous_framebuffer_stats.pipeline_key_hits;
+            pipelines_created =
+                current_framebuffer_stats->pipelines_created -
+                s_present_perf.previous_framebuffer_stats.pipelines_created;
+            pipeline_create_us =
+                current_framebuffer_stats->pipeline_create_us -
+                s_present_perf.previous_framebuffer_stats.pipeline_create_us;
+            renderer_texture_cache_hits =
+                current_framebuffer_stats->texture_cache_hits -
+                s_present_perf.previous_framebuffer_stats.texture_cache_hits;
+            renderer_texture_cache_misses =
+                current_framebuffer_stats->texture_cache_misses -
+                s_present_perf.previous_framebuffer_stats.texture_cache_misses;
+            renderer_texture_uploads =
+                current_framebuffer_stats->texture_uploads -
+                s_present_perf.previous_framebuffer_stats.texture_uploads;
+            renderer_texture_decode_us =
+                current_framebuffer_stats->texture_decode_us -
+                s_present_perf.previous_framebuffer_stats.texture_decode_us;
+            renderer_texture_scale_us =
+                current_framebuffer_stats->texture_scale_us -
+                s_present_perf.previous_framebuffer_stats.texture_scale_us;
+            host_upload_bytes =
+                current_framebuffer_stats->host_upload_bytes -
+                s_present_perf.previous_framebuffer_stats.host_upload_bytes;
+            host_readback_bytes =
+                current_framebuffer_stats->host_readback_bytes -
+                s_present_perf.previous_framebuffer_stats.host_readback_bytes;
+            framebuffer_upload_logical_bytes =
+                current_framebuffer_stats->framebuffer_upload_logical_bytes -
+                s_present_perf.previous_framebuffer_stats
+                    .framebuffer_upload_logical_bytes;
+            framebuffer_upload_host_bytes =
+                current_framebuffer_stats->framebuffer_upload_host_bytes -
+                s_present_perf.previous_framebuffer_stats
+                    .framebuffer_upload_host_bytes;
+            framebuffer_upload_expanded_pixels =
+                current_framebuffer_stats
+                    ->framebuffer_upload_expanded_pixels -
+                s_present_perf.previous_framebuffer_stats
+                    .framebuffer_upload_expanded_pixels;
+            framebuffer_uploads =
+                current_framebuffer_stats->framebuffer_uploads -
+                s_present_perf.previous_framebuffer_stats
+                    .framebuffer_uploads;
+            framebuffer_upload_fallbacks =
+                current_framebuffer_stats->framebuffer_upload_fallbacks -
+                s_present_perf.previous_framebuffer_stats
+                    .framebuffer_upload_fallbacks;
+            framebuffer_upload_sync_us =
+                current_framebuffer_stats->framebuffer_upload_sync_us -
+                s_present_perf.previous_framebuffer_stats
+                    .framebuffer_upload_sync_us;
         }
+        int thermal_state = gui_thermal_state();
+        if (thermal_state > s_present_perf.thermal_state_max)
+            s_present_perf.thermal_state_max = thermal_state;
         if (over_budget) s_present_perf.over_budget++;
+        double bezier_eval_ms =
+            phases->category_ms[SR_PERF_BEZIER_EVAL];
+        double bezier_draw_ms =
+            phases->category_ms[SR_PERF_BEZIER_DRAW];
+        double spline_eval_ms =
+            phases->category_ms[SR_PERF_SPLINE_EVAL];
+        double spline_draw_ms =
+            phases->category_ms[SR_PERF_SPLINE_DRAW];
+        double patch_eval_ms =
+            phases->category_ms[SR_PERF_PATCH_EVAL] +
+            bezier_eval_ms + spline_eval_ms;
+        double patch_draw_ms =
+            phases->category_ms[SR_PERF_PATCH_DRAW] +
+            bezier_draw_ms + spline_draw_ms;
         double vertex_ms =
             phases->category_ms[SR_PERF_VERTEX] +
             phases->category_ms[SR_PERF_PRIMITIVE] +
+            phases->category_ms[SR_PERF_POINT] +
+            phases->category_ms[SR_PERF_LINE] +
+            phases->category_ms[SR_PERF_SPRITE] +
             phases->category_ms[SR_PERF_BEZIER] +
             phases->category_ms[SR_PERF_SPLINE] +
-            phases->category_ms[SR_PERF_PATCH_EVAL] +
-            phases->category_ms[SR_PERF_PATCH_DRAW] +
+            patch_eval_ms + patch_draw_ms +
             phases->category_ms[SR_PERF_VERTEX_DECODE] +
             phases->category_ms[SR_PERF_CAPTURE] +
             phases->category_ms[SR_PERF_TEXTURE_CAPTURE] +
@@ -3616,12 +3804,19 @@ static void present_perf_finish(
                 s_present_perf.file,
                 "%u,%u,%.6f,%.6f,%.6f,%.6f,%d,%llu,"
                 "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
                 "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
                 "%llu,"
+                "%llu,%llu,%llu,%llu,%llu,%llu,"
+                "%llu,%llu,%llu,%llu,%llu,%llu,"
+                "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
                 "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%u,"
                 "%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,"
-                "%llu,%llu,%llu,%u\n",
+                "%llu,%llu,%llu,%llu,%llu,%llu,"
+                "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+                "%llu,%llu,%llu,%llu,%llu,%llu,"
+                "%llu,%llu,%d,%u\n",
                 flip, present, frame_ms,
                 s_present_perf.frontend_ms[index],
                 s_present_perf.previous_backend_ms,
@@ -3635,10 +3830,17 @@ static void present_perf_finish(
                 vertex_ms,
                 phases->category_ms[SR_PERF_SYNC],
                 phases->category_ms[SR_PERF_PRIMITIVE],
+                phases->category_ms[SR_PERF_POINT],
+                phases->category_ms[SR_PERF_LINE],
+                phases->category_ms[SR_PERF_SPRITE],
                 phases->category_ms[SR_PERF_BEZIER],
                 phases->category_ms[SR_PERF_SPLINE],
-                phases->category_ms[SR_PERF_PATCH_EVAL],
-                phases->category_ms[SR_PERF_PATCH_DRAW],
+                bezier_eval_ms,
+                bezier_draw_ms,
+                spline_eval_ms,
+                spline_draw_ms,
+                patch_eval_ms,
+                patch_draw_ms,
                 phases->category_ms[SR_PERF_VERTEX_DECODE],
                 (unsigned long long)
                     phases->counters[SR_PERF_HLE_CALLS],
@@ -3663,6 +3865,50 @@ static void present_perf_finish(
                 (unsigned long long)
                     phases->counters[
                         SR_PERF_GE_TRANSFORM_UNIQUE_VERTICES],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_POINT_DRAWS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_POINTS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_LINE_DRAWS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_LINE_SEGMENTS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_SPRITE_DRAWS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_SPRITES],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_BEZIER_DRAWS],
+                (unsigned long long)
+                    phases->counters[
+                        SR_PERF_GE_BEZIER_CONTROL_POINTS],
+                (unsigned long long)
+                    phases->counters[
+                        SR_PERF_GE_BEZIER_EVALUATED_VERTICES],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GE_SPLINE_DRAWS],
+                (unsigned long long)
+                    phases->counters[
+                        SR_PERF_GE_SPLINE_CONTROL_POINTS],
+                (unsigned long long)
+                    phases->counters[
+                        SR_PERF_GE_SPLINE_EVALUATED_VERTICES],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GPU_TNL_ELIGIBLE_DRAWS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GPU_TNL_ACCEPTED_DRAWS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GPU_TNL_DECLINED_DRAWS],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GPU_TNL_CANONICAL_VERTICES],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GPU_TNL_SUBMITTED_VERTICES],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GPU_TNL_CPU_DECODE_US],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GPU_TNL_CPU_REFERENCE_US],
+                (unsigned long long)
+                    phases->counters[SR_PERF_GPU_TNL_UPLOAD_BYTES],
                 s_present_perf.previous_backend_timing_valid
                     ? s_present_perf.previous_backend_timing.begin_ms : -1.0,
                 s_present_perf.previous_backend_timing_valid
@@ -3694,7 +3940,37 @@ static void present_perf_finish(
                 (unsigned long long)
                     phases->counters[SR_PERF_TEXTURE_DECODE_WAIT_US],
                 (unsigned long long)
+                    phases->counters[
+                        SR_PERF_GPU_TEXTURE_DECODE_JOBS],
+                (unsigned long long)
+                    phases->counters[
+                        SR_PERF_GPU_TEXTURE_DECODE_FALLBACKS],
+                (unsigned long long)
+                    phases->counters[
+                        SR_PERF_GPU_TEXTURE_DECODE_SOURCE_BYTES],
+                (unsigned long long)
                     phases->counters[SR_PERF_PSO_FALLBACKS],
+                (unsigned long long)pipeline_key_hits,
+                (unsigned long long)pipelines_created,
+                (unsigned long long)pipeline_create_us,
+                (unsigned long long)renderer_texture_cache_hits,
+                (unsigned long long)renderer_texture_cache_misses,
+                (unsigned long long)renderer_texture_uploads,
+                (unsigned long long)renderer_texture_decode_us,
+                (unsigned long long)renderer_texture_scale_us,
+                (unsigned long long)host_upload_bytes,
+                (unsigned long long)host_readback_bytes,
+                (unsigned long long)framebuffer_upload_logical_bytes,
+                (unsigned long long)framebuffer_upload_host_bytes,
+                (unsigned long long)framebuffer_upload_expanded_pixels,
+                (unsigned long long)framebuffer_uploads,
+                (unsigned long long)framebuffer_upload_fallbacks,
+                (unsigned long long)framebuffer_upload_sync_us,
+                (unsigned long long)
+                    phases->counters[SR_PERF_NATIVE_DISPATCHES],
+                (unsigned long long)
+                    phases->counters[SR_PERF_SCHEDULER_YIELDS],
+                thermal_state,
                 alt_off) < 0) {
             fprintf(stderr, "SR_PERF_FILE: write failed\n");
             runtime_exit_cleanly(2);
@@ -3742,7 +4018,7 @@ static void present_perf_finish(
                 "frame_ms avg=%.2f p50=%.2f p95=%.2f p99=%.2f "
                 "max=%.2f over_budget=%u "
                 "frontend_ms avg=%.2f backend_ms avg=%.2f max=%.2f "
-                "gpu_ms avg=%.2f max=%.2f samples=%u\n",
+                "gpu_ms avg=%.2f max=%.2f samples=%u thermal=%s\n",
                 flip - s_present_perf.samples + 1u, flip,
                 s_present_perf.window_first_present, present,
                 s_present_perf.samples, fps,
@@ -3753,7 +4029,8 @@ static void present_perf_finish(
                 backend_sum / s_present_perf.samples, backend_max,
                 gpu_samples ? gpu_sum / gpu_samples : -1.0,
                 gpu_samples ? gpu_max : -1.0,
-                gpu_samples);
+                gpu_samples,
+                thermal_state_name(s_present_perf.thermal_state_max));
             if (s_present_perf.file &&
                 fflush(s_present_perf.file) != 0) {
                 fprintf(stderr, "SR_PERF_FILE: flush failed\n");
@@ -3769,6 +4046,7 @@ static void present_perf_finish(
             }
             s_present_perf.samples = 0;
             s_present_perf.over_budget = 0;
+            s_present_perf.thermal_state_max = -1;
         }
     }
     s_present_perf.previous_entry = entry;
@@ -3816,8 +4094,11 @@ static void present_perf_shutdown(void) {
 
 static void runtime_exit_cleanly(int code) {
     present_perf_shutdown();
-    if (!sr_interp_profile_write() && code == 0)
+    if (!sr_ip_sampler_shutdown() && code == 0)
         code = 2;
+    if (!sr_interp_reports_write() && code == 0)
+        code = 2;
+    mpeg_runtime_shutdown();
     sr_audio_shutdown();
     gui_shutdown();
     sr_trace_close();

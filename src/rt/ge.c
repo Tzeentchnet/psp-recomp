@@ -22,7 +22,9 @@
 #include "recomp.h"
 #include "ge_patch_math.h"
 #include "ge_shared.h"
+#include "ge_tnl.h"
 #include "perf_stats.h"
+#include "platform.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -612,12 +614,12 @@ static void read_weights(uint32_t addr, const VFmt *v, float *w) {
 /* Convert a colour in PSP pixel format `psm` (0=5650,1=5551,2=4444,3=8888) read from `raw` into
  * 8-bit R,G,B,A. For 16-bit formats `raw` holds the 16-bit value; for 8888 the full 32 bits. */
 static void unpack_color(uint32_t raw, int psm, int *r, int *g, int *b, int *a) {
-    switch (psm & 3) {
-        case 0: *r=(int)((raw&0x1F)*255/31); *g=(int)(((raw>>5)&0x3F)*255/63); *b=(int)(((raw>>11)&0x1F)*255/31); *a=255; break;
-        case 1: *r=(int)((raw&0x1F)*255/31); *g=(int)(((raw>>5)&0x1F)*255/31); *b=(int)(((raw>>10)&0x1F)*255/31); *a=(raw&0x8000)?255:0; break;
-        case 2: *r=(int)((raw&0xF)*17); *g=(int)(((raw>>4)&0xF)*17); *b=(int)(((raw>>8)&0xF)*17); *a=(int)(((raw>>12)&0xF)*17); break;
-        default: *r=raw&0xFF; *g=(raw>>8)&0xFF; *b=(raw>>16)&0xFF; *a=(raw>>24)&0xFF; break;
-    }
+    uint32_t rgba =
+        ge_texture_unpack_direct_rgba(raw, (uint32_t)psm);
+    *r = (int)(rgba & 0xffu);
+    *g = (int)((rgba >> 8) & 0xffu);
+    *b = (int)((rgba >> 16) & 0xffu);
+    *a = (int)(rgba >> 24);
 }
 
 /* Read a vertex colour into 8-bit RGBA (col_fmt: 4=5650,5=5551,6=4444,7=8888). */
@@ -665,19 +667,15 @@ static void read_color(
 /* Look up a CLUT entry (palette index -> RGBA). */
 static void clut_lookup_level(uint32_t index, int level, uint32_t tex_fmt,
                               int *r, int *g, int *b, int *a) {
-    uint32_t shift = (ge.clut_fmt >> 2) & 0x1F;
-    uint32_t mask  = (ge.clut_fmt >> 8) & 0xFF;
-    uint32_t start = ((ge.clut_fmt >> 16) & 0x1F) << 4;
-    uint32_t start_mask = (ge.clut_fmt & 3) == 3 ? 0xFFu : 0x1FFu;
-    index = ((index >> shift) & mask) | (start & start_mask);
-    if ((ge.tex_mode & 0x100u) != 0) {
-        if (tex_fmt == 4) index += (uint32_t)level * 16u;
-        else if (tex_fmt == 5 && (ge.clut_fmt & 3) != 3)
-            index += (uint32_t)(level & 1) * 256u;
-    }
-    int epsm = ge.clut_fmt & 3;
-    if (epsm == 3) { uint32_t raw; memcpy(&raw, &ge.clutram[(index * 4) & 2047], 4); unpack_color(raw, 3, r, g, b, a); }
-    else           { uint16_t raw; memcpy(&raw, &ge.clutram[(index * 2) & 2047], 2); unpack_color(raw, epsm, r, g, b, a); }
+    uint32_t clut_index = ge_texture_clut_index(
+        index, tex_fmt, (uint32_t)level,
+        ge.clut_fmt, ge.tex_mode);
+    uint32_t rgba = ge_texture_clut_rgba(
+        ge.clutram, clut_index, ge.clut_fmt);
+    *r = (int)(rgba & 0xffu);
+    *g = (int)((rgba >> 8) & 0xffu);
+    *b = (int)((rgba >> 16) & 0xffu);
+    *a = (int)(rgba >> 24);
 }
 
 unsigned long g_tex_samples = 0, g_tex_nonzero = 0;
@@ -838,18 +836,8 @@ void ge_set_frame(uint32_t frame) {
 
 static uint32_t texel_offset(uint32_t row_pitch_pixels, uint32_t u, uint32_t v,
                              uint32_t texel_bits, int swizzled) {
-    if (!swizzled)
-        return v * ((row_pitch_pixels * texel_bits) >> 3) + ((u * texel_bits) >> 3);
-
-    /* PPSSPP Software/Sampler.cpp GetPixelDataOffset() */
-    const uint32_t tile_bits = 32, tiles_x = 4, tiles_y = 8;
-    uint32_t texels_per_tile = tile_bits / texel_bits;
-    uint32_t tile_u   = u / texels_per_tile;
-    uint32_t tile_idx = (v % tiles_y) * tiles_x
-        + (v / tiles_y) * ((row_pitch_pixels * texel_bits / tile_bits) * tiles_y)
-        + (tile_u % tiles_x)
-        + (tile_u / tiles_x) * (tiles_x * tiles_y);
-    return tile_idx * (tile_bits >> 3) + (((u % texels_per_tile) * texel_bits) >> 3);
+    return ge_texture_texel_byte_offset(
+        row_pitch_pixels, u, v, texel_bits, swizzled);
 }
 
 static int tex_coord(int v, int size, int clamp_mode) {
@@ -861,23 +849,6 @@ static int tex_coord(int v, int size, int clamp_mode) {
     }
     return v & (size - 1) & 511;
 }
-
-typedef struct {
-    uint8_t lines[4];
-    uint16_t color1, color2;
-} GeDxt1Block;
-
-typedef struct {
-    GeDxt1Block color;
-    uint16_t alpha_lines[4];
-} GeDxt3Block;
-
-typedef struct {
-    GeDxt1Block color;
-    uint32_t alpha_data2;
-    uint16_t alpha_data1;
-    uint8_t alpha1, alpha2;
-} GeDxt5Block;
 
 static void texture_level_info(int level, uint32_t *address, uint32_t *stride,
                                int *width, int *height) {
@@ -924,83 +895,6 @@ uint64_t ge_texture_level_byte_size(const GeState *state, int level) {
     return ((uint64_t)stride * rows * bits + 7u) >> 3;
 }
 
-static uint32_t dxt_color(const GeDxt1Block *block, int x, int y, int alpha) {
-    uint16_t c1 = block->color1;
-    uint16_t c2 = block->color2;
-    int b1 = (c1 << 3) & 0xF8, b2 = (c2 << 3) & 0xF8;
-    int g1 = (c1 >> 3) & 0xFC, g2 = (c2 >> 3) & 0xFC;
-    int r1 = (c1 >> 8) & 0xF8, r2 = (c2 >> 8) & 0xF8;
-    int index = (block->lines[y] >> (x * 2)) & 3;
-    int r, g, b, a = alpha;
-    if (index == 0) {
-        r = r1; g = g1; b = b1;
-    } else if (index == 1) {
-        r = r2; g = g2; b = b2;
-    } else if (c1 > c2) {
-        if (index == 2) {
-            r = (r1 + r1 + r2) / 3;
-            g = (g1 + g1 + g2) / 3;
-            b = (b1 + b1 + b2) / 3;
-        } else {
-            r = (r2 + r2 + r1) / 3;
-            g = (g2 + g2 + g1) / 3;
-            b = (b2 + b2 + b1) / 3;
-        }
-    } else if (index == 3) {
-        r = g = b = a = 0;
-    } else {
-        r = (r1 + r2) / 2;
-        g = (g1 + g2) / 2;
-        b = (b1 + b2) / 2;
-    }
-    return (uint32_t)r | ((uint32_t)g << 8) |
-           ((uint32_t)b << 16) | ((uint32_t)a << 24);
-}
-
-static uint8_t dxt_alpha_lerp(uint8_t a1, uint8_t a2, int n, int denominator) {
-    int v1 = (a1 * ((denominator - n) << 8)) / denominator;
-    int v2 = (a2 * (n << 8)) / denominator;
-    return (uint8_t)((v1 + v2 + 31) >> 8);
-}
-
-static uint32_t dxt_decode(
-    const uint8_t *bytes, uint32_t format, uint32_t u, uint32_t v) {
-    if (format == 8) {
-        GeDxt1Block block;
-        memcpy(&block, bytes, sizeof(block));
-        return dxt_color(&block, (int)(u & 3), (int)(v & 3), 255);
-    }
-    if (format == 9) {
-        GeDxt3Block block;
-        memcpy(&block, bytes, sizeof(block));
-        uint32_t color = dxt_color(
-            &block.color, (int)(u & 3), (int)(v & 3), 0);
-        uint32_t alpha =
-            (block.alpha_lines[v & 3] >> ((u & 3) * 4)) & 15u;
-        return color | (alpha << 28);
-    }
-    GeDxt5Block block;
-    memcpy(&block, bytes, sizeof(block));
-    uint32_t color = dxt_color(
-        &block.color, (int)(u & 3), (int)(v & 3), 0);
-    uint64_t alpha_data =
-        ((uint64_t)block.alpha_data1 << 32) | block.alpha_data2;
-    uint32_t alpha_index =
-        (uint32_t)((alpha_data >> ((v & 3) * 12 + (u & 3) * 3)) & 7u);
-    uint8_t alpha;
-    if (alpha_index == 0) alpha = block.alpha1;
-    else if (alpha_index == 1) alpha = block.alpha2;
-    else if (block.alpha1 > block.alpha2)
-        alpha = dxt_alpha_lerp(
-            block.alpha1, block.alpha2, (int)alpha_index - 1, 7);
-    else if (alpha_index == 6) alpha = 0;
-    else if (alpha_index == 7) alpha = 255;
-    else
-        alpha = dxt_alpha_lerp(
-            block.alpha1, block.alpha2, (int)alpha_index - 1, 5);
-    return color | ((uint32_t)alpha << 24);
-}
-
 static uint32_t dxt_sample(uint32_t address, uint32_t stride, uint32_t format,
                            uint32_t u, uint32_t v) {
     uint32_t blocks_per_row = (stride + 3u) >> 2;
@@ -1010,7 +904,7 @@ static uint32_t dxt_sample(uint32_t address, uint32_t stride, uint32_t format,
     uint8_t bytes[16] = {0};
     for (uint32_t i = 0; i < block_size; i++)
         bytes[i] = MEM_R8(address + block_index * block_size + i);
-    return dxt_decode(bytes, format, u, v);
+    return ge_texture_dxt_decode(bytes, format, u, v);
 }
 
 static void sample_tex_level(int level, int tu, int tv,
@@ -1236,26 +1130,15 @@ typedef struct {
 static void clut_lookup_ctx(
     const TexDecodeCtx *ctx, uint32_t index, int level,
     int *r, int *g, int *b, int *a) {
-    uint32_t shift = (ctx->clut_fmt >> 2) & 0x1F;
-    uint32_t mask  = (ctx->clut_fmt >> 8) & 0xFF;
-    uint32_t start = ((ctx->clut_fmt >> 16) & 0x1F) << 4;
-    uint32_t start_mask = (ctx->clut_fmt & 3) == 3 ? 0xFFu : 0x1FFu;
-    index = ((index >> shift) & mask) | (start & start_mask);
-    if ((ctx->tex_mode & 0x100u) != 0) {
-        if (ctx->fmt == 4) index += (uint32_t)level * 16u;
-        else if (ctx->fmt == 5 && (ctx->clut_fmt & 3) != 3)
-            index += (uint32_t)(level & 1) * 256u;
-    }
-    int epsm = ctx->clut_fmt & 3;
-    if (epsm == 3) {
-        uint32_t raw;
-        memcpy(&raw, &ctx->clutram[(index * 4) & 2047], 4);
-        unpack_color(raw, 3, r, g, b, a);
-    } else {
-        uint16_t raw;
-        memcpy(&raw, &ctx->clutram[(index * 2) & 2047], 2);
-        unpack_color(raw, epsm, r, g, b, a);
-    }
+    uint32_t clut_index = ge_texture_clut_index(
+        index, ctx->fmt, (uint32_t)level,
+        ctx->clut_fmt, ctx->tex_mode);
+    uint32_t rgba = ge_texture_clut_rgba(
+        ctx->clutram, clut_index, ctx->clut_fmt);
+    *r = (int)(rgba & 0xffu);
+    *g = (int)((rgba >> 8) & 0xffu);
+    *b = (int)((rgba >> 16) & 0xffu);
+    *a = (int)(rgba >> 24);
 }
 
 static void decode_texel_ctx(
@@ -1306,7 +1189,7 @@ static void decode_texel_ctx(
             uint32_t block_size = ctx->fmt == 8 ? 8u : 16u;
             uint32_t block_index =
                 (v >> 2) * blocks_per_row + (u >> 2);
-            uint32_t color = dxt_decode(
+            uint32_t color = ge_texture_dxt_decode(
                 data + block_index * block_size, ctx->fmt, u, v);
             *r = color & 0xff;
             *g = (color >> 8) & 0xff;
@@ -1488,6 +1371,94 @@ void ge_tex_snapshot_decode_level(
         &snapshot->ctx, snapshot->data + snapshot->offset[level],
         snapshot->stride[level], snapshot->width[level],
         snapshot->height[level], level, out);
+}
+
+const uint8_t *ge_tex_snapshot_source_data(
+    const GeTexSnapshot *snapshot, uint32_t level,
+    uint32_t *byte_count) {
+    if (byte_count) *byte_count = 0;
+    if (!snapshot || level >= snapshot->level_count ||
+        !snapshot->bytes[level] || !snapshot->data) {
+        return NULL;
+    }
+    if (byte_count) *byte_count = snapshot->bytes[level];
+    return snapshot->data + snapshot->offset[level];
+}
+
+const uint8_t *ge_tex_snapshot_clut_data(
+    const GeTexSnapshot *snapshot, uint32_t *byte_count) {
+    if (byte_count) *byte_count = 0;
+    if (!snapshot) return NULL;
+    if (byte_count) *byte_count = GE_TEXTURE_RAW_CLUT_BYTES;
+    return snapshot->clutram;
+}
+
+int ge_tex_snapshot_build_raw_job(
+    const GeTexSnapshot *snapshot, uint32_t level,
+    uint32_t source_byte_offset, uint32_t clut_byte_offset,
+    uint32_t destination_pixel_offset,
+    uint32_t destination_width, uint32_t destination_height,
+    GeTextureRawJob *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!snapshot || level >= snapshot->level_count ||
+        !snapshot->bytes[level] ||
+        snapshot->stride[level] == 0 ||
+        snapshot->width[level] <= 0 ||
+        snapshot->height[level] <= 0 ||
+        !destination_width || !destination_height ||
+        destination_width < (uint32_t)snapshot->width[level] ||
+        destination_height < (uint32_t)snapshot->height[level]) {
+        return 0;
+    }
+
+    uint32_t format = snapshot->ctx.fmt & 15u;
+    if (!ge_texture_bits_per_pixel(format) || format > 10u)
+        return 0;
+    uint32_t source_bytes = snapshot->bytes[level];
+    if (source_byte_offset > UINT32_MAX - source_bytes)
+        return 0;
+    uint64_t destination_pixels =
+        (uint64_t)destination_width * destination_height;
+    if (destination_pixels >
+        (uint64_t)UINT32_MAX - destination_pixel_offset) {
+        return 0;
+    }
+
+    uint32_t flags = 0;
+    if (snapshot->ctx.swizzle)
+        flags |= GE_TEXTURE_RAW_SWIZZLED;
+    if (format >= 4u && format <= 7u) {
+        if (clut_byte_offset >
+            UINT32_MAX - GE_TEXTURE_RAW_CLUT_BYTES) {
+            return 0;
+        }
+        flags |= GE_TEXTURE_RAW_INDEXED;
+        if ((snapshot->ctx.tex_mode & 0x100u) == 0)
+            flags |= GE_TEXTURE_RAW_CLUT_SHARED;
+    } else if (format >= 8u) {
+        flags |= GE_TEXTURE_RAW_BLOCK_COMPRESSED;
+    }
+
+    out->abi_version = GE_TEXTURE_RAW_JOB_ABI_VERSION;
+    out->flags = flags;
+    out->format = format;
+    out->mip_level = level;
+    out->source_byte_offset = source_byte_offset;
+    out->source_byte_count = source_bytes;
+    out->source_stride = snapshot->stride[level];
+    out->source_width = (uint32_t)snapshot->width[level];
+    out->source_height = (uint32_t)snapshot->height[level];
+    if ((flags & GE_TEXTURE_RAW_INDEXED) != 0) {
+        out->clut_byte_offset = clut_byte_offset;
+        out->clut_byte_count = GE_TEXTURE_RAW_CLUT_BYTES;
+        out->clut_format = snapshot->ctx.clut_fmt;
+        out->texture_mode = snapshot->ctx.tex_mode;
+    }
+    out->destination_pixel_offset = destination_pixel_offset;
+    out->destination_width = destination_width;
+    out->destination_height = destination_height;
+    return 1;
 }
 
 void ge_tex_snapshot_free(GeTexSnapshot *snapshot) {
@@ -2583,6 +2554,291 @@ static void decode_model_vtx(uint32_t addr, const VFmt *vf, ModelVtx *out) {
     out->nx = nx;
     out->ny = ny;
     out->nz = nz;
+}
+
+static GeTnlVertex *s_tnl_vertices;
+static uint16_t *s_tnl_submission;
+static uint16_t *s_tnl_indices;
+static size_t s_tnl_vertex_capacity;
+static size_t s_tnl_submission_capacity;
+static size_t s_tnl_index_capacity;
+static uint32_t *s_tnl_source_tags;
+static uint16_t *s_tnl_source_map;
+static uint32_t s_tnl_source_generation;
+
+static int reserve_tnl_array(
+    void **memory, size_t *capacity, size_t count, size_t element_size) {
+    if (count <= *capacity) return 1;
+    size_t grown = *capacity ? *capacity : 256u;
+    while (grown < count) {
+        if (grown > SIZE_MAX / 2u) return 0;
+        grown *= 2u;
+    }
+    if (grown > SIZE_MAX / element_size) return 0;
+    void *replacement = realloc(*memory, grown * element_size);
+    if (!replacement) return 0;
+    *memory = replacement;
+    *capacity = grown;
+    return 1;
+}
+
+static void decode_tnl_vertex(
+    uint32_t address, const VFmt *format, GeTnlVertex *out) {
+    ModelVtx model;
+    decode_model_vtx(address, format, &model);
+    out->position[0] = model.x;
+    out->position[1] = model.y;
+    out->position[2] = model.z;
+    out->normal[0] = model.nx;
+    out->normal[1] = model.ny;
+    out->normal[2] = model.nz;
+    out->texcoord[0] = model.u;
+    out->texcoord[1] = model.v;
+    out->color[0] = (uint8_t)clamp8(model.r);
+    out->color[1] = (uint8_t)clamp8(model.g);
+    out->color[2] = (uint8_t)clamp8(model.b);
+    out->color[3] = (uint8_t)clamp8(model.a);
+}
+
+static uint32_t tnl_vertex_flags(const VFmt *format) {
+    uint32_t flags = 0;
+    if (format->nrm_off >= 0) flags |= GE_TNL_VERTEX_NORMAL;
+    if (format->tc_off >= 0) flags |= GE_TNL_VERTEX_TEXCOORD;
+    if (format->col_off >= 0) flags |= GE_TNL_VERTEX_COLOR;
+    if (format->w_n) flags |= GE_TNL_VERTEX_SKINNED;
+    if (format->morph_n > 1) flags |= GE_TNL_VERTEX_MORPHED;
+    return flags;
+}
+
+static int build_tnl_draw(
+    uint32_t vbase, uint32_t ibase, int index_format,
+    const VFmt *format, int primitive, int count,
+    GeTnlState *state, GeTnlDraw *draw) {
+    if (count < 1 || count > 65535 ||
+        (primitive != GE_TNL_POINTS &&
+         primitive != GE_TNL_TRIANGLES &&
+         primitive != GE_TNL_TRIANGLE_STRIP &&
+         primitive != GE_TNL_TRIANGLE_FAN &&
+         primitive != GE_TNL_SPRITES)) {
+        return 0;
+    }
+    uint32_t submitted = (uint32_t)count;
+    uint32_t control_count = primitive == GE_TNL_SPRITES
+        ? submitted / 2u * 2u : submitted;
+    uint32_t assembled =
+        primitive == GE_TNL_POINTS ||
+        primitive == GE_TNL_SPRITES
+            ? control_count
+        : primitive == GE_TNL_TRIANGLES
+            ? submitted / 3u * 3u
+            : submitted >= 3u ? (submitted - 2u) * 3u : 0u;
+    if (!assembled ||
+        !reserve_tnl_array(
+            (void **)&s_tnl_vertices, &s_tnl_vertex_capacity,
+            control_count, sizeof(*s_tnl_vertices)) ||
+        !reserve_tnl_array(
+            (void **)&s_tnl_submission, &s_tnl_submission_capacity,
+            control_count, sizeof(*s_tnl_submission)) ||
+        !reserve_tnl_array(
+            (void **)&s_tnl_indices, &s_tnl_index_capacity,
+            assembled, sizeof(*s_tnl_indices))) {
+        return 0;
+    }
+
+    uint32_t canonical_count = 0;
+    if (index_format) {
+        if (!s_tnl_source_tags) {
+            s_tnl_source_tags =
+                (uint32_t *)calloc(65536u, sizeof(*s_tnl_source_tags));
+            s_tnl_source_map =
+                (uint16_t *)malloc(65536u * sizeof(*s_tnl_source_map));
+            if (!s_tnl_source_tags || !s_tnl_source_map)
+                return 0;
+        }
+        if (++s_tnl_source_generation == 0) {
+            memset(
+                s_tnl_source_tags, 0,
+                65536u * sizeof(*s_tnl_source_tags));
+            s_tnl_source_generation = 1;
+        }
+        for (uint32_t i = 0; i < control_count; i++) {
+            uint32_t source = index_value(
+                ibase, index_format, (int)i);
+            if (source >= 65536u) return 0;
+            if (s_tnl_source_tags[source] !=
+                s_tnl_source_generation) {
+                if (canonical_count >= 65535u) return 0;
+                decode_tnl_vertex(
+                    vbase + source * (uint32_t)format->stride,
+                    format, &s_tnl_vertices[canonical_count]);
+                s_tnl_source_tags[source] =
+                    s_tnl_source_generation;
+                s_tnl_source_map[source] =
+                    (uint16_t)canonical_count++;
+            }
+            s_tnl_submission[i] = s_tnl_source_map[source];
+        }
+    } else {
+        canonical_count = control_count;
+        for (uint32_t i = 0; i < control_count; i++) {
+            decode_tnl_vertex(
+                vbase + i * (uint32_t)format->stride,
+                format, &s_tnl_vertices[i]);
+            s_tnl_submission[i] = (uint16_t)i;
+        }
+    }
+
+    uint32_t index_count = 0;
+    if (primitive == GE_TNL_POINTS ||
+        primitive == GE_TNL_SPRITES) {
+        memcpy(
+            s_tnl_indices, s_tnl_submission,
+            control_count * sizeof(*s_tnl_indices));
+        index_count = control_count;
+    } else {
+        for (uint32_t i = 2; i < submitted; i++) {
+            uint32_t i0;
+            uint32_t i1;
+            uint32_t i2 = i;
+            if (primitive == GE_TNL_TRIANGLES) {
+                if (i % 3u != 2u) continue;
+                i0 = i - 2u;
+                i1 = i - 1u;
+            } else if (primitive == GE_TNL_TRIANGLE_STRIP) {
+                i0 = i - 2u;
+                i1 = i - 1u;
+            } else {
+                i0 = 0;
+                i1 = i - 1u;
+            }
+            uint16_t a = s_tnl_submission[i0];
+            uint16_t b = s_tnl_submission[i1];
+            uint16_t c = s_tnl_submission[i2];
+            if (ge.cull_enable && !ge.clear) {
+                int flip =
+                    ((ge.cull & 1u) == 0u) ^
+                    (primitive == GE_TNL_TRIANGLE_STRIP && (i & 1u));
+                if (flip) {
+                    uint16_t swap = a;
+                    a = b;
+                    b = swap;
+                }
+            }
+            s_tnl_indices[index_count++] = a;
+            s_tnl_indices[index_count++] = b;
+            s_tnl_indices[index_count++] = c;
+        }
+    }
+    if (!ge_tnl_state_capture(
+            &ge, tnl_vertex_flags(format), state)) {
+        return 0;
+    }
+    draw->vertices = s_tnl_vertices;
+    draw->indices = s_tnl_indices;
+    draw->state = state;
+    draw->vertex_count = canonical_count;
+    draw->index_count = index_count;
+    draw->primitive = (uint32_t)primitive;
+    draw->flags =
+        primitive == GE_TNL_SPRITES &&
+        ((ge.tex_filter & 1u) != 0u ||
+         ((ge.tex_filter >> 8u) & 1u) != 0u)
+            ? GE_TNL_DRAW_SPRITE_LINEAR_FILTER : 0;
+    return 1;
+}
+
+static uint64_t tnl_elapsed_us(uint64_t start) {
+    uint64_t end = sr_time_now();
+    uint64_t frequency = sr_time_frequency();
+    return frequency && end >= start
+        ? (end - start) * 1000000u / frequency : 0;
+}
+
+static int try_backend_transform_draw(
+    uint32_t vbase, uint32_t ibase, int index_format,
+    const VFmt *format, int primitive, int count) {
+    if (!s_backend || !s_backend->transform_draw ||
+        sr_perf_path_off(SR_PATH_GPU_TNL)) {
+        return 0;
+    }
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("SR_GPU_TNL");
+        enabled =
+            value && value[0] && strcmp(value, "0") != 0 ? 1 : 0;
+    }
+    if (!enabled) return 0;
+    static int diagnostic_override = -1;
+    if (diagnostic_override < 0) {
+        diagnostic_override =
+            getenv("SR_NOLIGHT") || getenv("SR_NOFOG");
+    }
+    if (diagnostic_override) return 0;
+
+    int timed = sr_perf_enabled();
+    uint64_t start = timed ? sr_time_now() : 0;
+    GeTnlState state;
+    GeTnlDraw draw;
+    if (!build_tnl_draw(
+            vbase, ibase, index_format, format, primitive, count,
+            &state, &draw)) {
+        return 0;
+    }
+    if (timed)
+        sr_perf_counter_add(
+            SR_PERF_GPU_TNL_CPU_DECODE_US, tnl_elapsed_us(start));
+    GeTnlEligibility eligibility = ge_tnl_classify(&draw);
+    if (eligibility != GE_TNL_ELIGIBLE &&
+        eligibility != GE_TNL_ELIGIBLE_PREPROCESS) {
+        return 0;
+    }
+    if (eligibility == GE_TNL_ELIGIBLE_PREPROCESS)
+        draw.flags |= GE_TNL_DRAW_PREPROCESS;
+
+    sr_perf_counter_add(SR_PERF_GPU_TNL_ELIGIBLE_DRAWS, 1);
+    sr_perf_counter_add(
+        SR_PERF_GPU_TNL_CANONICAL_VERTICES, draw.vertex_count);
+    sr_perf_counter_add(
+        SR_PERF_GPU_TNL_SUBMITTED_VERTICES, draw.index_count);
+    if (!s_backend->transform_draw(&draw)) {
+        sr_perf_counter_add(SR_PERF_GPU_TNL_DECLINED_DRAWS, 1);
+        return 0;
+    }
+    if (timed) {
+        static int reference_enabled = -1;
+        static volatile float reference_sink;
+        if (reference_enabled < 0) {
+            const char *value = getenv("SR_GPU_TNL_REFERENCE");
+            reference_enabled =
+                value && value[0] && strcmp(value, "0") != 0;
+        }
+        if (reference_enabled) {
+            uint64_t reference_start = sr_time_now();
+            float checksum = 0.0f;
+            for (uint32_t i = 0; i < draw.vertex_count; i++) {
+                GeTnlReferenceVertex output;
+                if (!ge_tnl_reference_transform(
+                        draw.state, &draw.vertices[i], &output)) {
+                    continue;
+                }
+                checksum +=
+                    output.screen[0] + output.screen[1] +
+                    output.screen[2] + output.uv[0] + output.uv[1] +
+                    output.reciprocal_w + output.fog +
+                    output.color[0] + output.color[1] +
+                    output.color[2] + output.color[3];
+            }
+            reference_sink = checksum;
+            (void)reference_sink;
+            sr_perf_counter_add(
+                SR_PERF_GPU_TNL_CPU_REFERENCE_US,
+                tnl_elapsed_us(reference_start));
+        }
+    }
+    sr_perf_counter_add(SR_PERF_GPU_TNL_ACCEPTED_DRAWS, 1);
+    sr_perf_counter_add(
+        SR_PERF_GE_TRANSFORM_UNIQUE_VERTICES, draw.vertex_count);
+    return 1;
 }
 
 /* Viewport/offset registers change per draw at most; decode them only when they do. */
@@ -4326,7 +4582,11 @@ static void draw_bezier(uint32_t op) {
         return;
     }
     SrPerfCategory patch_previous =
-        sr_perf_switch(SR_PERF_PATCH_EVAL);
+        sr_perf_switch(SR_PERF_BEZIER_EVAL);
+    sr_perf_counter_add(
+        SR_PERF_GE_BEZIER_EVALUATED_VERTICES,
+        (uint64_t)(uint32_t)patch_u * (uint32_t)patch_v *
+            (uint32_t)width * (uint32_t)height);
     for (int pu = 0; pu < patch_u; pu++) {
         for (int pv = 0; pv < patch_v; pv++) {
             const ModelVtx *patch =
@@ -4349,9 +4609,9 @@ static void draw_bezier(uint32_t op) {
                         &vertices[v * width + u]);
                 }
             }
-            sr_perf_switch(SR_PERF_PATCH_DRAW);
+            sr_perf_switch(SR_PERF_BEZIER_DRAW);
             draw_patch_grid(vertices, width, height, &vf);
-            sr_perf_switch(SR_PERF_PATCH_EVAL);
+            sr_perf_switch(SR_PERF_BEZIER_EVAL);
         }
     }
     sr_perf_switch(patch_previous);
@@ -4411,7 +4671,10 @@ static void draw_spline(uint32_t op) {
          (texture_map_mode == 1u &&
           ((ge.tex_map_mode >> 8) & 3u) >= 2u));
     SrPerfCategory patch_previous =
-        sr_perf_switch(SR_PERF_PATCH_EVAL);
+        sr_perf_switch(SR_PERF_SPLINE_EVAL);
+    sr_perf_counter_add(
+        SR_PERF_GE_SPLINE_EVALUATED_VERTICES,
+        (uint64_t)(uint32_t)width * (uint32_t)height);
 #if SR_GE_PATCH_SIMD_SUPPORTED
     if (patch_spline_simd_enabled()) {
         int flip_normal =
@@ -4449,9 +4712,38 @@ static void draw_spline(uint32_t op) {
         }
     }
     log_spline_vertices(vertices, width, height);
-    sr_perf_switch(SR_PERF_PATCH_DRAW);
+    sr_perf_switch(SR_PERF_SPLINE_DRAW);
     draw_patch_grid(vertices, width, height, &vf);
     sr_perf_switch(patch_previous);
+}
+
+static SrPerfCategory primitive_perf_category(uint32_t op) {
+    switch ((op >> 16) & 7u) {
+        case GE_TNL_POINTS: return SR_PERF_POINT;
+        case GE_TNL_LINES:
+        case GE_TNL_LINE_STRIP: return SR_PERF_LINE;
+        case GE_TNL_SPRITES: return SR_PERF_SPRITE;
+        default: return SR_PERF_PRIMITIVE;
+    }
+}
+
+static void record_primitive_work(uint32_t op) {
+    uint32_t type = (op >> 16) & 7u;
+    uint32_t count = op & 0xffffu;
+    if (type == GE_TNL_POINTS) {
+        sr_perf_counter_add(SR_PERF_GE_POINT_DRAWS, 1);
+        sr_perf_counter_add(SR_PERF_GE_POINTS, count);
+    } else if (type == GE_TNL_LINES ||
+               type == GE_TNL_LINE_STRIP) {
+        uint32_t segments = type == GE_TNL_LINES
+            ? count / 2u : (count ? count - 1u : 0u);
+        sr_perf_counter_add(SR_PERF_GE_LINE_DRAWS, 1);
+        sr_perf_counter_add(
+            SR_PERF_GE_LINE_SEGMENTS, segments);
+    } else if (type == GE_TNL_SPRITES) {
+        sr_perf_counter_add(SR_PERF_GE_SPRITE_DRAWS, 1);
+        sr_perf_counter_add(SR_PERF_GE_SPRITES, count / 2u);
+    }
 }
 
 static void draw_prim(uint32_t op) {
@@ -4668,6 +4960,11 @@ static void draw_prim(uint32_t op) {
                 }
             }
         }
+    }
+
+    if (!rt && try_backend_transform_draw(
+            vbase, ibase, idxfmt, &vf, type, count)) {
+        return;
     }
 
     SrPerfCategory decode_previous =
@@ -5405,10 +5702,11 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
 
             case GE_PRIM: {
                 SrPerfCategory previous =
-                    sr_perf_switch(SR_PERF_PRIMITIVE);
+                    sr_perf_switch(primitive_perf_category(op));
                 sr_perf_counter_add(SR_PERF_GE_DRAWS, 1);
                 sr_perf_counter_add(
                     SR_PERF_GE_VERTICES, op & 0xffffu);
+                record_primitive_work(op);
                 s_list_prims++;
                 ge_debug_begin_draw(pc, op);
                 draw_prim(op);
@@ -5422,6 +5720,10 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
                 sr_perf_counter_add(
                     SR_PERF_GE_VERTICES,
                     (op & 0xffu) * ((op >> 8) & 0xffu));
+                sr_perf_counter_add(SR_PERF_GE_BEZIER_DRAWS, 1);
+                sr_perf_counter_add(
+                    SR_PERF_GE_BEZIER_CONTROL_POINTS,
+                    (op & 0xffu) * ((op >> 8) & 0xffu));
                 s_list_prims++;
                 ge_debug_begin_draw(pc, op);
                 draw_bezier(op);
@@ -5434,6 +5736,10 @@ void ge_execute_op(uint32_t op, uint32_t pc) {
                 sr_perf_counter_add(SR_PERF_GE_DRAWS, 1);
                 sr_perf_counter_add(
                     SR_PERF_GE_VERTICES,
+                    (op & 0xffu) * ((op >> 8) & 0xffu));
+                sr_perf_counter_add(SR_PERF_GE_SPLINE_DRAWS, 1);
+                sr_perf_counter_add(
+                    SR_PERF_GE_SPLINE_CONTROL_POINTS,
                     (op & 0xffu) * ((op >> 8) & 0xffu));
                 s_list_prims++;
                 ge_debug_begin_draw(pc, op);

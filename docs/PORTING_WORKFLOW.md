@@ -212,8 +212,15 @@ either eliminated or classified with bounded acceptance thresholds.
 ### Input
 
 - Begin with deterministic pad scripts.
+- Use presentation-timed analog scripts for unattended movement paths that must
+  remain stable across paced and turbo runs.
 - Validate gameplay state transitions, not just host input events.
 - Keep generic PSP bindings separate from title-specific hidden controls.
+- Set `SR_GAME_TITLE`, `SR_APPLICATION_DATA_NAME`, and
+  `SR_ISO_PICKER_TITLE` in the title build rather than hard-coding title policy
+  in the shared runtime.
+- Leave title-specific input extensions disabled in shared builds and enable
+  them explicitly from the owning title repository.
 
 ### Filesystems and savedata
 
@@ -264,7 +271,14 @@ Before release:
 - Verify a clean recursive clone.
 - Build the complete corresponding-source archive.
 - Confirm release configurations do not enable permissive diagnostics.
-- Pin the exact shared runtime commit in the title repository.
+- Pin the exact shared runtime commit in the title repository only after the
+  public title build and every affected protected route pass that same commit.
+  Do not pin an uncommitted worktree or advance a pin solely to consume an
+  opt-in performance experiment.
+- Name the state reached by each performance window using expected frames or
+  workload checkpoints. Do not treat an opening movie, menu or cutscene as a
+  gameplay route merely because the process reached a high presentation
+  count.
 
 ## Stop conditions
 

@@ -17,6 +17,7 @@ The documentation separates:
 |---|---|
 | Start a new PSP recompilation | [Porting workflow](PORTING_WORKFLOW.md), then [title project template](TITLE_PROJECT_TEMPLATE.md) |
 | Change shared runtime or codegen behavior | [Shared findings](SHARED_FINDINGS.md), then [validation](VALIDATION.md) |
+| Plan or implement shared performance work | [Performance TODO](PERFTODO.md), then [shared findings](SHARED_FINDINGS.md#psp-f-038--profile-across-guest-scheduler-frontend-backend-and-gpu-boundaries) |
 | Recognize or reuse previously translated functions | [Safe function reuse](FUNCTION_REUSE.md) |
 | Investigate a regression in an existing title | [Title findings](titles/README.md), then [validation](VALIDATION.md) |
 | Decide whether behavior is generic or title-specific | [Shared findings: ownership boundary](SHARED_FINDINGS.md#shared-runtime-versus-title-project) |
@@ -35,6 +36,8 @@ conditions and evidence requirements.
   shared-runtime/title-policy boundary.
 - [Validation and evidence](VALIDATION.md) — validation ladder, commands,
   diagnostics, protected evidence rules, and release gates.
+- [Performance TODO](PERFTODO.md) — measured CPU/GPU optimization roadmap,
+  implementation phases, A/B requirements, and promotion gates.
 - [Safe function reuse](FUNCTION_REUSE.md) — provenance catalog, exact local
   codegen cache, invalidation keys, and trust boundary.
 - [Title project template](TITLE_PROJECT_TEMPLATE.md) — copyable structure for

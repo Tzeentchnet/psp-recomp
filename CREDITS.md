@@ -97,7 +97,7 @@ relative to `third_party/ppsspp/`.
 
 | File in this project | Translated/derived from (PPSSPP) | Nature |
 | --- | --- | --- |
-| `src/rt/mpeg.c`, `src/rt/h264_mf.c`, `mpeg` wrappers in `src/rt/hle.c` | `Core/HLE/sceMpeg.cpp` (rev 4e109dd6), `Core/HW/MpegDemux.cpp` | PSMF header/ring/context/stream/AU behavior modelled on PPSSPP; native decode uses original Windows Media Foundation H.264 glue plus the separately attributed standalone ATRAC decoder rather than PPSSPP's FFmpeg MediaEngine. |
+| `src/rt/mpeg.c`, `src/rt/h264_psmf.c`, `src/rt/h264_mf.c`, `src/rt/h264_vt.c`, `mpeg` wrappers in `src/rt/hle.c` | `Core/HLE/sceMpeg.cpp` (rev 4e109dd6), `Core/HW/MpegDemux.cpp` | PSMF header/ring/context/stream/AU behavior modelled on PPSSPP; native H.264 decode uses Media Foundation or VideoToolbox plus the separately attributed standalone ATRAC decoder rather than PPSSPP's FFmpeg MediaEngine. |
 | `src/rt/atrac_decode.cpp`, Atrac wrappers in `src/rt/hle.c` | `Core/HW/Atrac3Standalone.cpp`, `Core/Util/AtracTrack.cpp`, `Core/HLE/AtracCtx.cpp` | C ABI and PSP RIFF/buffer/loop integration around the separately attributed LGPL standalone decoder above. |
 | `src/rt/pgf.c`, `src/rt/pgf.h` | `Core/Font/PGF.cpp` | C port of the PGF font reader: PGF parse, `PGFFontInfo`/`PGFCharInfo`/`GlyphImage` layouts, glyph rasterisation. |
 | `src/rt/vfpu_interp.c`; VFPU prefix + transcendental helpers behind `src/rt/recomp.h`/`recomp.c` | `Core/MIPS/MIPS.cpp` and PPSSPP's VFPU kernels | Exact ports of the table-based VFPU transcendentals and the `vcst` constant table; source/destination prefix application ported from PPSSPP. |
@@ -117,7 +117,7 @@ licensing purposes.
 
 - **SDL3** (`SDL3.dll`, `src/rt/gpu_d3d12/`, `src/rt/gpu_sdl3vk/`) — zlib license — https://libsdl.org
 - **Vulkan loader / headers** — Apache-2.0 — https://github.com/KhronosGroup/Vulkan-Loader
-- **SMAA** (`third_party/smaa/`, D3D12 optional post-processing) — MIT —
+- **SMAA** (`third_party/smaa/`, D3D12/Vulkan optional post-processing) — MIT —
   https://github.com/iryoku/smaa at commit
   `71c806a838bdd7d517df19192a20f0c61b3ca29d`. The original shader and
   precomputed area/search lookup data are included with their license.

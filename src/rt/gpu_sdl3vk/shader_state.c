@@ -85,6 +85,29 @@ int ge_vk_shader_direct_stencil_write(const GeState *state) {
            writes_stencil;
 }
 
+int ge_vk_indexed_framebuffer_compatible(
+    const GeState *state, uint32_t format, uint32_t stride, uint32_t offset) {
+    return state && state->tex_fmt == 7u && format == 3u &&
+           !state->tex_swizzle && (offset & 3u) == 0u &&
+           ge_texture_buffer_width(state->tex_fmt, state->tex_bufw) == stride;
+}
+
+uint64_t ge_vk_texture_palette_key(const GeState *state) {
+    if (!state || state->tex_fmt < 4u || state->tex_fmt > 7u) return 0;
+    uint64_t hash = 1469598103934665603ull;
+    const uint8_t *bytes = (const uint8_t *)state->clutram;
+    for (size_t i = 0; i < sizeof(state->clutram); i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    bytes = (const uint8_t *)&state->clut_fmt;
+    for (size_t i = 0; i < sizeof(state->clut_fmt); i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
 static uint32_t pack_dimensions(int width, int height) {
     uint32_t w = width > 0 ? (uint32_t)width : 1u;
     uint32_t h = height > 0 ? (uint32_t)height : 1u;

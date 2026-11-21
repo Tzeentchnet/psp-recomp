@@ -26,6 +26,8 @@
 
 #pragma once
 
+#include <stddef.h>
+
 #include "kirk_common.h"
 #include "SHA1.h"
 #include "AES.h"

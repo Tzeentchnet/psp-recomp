@@ -2,6 +2,7 @@
 #
 # Usage:
 #   mingw32-make GAME_NAME=mygame GAME_ELF=eboot.elf GAME_BASE=0x08804000 GAME_ENTRY=0x08804128
+#   make GAME_NAME=mygame GAME_ELF=eboot.elf GAME_BASE=0x08804000 GAME_ENTRY=0x08804128
 #
 
 # Override these on the command line for your game (see README).
@@ -12,15 +13,70 @@ GAME_ELF   ?= eboot.elf
 GAME_BASE  ?= 0x08804000
 GAME_ENTRY ?= 0x08804000
 
+PLATFORM_FIBER_SRCS :=
+INTERP_FIBER_OBJS :=
+
+ifeq ($(OS),Windows_NT)
+HOST_WINDOWS := 1
+EXEEXT       := .exe
+DEFAULT_PYTHON := python
+PLATFORM_DEFINES := -DSR_SDL3VK -DSR_SDL3VK_SMAA -DSR_D3D12
+PLATFORM_RT_SRCS := src/rt/gui.c \
+                    src/rt/graphics_settings.c \
+                    src/rt/input_settings.c \
+                    src/rt/h264_mf.c \
+                    src/rt/h264_psmf.c \
+                    src/rt/osk_win.c
+PLATFORM_LIBS := -lSDL3 -lvulkan-1 -ld3d12 -ldxgi -lmfplat -lgdi32 \
+                 -ldinput8 -ldxguid -lole32 -lwinmm -lxaudio2_9 -lbcrypt
+CXX_RUNTIME_LIB := -lstdc++
+else
+HOST_WINDOWS := 0
+EXEEXT       :=
+DEFAULT_PYTHON := python3
+PKG_CONFIG   ?= pkg-config
+PLATFORM_DEFINES := -DSR_SDL3VK -DSR_SDL3VK_SMAA
+PLATFORM_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl3 vulkan 2>/dev/null)
+PLATFORM_RT_SRCS := src/rt/gui_sdl.c \
+                    src/rt/settings_portable.c \
+                    src/rt/audio_sdl.c \
+                    src/rt/osk_posix.c
+PLATFORM_LIBS := $(shell $(PKG_CONFIG) --libs sdl3 vulkan 2>/dev/null)
+ifeq ($(shell uname -s),Darwin)
+HOST_APPLE := 1
+CXX_RUNTIME_LIB := -lc++
+PLATFORM_RT_SRCS := $(filter-out src/rt/settings_portable.c src/rt/osk_posix.c,$(PLATFORM_RT_SRCS))
+PLATFORM_RT_SRCS += src/rt/macos_app.mm src/rt/settings_macos.mm \
+                    src/rt/osk_macos.mm src/rt/h264_vt.c src/rt/h264_psmf.c
+ifeq ($(shell uname -m),arm64)
+PLATFORM_FIBER_SRCS := src/rt/fiber_arm64.S
+INTERP_FIBER_OBJS := build/tests/interp_fiber_arm64.o
+PLATFORM_RT_SRCS += $(PLATFORM_FIBER_SRCS)
+FIBER_ASM_SRCS := $(PLATFORM_FIBER_SRCS) tools/tests/fiber_arm64_test.S
+endif
+PLATFORM_LIBS += -framework VideoToolbox -framework CoreMedia \
+                 -framework CoreVideo -framework CoreFoundation \
+                 -framework AppKit
+else
+CXX_RUNTIME_LIB := -lstdc++
+PLATFORM_RT_SRCS += src/rt/h264_stub.c
+endif
+endif
+
 CC         ?= gcc
 CXX        ?= g++
-PYTHON     ?= python
-CFLAGS     ?= -O1 -foptimize-sibling-calls -Isrc/rt -DSR_SDL3VK -DSR_D3D12 -Wall -Wextra
-CXXFLAGS   ?= -std=c++17 -O1 -Isrc/rt -DSR_D3D12 -Wall -Wextra -fno-exceptions -fno-rtti
+PYTHON     ?= $(DEFAULT_PYTHON)
+CFLAGS     ?= -O1 -foptimize-sibling-calls -Isrc/rt $(PLATFORM_DEFINES) $(PLATFORM_CFLAGS) -Wall -Wextra
+CXXFLAGS   ?= -std=c++17 -O1 -Isrc/rt $(PLATFORM_DEFINES) $(PLATFORM_CFLAGS) -Wall -Wextra -fno-exceptions -fno-rtti
+ifeq ($(HOST_WINDOWS),1)
 LDFLAGS    ?= -fuse-ld=lld
-LIBS       ?= -lSDL3 -lvulkan-1 -ld3d12 -ldxgi -lmfplat -lgdi32 -ldinput8 -ldxguid -lole32 -lwinmm -lxaudio2_9 -lbcrypt
+else
+LDFLAGS    ?=
+endif
+LIBS       ?= $(PLATFORM_LIBS)
 
 BUILD_DIR  ?= build/$(GAME_NAME)
+PROGRAM    := $(BUILD_DIR)/$(GAME_NAME)$(EXEEXT)
 
 RT_GE_O    := $(BUILD_DIR)/ge.o
 RT_AUDIO_XAUDIO2_O := $(BUILD_DIR)/audio_xaudio2.o
@@ -38,16 +94,32 @@ RT_D3D12_TEXTURE_O := $(BUILD_DIR)/gpu_d3d12_texture.o
 RT_D3D12_TEXTURE_KEY_O := $(BUILD_DIR)/gpu_d3d12_texture_key.o
 RT_TEXTURE_SCALER_O := $(BUILD_DIR)/texture_scaler.o
 RT_XBRZ_O := $(BUILD_DIR)/xbrz.o
+WINDOWS_RT_OBJS := $(RT_AUDIO_XAUDIO2_O) $(RT_D3D12_O) \
+                   $(RT_D3D12_FRAMEBUFFER_O) \
+                   $(RT_D3D12_FRAMEBUFFER_KEY_O) \
+                   $(RT_D3D12_VERTEX_O) $(RT_D3D12_PIPELINE_O) \
+                   $(RT_D3D12_PIPELINE_KEY_O) $(RT_D3D12_PRESENT_O) \
+                   $(RT_D3D12_PRESENT_LAYOUT_O) $(RT_D3D12_SMAA_O) \
+                   $(RT_D3D12_SHADER_STATE_O) $(RT_D3D12_TEXTURE_O) \
+                   $(RT_D3D12_TEXTURE_KEY_O)
+ifeq ($(HOST_WINDOWS),1)
+PLATFORM_RT_OBJS := $(WINDOWS_RT_OBJS)
+else
+PLATFORM_RT_OBJS :=
+endif
 RT_SRCS    := src/rt/recomp.c \
               src/rt/dispatch_table.c \
               src/rt/fpu_mode.c \
               src/rt/fps_counter.c \
-src/rt/interp_runtime.cpp \
-src/ref/interp.cpp \
+              src/rt/platform.c \
+              src/rt/perf_stats.c \
+              src/rt/display_state.c \
+              src/rt/host_lifecycle.c \
+              src/rt/interp_runtime.cpp \
+              src/ref/interp.cpp \
               src/rt/module.c \
               src/rt/vfpu_interp.c \
               src/rt/vfpu_asin.c \
-              src/rt/perf_stats.c \
               src/rt/hle.c \
               src/rt/memstick_state.c \
               src/rt/net.c \
@@ -59,17 +131,15 @@ src/ref/interp.cpp \
               src/rt/iso.c \
               src/rt/mpeg.c \
               src/rt/pgf.c \
-              src/rt/gui.c \
               src/rt/settings_path.c \
               src/rt/graphics_config.c \
-              src/rt/graphics_settings.c \
+              src/rt/graphics_auto.c \
               src/rt/input_config.c \
-              src/rt/input_settings.c \
+              src/rt/input_script.c \
               src/rt/kzl_twinstick.c \
               src/rt/startup_check.c \
               src/rt/audio_mixer.c \
               src/rt/sas_reverb.c \
-              src/rt/h264_mf.c \
               src/rt/savedata.c \
               src/rt/savedata_crypto.cpp \
               third_party/ppsspp_savedata/AES.c \
@@ -78,11 +148,14 @@ src/ref/interp.cpp \
               third_party/ppsspp_savedata/ec.c \
               third_party/ppsspp_savedata/kirk_engine.c \
               third_party/ppsspp_savedata/chnnlsv.cpp \
-              src/rt/osk_win.c \
               src/rt/driver.c \
               src/rt/gpu_sdl3vk/sdl3vk.c \
               src/rt/gpu_sdl3vk/ge_gpu.c \
-              src/rt/gpu_sdl3vk/shader_state.c
+              src/rt/gpu_sdl3vk/pipeline_cache_vk.c \
+              src/rt/gpu_sdl3vk/present_layout.c \
+              src/rt/gpu_sdl3vk/smaa_vk.c \
+              src/rt/gpu_sdl3vk/shader_state.c \
+              $(PLATFORM_RT_SRCS)
 AT3_NAMES  := atrac atrac3 atrac3plus atrac3plusdec atrac3plusdsp get_bits compat fft mem
 AT3_OBJS   := $(addprefix $(BUILD_DIR)/at3_,$(addsuffix .o,$(AT3_NAMES))) \
               $(BUILD_DIR)/atrac_decode.o
@@ -91,15 +164,27 @@ DXC        ?= dxc
 GLSLANG_VALIDATOR ?= glslangValidator
 
 .PHONY: all pipeline compile clean run \
+        check-native-deps \
         shaders-d3d12 check-shaders-d3d12 \
         shaders-vulkan check-shaders-vulkan \
         test-d3d12-vertex test-dispatch-table test-fps-counter \
-        test-perf-stats test-ge-patch-math \
-        test-input-config test-module-loader test-memstick-state \
+        test-perf-stats test-ge-patch-math test-ge-tnl \
+        test-input-config test-input-script test-settings-path \
+        test-module-loader test-memstick-state \
         test-interpreter test-texture-scaler \
-        test-vulkan-shader-state test-runtime
+        test-vulkan-shader-state test-vulkan-tnl-validation \
+        test-h264-psmf test-h264-vt test-fiber \
+        test-host-lifecycle test-audio-sdl-lifecycle test-runtime
 
 all: pipeline compile
+
+check-native-deps:
+ifeq ($(HOST_WINDOWS),0)
+	@$(PKG_CONFIG) --exists sdl3 vulkan || { \
+		echo "SDL3 and Vulkan development packages are required (pkg-config: sdl3 vulkan)."; \
+		exit 1; \
+	}
+endif
 
 pipeline: $(BUILD_DIR)/$(GAME_NAME)_image.bin $(BUILD_DIR)/$(GAME_NAME)_recomp.c $(BUILD_DIR)/$(GAME_NAME)_imports.toml
 
@@ -116,7 +201,8 @@ $(BUILD_DIR)/$(GAME_NAME)_imports.toml: $(GAME_ELF) tools/imports.py tools/analy
 	$(PYTHON) tools/imports.py $(GAME_ELF) $(GAME_BASE) --toml=$@
 
 # ge.c is the software rasterizer fallback, compile with -O2
-$(RT_GE_O): src/rt/ge.c src/rt/ge_patch_math.h src/rt/recomp.h
+$(RT_GE_O): src/rt/ge.c src/rt/ge_patch_math.h src/rt/ge_tnl.h \
+            src/rt/ge_shared.h src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) -O2 -fno-math-errno -Wall -Wextra -Isrc/rt -c src/rt/ge.c -o $@
 
@@ -138,9 +224,13 @@ $(RT_D3D12_O): src/rt/gpu_d3d12/device.cpp src/rt/gpu_d3d12/device.h \
                src/rt/gpu_d3d12/vertex.h \
                src/rt/gpu_d3d12/texture.h \
                src/rt/graphics_config.h \
-               src/rt/gpu_d3d12/shaders/psp_vs.inc src/rt/gpu_d3d12/shaders/psp_ps.inc \
+               src/rt/gpu_d3d12/shaders/psp_vs.inc \
+               src/rt/gpu_d3d12/shaders/psp_vs_validation.inc \
+               src/rt/gpu_d3d12/shaders/psp_tnl_transform_cs.inc \
+               src/rt/gpu_d3d12/shaders/psp_tnl_triangles_cs.inc \
+               src/rt/gpu_d3d12/shaders/psp_ps.inc \
                src/rt/gpu_d3d12/shaders/psp_ps_direct.inc \
-               src/rt/ge_shared.h src/rt/recomp.h
+               src/rt/ge_tnl.h src/rt/ge_shared.h src/rt/recomp.h
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/device.cpp -o $@
 
@@ -161,7 +251,7 @@ $(RT_D3D12_FRAMEBUFFER_KEY_O): src/rt/gpu_d3d12/framebuffer_key.cpp \
 $(RT_D3D12_VERTEX_O): src/rt/gpu_d3d12/vertex.cpp src/rt/gpu_d3d12/vertex.h \
                       src/rt/gpu_d3d12/device.h src/rt/gpu_d3d12/pipeline.h \
                       src/rt/gpu_d3d12/texture.h \
-                      src/rt/ge_shared.h
+                      src/rt/ge_tnl.h src/rt/ge_shared.h
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) -c src/rt/gpu_d3d12/vertex.cpp -o $@
 
@@ -244,7 +334,8 @@ $(BUILD_DIR)/d3d12_vertex_test.exe: tools/tests/d3d12_vertex_test.cpp \
                                    src/rt/gpu_d3d12/pipeline.h \
                                    src/rt/gpu_d3d12/present.h \
                                    src/rt/gpu_d3d12/framebuffer.h \
-                                   src/rt/gpu_d3d12/device.h src/rt/ge_shared.h
+                                   src/rt/gpu_d3d12/device.h \
+                                   src/rt/ge_tnl.h src/rt/ge_shared.h
 	@$(PYTHON) -c "from pathlib import Path; Path(r'$(BUILD_DIR)').mkdir(parents=True, exist_ok=True)"
 	$(CXX) $(CXXFLAGS) tools/tests/d3d12_vertex_test.cpp \
 		src/rt/gpu_d3d12/vertex.cpp src/rt/gpu_d3d12/pipeline_key.cpp \
@@ -274,9 +365,34 @@ test-vulkan-shader-state:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O2 -Isrc/rt -Wall -Wextra \
 		tools/tests/vulkan_shader_state_test.c \
+		src/rt/gpu_sdl3vk/present_layout.c \
 		src/rt/gpu_sdl3vk/shader_state.c \
 		-o build/tests/vulkan_shader_state_test.exe
 	./build/tests/vulkan_shader_state_test.exe
+
+test-vulkan-tnl-validation: \
+		src/rt/gpu_sdl3vk/psp_tnl_validation_vert.inc \
+		src/rt/gpu_sdl3vk/psp_tnl_points_validation_vert.inc \
+		src/rt/gpu_sdl3vk/psp_tnl_sprites_validation_vert.inc \
+		src/rt/gpu_sdl3vk/psp_tnl_through_sprites_validation_vert.inc \
+		src/rt/gpu_sdl3vk/psp_tnl_transform_comp.inc \
+		src/rt/gpu_sdl3vk/psp_tnl_triangles_comp.inc \
+		src/rt/gpu_sdl3vk/psp_texture_decode_comp.inc
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt $(PLATFORM_CFLAGS) -Wall -Wextra \
+		-Wno-missing-field-initializers \
+		tools/tests/vulkan_tnl_validation_test.c \
+		-o build/tests/vulkan_tnl_validation_test.exe \
+		$(shell $(PKG_CONFIG) --libs vulkan 2>/dev/null) -lm
+	@if [ -f /opt/homebrew/lib/libVkLayer_khronos_validation.dylib ]; then \
+		DYLD_LIBRARY_PATH="/opt/homebrew/lib:$${DYLD_LIBRARY_PATH}" \
+			./build/tests/vulkan_tnl_validation_test.exe; \
+	elif [ -f /usr/local/lib/libVkLayer_khronos_validation.dylib ]; then \
+		DYLD_LIBRARY_PATH="/usr/local/lib:$${DYLD_LIBRARY_PATH}" \
+			./build/tests/vulkan_tnl_validation_test.exe; \
+	else \
+		./build/tests/vulkan_tnl_validation_test.exe; \
+	fi
 
 test-module-loader:
 	@mkdir -p build/tests
@@ -302,7 +418,8 @@ test-fps-counter:
 test-perf-stats:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
-		tools/tests/perf_stats_test.c src/rt/perf_stats.c \
+		tools/tests/perf_stats_test.c src/rt/perf_stats.c src/rt/platform.c \
+		$(PLATFORM_FIBER_SRCS) \
 		-o build/tests/perf_stats_test.exe
 	./build/tests/perf_stats_test.exe
 
@@ -312,6 +429,16 @@ test-ge-patch-math:
 		-Isrc/rt -Wall -Wextra tools/tests/ge_patch_math_test.c \
 		-o build/tests/ge_patch_math_test.exe -lm
 	./build/tests/ge_patch_math_test.exe
+
+test-ge-tnl:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt -Wall -Wextra \
+		tools/tests/ge_tnl_test.c -o build/tests/ge_tnl_test.exe -lm
+	./build/tests/ge_tnl_test.exe
+	$(CC) -std=c11 -O2 -ffp-contract=off -fno-strict-aliasing \
+		-Isrc/rt -Wall -Wextra tools/tests/ge_tnl_decode_test.c \
+		src/rt/ge.c -o build/tests/ge_tnl_decode_test.exe -lm
+	./build/tests/ge_tnl_decode_test.exe
 
 test-memstick-state:
 	@mkdir -p build/tests
@@ -323,11 +450,46 @@ test-memstick-state:
 test-input-config:
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
+		-DSR_ENABLE_KZL_TWIN_STICK=1 \
 		tools/tests/input_config_test.c src/rt/input_config.c \
-		src/rt/settings_path.c -o build/tests/input_config_test.exe -lm
+		src/rt/settings_path.c src/rt/platform.c \
+		$(PLATFORM_FIBER_SRCS) \
+		-o build/tests/input_config_test.exe -lm
 	./build/tests/input_config_test.exe
 
-test-interpreter:
+test-input-script:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O0 -Isrc/rt -Itools/tests -Wall -Wextra \
+		tools/tests/input_script_test.c src/rt/input_script.c \
+		-o build/tests/input_script_test.exe
+	./build/tests/input_script_test.exe
+
+test-settings-path:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O0 -Isrc/rt -Itools/tests -Wall -Wextra \
+		-DSR_APPLICATION_DATA_NAME=\"KZLRecomp\" \
+		tools/tests/settings_path_test.c src/rt/settings_path.c \
+		src/rt/platform.c $(PLATFORM_FIBER_SRCS) \
+		-o build/tests/settings_path_test.exe
+	./build/tests/settings_path_test.exe
+
+test-graphics-config:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O0 -Isrc/rt -Wall -Wextra \
+		tools/tests/graphics_config_test.c src/rt/graphics_config.c \
+		src/rt/graphics_auto.c \
+		src/rt/settings_path.c src/rt/platform.c \
+		$(PLATFORM_FIBER_SRCS) \
+		-o build/tests/graphics_config_test.exe
+	./build/tests/graphics_config_test.exe
+
+ifneq ($(strip $(PLATFORM_FIBER_SRCS)),)
+$(INTERP_FIBER_OBJS): $(PLATFORM_FIBER_SRCS)
+	@mkdir -p build/tests
+	$(CC) -c $< -o $@
+endif
+
+test-interpreter: $(INTERP_FIBER_OBJS)
 	@mkdir -p build/tests
 	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/recomp.c -o build/tests/interp_recomp.o
 	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/dispatch_table.c -o build/tests/interp_dispatch.o
@@ -335,6 +497,8 @@ test-interpreter:
 	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/vfpu_interp.c -o build/tests/interp_vfpu.o
 	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/vfpu_asin.c -o build/tests/interp_vfpu_asin.o
 	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/settings_path.c -o build/tests/interp_settings.o
+	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/platform.c -o build/tests/interp_platform.o
+	$(CC) -std=c11 -O0 -Isrc/rt -c src/rt/perf_stats.c -o build/tests/interp_perf.o
 	$(CXX) -std=c++17 -O0 -Isrc/rt -Isrc/ref -c \
 		src/rt/interp_runtime.cpp -o build/tests/interp_runtime.o
 	$(CXX) -std=c++17 -O0 -Isrc/rt -Isrc/ref -c \
@@ -345,8 +509,9 @@ test-interpreter:
 		build/tests/interp_test.o build/tests/interp_recomp.o \
 		build/tests/interp_dispatch.o build/tests/interp_fpu.o \
 		build/tests/interp_vfpu.o build/tests/interp_vfpu_asin.o \
-		build/tests/interp_settings.o build/tests/interp_runtime.o \
-		build/tests/interp_ref.o -lm
+		build/tests/interp_settings.o build/tests/interp_platform.o \
+		build/tests/interp_perf.o build/tests/interp_runtime.o \
+		build/tests/interp_ref.o $(INTERP_FIBER_OBJS) -lm
 	./build/tests/interp_fallback_test.exe
 
 test-texture-scaler:
@@ -356,50 +521,92 @@ test-texture-scaler:
 		third_party/xbrz/xbrz.cpp -o build/tests/texture_scaler_test.exe
 	./build/tests/texture_scaler_test.exe
 
-test-runtime: test-dispatch-table test-fps-counter test-perf-stats \
-	test-ge-patch-math test-input-config \
+test-h264-psmf:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt -Wall -Wextra \
+		tools/tests/h264_psmf_test.c src/rt/h264_psmf.c \
+		-o build/tests/h264_psmf_test$(EXEEXT)
+	./build/tests/h264_psmf_test$(EXEEXT)
+
+ifeq ($(HOST_APPLE),1)
+test-h264-vt:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt -Wall -Wextra \
+		tools/tests/h264_vt_test.c src/rt/h264_vt.c src/rt/h264_psmf.c \
+		-framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+		-framework CoreFoundation -o build/tests/h264_vt_test
+	./build/tests/h264_vt_test
+
+test-runtime: test-h264-vt
+else
+test-h264-vt:
+	@echo "VideoToolbox tests require macOS."
+	@exit 2
+endif
+
+ifeq ($(HOST_WINDOWS),0)
+test-fiber:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt -Wall -Wextra \
+		tools/tests/fiber_test.c src/rt/platform.c $(FIBER_ASM_SRCS) \
+		-o build/tests/fiber_test
+	./build/tests/fiber_test
+
+test-audio-sdl-lifecycle:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt $(PLATFORM_CFLAGS) -Wall -Wextra \
+		tools/tests/audio_sdl_lifecycle_test.c \
+		src/rt/audio_sdl.c src/rt/audio_mixer.c \
+		$(PLATFORM_LIBS) -o build/tests/audio_sdl_lifecycle_test
+	./build/tests/audio_sdl_lifecycle_test
+
+test-runtime: test-fiber test-audio-sdl-lifecycle
+else
+test-fiber:
+	@echo "Portable fiber tests require a POSIX host."
+	@exit 2
+test-audio-sdl-lifecycle:
+	@echo "SDL audio lifecycle tests require a POSIX host."
+	@exit 2
+endif
+
+test-host-lifecycle:
+	@mkdir -p build/tests
+	$(CC) -std=c11 -O2 -Isrc/rt -Wall -Wextra \
+		tools/tests/host_lifecycle_test.c src/rt/host_lifecycle.c \
+		-o build/tests/host_lifecycle_test
+	./build/tests/host_lifecycle_test
+
+test-runtime: test-dispatch-table test-fps-counter test-perf-stats test-h264-psmf \
+	test-ge-patch-math test-ge-tnl test-input-config test-input-script test-settings-path \
+	test-graphics-config \
 	test-module-loader test-memstick-state test-interpreter \
-	test-texture-scaler test-vulkan-shader-state
+	test-texture-scaler test-vulkan-shader-state test-host-lifecycle
 
 # Generated C code gets huge. Cache the compiled object to avoid rebuilding it on runtime changes.
 $(BUILD_DIR)/$(GAME_NAME)_recomp.o: $(BUILD_DIR)/$(GAME_NAME)_recomp.c src/rt/recomp.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) $(RT_AUDIO_XAUDIO2_O) $(RT_D3D12_O) \
-         $(RT_D3D12_FRAMEBUFFER_O) $(RT_D3D12_FRAMEBUFFER_KEY_O) \
-         $(RT_D3D12_VERTEX_O) $(RT_D3D12_PIPELINE_O) $(RT_D3D12_PIPELINE_KEY_O) \
-         $(RT_D3D12_PRESENT_O) $(RT_D3D12_PRESENT_LAYOUT_O) \
-         $(RT_D3D12_SMAA_O) \
-         $(RT_D3D12_SHADER_STATE_O) \
-         $(RT_D3D12_TEXTURE_O) $(RT_D3D12_TEXTURE_KEY_O) \
-         $(RT_TEXTURE_SCALER_O) $(RT_XBRZ_O) $(AT3_OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(GAME_NAME).exe \
+compile: check-native-deps $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O) \
+         $(PLATFORM_RT_OBJS) $(RT_TEXTURE_SCALER_O) $(RT_XBRZ_O) $(AT3_OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $(PROGRAM) \
 		$(BUILD_DIR)/$(GAME_NAME)_recomp.o \
 		$(RT_GE_O) \
-		$(RT_AUDIO_XAUDIO2_O) \
-		$(RT_D3D12_O) \
-		$(RT_D3D12_FRAMEBUFFER_O) \
-		$(RT_D3D12_FRAMEBUFFER_KEY_O) \
-		$(RT_D3D12_VERTEX_O) \
-		$(RT_D3D12_PIPELINE_O) \
-		$(RT_D3D12_PIPELINE_KEY_O) \
-		$(RT_D3D12_PRESENT_O) \
-		$(RT_D3D12_PRESENT_LAYOUT_O) \
-		$(RT_D3D12_SMAA_O) \
-		$(RT_D3D12_SHADER_STATE_O) \
-		$(RT_D3D12_TEXTURE_O) \
-		$(RT_D3D12_TEXTURE_KEY_O) \
+		$(PLATFORM_RT_OBJS) \
 		$(RT_TEXTURE_SCALER_O) \
 		$(RT_XBRZ_O) \
 		$(AT3_OBJS) \
 		$(RT_SRCS) \
-		$(LIBS) -lstdc++ -lm
+		$(LIBS) $(CXX_RUNTIME_LIB) -lm
+ifeq ($(HOST_WINDOWS),1)
 	@cp SDL3.dll $(BUILD_DIR)/ 2>/dev/null || cp ../SDL3.dll $(BUILD_DIR)/ 2>/dev/null || true
+endif
+	@cp -r assets $(BUILD_DIR)/ 2>/dev/null || true
 	@cp -r font $(BUILD_DIR)/ 2>/dev/null || cp -r ../font $(BUILD_DIR)/ 2>/dev/null || true
-	@echo "Build finished: $(BUILD_DIR)/$(GAME_NAME).exe"
+	@echo "Build finished: $(PROGRAM)"
 
 clean:
 	rm -rf $(BUILD_DIR)
 
 run: all
-	./$(BUILD_DIR)/$(GAME_NAME).exe --image $(BUILD_DIR)/$(GAME_NAME)_image.bin $(GAME_BASE) $(GAME_ENTRY) none none --gui
+	./$(PROGRAM) --image $(BUILD_DIR)/$(GAME_NAME)_image.bin $(GAME_BASE) $(GAME_ENTRY) none none --gui

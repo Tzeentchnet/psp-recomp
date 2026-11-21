@@ -43,6 +43,16 @@ typedef struct GeD3D12FramebufferStats {
     uint64_t feedback_snapshots;
     uint64_t feedback_snapshot_pixels;
     uint64_t feedback_reuses;
+    uint64_t pipeline_key_hits;
+    uint64_t pipelines_created;
+    uint64_t pipeline_create_us;
+    uint64_t texture_cache_hits;
+    uint64_t texture_cache_misses;
+    uint64_t texture_uploads;
+    uint64_t texture_decode_us;
+    uint64_t texture_scale_us;
+    uint64_t host_upload_bytes;
+    uint64_t host_readback_bytes;
 } GeD3D12FramebufferStats;
 
 int ged3d12_framebuffer_stats(GeD3D12FramebufferStats *stats);
@@ -77,6 +87,8 @@ enum GeD3D12RootParameter : UINT {
     GE_D3D12_ROOT_SAMPLER = 2,
     GE_D3D12_ROOT_DESTINATION = 3,
     GE_D3D12_ROOT_VERTICES = 4,
+    GE_D3D12_ROOT_TNL_STATES = 5,
+    GE_D3D12_ROOT_TNL_VALIDATION = 6,
 };
 
 enum GeD3D12SamplerRegister : UINT {
@@ -104,6 +116,7 @@ void ged3d12_set_coarse_shading(bool enabled);
 
 /* Allocations are valid until the current frame slot is reused after its fence completes. */
 bool ged3d12_upload_alloc(UINT64 size, UINT64 alignment, GeD3D12UploadSlice *out);
+void ged3d12_record_readback_bytes(uint64_t bytes);
 bool ged3d12_srv_alloc(UINT count, GeD3D12DescriptorSlice *out);
 bool ged3d12_sampler_alloc(UINT count, GeD3D12DescriptorSlice *out);
 bool ged3d12_rtv_alloc(GeD3D12CpuDescriptor *out);

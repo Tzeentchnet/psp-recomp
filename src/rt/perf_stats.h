@@ -26,6 +26,13 @@ typedef enum SrPerfCategory {
     SR_PERF_CAPTURE,
     SR_PERF_TEXTURE_CAPTURE,
     SR_PERF_STATE_CAPTURE,
+    SR_PERF_POINT,
+    SR_PERF_LINE,
+    SR_PERF_SPRITE,
+    SR_PERF_BEZIER_EVAL,
+    SR_PERF_BEZIER_DRAW,
+    SR_PERF_SPLINE_EVAL,
+    SR_PERF_SPLINE_DRAW,
     SR_PERF_CATEGORY_COUNT
 } SrPerfCategory;
 
@@ -44,6 +51,31 @@ typedef enum SrPerfCounter {
     SR_PERF_TEXTURE_MISSES,
     SR_PERF_TEXTURE_DECODE_WAIT_US,
     SR_PERF_PSO_FALLBACKS,
+    SR_PERF_GPU_TNL_ELIGIBLE_DRAWS,
+    SR_PERF_GPU_TNL_ACCEPTED_DRAWS,
+    SR_PERF_GPU_TNL_DECLINED_DRAWS,
+    SR_PERF_GPU_TNL_CANONICAL_VERTICES,
+    SR_PERF_GPU_TNL_SUBMITTED_VERTICES,
+    SR_PERF_GPU_TNL_CPU_DECODE_US,
+    SR_PERF_GPU_TNL_CPU_REFERENCE_US,
+    SR_PERF_GPU_TNL_UPLOAD_BYTES,
+    SR_PERF_GPU_TEXTURE_DECODE_JOBS,
+    SR_PERF_GPU_TEXTURE_DECODE_FALLBACKS,
+    SR_PERF_GPU_TEXTURE_DECODE_SOURCE_BYTES,
+    SR_PERF_GE_POINT_DRAWS,
+    SR_PERF_GE_POINTS,
+    SR_PERF_GE_LINE_DRAWS,
+    SR_PERF_GE_LINE_SEGMENTS,
+    SR_PERF_GE_SPRITE_DRAWS,
+    SR_PERF_GE_SPRITES,
+    SR_PERF_GE_BEZIER_DRAWS,
+    SR_PERF_GE_BEZIER_CONTROL_POINTS,
+    SR_PERF_GE_BEZIER_EVALUATED_VERTICES,
+    SR_PERF_GE_SPLINE_DRAWS,
+    SR_PERF_GE_SPLINE_CONTROL_POINTS,
+    SR_PERF_GE_SPLINE_EVALUATED_VERTICES,
+    SR_PERF_NATIVE_DISPATCHES,
+    SR_PERF_SCHEDULER_YIELDS,
     SR_PERF_COUNTER_COUNT
 } SrPerfCounter;
 
@@ -58,6 +90,7 @@ SrPerfCategory sr_perf_switch(SrPerfCategory category);
 void sr_perf_counter_add(SrPerfCounter counter, uint64_t value);
 void sr_perf_snapshot(SrPerfFrame *out);
 void sr_ip_sampler_present(uint32_t present);
+int sr_ip_sampler_shutdown(void);
 
 /* Optimization paths that SR_PERF_ALTERNATE=<name>[,<name>...] can switch off every other
  * SR_PERF_ALTERNATE_PRESENTS presentations (default 60) so one run measures a path on and off
@@ -68,6 +101,10 @@ typedef enum SrPerfPath {
     SR_PATH_DRAW_MERGE,         /* adjacent direct draw merging */
     SR_PATH_STATE_MEMO,         /* pipeline key and shader constant memo */
     SR_PATH_INDEXED_CAPTURE,    /* indexed triangle capture */
+    SR_PATH_GPU_UPLOAD,         /* scaled framebuffer upload expansion */
+    SR_PATH_GPU_TNL,            /* model-space transform and lighting */
+    SR_PATH_GPU_TEXTURE_DECODE, /* compute decode versus async CPU decode */
+    SR_PATH_GPU_PRIMITIVE_EXPANSION, /* through-mode sprite expansion */
     SR_PATH_COUNT
 } SrPerfPath;
 

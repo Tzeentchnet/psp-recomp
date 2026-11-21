@@ -10,32 +10,61 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SHADER_DIR = ROOT / "src" / "rt" / "gpu_d3d12" / "shaders"
+SCRATCH_DIR = ROOT / "build" / f"d3d12-shader-scratch-{os.getpid()}"
 SHADERS = (
-    ("psp_vs.hlsl", "vs_6_0", "main", "psp_vs.inc"),
-    ("psp_ps.hlsl", "ps_6_0", "main", "psp_ps.inc"),
-    ("psp_ps.hlsl", "ps_6_0", "main_direct", "psp_ps_direct.inc"),
-    ("present_vs.hlsl", "vs_6_0", "main", "present_vs.inc"),
-    ("present_ps.hlsl", "ps_6_0", "main", "present_ps.inc"),
-    ("smaa.hlsl", "vs_6_0", "smaa_edge_vs", "smaa_edge_vs.inc"),
-    ("smaa.hlsl", "ps_6_0", "smaa_edge_ps", "smaa_edge_ps.inc"),
-    ("smaa.hlsl", "vs_6_0", "smaa_blend_vs", "smaa_blend_vs.inc"),
-    ("smaa.hlsl", "ps_6_0", "smaa_blend_ps", "smaa_blend_ps.inc"),
+    ("psp_vs.hlsl", "vs_6_0", "main", "psp_vs.inc", ()),
+    (
+        "psp_vs.hlsl", "vs_6_0", "main",
+        "psp_vs_validation.inc", ("TNL_VALIDATE=1",),
+    ),
+    (
+        "psp_tnl_preprocess.hlsl", "cs_6_0", "transform_main",
+        "psp_tnl_transform_cs.inc", (),
+    ),
+    (
+        "psp_tnl_preprocess.hlsl", "cs_6_0", "triangles_main",
+        "psp_tnl_triangles_cs.inc", (),
+    ),
+    ("psp_ps.hlsl", "ps_6_0", "main", "psp_ps.inc", ()),
+    (
+        "psp_ps.hlsl", "ps_6_0", "main_direct",
+        "psp_ps_direct.inc", (),
+    ),
+    ("present_vs.hlsl", "vs_6_0", "main", "present_vs.inc", ()),
+    ("present_ps.hlsl", "ps_6_0", "main", "present_ps.inc", ()),
+    (
+        "smaa.hlsl", "vs_6_0", "smaa_edge_vs",
+        "smaa_edge_vs.inc", (),
+    ),
+    (
+        "smaa.hlsl", "ps_6_0", "smaa_edge_ps",
+        "smaa_edge_ps.inc", (),
+    ),
+    (
+        "smaa.hlsl", "vs_6_0", "smaa_blend_vs",
+        "smaa_blend_vs.inc", (),
+    ),
+    (
+        "smaa.hlsl", "ps_6_0", "smaa_blend_ps",
+        "smaa_blend_ps.inc", (),
+    ),
     (
         "smaa.hlsl",
         "vs_6_0",
         "smaa_neighborhood_vs",
         "smaa_neighborhood_vs.inc",
+        (),
     ),
     (
         "smaa.hlsl",
         "ps_6_0",
         "smaa_neighborhood_ps",
         "smaa_neighborhood_ps.inc",
+        (),
     ),
 )
 
@@ -74,45 +103,55 @@ def find_dxc(requested: str | None) -> Path:
 
 
 def compile_shader(
-    dxc: Path, source: Path, profile: str, entry: str
+    dxc: Path, source: Path, profile: str, entry: str,
+    defines: tuple[str, ...] = (),
 ) -> bytes:
-    with tempfile.TemporaryDirectory(prefix="psprecomp-dxil-") as directory:
-        output = Path(directory) / (source.stem + ".dxil")
-        command = [
-            str(dxc),
-            "-nologo",
-            "-E",
-            entry,
-            "-T",
-            profile,
-            "-HV",
-            "2021",
-            "-Ges",
-            "-WX",
-            "-O3",
-            "-Qstrip_debug",
-            "-Qstrip_reflect",
-            "-Fo",
-            str(output),
-            str(source),
-        ]
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode:
-            if result.stdout:
-                print(result.stdout, file=sys.stderr, end="")
-            if result.stderr:
-                print(result.stderr, file=sys.stderr, end="")
-            raise RuntimeError(f"DXC failed for {source.name} ({result.returncode})")
-        return output.read_bytes()
+    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    variant = "-".join(defines) if defines else "production"
+    output = SCRATCH_DIR / (
+        f"{source.stem}-{entry}-{profile}-{variant}.dxil"
+    )
+    command = [
+        str(dxc),
+        "-nologo",
+        "-E",
+        entry,
+        "-T",
+        profile,
+        "-HV",
+        "2021",
+        "-Ges",
+        "-WX",
+        "-O3",
+        "-Qstrip_debug",
+        "-Qstrip_reflect",
+        "-Fo",
+        str(output),
+    ]
+    command.extend(f"-D{define}" for define in defines)
+    command.append(str(source))
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        if result.stdout:
+            print(result.stdout, file=sys.stderr, end="")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        raise RuntimeError(f"DXC failed for {source.name} ({result.returncode})")
+    return output.read_bytes()
 
 
 def render_include(
-    source: Path, profile: str, entry: str, data: bytes
+    source: Path, profile: str, entry: str, data: bytes,
+    defines: tuple[str, ...] = (),
 ) -> str:
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest().upper()
     dxil_hash = hashlib.sha256(data).hexdigest().upper()
+    variant = (
+        " [" + ", ".join(defines) + "]"
+        if defines else ""
+    )
     lines = [
-        f"/* Generated from {source.name} ({profile}, {entry}) by tools/compile_d3d12_shaders.py.",
+        f"/* Generated from {source.name} ({profile}, {entry}){variant} by tools/compile_d3d12_shaders.py.",
         f" * source SHA-256: {source_hash}",
         f" * DXIL SHA-256:   {dxil_hash} */",
         "{",
@@ -138,18 +177,21 @@ def main(argv: list[str]) -> int:
     try:
         dxc = find_dxc(args.dxc)
         stale: list[Path] = []
-        for source_name, profile, entry, output_name in SHADERS:
+        for source_name, profile, entry, output_name, defines in SHADERS:
             source = SHADER_DIR / source_name
             output = SHADER_DIR / output_name
             rendered = render_include(
                 source, profile, entry,
-                compile_shader(dxc, source, profile, entry)
+                compile_shader(
+                    dxc, source, profile, entry, defines),
+                defines,
             )
             if args.check:
                 if not output.is_file() or output.read_text(encoding="ascii") != rendered:
                     stale.append(output)
             else:
-                output.write_text(rendered, encoding="ascii", newline="\n")
+                with output.open("w", encoding="ascii", newline="\n") as file:
+                    file.write(rendered)
                 print(f"wrote {output.relative_to(ROOT)}")
         if stale:
             for output in stale:
@@ -158,6 +200,8 @@ def main(argv: list[str]) -> int:
     except (FileNotFoundError, OSError, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+    finally:
+        shutil.rmtree(SCRATCH_DIR, ignore_errors=True)
     return 0
 
 

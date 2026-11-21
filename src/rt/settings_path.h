@@ -10,6 +10,14 @@ extern "C" {
 int sr_settings_path(
     const char *filename, char *path, size_t path_size,
     char *error, size_t error_size);
+int sr_resource_path(
+    const char *filename, char *path, size_t path_size,
+    char *error, size_t error_size);
+int sr_data_root(
+    char *path, size_t path_size, char *error, size_t error_size);
+int sr_data_path(
+    const char *filename, char *path, size_t path_size,
+    char *error, size_t error_size);
 
 #ifdef __cplusplus
 }

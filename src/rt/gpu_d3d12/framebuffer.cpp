@@ -641,6 +641,9 @@ static bool readback_color_rect(
     transition(s_immediate_list, target->resource, &target->state,
                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (!immediate_submit()) return false;
+    ged3d12_record_readback_bytes(
+        (uint64_t)(physical_right - physical_left) *
+        (physical_bottom - physical_top) * 4u);
 
     const uint64_t readback_bytes =
         (uint64_t)physical_width * render_height() * 4u;
@@ -718,6 +721,7 @@ static bool readback_color(ColorTarget *target) {
 
     const uint64_t bytes =
         (uint64_t)physical_width * physical_height * 4u;
+    ged3d12_record_readback_bytes(bytes);
     D3D12_RANGE read_range = {0, (SIZE_T)bytes};
     void *mapped = nullptr;
     if (!check_hr(s_readback->Map(0, &read_range, &mapped),

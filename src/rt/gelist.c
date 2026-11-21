@@ -29,6 +29,7 @@
 #include "recomp.h"
 #include "ge_shared.h"
 #include "perf_stats.h"
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,9 +42,6 @@ GeState *ge_state_ptr(void);
  * if it ran on a worker. A chunk is one process_dl_queue run. Time spent in guest/scheduler
  * code after the first unsynchronized chunk, until the next sceGeDrawSync/ListSync(wait) or
  * display flip, bounds the overlap for the GE time accumulated in between. */
-#ifdef _WIN32
-#include <windows.h>
-#endif
 static struct {
     int enabled, initialized;
     long long frequency;

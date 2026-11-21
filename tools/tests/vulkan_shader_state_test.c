@@ -1,4 +1,9 @@
 #include "gpu_sdl3vk/shader_state.h"
+#include "gpu_sdl3vk/feedback_region.h"
+#include "gpu_sdl3vk/present_cache.h"
+#include "gpu_sdl3vk/present_layout.h"
+#include "gpu_sdl3vk/tnl_classes.h"
+#include "gpu_sdl3vk/upload_scale.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -146,7 +151,7 @@ static void test_state_packing(void) {
     source.zwrite_disable = 0;
 
     ge_vk_shader_state_build(&source, 1, 0, 4, &state);
-    check_u32("push constant size", sizeof(state), 112);
+    check_u32("push constant size", sizeof(state), 128);
     check_u32("shader flags", shader_flags(&state), expected_flags);
     check_u32("texture function", (uint32_t)state.config[0] & 7u, 3);
     check_u32("alpha test", (uint32_t)state.config[1], source.atest);
@@ -215,12 +220,285 @@ static void test_invalid_render_scale(void) {
         (uint32_t)state.fragment[3] >> 24, 1);
 }
 
+static void test_indexed_framebuffer(void) {
+    GeState state;
+    memset(&state, 0, sizeof(state));
+    state.tex_fmt = 7;
+    state.tex_bufw = 512;
+    if (!ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 16))
+        fail("compatible indexed framebuffer rejected");
+    if (!ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 0))
+        fail("indexed framebuffer base rejected");
+    if (ge_vk_indexed_framebuffer_compatible(&state, 1, 512, 0))
+        fail("16-bit framebuffer admitted for 32-bit indices");
+    if (ge_vk_indexed_framebuffer_compatible(&state, 3, 256, 0))
+        fail("mismatched framebuffer stride admitted");
+    if (ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 2))
+        fail("unaligned framebuffer offset admitted");
+    state.tex_swizzle = 1;
+    if (ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 0))
+        fail("swizzled indexed framebuffer admitted");
+    state.tex_swizzle = 0;
+    state.tex_fmt = 6;
+    if (ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 0))
+        fail("16-bit indices admitted");
+    state.tex_fmt = 7;
+    state.tex_bufw = 0;
+    if (ge_vk_indexed_framebuffer_compatible(&state, 3, 512, 0))
+        fail("mismatched default indexed stride admitted");
+    if (!ge_vk_indexed_framebuffer_compatible(&state, 3, 4, 0))
+        fail("matching default indexed stride rejected");
+}
+
+static void test_indexed_palette_keys(void) {
+    GeState state;
+    memset(&state, 0, sizeof(state));
+    for (uint32_t format = 4; format <= 7; format++) {
+        state.tex_fmt = format;
+        uint64_t original = ge_vk_texture_palette_key(&state);
+        state.clutram[0] ^= 0x80u;
+        if (ge_vk_texture_palette_key(&state) == original)
+            fail("indexed palette data omitted from texture key");
+        state.clutram[0] ^= 0x80u;
+        state.clut_fmt ^= 0x100u;
+        if (ge_vk_texture_palette_key(&state) == original)
+            fail("indexed palette format omitted from texture key");
+        state.clut_fmt ^= 0x100u;
+        if (ge_vk_texture_palette_key(&state) != original)
+            fail("unchanged indexed palette key not stable");
+    }
+    state.tex_fmt = 3;
+    if (ge_vk_texture_palette_key(&state) != 0)
+        fail("direct-color texture depends on palette");
+    state.tex_fmt = 8;
+    if (ge_vk_texture_palette_key(&state) != 0)
+        fail("compressed texture depends on palette");
+}
+
+static void test_present_cache(void) {
+    SrVkPresentCache cache = {0};
+    if (sr_vk_present_can_reuse(&cache, 1, 0))
+        fail("uninitialized presentation cache reused a frame");
+    sr_vk_present_record(&cache, 1);
+    if (!sr_vk_present_can_reuse(&cache, 1, 0))
+        fail("unchanged presentation not reused");
+    if (sr_vk_present_can_reuse(&cache, 2, 0) ||
+        sr_vk_present_can_reuse(&cache, 1, 1) ||
+        sr_vk_present_can_reuse(&cache, 0, 0))
+        fail("changed, exposed, or software presentation reused");
+    for (unsigned i = 0; i < SR_VK_PRESENT_MAX_REUSES; i++) {
+        if (!sr_vk_present_can_reuse(&cache, 1, 0))
+            fail("presentation revalidation triggered too early");
+        sr_vk_present_reused(&cache);
+    }
+    if (sr_vk_present_can_reuse(&cache, 1, 0))
+        fail("unchanged presentation not periodically revalidated");
+    sr_vk_present_record(&cache, 1);
+    if (!sr_vk_present_can_reuse(&cache, 1, 0))
+        fail("presentation reuse not restored after revalidation");
+    sr_vk_present_invalidate(&cache);
+    if (sr_vk_present_can_reuse(&cache, 1, 0))
+        fail("invalidated presentation reused");
+    sr_vk_present_record(&cache, 0);
+    if (sr_vk_present_can_reuse(&cache, 0, 0))
+        fail("software frame entered presentation cache");
+}
+
+static void test_feedback_regions(void) {
+    GeVkRegion whole = {0, 0, 16, 16};
+    GeVkRegion copy, left = {0, 0, 4, 4}, right = {12, 12, 16, 16};
+    GeVkFeedbackRegion snapshot = {0};
+    if (!ge_vk_feedback_copy_region(&snapshot, whole, left, &copy) ||
+        memcmp(&copy, &whole, sizeof(copy)) != 0)
+        fail("initial feedback snapshot must copy the full image");
+    ge_vk_feedback_record(&snapshot, left);
+    if (ge_vk_feedback_copy_region(&snapshot, whole, right, &copy))
+        fail("disjoint feedback read unnecessarily copied");
+    ge_vk_feedback_record(&snapshot, right);
+    if (!ge_vk_feedback_copy_region(&snapshot, whole, right, &copy) ||
+        memcmp(&copy, &whole, sizeof(copy)) != 0)
+        fail("feedback copy did not preserve all pending damage");
+    if (ge_vk_feedback_copy_region(&snapshot, whole, left, &copy))
+        fail("unchanged feedback snapshot was not reused");
+
+    GeVkRegion scissor = {5, 6, 40, 45};
+    GeVkRegion bounds = ge_vk_draw_damage(2.5f, 3.5f, 7.25f, 8.25f, 4, scissor);
+    GeVkRegion expected = {9, 13, 31, 35};
+    if (memcmp(&bounds, &expected, sizeof(bounds)) != 0)
+        fail("scaled feedback damage bounds");
+    bounds = ge_vk_draw_damage(NAN, 1.0f, 2.0f, 3.0f, 4, scissor);
+    if (memcmp(&bounds, &scissor, sizeof(bounds)) != 0)
+        fail("non-finite feedback bounds must use the scissor");
+
+    uint32_t target[16][16] = {{0}}, image[16][16] = {{0}};
+    uint32_t random = 0x12345678u;
+    memset(&snapshot, 0, sizeof(snapshot));
+    for (uint32_t iteration = 1; iteration <= 1000; iteration++) {
+        GeVkRegion damage, sample;
+        random = random * 1664525u + 1013904223u;
+        damage.x0 = (int32_t)(random % 16u);
+        random = random * 1664525u + 1013904223u;
+        damage.y0 = (int32_t)(random % 16u);
+        random = random * 1664525u + 1013904223u;
+        damage.x1 = damage.x0 + 1 + (int32_t)(random % (uint32_t)(16 - damage.x0));
+        random = random * 1664525u + 1013904223u;
+        damage.y1 = damage.y0 + 1 + (int32_t)(random % (uint32_t)(16 - damage.y0));
+        for (int y = damage.y0; y < damage.y1; y++)
+            for (int x = damage.x0; x < damage.x1; x++)
+                target[y][x] = iteration;
+        ge_vk_feedback_record(&snapshot, damage);
+
+        random = random * 1664525u + 1013904223u;
+        sample.x0 = (int32_t)(random % 16u);
+        random = random * 1664525u + 1013904223u;
+        sample.y0 = (int32_t)(random % 16u);
+        random = random * 1664525u + 1013904223u;
+        sample.x1 = sample.x0 + 1 + (int32_t)(random % (uint32_t)(16 - sample.x0));
+        random = random * 1664525u + 1013904223u;
+        sample.y1 = sample.y0 + 1 + (int32_t)(random % (uint32_t)(16 - sample.y0));
+        if (ge_vk_feedback_copy_region(&snapshot, whole, sample, &copy)) {
+            for (int y = copy.y0; y < copy.y1; y++)
+                for (int x = copy.x0; x < copy.x1; x++)
+                    image[y][x] = target[y][x];
+        }
+        for (int y = sample.y0; y < sample.y1; y++)
+            for (int x = sample.x0; x < sample.x1; x++)
+                if (image[y][x] != target[y][x]) {
+                    fail("feedback snapshot differs from full-copy reference");
+                    return;
+                }
+    }
+}
+
+static void test_present_layout(void) {
+    SrVkPresentRect rect;
+    if (!sr_vk_present_rect(1920, 1088, &rect) ||
+        rect.x != 0 || rect.y != 0 ||
+        rect.width != 1920 || rect.height != 1088) {
+        fail("native-aspect Retina presentation rectangle");
+    }
+    if (!sr_vk_present_rect(1920, 1200, &rect) ||
+        rect.x != 0 || rect.y != 56 ||
+        rect.width != 1920 || rect.height != 1088) {
+        fail("letterboxed presentation rectangle");
+    }
+    if (!sr_vk_present_rect(1000, 300, &rect) ||
+        rect.x != 235 || rect.y != 0 ||
+        rect.width != 529 || rect.height != 300) {
+        fail("pillarboxed presentation rectangle");
+    }
+    if (!sr_vk_present_rect(1, 1, &rect) ||
+        rect.width != 1 || rect.height != 1) {
+        fail("minimum presentation rectangle");
+    }
+    if (sr_vk_present_rect(0, 1088, &rect))
+        fail("zero-width presentation rectangle accepted");
+
+    SrVkCaptureLayout capture;
+    if (!sr_vk_capture_layout(960, 544, 0, &capture) ||
+        capture.width != 480 || capture.height != 272 ||
+        capture.source_step != 2 || capture.sample_offset != 1) {
+        fail("logical-resolution Vulkan capture layout");
+    }
+    if (!sr_vk_capture_layout(960, 544, 1, &capture) ||
+        capture.width != 960 || capture.height != 544 ||
+        capture.source_step != 1 || capture.sample_offset != 0) {
+        fail("internal-resolution Vulkan capture layout");
+    }
+    if (sr_vk_capture_layout(960, 545, 0, &capture))
+        fail("non-integral Vulkan capture layout accepted");
+
+    SrVkExtent extent;
+    if (!sr_vk_internal_extent(2, &extent) ||
+        extent.width != 960 || extent.height != 544) {
+        fail("2x Vulkan internal extent");
+    }
+    if (!sr_vk_internal_extent(8, &extent) ||
+        extent.width != 3840 || extent.height != 2176) {
+        fail("8x Vulkan internal extent");
+    }
+    if (sr_vk_internal_extent(0, &extent))
+        fail("zero Vulkan internal resolution accepted");
+}
+
+static void test_upload_scale(void) {
+    SrVkUploadScalePlan plan;
+    if (!sr_vk_upload_scale_plan(512, 512, 4, 1, 0, &plan))
+        fail("4x GPU upload plan rejected");
+    if (!plan.use_gpu || plan.fallback ||
+        plan.physical_width != 2048 || plan.physical_height != 2048 ||
+        plan.logical_bytes != 512u * 512u * 4u ||
+        plan.host_bytes != 512u * 512u * 4u ||
+        plan.expanded_pixels != 2048u * 2048u) {
+        fail("4x GPU upload plan mismatch");
+    }
+
+    if (!sr_vk_upload_scale_plan(512, 512, 4, 1, 1, &plan) ||
+        plan.use_gpu || !plan.fallback ||
+        plan.host_bytes != 2048u * 2048u * 4u) {
+        fail("forced CPU upload plan mismatch");
+    }
+    if (!sr_vk_upload_scale_plan(512, 512, 2, 0, 0, &plan) ||
+        plan.use_gpu || !plan.fallback ||
+        plan.physical_width != 1024 || plan.physical_height != 1024 ||
+        plan.host_bytes != 1024u * 1024u * 4u) {
+        fail("capability fallback upload plan mismatch");
+    }
+    if (!sr_vk_upload_scale_plan(512, 512, 1, 1, 0, &plan) ||
+        plan.use_gpu || plan.fallback ||
+        plan.logical_bytes != plan.host_bytes ||
+        plan.expanded_pixels != 512u * 512u) {
+        fail("native-resolution upload plan mismatch");
+    }
+    if (sr_vk_upload_scale_plan(UINT32_MAX, 1, 2, 1, 0, &plan))
+        fail("overflowing upload width accepted");
+    if (sr_vk_upload_scale_plan(UINT32_MAX, UINT32_MAX, 1, 1, 0, &plan))
+        fail("overflowing upload byte count accepted");
+    if (sr_vk_upload_scale_plan(512, 512, 0, 1, 0, &plan))
+        fail("zero upload scale accepted");
+}
+
+static void test_tnl_classes(void) {
+    uint32_t mask = 0;
+    if (!ge_vk_tnl_class_mask(NULL, &mask) ||
+        mask != GE_VK_TNL_CLASS_ALL) {
+        fail("default GPU T&L classes");
+    }
+    if (!ge_vk_tnl_class_mask(
+            "direct,sprites", &mask) ||
+        mask !=
+            (GE_VK_TNL_CLASS_DIRECT |
+             GE_VK_TNL_CLASS_SPRITES)) {
+        fail("selected GPU T&L classes");
+    }
+    if (!ge_vk_tnl_class_mask(
+            "preprocess,points,preprocess", &mask) ||
+        mask !=
+            (GE_VK_TNL_CLASS_PREPROCESS |
+             GE_VK_TNL_CLASS_POINTS)) {
+        fail("duplicate GPU T&L classes");
+    }
+    if (ge_vk_tnl_class_mask("triangles", &mask))
+        fail("unknown GPU T&L class accepted");
+    if (ge_vk_tnl_class_mask("direct,", &mask))
+        fail("trailing GPU T&L class delimiter accepted");
+    if (ge_vk_tnl_class_mask("direct", NULL))
+        fail("null GPU T&L class output accepted");
+}
+
 int main(void) {
     test_direct_classification();
     test_stencil_classification();
     test_state_packing();
     test_clear_packing();
     test_invalid_render_scale();
+    test_indexed_framebuffer();
+    test_indexed_palette_keys();
+    test_present_cache();
+    test_feedback_regions();
+    test_present_layout();
+    test_upload_scale();
+    test_tnl_classes();
     if (s_failures) {
         fprintf(stderr, "%d Vulkan shader-state test(s) failed\n", s_failures);
         return 1;

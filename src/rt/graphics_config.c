@@ -3,15 +3,14 @@
 #endif
 #include "graphics_config.h"
 
+#include "platform.h"
 #include "settings_path.h"
 
 #include <ctype.h>
 #include <errno.h>
-#include <io.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 static SrGraphicsConfig s_config;
 static char s_config_path[1024];
@@ -79,14 +78,40 @@ static int toggle_from_name(const char *name) {
     return -1;
 }
 
+static int quality_from_name(const char *name) {
+    if (text_equal(name, "auto"))
+        return SR_GRAPHICS_QUALITY_AUTO;
+    if (text_equal(name, "manual"))
+        return SR_GRAPHICS_QUALITY_MANUAL;
+    return -1;
+}
+
 void sr_graphics_config_defaults(SrGraphicsConfig *config) {
     if (!config) return;
+#ifdef _WIN32
     config->renderer = SR_GRAPHICS_RENDERER_D3D12;
+#else
+    config->renderer = SR_GRAPHICS_RENDERER_VULKAN;
+#endif
+#ifdef __APPLE__
+    config->quality_mode = SR_GRAPHICS_QUALITY_AUTO;
+    config->internal_resolution = 1u;
+#else
+    config->quality_mode = SR_GRAPHICS_QUALITY_MANUAL;
     config->internal_resolution = 2u;
+#endif
     config->texture_scale = 1u;
     config->d3d12_full_rate = 0u;
     config->anti_aliasing = SR_GRAPHICS_ANTI_ALIASING_OFF;
     config->skip_startup = 0u;
+}
+
+const char *sr_graphics_quality_name(int quality_mode) {
+    switch (quality_mode) {
+        case SR_GRAPHICS_QUALITY_AUTO: return "auto";
+        case SR_GRAPHICS_QUALITY_MANUAL: return "manual";
+        default: return NULL;
+    }
 }
 
 const char *sr_graphics_renderer_name(int renderer) {
@@ -165,7 +190,24 @@ int sr_graphics_config_parse(
             return 0;
         }
 
-        if (text_equal(name, "renderer")) {
+        if (text_equal(name, "quality")) {
+            int quality_mode = quality_from_name(value);
+            setting = 32u;
+            if (quality_mode < 0) {
+                set_error(
+                    error, error_size, line_number,
+                    "expected auto or manual", value);
+                return 0;
+            }
+            if (seen & setting) {
+                set_error(
+                    error, error_size, line_number,
+                    "duplicate setting", name);
+                return 0;
+            }
+            seen |= setting;
+            config->quality_mode = quality_mode;
+        } else if (text_equal(name, "renderer")) {
             int renderer = renderer_from_name(value);
             setting = 1u;
             if (renderer < 0) {
@@ -267,7 +309,7 @@ int sr_graphics_config_parse(
             config->anti_aliasing = anti_aliasing;
         } else if (text_equal(name, "skip_startup")) {
             int enabled = toggle_from_name(value);
-            setting = 32u;
+            setting = 64u;
             if (enabled < 0) {
                 set_error(
                     error, error_size, line_number,
@@ -289,6 +331,8 @@ int sr_graphics_config_parse(
             return 0;
         }
     }
+    if (!(seen & 32u))
+        config->quality_mode = SR_GRAPHICS_QUALITY_MANUAL;
     return 1;
 }
 
@@ -397,10 +441,12 @@ int sr_graphics_config_init(void) {
     s_initialized = 1;
     fprintf(
         stderr,
-        "graphics: loaded %s (renderer %s, internal resolution %ux, "
+        "graphics: loaded %s (renderer %s, quality %s, "
+        "internal resolution %ux, "
         "texture scale %ux, D3D12 full-rate %s, anti-aliasing %s, "
         "startup skip %s)\n",
         s_config_path, sr_graphics_renderer_name(s_config.renderer),
+        sr_graphics_quality_name(s_config.quality_mode),
         s_config.internal_resolution, s_config.texture_scale,
         s_config.d3d12_full_rate ? "on" : "off",
         sr_graphics_anti_aliasing_name(s_config.anti_aliasing),
@@ -424,6 +470,7 @@ int sr_graphics_config_save(
     const SrGraphicsConfig *config, char *error, size_t error_size) {
     char temporary[1100];
     const char *renderer;
+    const char *quality;
     const char *anti_aliasing;
     FILE *file;
     int length;
@@ -437,9 +484,10 @@ int sr_graphics_config_save(
         return 0;
     }
     renderer = sr_graphics_renderer_name(config->renderer);
+    quality = sr_graphics_quality_name(config->quality_mode);
     anti_aliasing =
         sr_graphics_anti_aliasing_name(config->anti_aliasing);
-    if (!renderer || !anti_aliasing ||
+    if (!renderer || !quality || !anti_aliasing ||
         config->internal_resolution < SR_GRAPHICS_SCALE_MIN ||
         config->internal_resolution > SR_GRAPHICS_SCALE_MAX ||
         config->texture_scale < SR_TEXTURE_SCALE_MIN ||
@@ -470,32 +518,30 @@ int sr_graphics_config_save(
             file,
         "# PSP recomp graphics config v4\n"
         "renderer = %s\n"
+        "quality = %s\n"
         "internal_resolution = %u\n"
         "texture_scale = %u\n"
         "d3d12_full_rate = %u\n"
         "anti_aliasing = %s\n"
         "skip_startup = %s\n",
-        renderer, config->internal_resolution,
+        renderer, quality, config->internal_resolution,
         config->texture_scale, config->d3d12_full_rate,
         anti_aliasing, config->skip_startup ? "on" : "off") > 0 &&
-         fflush(file) == 0 &&
-         _commit(_fileno(file)) == 0;
+         sr_file_commit(file);
     if (fclose(file) != 0) ok = 0;
     if (!ok) {
-        DeleteFileA(temporary);
+        sr_file_remove(temporary);
         set_error(
             error, error_size, 0,
             "cannot write temporary graphics config", temporary);
         return 0;
     }
-    if (!MoveFileExA(
-            temporary, s_config_path,
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (!sr_file_replace(temporary, s_config_path)) {
         char detail[256];
         snprintf(
-            detail, sizeof(detail), "%s (error %lu)",
-            s_config_path, (unsigned long)GetLastError());
-        DeleteFileA(temporary);
+            detail, sizeof(detail), "%s (%s)",
+            s_config_path, strerror(errno));
+        sr_file_remove(temporary);
         set_error(
             error, error_size, 0,
             "cannot publish graphics config", detail);
@@ -505,13 +551,52 @@ int sr_graphics_config_save(
     s_first_run = 0;
     fprintf(
         stderr,
-        "graphics: saved %s (renderer %s, internal resolution %ux, "
+        "graphics: saved %s (renderer %s, quality %s, "
+        "internal resolution %ux, "
         "texture scale %ux, D3D12 full-rate %s, anti-aliasing %s, "
         "startup skip %s)\n",
-        s_config_path, renderer, config->internal_resolution,
+        s_config_path, renderer, quality,
+        config->internal_resolution,
         config->texture_scale,
         config->d3d12_full_rate ? "on" : "off",
         anti_aliasing, config->skip_startup ? "on" : "off");
+    return 1;
+}
+
+int sr_graphics_config_resolve_auto(
+    const SrGraphicsAutoCaps *caps,
+    SrGraphicsAutoSelection *selection,
+    char *error, size_t error_size) {
+    if (error && error_size)
+        error[0] = 0;
+    if (!s_initialized || !selection) {
+        set_error(
+            error, error_size, 0,
+            "graphics config is not initialized", NULL);
+        return 0;
+    }
+    if (s_config.quality_mode == SR_GRAPHICS_QUALITY_MANUAL) {
+        memset(selection, 0, sizeof(*selection));
+        selection->profile = SR_GRAPHICS_AUTO_PROFILE_MANUAL;
+        selection->internal_resolution =
+            s_config.internal_resolution;
+        selection->texture_scale = s_config.texture_scale;
+        selection->anti_aliasing = s_config.anti_aliasing;
+        snprintf(
+            selection->reason, sizeof(selection->reason),
+            "persisted manual graphics settings");
+        return 1;
+    }
+    if (!sr_graphics_auto_select(caps, selection)) {
+        set_error(
+            error, error_size, 0,
+            "cannot select automatic graphics quality", NULL);
+        return 0;
+    }
+    s_config.internal_resolution =
+        selection->internal_resolution;
+    s_config.texture_scale = selection->texture_scale;
+    s_config.anti_aliasing = selection->anti_aliasing;
     return 1;
 }
 

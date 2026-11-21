@@ -2,9 +2,9 @@
  *
  * This is a faithful port of PPSSPP's sceMpeg control flow: PSMF header analysis, ring-buffer
  * packet accounting, MPEG handle/context creation, stream registration, and the access-unit
- * getters with timestamp progression and end-of-stream detection. Windows GPU builds demux the
- * program stream into Media Foundation H.264 video and standalone ATRAC3+ audio; timestamp-only
- * operation remains the fallback for renderer-less tools.
+ * getters with timestamp progression and end-of-stream detection. Supported GPU builds demux
+ * the program stream into native H.264 video and standalone ATRAC3+ audio; timestamp-only
+ * operation remains the fallback for renderer-less tools and unsupported platforms.
  *
  * Because the project links the recompiled game (GPLv2+ via this port), this binds to GPLv2+.
  */
@@ -12,8 +12,9 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "recomp.h"
 #include "atrac_decode.h"
+#include "mpeg_audio_clock.h"
 #if defined(SR_SDL3VK) || defined(SR_D3D12)
-/* Media Foundation H.264 decode (h264_mf.c): real movie frames for Windows GPU builds. */
+/* Platform H.264/PSMF decoder. */
 int  sr_h264_create(void);
 void sr_h264_destroy(int id);
 void sr_h264_feed(int id, const uint8_t *data, uint32_t len);
@@ -84,7 +85,7 @@ typedef struct {
     uint32_t fedPackets;         /* cumulative packets the game has put into the ring */
     uint32_t consumedPackets;    /* packets consumed by timestamp-proportional demux */
     uint32_t headerAddr;         /* guest address of the PSMF header passed to QueryStreamOffset */
-    int h264;                    /* Windows GPU build: PSMF demux/H.264 decoder id (-1 = none) */
+    int h264;                    /* PSMF demux/H.264 decoder id (-1 = none) */
     int h264Init, h264Frames;
     SrAtracDecoder *pmfAtrac;
     int pmfAtracChannels, pmfAtracBlock, pmfAudioFrames;
@@ -386,7 +387,28 @@ uint32_t mpeg_ringbuffer_available_size(uint32_t ring) {
     return rb_get(ring, RB_packets) - rb_get(ring, RB_packetsAvail);
 }
 
-unsigned long g_mpeg_put = 0, g_mpeg_getavc = 0, g_mpeg_avcdec = 0, g_mpeg_nodata = 0;
+unsigned long g_mpeg_put = 0;
+unsigned long g_mpeg_getavc = 0;
+unsigned long g_mpeg_avcdec = 0;
+unsigned long g_mpeg_nodata = 0;
+static unsigned long s_mpeg_video_frames;
+static unsigned long s_mpeg_audio_frames;
+static int64_t s_mpeg_max_av_drift;
+
+void mpeg_runtime_shutdown(void) {
+    fprintf(
+        stderr,
+        "media: MPEG shutdown ring_put=%lu get_avc=%lu "
+        "avc_decode=%lu video_frames=%lu audio_frames=%lu "
+        "no_data=%lu max_av_drift_ticks=%lld "
+        "max_av_drift_ms=%.3f\n",
+        g_mpeg_put, g_mpeg_getavc, g_mpeg_avcdec,
+        s_mpeg_video_frames, s_mpeg_audio_frames,
+        g_mpeg_nodata, (long long)s_mpeg_max_av_drift,
+        (double)s_mpeg_max_av_drift * 1000.0 /
+            (double)mpegTimestampPerSecond);
+}
+
 /* RingbufferPut(ring, numPackets, available): call the game's fill callback, then feed the bytes
  * it wrote into PPSSPP's MediaEngine bridge. */
 uint32_t mpeg_ringbuffer_put(CpuState *s, uint32_t ring, uint32_t numPackets, uint32_t available) {
@@ -601,8 +623,7 @@ static void consume_stream_for_video_pts(Mpeg *ctx) {
 }
 
 /* AvcDecode(mpeg, auAddr, frameWidth, bufferAddr, initAddr): decode one AVC frame into
- * *bufferAddr. Windows GPU builds decode through Media Foundation (h264_mf.c); otherwise the
- * timestamp-only model runs and leaves the frame blank. */
+ * *bufferAddr, or use the timestamp-only model when no native decoder is available. */
 uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth, uint32_t bufferAddr, uint32_t initAddr) {
     (void)auAddr;
     Mpeg *ctx = mpeg_find(mpegAddr);
@@ -628,7 +649,15 @@ uint32_t mpeg_avc_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t frameWidth
         int eos = ctx->totalPackets && ctx->fedPackets >= ctx->totalPackets;
         gotFrame = sr_h264_frame(ctx->h264, eos, (uint8_t *)SR_HOST(buffer),
                                  (int)frameWidth, ctx->pixelMode);
-        if (gotFrame > 0) ctx->h264Frames++;
+        if (gotFrame < 0) {
+            fprintf(stderr, "sceMpegAvcDecode: native video decoder failed\n");
+            if (initAddr) MEM_W32(initAddr, 0);
+            return (uint32_t)-1;
+        }
+        if (gotFrame > 0) {
+            ctx->h264Frames++;
+            s_mpeg_video_frames++;
+        }
     }
 #endif
     /* No decoder (or it hasn't produced its first frame yet): clear the destination instead of
@@ -671,7 +700,12 @@ uint32_t mpeg_atrac_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t bufferAd
             sr_h264_audio_frame(
                 ctx->h264, encoded, sizeof(encoded), &channels, &encoded_pts);
 #endif
+    if (encoded_bytes < 0) {
+        fprintf(stderr, "sceMpegAtracDecode: invalid movie audio frame\n");
+        return (uint32_t)-1;
+    }
     int samples = 0;
+    int first_audio_frame = ctx->pmfAudioFrames == 0;
     if (encoded_bytes > 0) {
         if (!ctx->pmfAtrac || ctx->pmfAtracChannels != channels ||
             ctx->pmfAtracBlock != encoded_bytes) {
@@ -698,20 +732,23 @@ uint32_t mpeg_atrac_decode(uint32_t mpegAddr, uint32_t auAddr, uint32_t bufferAd
                 bytes = MPEG_ATRAC_ES_OUTPUT_SIZE;
             memcpy(SR_HOST(bufferAddr), pcm, bytes);
             ctx->pmfAudioFrames++;
+            s_mpeg_audio_frames++;
         }
     }
 
     if (encoded_bytes > 0) {
-        if (encoded_pts >= ctx->firstTimestamp)
-            ctx->audioPts =
-                encoded_pts - ctx->firstTimestamp + audioTimestampStep;
-        else
-            ctx->audioPts += audioTimestampStep;
+        ctx->audioPts = sr_mpeg_audio_next_pts(
+            ctx->audioPts, encoded_pts, ctx->firstTimestamp,
+            audioTimestampStep, first_audio_frame);
     }
     int64_t drift = ctx->videoPts - ctx->audioPts;
     int64_t abs_drift = drift < 0 ? -drift : drift;
-    if (ctx->h264Frames && ctx->pmfAudioFrames && abs_drift > ctx->maxAvDrift)
-        ctx->maxAvDrift = abs_drift;
+    if (ctx->h264Frames && ctx->pmfAudioFrames) {
+        if (abs_drift > ctx->maxAvDrift)
+            ctx->maxAvDrift = abs_drift;
+        if (abs_drift > s_mpeg_max_av_drift)
+            s_mpeg_max_av_drift = abs_drift;
+    }
     if (auAddr)
         au_write_pts(auAddr, 0, ctx->audioPts + ctx->firstTimestamp);
     if (getenv("SR_MPEGLOG")) {

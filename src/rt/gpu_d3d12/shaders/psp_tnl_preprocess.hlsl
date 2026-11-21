@@ -1,0 +1,501 @@
+struct TnlState {
+    float4 world[3];
+    float4 view[3];
+    float4 projection[4];
+    float4 texture_matrix[3];
+    float4 texture_params;
+    float4 viewport_scale;
+    float4 viewport_center;
+    float4 viewport_offset_size;
+    float4 fog_material;
+    uint4 config;
+    uint4 depth_material;
+    uint4 material_colors;
+    uint4 material_config;
+    float4 light_position[4];
+    float4 light_direction[4];
+    float4 light_attenuation[4];
+    uint4 light_colors[4];
+};
+
+struct ClipVertex {
+    float4 clip;
+    float4 uv_fog;
+    uint4 color;
+};
+
+struct ScreenVertex {
+    float4 position;
+    float2 texcoord;
+    float fog;
+    uint color;
+};
+
+ByteAddressBuffer canonical_vertices : register(t0);
+ByteAddressBuffer triangle_indices : register(t1);
+StructuredBuffer<TnlState> tnl_states : register(t2);
+RWStructuredBuffer<ClipVertex> clip_vertices : register(u0);
+RWStructuredBuffer<ScreenVertex> screen_vertices : register(u1);
+
+cbuffer TnlJob : register(b0) {
+    uint4 job_offsets;
+    uint4 job_counts;
+};
+
+static const uint STATE_LIGHTING = 2u;
+static const uint STATE_FOG = 16u;
+static const uint STATE_DEPTH_CLIP = 64u;
+static const uint STATE_MATERIAL_ALPHA_SET = 1024u;
+static const float NEAR_W = 1e-3;
+static const float DEPTH_BOUND = 1.000030517578125;
+static const float SCREEN_BOUND = 4095.0 + 15.5 / 16.0;
+
+float ordered_dot4(float4 row, float4 value) {
+    precise float result = row.x * value.x;
+    result = result + row.y * value.y;
+    result = result + row.z * value.z;
+    result = result + row.w * value.w;
+    return result;
+}
+
+float3 transform43(
+    float4 row0, float4 row1, float4 row2,
+    float3 value, float w) {
+    float4 input_value = float4(value, w);
+    return float3(
+        ordered_dot4(row0, input_value),
+        ordered_dot4(row1, input_value),
+        ordered_dot4(row2, input_value));
+}
+
+float4 transform44(
+    float4 row0, float4 row1, float4 row2, float4 row3,
+    float3 value) {
+    float4 input_value = float4(value, 1.0);
+    return float4(
+        ordered_dot4(row0, input_value),
+        ordered_dot4(row1, input_value),
+        ordered_dot4(row2, input_value),
+        ordered_dot4(row3, input_value));
+}
+
+float3 unpack_rgb(uint color) {
+    return float3(
+        color & 255u,
+        (color >> 8u) & 255u,
+        (color >> 16u) & 255u) * (1.0 / 255.0);
+}
+
+float4 light_vertex(
+    TnlState state, float3 world_position, float3 world_normal,
+    float4 vertex_color) {
+    uint material_update = state.material_config.x;
+    float3 ambient_material = (material_update & 1u) != 0u
+        ? vertex_color.rgb : unpack_rgb(state.depth_material.z);
+    float3 diffuse_material = (material_update & 2u) != 0u
+        ? vertex_color.rgb : unpack_rgb(state.material_colors.y);
+    float3 specular_material = (material_update & 4u) != 0u
+        ? vertex_color.rgb : unpack_rgb(state.material_colors.z);
+    float3 result =
+        unpack_rgb(state.material_colors.x) +
+        unpack_rgb(state.material_colors.w) * ambient_material;
+
+    [unroll]
+    for (uint i = 0u; i < 4u; i++) {
+        if ((state.material_config.z & (1u << i)) == 0u)
+            continue;
+        uint light_type = state.light_colors[i].w;
+        uint computation = light_type & 3u;
+        uint type = (light_type >> 8u) & 3u;
+        float3 light_vector = state.light_position[i].xyz;
+        float attenuation = 1.0;
+        if (type != 0u) {
+            light_vector -= world_position;
+            float distance_squared = dot(light_vector, light_vector);
+            float distance_value = sqrt(distance_squared);
+            float denominator =
+                state.light_attenuation[i].x +
+                state.light_attenuation[i].y * distance_value +
+                state.light_attenuation[i].z * distance_squared;
+            attenuation = denominator > 0.0
+                ? clamp(1.0 / denominator, 0.0, 1.0) : 1.0;
+            if (distance_value > 0.0)
+                light_vector /= distance_value;
+        } else {
+            float distance_value = length(light_vector);
+            if (distance_value > 0.0)
+                light_vector /= distance_value;
+        }
+
+        float diffuse = max(dot(world_normal, light_vector), 0.0);
+        if (computation == 2u && state.fog_material.z > 0.0)
+            diffuse = pow(diffuse, state.fog_material.z);
+        result += attenuation * (
+            unpack_rgb(state.light_colors[i].x) * ambient_material +
+            unpack_rgb(state.light_colors[i].y) *
+                diffuse_material * diffuse);
+
+        if ((computation & 1u) != 0u && diffuse > 0.0) {
+            float3 half_vector =
+                float3(light_vector.xy, light_vector.z + 1.0);
+            float half_length = length(half_vector);
+            if (half_length > 0.0) {
+                float normal_half =
+                    dot(world_normal, half_vector) / half_length;
+                if (normal_half > 0.0) {
+                    float specular = state.fog_material.z > 0.0
+                        ? pow(normal_half, state.fog_material.z)
+                        : normal_half;
+                    result += attenuation *
+                        unpack_rgb(state.light_colors[i].z) *
+                        specular_material * specular;
+                }
+            }
+        }
+    }
+
+    uint vertex_alpha =
+        (uint)floor(vertex_color.a * 255.0 + 0.5);
+    uint material_alpha = (material_update & 1u) != 0u
+        ? vertex_alpha
+        : ((state.config.x & STATE_MATERIAL_ALPHA_SET) != 0u
+            ? state.depth_material.w : 255u);
+    uint alpha =
+        (material_alpha * state.material_config.y + 127u) / 255u;
+    float3 rounded =
+        floor(clamp(result, 0.0, 1.0) * 255.0 + 0.5) *
+        (1.0 / 255.0);
+    return float4(
+        rounded, float(min(alpha, 255u)) * (1.0 / 255.0));
+}
+
+float fog_factor(TnlState state, float view_z) {
+    float fog_end = state.fog_material.x;
+    float fog_slope = state.fog_material.y;
+    if (isinf(fog_end) || isnan(fog_end)) {
+        bool negative = (asuint(fog_end) & 0x80000000u) != 0u;
+        if ((asuint(fog_slope) & 0x80000000u) != 0u)
+            negative = !negative;
+        if (fog_slope == 0.0)
+            negative = true;
+        return negative ? 0.0 : 1.0;
+    }
+    if (isinf(fog_slope) || isnan(fog_slope))
+        fog_slope = (asuint(fog_slope) & 0x80000000u) != 0u
+            ? -262144.0 : 262144.0;
+    return clamp((view_z + fog_end) * fog_slope, 0.0, 1.0);
+}
+
+ClipVertex transform_vertex(uint local_index) {
+    uint vertex_index = job_offsets.x + local_index;
+    uint byte_offset = vertex_index * 36u;
+    float3 input_position =
+        asfloat(canonical_vertices.Load3(byte_offset));
+    float3 input_normal =
+        asfloat(canonical_vertices.Load3(byte_offset + 12u));
+    float2 input_uv =
+        asfloat(canonical_vertices.Load2(byte_offset + 24u));
+    uint packed_color =
+        canonical_vertices.Load(byte_offset + 32u);
+    uint4 input_color_bytes = uint4(
+        packed_color & 255u,
+        (packed_color >> 8u) & 255u,
+        (packed_color >> 16u) & 255u,
+        packed_color >> 24u);
+    float4 input_color =
+        float4(input_color_bytes) * (1.0 / 255.0);
+
+    TnlState state = tnl_states[job_offsets.z];
+    precise float3 world_position = transform43(
+        state.world[0], state.world[1], state.world[2],
+        input_position, 1.0);
+    precise float3 view_position = transform43(
+        state.view[0], state.view[1], state.view[2],
+        world_position, 1.0);
+    precise float4 clip_position = transform44(
+        state.projection[0], state.projection[1],
+        state.projection[2], state.projection[3],
+        view_position);
+    precise float3 world_normal = transform43(
+        state.world[0], state.world[1], state.world[2],
+        input_normal, 0.0);
+    float normal_length = length(world_normal);
+    if (normal_length > 0.0)
+        world_normal /= normal_length;
+
+    uint texture_mode = state.config.z & 3u;
+    precise float2 uv;
+    if (texture_mode == 1u) {
+        uint source_mode = (state.config.z >> 8u) & 3u;
+        float3 source;
+        if (source_mode == 0u)
+            source = input_position;
+        else if (source_mode == 1u)
+            source = float3(input_uv, 0.0);
+        else {
+            source = input_normal;
+            if (source_mode == 2u) {
+                float source_length = length(source);
+                if (source_length > 0.0)
+                    source /= source_length;
+            }
+        }
+        precise float3 generated = transform43(
+            state.texture_matrix[0], state.texture_matrix[1],
+            state.texture_matrix[2], source, 1.0);
+        float q = generated.z == 0.0 ? 1.0 : generated.z;
+        uv = generated.xy / q * state.viewport_offset_size.zw;
+    } else if (texture_mode == 2u) {
+        float2 environment;
+        [unroll]
+        for (uint i = 0u; i < 2u; i++) {
+            uint light_index =
+                (state.config.w >> (i * 8u)) & 3u;
+            float3 direction =
+                state.light_position[light_index].xyz;
+            float direction_length = length(direction);
+            if (direction_length > 0.0)
+                direction /= direction_length;
+            environment[i] =
+                (1.0 + dot(direction, world_normal)) * 0.5;
+        }
+        uv = environment * state.viewport_offset_size.zw;
+    } else {
+        uv = (input_uv * state.texture_params.xy +
+            state.texture_params.zw) *
+            state.viewport_offset_size.zw;
+    }
+
+    float output_fog = (state.config.x & STATE_FOG) != 0u
+        ? fog_factor(state, view_position.z) : 1.0;
+    float4 output_color = (state.config.x & STATE_LIGHTING) != 0u
+        ? light_vertex(
+            state, world_position, world_normal, input_color)
+        : input_color;
+    ClipVertex output_vertex;
+    output_vertex.clip = clip_position;
+    output_vertex.uv_fog = float4(uv, output_fog, 0.0);
+    output_vertex.color = (uint4)floor(
+        clamp(output_color, 0.0, 1.0) * 255.0 + 0.5);
+    return output_vertex;
+}
+
+bool finite_clip(ClipVertex vertex) {
+    return !any(isnan(vertex.clip)) && !any(isinf(vertex.clip));
+}
+
+bool original_out_of_range(TnlState state, ClipVertex vertex) {
+    precise float inverse_w = 1.0 / vertex.clip.w;
+    precise float3 screen =
+        vertex.clip.xyz * inverse_w * state.viewport_scale.xyz +
+        state.viewport_center.xyz;
+    if ((state.config.x & STATE_DEPTH_CLIP) != 0u) {
+        return vertex.clip.z > -vertex.clip.w &&
+            (screen.x >= SCREEN_BOUND || screen.y >= SCREEN_BOUND ||
+             screen.x < 0.0 || screen.y < 0.0);
+    }
+    return screen.x > SCREEN_BOUND || screen.y >= SCREEN_BOUND ||
+        screen.x < 0.0 || screen.y < 0.0 ||
+        screen.z < 0.0 || screen.z >= 65536.0;
+}
+
+bool created_out_of_range(TnlState state, ClipVertex vertex) {
+    if (vertex.clip.w <= NEAR_W)
+        return true;
+    precise float inverse_w = 1.0 / vertex.clip.w;
+    precise float3 screen =
+        vertex.clip.xyz * inverse_w * state.viewport_scale.xyz +
+        state.viewport_center.xyz;
+    if ((state.config.x & STATE_DEPTH_CLIP) != 0u) {
+        return screen.x >= SCREEN_BOUND || screen.y >= SCREEN_BOUND ||
+            screen.x < 0.0 || screen.y < 0.0;
+    }
+    return screen.x > SCREEN_BOUND || screen.y >= SCREEN_BOUND ||
+        screen.x < 0.0 || screen.y < 0.0 ||
+        screen.z < 0.0 || screen.z >= 65536.0;
+}
+
+ClipVertex clip_lerp(
+    ClipVertex first, ClipVertex second, float amount) {
+    ClipVertex output_vertex;
+    output_vertex.clip =
+        first.clip + (second.clip - first.clip) * amount;
+    output_vertex.uv_fog =
+        first.uv_fog + (second.uv_fog - first.uv_fog) * amount;
+    int4 difference = int4(second.color) - int4(first.color);
+    output_vertex.color = uint4(
+        int4(first.color) +
+        int4(float4(difference) * amount));
+    return output_vertex;
+}
+
+ScreenVertex degenerate_vertex() {
+    ScreenVertex output_vertex;
+    output_vertex.position = float4(0.0, 0.0, 0.0, 1.0);
+    output_vertex.texcoord = float2(0.0, 0.0);
+    output_vertex.fog = 1.0;
+    output_vertex.color = 0u;
+    return output_vertex;
+}
+
+ScreenVertex project_vertex(TnlState state, ClipVertex vertex) {
+    precise float inverse_w = 1.0 / vertex.clip.w;
+    precise float3 screen =
+        vertex.clip.xyz * inverse_w * state.viewport_scale.xyz +
+        state.viewport_center.xyz;
+    screen.xy -= state.viewport_offset_size.xy;
+    screen.xy =
+        floor(screen.xy * 16.0 + 0.375) * (1.0 / 16.0);
+    screen.z = clamp(screen.z, 0.0, 65535.0);
+    ScreenVertex output_vertex;
+    output_vertex.position = float4(screen, inverse_w);
+    precise float2 uv_over_w =
+        vertex.uv_fog.xy * inverse_w;
+    output_vertex.texcoord = uv_over_w;
+    output_vertex.fog = vertex.uv_fog.z;
+    output_vertex.color =
+        (vertex.color.x & 255u) |
+        ((vertex.color.y & 255u) << 8u) |
+        ((vertex.color.z & 255u) << 16u) |
+        ((vertex.color.w & 255u) << 24u);
+    return output_vertex;
+}
+
+void write_triangle(
+    uint output_base, uint output_triangle,
+    TnlState state, ClipVertex first,
+    ClipVertex second, ClipVertex third) {
+    uint base = output_base + output_triangle * 3u;
+    screen_vertices[base] = project_vertex(state, first);
+    screen_vertices[base + 1u] = project_vertex(state, second);
+    screen_vertices[base + 2u] = project_vertex(state, third);
+}
+
+uint load_triangle_index(uint index) {
+    uint packed =
+        triangle_indices.Load((index >> 1u) * 4u);
+    return (index & 1u) != 0u
+        ? packed >> 16u : packed & 0xffffu;
+}
+
+void preprocess_triangle(uint triangle_index) {
+    uint output_base =
+        job_offsets.w + triangle_index * 6u;
+    ScreenVertex degenerate = degenerate_vertex();
+    [unroll]
+    for (uint i = 0u; i < 6u; i++)
+        screen_vertices[output_base + i] = degenerate;
+
+    uint index_base =
+        job_offsets.y + triangle_index * 3u;
+    ClipVertex input_vertices[3];
+    [unroll]
+    for (uint i = 0u; i < 3u; i++) {
+        uint vertex_index = job_offsets.x +
+            load_triangle_index(index_base + i);
+        input_vertices[i] = clip_vertices[vertex_index];
+        if (!finite_clip(input_vertices[i]))
+            return;
+    }
+    TnlState state = tnl_states[job_offsets.z];
+    bool any_out_of_range = false;
+    bool all_negative_w = true;
+    int positive_count = 0;
+    int negative_count = 0;
+    float distance[3];
+    [unroll]
+    for (uint i = 0u; i < 3u; i++) {
+        ClipVertex vertex = input_vertices[i];
+        float depth = vertex.clip.z / vertex.clip.w;
+        positive_count += depth >= DEPTH_BOUND ? 1 : 0;
+        negative_count += -depth >= DEPTH_BOUND ? 1 : 0;
+        all_negative_w =
+            all_negative_w && vertex.clip.w < 0.0;
+        any_out_of_range =
+            any_out_of_range ||
+            original_out_of_range(state, vertex);
+        distance[i] = vertex.clip.z + vertex.clip.w;
+    }
+    if (any_out_of_range || all_negative_w)
+        return;
+    if ((state.config.x & STATE_DEPTH_CLIP) == 0u &&
+        positive_count + negative_count > 0) {
+        return;
+    }
+    if (positive_count == 3 || negative_count == 3)
+        return;
+
+    if (distance[0] >= 0.0 && distance[1] >= 0.0 &&
+        distance[2] >= 0.0) {
+        if (input_vertices[0].clip.w <= NEAR_W ||
+            input_vertices[1].clip.w <= NEAR_W ||
+            input_vertices[2].clip.w <= NEAR_W) {
+            return;
+        }
+        write_triangle(
+            output_base, 0u, state,
+            input_vertices[0], input_vertices[1],
+            input_vertices[2]);
+        return;
+    }
+    if (distance[0] < 0.0 && distance[1] < 0.0 &&
+        distance[2] < 0.0) {
+        return;
+    }
+
+    ClipVertex clipped[4];
+    bool created[4];
+    uint clipped_count = 0u;
+    [unroll]
+    for (uint i = 0u; i < 3u; i++) {
+        uint next = (i + 1u) % 3u;
+        bool first_inside = distance[i] >= 0.0;
+        bool second_inside = distance[next] >= 0.0;
+        if (first_inside) {
+            clipped[clipped_count] = input_vertices[i];
+            created[clipped_count++] = false;
+        }
+        if (first_inside != second_inside) {
+            float amount =
+                distance[i] / (distance[i] - distance[next]);
+            clipped[clipped_count] = clip_lerp(
+                input_vertices[i], input_vertices[next], amount);
+            created[clipped_count++] = true;
+        }
+    }
+    if (clipped_count < 3u || clipped_count > 4u)
+        return;
+
+    bool bad[4] = {false, false, false, false};
+    for (uint i = 0u; i < clipped_count; i++) {
+        bad[i] =
+            clipped[i].clip.w <= NEAR_W ||
+            (created[i] &&
+             created_out_of_range(state, clipped[i]));
+    }
+    uint output_triangle = 0u;
+    for (uint i = 2u; i < clipped_count; i++) {
+        if (bad[0] || bad[i - 1u] || bad[i])
+            continue;
+        write_triangle(
+            output_base, output_triangle++, state,
+            clipped[0], clipped[i - 1u], clipped[i]);
+    }
+}
+
+[numthreads(64, 1, 1)]
+void transform_main(uint3 dispatch_id : SV_DispatchThreadID) {
+    uint local_index = dispatch_id.x;
+    if (local_index >= job_counts.x)
+        return;
+    uint vertex_index = job_offsets.x + local_index;
+    clip_vertices[vertex_index] =
+        transform_vertex(local_index);
+}
+
+[numthreads(64, 1, 1)]
+void triangles_main(uint3 dispatch_id : SV_DispatchThreadID) {
+    uint local_index = dispatch_id.x;
+    if (local_index < job_counts.y)
+        preprocess_triangle(local_index);
+}

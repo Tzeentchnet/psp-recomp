@@ -21,6 +21,7 @@ enum GeVkShaderFlag {
     GE_VK_SHADER_FRAMEBUFFER = 65536u,
     GE_VK_SHADER_CLAMP_U = 131072u,
     GE_VK_SHADER_CLAMP_V = 262144u,
+    GE_VK_SHADER_INDEXED_FRAMEBUFFER = 524288u,
 };
 
 typedef struct GeVkShaderState {
@@ -31,10 +32,14 @@ typedef struct GeVkShaderState {
     uint32_t dither[4];
     uint32_t blend[4];
     uint32_t fragment[4];
+    uint32_t tnl[4];
 } GeVkShaderState;
 
 int ge_vk_shader_direct_compatible(const GeState *state);
 int ge_vk_shader_direct_stencil_write(const GeState *state);
+int ge_vk_indexed_framebuffer_compatible(
+    const GeState *state, uint32_t format, uint32_t stride, uint32_t offset);
+uint64_t ge_vk_texture_palette_key(const GeState *state);
 void ge_vk_shader_state_build(
     const GeState *state, int perspective, int sprite_semantics,
     uint32_t render_scale, GeVkShaderState *out);

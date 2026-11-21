@@ -16,12 +16,21 @@
 #define MAX_FRAME_BATCHES (256u * 1024u)
 
 static GeD3D12Vertex *s_vertices;
+static GeTnlVertex *s_tnl_vertices;
+static GeTnlGpuState *s_tnl_states;
+static GeTnlState *s_tnl_reference_states;
+static int s_tnl_reference_enabled;
 static GeD3D12VertexBatch *s_batches;
 static uint16_t *s_indices;
 static uint32_t s_index_count;
 static uint32_t s_index_capacity;
 static uint32_t s_vertex_count;
 static uint32_t s_vertex_capacity;
+static uint32_t s_tnl_vertex_count;
+static uint32_t s_tnl_vertex_capacity;
+static uint32_t s_tnl_state_count;
+static uint32_t s_tnl_state_capacity;
+static uint32_t s_tnl_screen_vertex_count;
 static uint32_t s_batch_count;
 static uint32_t s_batch_capacity;
 static uint32_t s_primitive_count[GE_D3D12_PRIMITIVE_COUNT];
@@ -59,6 +68,69 @@ static bool reserve_vertices(uint32_t additional) {
     }
     s_vertices = static_cast<GeD3D12Vertex *>(memory);
     s_vertex_capacity = capacity;
+    return true;
+}
+
+static bool reserve_tnl_vertices(uint32_t additional) {
+    if (!s_tnl_vertices ||
+        additional > MAX_FRAME_VERTICES - s_tnl_vertex_count) {
+        capture_error(
+            "canonical vertex frame capacity exceeded",
+            s_tnl_vertex_count + additional, MAX_FRAME_VERTICES);
+        return false;
+    }
+    uint32_t required = s_tnl_vertex_count + additional;
+    if (required <= s_tnl_vertex_capacity) return true;
+    uint32_t capacity = s_tnl_vertex_capacity;
+    while (capacity < required) {
+        capacity = capacity > MAX_FRAME_VERTICES / 2u
+            ? MAX_FRAME_VERTICES : capacity * 2u;
+    }
+    void *memory = realloc(
+        s_tnl_vertices, (size_t)capacity * sizeof(*s_tnl_vertices));
+    if (!memory) {
+        capture_error(
+            "could not grow canonical vertex storage", required, capacity);
+        return false;
+    }
+    s_tnl_vertices = static_cast<GeTnlVertex *>(memory);
+    s_tnl_vertex_capacity = capacity;
+    return true;
+}
+
+static bool reserve_tnl_state(void) {
+    if (!s_tnl_states || s_tnl_state_count >= MAX_FRAME_BATCHES) {
+        capture_error(
+            "transform-state frame capacity exceeded",
+            s_tnl_state_count + 1u, MAX_FRAME_BATCHES);
+        return false;
+    }
+    if (s_tnl_state_count < s_tnl_state_capacity) return true;
+    uint32_t capacity =
+        s_tnl_state_capacity > MAX_FRAME_BATCHES / 2u
+            ? MAX_FRAME_BATCHES : s_tnl_state_capacity * 2u;
+    void *memory = realloc(
+        s_tnl_states, (size_t)capacity * sizeof(*s_tnl_states));
+    if (!memory) {
+        capture_error(
+            "could not grow transform-state storage",
+            s_tnl_state_count + 1u, capacity);
+        return false;
+    }
+    s_tnl_states = static_cast<GeTnlGpuState *>(memory);
+    if (s_tnl_reference_enabled) {
+        memory = realloc(
+            s_tnl_reference_states,
+            (size_t)capacity * sizeof(*s_tnl_reference_states));
+        if (!memory) {
+            capture_error(
+                "could not grow reference transform-state storage",
+                s_tnl_state_count + 1u, capacity);
+            return false;
+        }
+        s_tnl_reference_states = static_cast<GeTnlState *>(memory);
+    }
+    s_tnl_state_capacity = capacity;
     return true;
 }
 
@@ -405,21 +477,41 @@ bool ged3d12_vertex_capture_init(void) {
     }
     s_vertices = static_cast<GeD3D12Vertex *>(
         malloc(INITIAL_VERTEX_CAPACITY * sizeof(*s_vertices)));
+    s_tnl_vertices = static_cast<GeTnlVertex *>(
+        malloc(INITIAL_VERTEX_CAPACITY * sizeof(*s_tnl_vertices)));
+    s_tnl_states = static_cast<GeTnlGpuState *>(
+        malloc(INITIAL_BATCH_CAPACITY * sizeof(*s_tnl_states)));
+    const char *validate = getenv("SR_GPU_TNL_VALIDATE");
+    s_tnl_reference_enabled =
+        validate && validate[0] && strcmp(validate, "0") != 0;
+    if (s_tnl_reference_enabled) {
+        s_tnl_reference_states = static_cast<GeTnlState *>(
+            malloc(
+                INITIAL_BATCH_CAPACITY *
+                sizeof(*s_tnl_reference_states)));
+    }
     s_batches = static_cast<GeD3D12VertexBatch *>(
         malloc(INITIAL_BATCH_CAPACITY * sizeof(*s_batches)));
     s_indices = static_cast<uint16_t *>(
         malloc(INITIAL_VERTEX_CAPACITY * sizeof(*s_indices)));
-    if (!s_vertices || !s_batches || !s_indices) {
+    if (!s_vertices || !s_tnl_vertices || !s_tnl_states ||
+        (s_tnl_reference_enabled && !s_tnl_reference_states) ||
+        !s_batches || !s_indices) {
         fprintf(stderr, "ged3d12: could not allocate decoded vertex capture storage\n");
         ged3d12_vertex_capture_shutdown();
         return false;
     }
     s_memo_primitive = -1;
     s_vertex_capacity = INITIAL_VERTEX_CAPACITY;
+    s_tnl_vertex_capacity = INITIAL_VERTEX_CAPACITY;
+    s_tnl_state_capacity = INITIAL_BATCH_CAPACITY;
     s_batch_capacity = INITIAL_BATCH_CAPACITY;
     s_index_capacity = INITIAL_VERTEX_CAPACITY;
     s_index_count = 0;
     s_vertex_count = 0;
+    s_tnl_vertex_count = 0;
+    s_tnl_state_count = 0;
+    s_tnl_screen_vertex_count = 0;
     s_batch_count = 0;
     s_capture_failed = 0;
     memset(s_primitive_count, 0, sizeof(s_primitive_count));
@@ -428,15 +520,27 @@ bool ged3d12_vertex_capture_init(void) {
 
 void ged3d12_vertex_capture_shutdown(void) {
     free(s_vertices);
+    free(s_tnl_vertices);
+    free(s_tnl_states);
+    free(s_tnl_reference_states);
     free(s_batches);
     free(s_indices);
     s_indices = nullptr;
     s_index_count = 0;
     s_index_capacity = 0;
     s_vertices = nullptr;
+    s_tnl_vertices = nullptr;
+    s_tnl_states = nullptr;
+    s_tnl_reference_states = nullptr;
+    s_tnl_reference_enabled = 0;
     s_batches = nullptr;
     s_vertex_count = 0;
     s_vertex_capacity = 0;
+    s_tnl_vertex_count = 0;
+    s_tnl_vertex_capacity = 0;
+    s_tnl_state_count = 0;
+    s_tnl_state_capacity = 0;
+    s_tnl_screen_vertex_count = 0;
     s_batch_count = 0;
     s_batch_capacity = 0;
     s_capture_failed = 0;
@@ -549,6 +653,111 @@ static int capture_tri_indexed_impl(
     s_index_count += index_count;
     s_primitive_count[GE_D3D12_PRIMITIVE_TRIANGLE] += index_count / 3u - 1u;
     update_batch_bounds(first, table_count);
+    return 1;
+}
+
+int ged3d12_vertex_capture_transform(const GeTnlDraw *draw) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("SR_GPU_TNL");
+        enabled =
+            value && value[0] && strcmp(value, "0") != 0 ? 1 : 0;
+    }
+    if (!enabled || !draw || !draw->state ||
+        draw->state->abi_version != GE_TNL_ABI_VERSION ||
+        (draw->state->flags & GE_TNL_STATE_CLEAR) != 0 ||
+        (draw->state->flags & GE_TNL_STATE_GOURAUD) == 0 ||
+        (draw->flags & ~GE_TNL_DRAW_PREPROCESS) != 0 ||
+        (draw->primitive != GE_TNL_TRIANGLES &&
+         draw->primitive != GE_TNL_TRIANGLE_STRIP &&
+         draw->primitive != GE_TNL_TRIANGLE_FAN) ||
+        !draw->vertices || !draw->indices ||
+        draw->vertex_count == 0 || draw->vertex_count > 65536u ||
+        draw->index_count == 0 || draw->index_count % 3u) {
+        return 0;
+    }
+    const bool preprocess =
+        (draw->flags & GE_TNL_DRAW_PREPROCESS) != 0;
+    const uint32_t triangle_count = draw->index_count / 3u;
+    if (draw->vertex_count >
+            MAX_FRAME_VERTICES - s_tnl_vertex_count ||
+        draw->index_count >
+            MAX_FRAME_VERTICES * 4u - s_index_count ||
+        s_tnl_state_count >= MAX_FRAME_BATCHES ||
+        s_batch_count >= MAX_FRAME_BATCHES ||
+        (preprocess &&
+         (triangle_count > MAX_FRAME_VERTICES / 6u ||
+          triangle_count * 6u >
+              MAX_FRAME_VERTICES - s_tnl_screen_vertex_count))) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < draw->index_count; i++)
+        if (draw->indices[i] >= draw->vertex_count) return 0;
+    if (!reserve_tnl_vertices(draw->vertex_count) ||
+        !reserve_tnl_state() ||
+        !reserve_indices(draw->index_count)) {
+        return 0;
+    }
+
+    uint32_t ignored_first;
+    if (!begin_primitive_ex(
+            GE_D3D12_PRIMITIVE_TRIANGLE, 1, 0,
+            &ignored_first, false)) {
+        return 0;
+    }
+    GeD3D12VertexBatch *batch = &s_batches[s_batch_count - 1u];
+    const uint32_t canonical_first = s_tnl_vertex_count;
+    const uint32_t output_count =
+        preprocess ? triangle_count * 6u : 0u;
+    batch->flags = GE_D3D12_BATCH_GPU_TNL |
+        (preprocess
+            ? GE_D3D12_BATCH_TNL_PREPROCESS
+            : GE_D3D12_BATCH_INDEXED);
+    batch->first =
+        preprocess ? s_tnl_screen_vertex_count : canonical_first;
+    batch->table_count = draw->vertex_count;
+    batch->index_first = s_index_count;
+    batch->count =
+        preprocess ? output_count : draw->index_count;
+    batch->shader.tnl[0] = s_tnl_state_count;
+    batch->shader.tnl[1] = preprocess ? 0u : 1u;
+    batch->shader.tnl[2] = 0u;
+    batch->shader.tnl[3] = canonical_first;
+    batch->framebuffer.draw_left = 0;
+    batch->framebuffer.draw_top = 0;
+    batch->framebuffer.draw_right = GE_D3D12_FRAMEBUFFER_WIDTH;
+    batch->framebuffer.draw_bottom = GE_D3D12_FRAMEBUFFER_HEIGHT;
+    if (batch->texture.framebuffer.handle !=
+        GE_D3D12_FRAMEBUFFER_HANDLE_NONE) {
+        batch->texture.framebuffer.snapshot_left = 0;
+        batch->texture.framebuffer.snapshot_top = 0;
+        batch->texture.framebuffer.snapshot_right =
+            GE_D3D12_FRAMEBUFFER_WIDTH;
+        batch->texture.framebuffer.snapshot_bottom =
+            GE_D3D12_FRAMEBUFFER_HEIGHT;
+    }
+
+    memcpy(
+        &s_tnl_vertices[s_tnl_vertex_count], draw->vertices,
+        (size_t)draw->vertex_count * sizeof(*draw->vertices));
+    memcpy(
+        &s_indices[s_index_count], draw->indices,
+        (size_t)draw->index_count * sizeof(*draw->indices));
+    ge_tnl_gpu_state_build(
+        draw->state, &s_tnl_states[s_tnl_state_count]);
+    if (s_tnl_reference_states)
+        s_tnl_reference_states[s_tnl_state_count] = *draw->state;
+    s_tnl_vertex_count += draw->vertex_count;
+    s_tnl_screen_vertex_count += output_count;
+    s_tnl_state_count++;
+    s_index_count += draw->index_count;
+    s_primitive_count[GE_D3D12_PRIMITIVE_TRIANGLE] +=
+        draw->index_count / 3u - 1u;
+    sr_perf_counter_add(
+        SR_PERF_GPU_TNL_UPLOAD_BYTES,
+        (uint64_t)draw->vertex_count * sizeof(*draw->vertices) +
+            (uint64_t)draw->index_count * sizeof(uint16_t) +
+            sizeof(GeTnlGpuState));
     return 1;
 }
 
@@ -683,51 +892,143 @@ bool ged3d12_vertex_upload_pending(GeD3D12VertexFrame *out) {
         fprintf(stderr, "ged3d12: decoded vertex capture failed; refusing a partial upload\n");
         return false;
     }
-    if (!s_vertex_count) {
+    if (!s_vertex_count && !s_tnl_vertex_count) {
         s_batch_count = 0;
+        s_tnl_state_count = 0;
+        s_tnl_screen_vertex_count = 0;
         memset(s_primitive_count, 0, sizeof(s_primitive_count));
         return true;
     }
 
     UINT64 size = (UINT64)s_vertex_count * sizeof(*s_vertices);
-    GeD3D12UploadSlice upload = {};
-    if (!ged3d12_upload_alloc(size, 16, &upload)) {
-        fprintf(stderr, "ged3d12: could not allocate %llu bytes for decoded vertices\n",
+    if (s_vertex_count) {
+        GeD3D12UploadSlice upload = {};
+        if (!ged3d12_upload_alloc(size, 16, &upload)) {
+            fprintf(
+                stderr,
+                "ged3d12: could not allocate %llu bytes for decoded vertices\n",
                 (unsigned long long)size);
-        return false;
+            return false;
+        }
+        memcpy(upload.cpu, s_vertices, (size_t)size);
+        out->buffer.BufferLocation = upload.gpu;
+        out->buffer.SizeInBytes = (UINT)size;
+        out->buffer.StrideInBytes = sizeof(*s_vertices);
     }
-    memcpy(upload.cpu, s_vertices, (size_t)size);
+    if (s_tnl_vertex_count) {
+        UINT64 tnl_size =
+            (UINT64)s_tnl_vertex_count * sizeof(*s_tnl_vertices);
+        GeD3D12UploadSlice tnl_upload = {};
+        if (!ged3d12_upload_alloc(tnl_size, 16, &tnl_upload)) {
+            fprintf(
+                stderr,
+                "ged3d12: could not allocate %llu bytes for canonical vertices\n",
+                (unsigned long long)tnl_size);
+            return false;
+        }
+        memcpy(tnl_upload.cpu, s_tnl_vertices, (size_t)tnl_size);
+        out->tnl_vertex_base = tnl_upload.gpu;
+
+        UINT64 state_size =
+            (UINT64)s_tnl_state_count * sizeof(*s_tnl_states);
+        GeD3D12UploadSlice state_upload = {};
+        if (!ged3d12_upload_alloc(state_size, 16, &state_upload)) {
+            fprintf(
+                stderr,
+                "ged3d12: could not allocate %llu bytes for transform states\n",
+                (unsigned long long)state_size);
+            return false;
+        }
+        memcpy(state_upload.cpu, s_tnl_states, (size_t)state_size);
+        out->tnl_state_base = state_upload.gpu;
+    }
     if (s_index_count) {
         UINT64 index_size = (UINT64)s_index_count * sizeof(*s_indices);
+        UINT64 upload_size = (index_size + 3u) & ~UINT64_C(3);
         GeD3D12UploadSlice index_upload = {};
-        if (!ged3d12_upload_alloc(index_size, 16, &index_upload)) {
+        if (!ged3d12_upload_alloc(upload_size, 16, &index_upload)) {
             fprintf(stderr, "ged3d12: could not allocate %llu bytes for indices\n",
-                    (unsigned long long)index_size);
+                    (unsigned long long)upload_size);
             return false;
         }
         memcpy(index_upload.cpu, s_indices, (size_t)index_size);
+        if (upload_size != index_size) {
+            memset(
+                static_cast<uint8_t *>(index_upload.cpu) + index_size,
+                0, (size_t)(upload_size - index_size));
+        }
         out->index_base = index_upload.gpu;
     }
 
-    out->buffer.BufferLocation = upload.gpu;
-    out->buffer.SizeInBytes = (UINT)size;
-    out->buffer.StrideInBytes = sizeof(*s_vertices);
     out->vertices = s_vertices;
+    out->tnl_vertices = s_tnl_vertices;
+    out->tnl_states = s_tnl_states;
+    out->tnl_reference_states = s_tnl_reference_states;
+    out->indices = s_indices;
     out->batches = s_batches;
     out->vertex_count = s_vertex_count;
+    out->tnl_vertex_count = s_tnl_vertex_count;
+    out->tnl_state_count = s_tnl_state_count;
+    out->tnl_screen_vertex_count = s_tnl_screen_vertex_count;
+    out->index_count = s_index_count;
     out->batch_count = s_batch_count;
     memcpy(out->primitive_count, s_primitive_count, sizeof(out->primitive_count));
     out->hash = 0;
 
     s_vertex_count = 0;
+    s_tnl_vertex_count = 0;
+    s_tnl_state_count = 0;
+    s_tnl_screen_vertex_count = 0;
     s_index_count = 0;
     s_batch_count = 0;
     memset(s_primitive_count, 0, sizeof(s_primitive_count));
     return true;
 }
 
+bool ged3d12_vertex_tnl_job(
+    const GeD3D12VertexFrame *frame,
+    const GeD3D12VertexBatch *batch,
+    GeD3D12TnlJob *out) {
+    if (!frame || !batch || !out ||
+        (batch->flags &
+         (GE_D3D12_BATCH_GPU_TNL |
+          GE_D3D12_BATCH_TNL_PREPROCESS)) !=
+            (GE_D3D12_BATCH_GPU_TNL |
+             GE_D3D12_BATCH_TNL_PREPROCESS) ||
+        (batch->flags &
+         ~(GE_D3D12_BATCH_GPU_TNL |
+           GE_D3D12_BATCH_TNL_PREPROCESS)) != 0 ||
+        (batch->flags & GE_D3D12_BATCH_INDEXED) != 0 ||
+        batch->primitive != GE_D3D12_PRIMITIVE_TRIANGLE ||
+        batch->shader.tnl[1] != 0u ||
+        batch->count == 0 || batch->count % 6u != 0 ||
+        batch->shader.tnl[0] >= frame->tnl_state_count ||
+        batch->shader.tnl[3] > frame->tnl_vertex_count ||
+        batch->table_count >
+            frame->tnl_vertex_count - batch->shader.tnl[3] ||
+        batch->index_first > frame->index_count ||
+        batch->count / 2u >
+            frame->index_count - batch->index_first ||
+        batch->first > frame->tnl_screen_vertex_count ||
+        batch->count >
+            frame->tnl_screen_vertex_count - batch->first) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->offsets[0] = batch->shader.tnl[3];
+    out->offsets[1] = batch->index_first;
+    out->offsets[2] = batch->shader.tnl[0];
+    out->offsets[3] = batch->first;
+    out->counts[0] = batch->table_count;
+    out->counts[1] = batch->count / 6u;
+    return true;
+}
+
 void ged3d12_vertex_pending_counts(
     uint32_t *vertex_count, uint32_t *batch_count) {
-    if (vertex_count) *vertex_count = s_vertex_count;
+    if (vertex_count)
+        *vertex_count =
+            s_vertex_count + s_tnl_vertex_count +
+            s_tnl_screen_vertex_count;
     if (batch_count) *batch_count = s_batch_count;
 }

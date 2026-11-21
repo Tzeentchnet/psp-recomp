@@ -8,7 +8,7 @@
 layout(location = 0) in vec4 in_pos;    /* x px, y px, z 0..65535, rw */
 layout(location = 1) in vec2 in_uv;     /* u*rw, v*rw texel coords (raw u,v in through mode) */
 layout(location = 2) in float in_fog;   /* per-vertex fog factor, 1 = no fog */
-layout(location = 3) in vec4 in_color;  /* UNORM8 RGBA */
+layout(location = 3) in uvec4 in_color; /* packed RGBA8 */
 
 layout(location = 0) noperspective out vec2  v_uv;
 layout(location = 1) noperspective out float v_rw;
@@ -23,5 +23,5 @@ void main() {
     v_uv    = in_uv;
     v_rw    = in_pos.w;
     v_fog   = in_fog;
-    v_color = in_color;
+    v_color = vec4(in_color) * (1.0 / 255.0);
 }

@@ -18,6 +18,7 @@ static UINT64 s_upload_cursor;
 static uint32_t s_texture_captures;
 static uint32_t s_framebuffer_captures;
 static uint32_t s_render_scale = 1;
+static uint64_t s_perf_counters[SR_PERF_COUNTER_COUNT];
 static int s_failures;
 
 extern "C" GeState *ge_state_ptr(void) {
@@ -51,7 +52,15 @@ extern "C" SrPerfCategory sr_perf_switch(SrPerfCategory category) {
     return category;
 }
 
-extern "C" volatile uint32_t sr_perf_alternate_mask = 0;
+extern "C" void sr_perf_counter_add(
+    SrPerfCounter counter, uint64_t value) {
+    if (counter >= 0 && counter < SR_PERF_COUNTER_COUNT)
+        s_perf_counters[counter] += value;
+}
+
+extern "C" {
+volatile uint32_t sr_perf_alternate_mask = 0;
+}
 
 uint32_t ged3d12_command_list_generation(void) {
     return 1;
@@ -117,6 +126,23 @@ static void check_float(const char *what, float got, float expected) {
 static const GeD3D12Vertex *uploaded_vertices(const GeD3D12VertexFrame *frame) {
     UINT64 offset = frame->buffer.BufferLocation - TEST_GPU_BASE;
     return reinterpret_cast<const GeD3D12Vertex *>(s_upload + offset);
+}
+
+static const GeTnlVertex *uploaded_tnl_vertices(
+    const GeD3D12VertexFrame *frame) {
+    UINT64 offset = frame->tnl_vertex_base - TEST_GPU_BASE;
+    return reinterpret_cast<const GeTnlVertex *>(s_upload + offset);
+}
+
+static const GeTnlGpuState *uploaded_tnl_states(
+    const GeD3D12VertexFrame *frame) {
+    UINT64 offset = frame->tnl_state_base - TEST_GPU_BASE;
+    return reinterpret_cast<const GeTnlGpuState *>(s_upload + offset);
+}
+
+static const uint16_t *uploaded_indices(const GeD3D12VertexFrame *frame) {
+    UINT64 offset = frame->index_base - TEST_GPU_BASE;
+    return reinterpret_cast<const uint16_t *>(s_upload + offset);
 }
 
 static GeVtx vertex(
@@ -1324,7 +1350,250 @@ static void test_indexed_triangles(void) {
     check_u32("indexed upload reached the ring", frame.index_base != 0, 1);
 }
 
+static void test_transform_draw(void) {
+    reset_upload();
+    memset(&s_state, 0, sizeof(s_state));
+    s_state.shade_gouraud = 1;
+    GeTnlVertex vertices[4] = {};
+    vertices[0].position[0] = -0.5f;
+    vertices[1].position[0] = 0.5f;
+    vertices[2].position[1] = 0.5f;
+    vertices[3].position[1] = -0.5f;
+    for (uint32_t i = 0; i < 4; i++) {
+        vertices[i].normal[2] = 1.0f;
+        vertices[i].color[0] = (uint8_t)(10u + i);
+        vertices[i].color[1] = 20;
+        vertices[i].color[2] = 30;
+        vertices[i].color[3] = 40;
+    }
+    GeTnlVertex clipped_vertices[3] = {};
+    clipped_vertices[0].position[0] = -0.5f;
+    clipped_vertices[0].position[1] = -0.5f;
+    clipped_vertices[0].position[2] = -2.0f;
+    clipped_vertices[1].position[0] = 0.5f;
+    clipped_vertices[1].position[1] = -0.5f;
+    clipped_vertices[2].position[1] = 0.5f;
+    for (uint32_t i = 0; i < 3; i++) {
+        clipped_vertices[i].normal[2] = 1.0f;
+        clipped_vertices[i].texcoord[0] = (float)i;
+        clipped_vertices[i].color[0] = (uint8_t)(30u + i);
+        clipped_vertices[i].color[1] = 40;
+        clipped_vertices[i].color[2] = 50;
+        clipped_vertices[i].color[3] = 255;
+    }
+    uint16_t indices[6] = {0, 1, 2, 0, 2, 3};
+    uint16_t clipped_indices[3] = {0, 1, 2};
+    uint16_t invalid_indices[3] = {0, 1, 4};
+    GeTnlState state = {};
+    state.abi_version = GE_TNL_ABI_VERSION;
+    state.flags =
+        GE_TNL_STATE_GOURAUD | GE_TNL_STATE_DEPTH_CLIP;
+    state.world[0] = state.world[4] = state.world[8] = 1.0f;
+    state.view[0] = state.view[4] = state.view[8] = 1.0f;
+    state.projection[0] = state.projection[5] =
+        state.projection[10] = state.projection[15] = 1.0f;
+    state.viewport_scale[0] = 240.0f;
+    state.viewport_scale[1] = -136.0f;
+    state.viewport_scale[2] = 32767.5f;
+    state.viewport_center[0] = 240.0f;
+    state.viewport_center[1] = 136.0f;
+    state.viewport_center[2] = 32767.5f;
+    GeTnlDraw invalid = {
+        vertices, invalid_indices, &state, 4, 3, GE_TNL_TRIANGLES, 0,
+    };
+    GeTnlDraw draw = {
+        vertices, indices, &state, 4, 6, GE_TNL_TRIANGLES, 0,
+    };
+    check_u32(
+        "transform invalid index falls back",
+        ged3d12_vertex_capture_transform(&invalid), 0);
+    GeTnlDraw preprocess = {
+        clipped_vertices, clipped_indices, &state, 3, 3,
+        GE_TNL_TRIANGLES, GE_TNL_DRAW_PREPROCESS,
+    };
+    check_u32(
+        "transform preprocess is GPU-owned",
+        ged3d12_vertex_capture_transform(&preprocess), 1);
+    GeTnlDraw unsupported_flags = draw;
+    unsupported_flags.flags =
+        GE_TNL_DRAW_SPRITE_LINEAR_FILTER;
+    check_u32(
+        "transform unsupported flags fall back",
+        ged3d12_vertex_capture_transform(&unsupported_flags), 0);
+    GeTnlState flat_state = state;
+    flat_state.flags &= ~GE_TNL_STATE_GOURAUD;
+    GeTnlDraw flat = draw;
+    flat.state = &flat_state;
+    check_u32(
+        "transform flat shading falls back",
+        ged3d12_vertex_capture_transform(&flat), 0);
+    GeTnlDraw points = draw;
+    points.primitive = GE_TNL_POINTS;
+    check_u32(
+        "transform points fall back",
+        ged3d12_vertex_capture_transform(&points), 0);
+    GeTnlDraw sprites = draw;
+    sprites.primitive = GE_TNL_SPRITES;
+    sprites.index_count = 2;
+    check_u32(
+        "transform sprites fall back",
+        ged3d12_vertex_capture_transform(&sprites), 0);
+    GeTnlDraw lines = draw;
+    lines.primitive = GE_TNL_LINES;
+    lines.index_count = 2;
+    check_u32(
+        "transform lines fall back",
+        ged3d12_vertex_capture_transform(&lines), 0);
+    check_u32(
+        "transform hook is GPU-owned",
+        ged3d12_vertex_capture_transform(&draw), 1);
+
+    GeVtx ordinary[3] = {
+        vertex(1.0f, 2.0f, 3.0f, 1.0f, 4.0f, 5.0f, 1.0f,
+               1, 2, 3, 4),
+        vertex(2.0f, 3.0f, 4.0f, 1.0f, 5.0f, 6.0f, 1.0f,
+               5, 6, 7, 8),
+        vertex(3.0f, 4.0f, 5.0f, 1.0f, 6.0f, 7.0f, 1.0f,
+               9, 10, 11, 12),
+    };
+    check_u32(
+        "screen-space hook after transform",
+        ged3d12_vertex_capture_tri_list(ordinary, 3, 1), 1);
+
+    GeD3D12VertexFrame frame = {};
+    if (!ged3d12_vertex_upload_pending(&frame)) {
+        fail("transform upload failed");
+        return;
+    }
+    check_u32("transform screen vertex count", frame.vertex_count, 3);
+    check_u32("transform canonical vertex count", frame.tnl_vertex_count, 7);
+    check_u32("transform state count", frame.tnl_state_count, 2);
+    check_u32("transform preprocess screen slots",
+              frame.tnl_screen_vertex_count, 6);
+    check_u32("transform index count", frame.index_count, 9);
+    check_u32("transform mixed batch count", frame.batch_count, 3);
+    check_u32(
+        "preprocess batch flags", frame.batches[0].flags,
+        GE_D3D12_BATCH_GPU_TNL |
+            GE_D3D12_BATCH_TNL_PREPROCESS);
+    check_u32("preprocess batch first", frame.batches[0].first, 0);
+    check_u32("preprocess batch slots", frame.batches[0].count, 6);
+    check_u32("preprocess canonical count",
+              frame.batches[0].table_count, 3);
+    check_u32("preprocess state index",
+              frame.batches[0].shader.tnl[0], 0);
+    check_u32("preprocess screen mode",
+              frame.batches[0].shader.tnl[1], 0);
+    check_u32("preprocess canonical base",
+              frame.batches[0].shader.tnl[3], 0);
+    check_u32(
+        "transform batch flags", frame.batches[1].flags,
+        GE_D3D12_BATCH_INDEXED | GE_D3D12_BATCH_GPU_TNL);
+    check_u32("transform batch first", frame.batches[1].first, 3);
+    check_u32("transform batch indices", frame.batches[1].count, 6);
+    check_u32("transform batch index first",
+              frame.batches[1].index_first, 3);
+    check_u32("transform state index", frame.batches[1].shader.tnl[0], 1);
+    check_u32("transform mode", frame.batches[1].shader.tnl[1], 1);
+    check_u32(
+        "transform validation vertex base",
+        frame.batches[1].shader.tnl[3], 3);
+    check_u32("ordinary batch flags", frame.batches[2].flags, 0);
+    check_u32("ordinary transform mode", frame.batches[2].shader.tnl[1], 0);
+    check_u32(
+        "transform full draw right",
+        (uint32_t)frame.batches[1].framebuffer.draw_right,
+        GE_D3D12_FRAMEBUFFER_WIDTH);
+    check_u32(
+        "transform full draw bottom",
+        (uint32_t)frame.batches[1].framebuffer.draw_bottom,
+        GE_D3D12_FRAMEBUFFER_HEIGHT);
+
+    const GeTnlVertex *uploaded_vertices = uploaded_tnl_vertices(&frame);
+    const GeTnlGpuState *uploaded_states = uploaded_tnl_states(&frame);
+    const uint16_t *uploaded_draw_indices = uploaded_indices(&frame);
+    if (!frame.tnl_vertices || !frame.tnl_states ||
+        !frame.tnl_reference_states || !frame.indices)
+        fail("transform validation sources missing");
+    else if (memcmp(
+                 frame.tnl_vertices, uploaded_vertices,
+                 sizeof(clipped_vertices) + sizeof(vertices)) != 0 ||
+             memcmp(
+                 frame.tnl_states, uploaded_states,
+                 2u * sizeof(GeTnlGpuState)) != 0 ||
+             memcmp(
+                 frame.indices, uploaded_draw_indices,
+                 sizeof(clipped_indices) + sizeof(indices)) != 0)
+        fail("transform validation sources differ from upload");
+    check_float(
+        "transform uploaded position",
+        uploaded_vertices[4].position[0], 0.5f);
+    check_u32(
+        "transform uploaded color",
+        uploaded_vertices[3].color[0] |
+            (uploaded_vertices[3].color[1] << 8u) |
+            (uploaded_vertices[3].color[2] << 16u) |
+            (uploaded_vertices[3].color[3] << 24u),
+        0x281e140au);
+    check_float(
+        "transform uploaded projection",
+        uploaded_states[1].projection[3][3], 1.0f);
+    check_u32("transform uploaded final index", uploaded_draw_indices[8], 3);
+    const uint8_t *uploaded_index_bytes =
+        reinterpret_cast<const uint8_t *>(uploaded_draw_indices);
+    check_u32("transform index padding byte 0", uploaded_index_bytes[18], 0);
+    check_u32("transform index padding byte 1", uploaded_index_bytes[19], 0);
+    check_u32(
+        "transform reference state retained",
+        frame.tnl_reference_states[0].flags,
+        GE_TNL_STATE_GOURAUD | GE_TNL_STATE_DEPTH_CLIP);
+
+    GeD3D12TnlJob job = {};
+    check_u32(
+        "preprocess job builds",
+        ged3d12_vertex_tnl_job(
+            &frame, &frame.batches[0], &job),
+        1);
+    check_u32("preprocess job canonical offset", job.offsets[0], 0);
+    check_u32("preprocess job index offset", job.offsets[1], 0);
+    check_u32("preprocess job state offset", job.offsets[2], 0);
+    check_u32("preprocess job output offset", job.offsets[3], 0);
+    check_u32("preprocess job vertex count", job.counts[0], 3);
+    check_u32("preprocess job triangle count", job.counts[1], 1);
+    check_u32(
+        "direct batch is not preprocess job",
+        ged3d12_vertex_tnl_job(
+            &frame, &frame.batches[1], &job),
+        0);
+
+    GeTnlClipVertex clip[3] = {};
+    GeTnlScreenVertex screen[6] = {};
+    for (uint32_t i = 0; i < 3; i++) {
+        if (!ge_tnl_reference_clip_transform(
+                &frame.tnl_reference_states[0],
+                &frame.tnl_vertices[i], &clip[i])) {
+            fail("preprocess CPU clip oracle rejected");
+            break;
+        }
+    }
+    check_u32(
+        "preprocess CPU oracle emits two triangles",
+        ge_tnl_reference_preprocess_triangle(
+            &frame.tnl_reference_states[0], clip, screen),
+        6);
+    check_u64(
+        "transform upload metric",
+        s_perf_counters[SR_PERF_GPU_TNL_UPLOAD_BYTES],
+        sizeof(clipped_vertices) + sizeof(clipped_indices) +
+            sizeof(vertices) + sizeof(indices) +
+            2u * sizeof(GeTnlGpuState));
+}
+
 int main(void) {
+    if (_putenv_s("SR_GPU_TNL", "1") != 0 ||
+        _putenv_s("SR_GPU_TNL_VALIDATE", "1") != 0) {
+        fail("could not configure GPU T&L test environment");
+    }
     if (!ged3d12_vertex_capture_init()) {
         fail("vertex capture initialization failed");
     } else {
@@ -1340,6 +1609,7 @@ int main(void) {
         test_draw_batching();
         test_storage_growth();
         test_indexed_triangles();
+        test_transform_draw();
         ged3d12_vertex_capture_shutdown();
     }
 

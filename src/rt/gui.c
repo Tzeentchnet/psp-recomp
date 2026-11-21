@@ -577,6 +577,9 @@ int gui_last_gpu_sample(uint64_t *flip, double *milliseconds) {
 #endif
     return 0;
 }
+int gui_thermal_state(void) {
+    return -1;
+}
 int gui_last_backend_timing(SrBackendTiming *timing) {
 #ifdef SR_D3D12
     if (s_on && s_d3d12 && timing) {
@@ -604,12 +607,23 @@ int gui_framebuffer_stats(SrFramebufferStats *stats) {
     if (s_on && s_d3d12 && stats) {
         GeD3D12FramebufferStats source;
         if (!ged3d12_framebuffer_stats(&source)) return 0;
+        memset(stats, 0, sizeof(*stats));
         stats->readbacks = source.readbacks;
         stats->aliases = source.aliases;
         stats->feedback_snapshots = source.feedback_snapshots;
         stats->feedback_snapshot_pixels =
             source.feedback_snapshot_pixels;
         stats->feedback_reuses = source.feedback_reuses;
+        stats->pipeline_key_hits = source.pipeline_key_hits;
+        stats->pipelines_created = source.pipelines_created;
+        stats->pipeline_create_us = source.pipeline_create_us;
+        stats->texture_cache_hits = source.texture_cache_hits;
+        stats->texture_cache_misses = source.texture_cache_misses;
+        stats->texture_uploads = source.texture_uploads;
+        stats->texture_decode_us = source.texture_decode_us;
+        stats->texture_scale_us = source.texture_scale_us;
+        stats->host_upload_bytes = source.host_upload_bytes;
+        stats->host_readback_bytes = source.host_readback_bytes;
         return 1;
     }
 #else
@@ -689,6 +703,14 @@ void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
         if (shown == -1) {
             convert_fb(fbaddr, fmt, stride);
             shown = sdl3vk_present_rgba(s_px);
+            if (shown < 0) {
+                fprintf(stderr, "gui_present: Vulkan presenter failed\n");
+                if (s_ge_backend && s_ge_backend->shutdown) s_ge_backend->shutdown();
+                ge_set_backend(NULL);
+                s_ge_backend = NULL;
+                sdl3vk_shutdown();
+                _Exit(2);
+            }
         }
         if (shown == 0) {
             if (s_ge_backend && s_ge_backend->shutdown) s_ge_backend->shutdown();
