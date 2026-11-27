@@ -33,6 +33,12 @@
 #include <SDL3/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
 
+/* vulkan_beta.h is only included on Apple; the name is still needed for the
+ * availability check, which simply never matches elsewhere. */
+#ifndef VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME
+#define VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME "VK_KHR_portability_subset"
+#endif
+
 #include "smaa_vk.h"
 
 #include <stdio.h>
