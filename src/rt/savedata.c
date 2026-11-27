@@ -1,8 +1,8 @@
 /* sceUtilitySavedata: a persistent virtual memory stick.
  *
- * Save operations write real files under memstick/PSP/SAVEDATA/<gameName><saveName>/ next to
- * the executable (override the root with SR_MEMSTICK), the same layout PPSSPP and a real PSP
- * use. Secure operations use PPSSPP's Chnnlsv/libkirk path and SFO/file hashes, so encrypted
+ * Save operations write real files under memstick/PSP/SAVEDATA/<gameName><saveName>/ in the
+ * SR_DATA_DIR data folder, or the working directory without one (override the root with
+ * SR_MEMSTICK), the same layout PPSSPP and a real PSP use. Secure operations use PPSSPP's Chnnlsv/libkirk path and SFO/file hashes, so encrypted
  * saves round-trip with PPSSPP and real PSP saves. Field offsets and result codes
  * follow PPSSPP's SceUtilitySavedataParam (Core/Dialog/SavedataParam.h); the earlier no-op
  * implementation was also missing the abortStatus word, putting msFree/idList/fileList four
@@ -18,6 +18,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include "recomp.h"
 #include "savedata_crypto.h"
+#include "settings_path.h"
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,9 +90,13 @@ static void rd_cstr(uint32_t addr, char *out, int max) {
     out[i] = 0;
 }
 
+/* SR_MEMSTICK, else <SR_DATA_DIR>\memstick, else memstick in the working directory. */
 static const char *ms_root(void) {
+    static char data_root[MAX_PATH];
     const char *r = getenv("SR_MEMSTICK");
-    return r && *r ? r : "memstick";
+    if (r && *r) return r;
+    if (sr_data_path("memstick", data_root, sizeof(data_root))) return data_root;
+    return "memstick";
 }
 
 static void mkdirs(const char *path) {

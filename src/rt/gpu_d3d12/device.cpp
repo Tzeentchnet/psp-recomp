@@ -22,6 +22,7 @@
 #include "vertex.h"
 #include "../graphics_config.h"
 #include "../input_sdl.h"
+#include "../window_mode.h"
 extern "C" {
 #include "../recomp.h"
 }
@@ -388,7 +389,8 @@ int ged3d12_window_init(const char *title) {
     s_sdl_initialized = 1;
     s_window = SDL_CreateWindow(
         title ? title : "PSP Recomp", PSP_W * 2, PSP_H * 2,
-        SDL_WINDOW_RESIZABLE);
+        SDL_WINDOW_RESIZABLE |
+            (sr_start_fullscreen() ? SDL_WINDOW_FULLSCREEN : 0));
     if (!s_window) {
         fprintf(stderr, "ged3d12: SDL_CreateWindow failed: %s\n", SDL_GetError());
         ged3d12_window_shutdown();
@@ -1302,6 +1304,10 @@ static void poll_input(int *quit) {
             if (event.key.key == SDLK_ESCAPE) *quit = 1;
             if (event.key.key == SDLK_F10 && !event.key.repeat)
                 dump_ge_state_hotkey();
+            if (event.key.key == SDLK_F11 && !event.key.repeat)
+                SDL_SetWindowFullscreen(
+                    s_window,
+                    !(SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN));
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
             if (!s_pad) s_pad = SDL_OpenGamepad(event.gdevice.which);

@@ -16,6 +16,7 @@
 
 #include "sdl3vk.h"
 #include "../input_sdl.h"
+#include "../window_mode.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -145,7 +146,8 @@ int sdl3vk_init(const char *title) {
     }
     s_win = SDL_CreateWindow(title ? title : "PSP Recomp",
                              PSP_W * 2, PSP_H * 2,
-                             SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+                             SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
+                                 (sr_start_fullscreen() ? SDL_WINDOW_FULLSCREEN : 0));
     if (!s_win) {
         fprintf(stderr, "sdl3vk: SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 0;
@@ -276,6 +278,9 @@ static void poll_input(int *quit) {
         case SDL_EVENT_QUIT: *quit = 1; break;
         case SDL_EVENT_KEY_DOWN:
             if (ev.key.key == SDLK_ESCAPE) *quit = 1;
+            if (ev.key.key == SDLK_F11 && !ev.key.repeat)
+                SDL_SetWindowFullscreen(
+                    s_win, !(SDL_GetWindowFlags(s_win) & SDL_WINDOW_FULLSCREEN));
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
             if (!s_pad) s_pad = SDL_OpenGamepad(ev.gdevice.which);

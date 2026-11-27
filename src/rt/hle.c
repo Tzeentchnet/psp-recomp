@@ -416,7 +416,7 @@ static void font_load(void) {
     if (dir) { snprintf(path, sizeof path, "%s/ltn0.pgf", dir); s_pgf_ltn = pgf_open(path); }
     if (!s_pgf_ltn) {
         char error[256];
-        if (sr_settings_path(
+        if (sr_program_path(
                 "font\\ltn0.pgf", path, sizeof(path), error, sizeof(error)))
             s_pgf_ltn = pgf_open(path);
     }
@@ -425,7 +425,7 @@ static void font_load(void) {
     if (dir) { snprintf(path, sizeof path, "%s/jpn0.pgf", dir); s_pgf_jpn = pgf_open(path); }
     if (!s_pgf_jpn) {
         char error[256];
-        if (sr_settings_path(
+        if (sr_program_path(
                 "font\\jpn0.pgf", path, sizeof(path), error, sizeof(error)))
             s_pgf_jpn = pgf_open(path);
     }
@@ -1652,11 +1652,21 @@ static void io_release_fd(uint32_t fd) {
     memset(f, 0, sizeof(*f));
 }
 
+/* With SR_DATA_DIR (and no SR_FSDIR) the writable devices live in the player's data folder:
+ * ms0: in <data>\memstick, beside the saves sceUtilitySavedata writes, and the others in
+ * <data>\fs\<device>. */
+static int host_data_mode(void) {
+    const char *override = getenv("SR_FSDIR");
+    return !(override && override[0]) && sr_data_dir() != NULL;
+}
+
 static int host_root(char *out, int max) {
     const char *override = getenv("SR_FSDIR");
     int n;
     if (override && override[0]) {
         n = snprintf(out, (size_t)max, "%s", override);
+    } else if (sr_data_dir()) {
+        n = snprintf(out, (size_t)max, "%s", sr_data_dir());
     } else {
         const char *local = getenv("LOCALAPPDATA");
         if (!local || !local[0]) {
@@ -1699,6 +1709,14 @@ static int host_path(const char *guest, char *out, int max) {
         if (_stricmp(device, "fatms0") == 0 || _stricmp(device, "cache") == 0)
             strcpy(device, "ms0");
         p = colon + 1;
+    }
+    if (host_data_mode()) {
+        char mapped[sizeof(device)];
+        if (_stricmp(device, "ms0") == 0)
+            strcpy(mapped, "memstick");
+        else if (snprintf(mapped, sizeof(mapped), "fs\\%s", device) >= (int)sizeof(mapped))
+            return -1;
+        strcpy(device, mapped);
     }
     if (n + 1 + (int)strlen(device) >= max) return -1;
     out[n++] = '\\';

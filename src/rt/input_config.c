@@ -253,18 +253,92 @@ static int find_name(
     return -1;
 }
 
+/* Other spellings a launcher or a player may write (SDL key names, Xbox and PlayStation button
+ * names), compared after dropping case, spaces, '_' and '-'. The file is always written with
+ * the canonical names above. */
+static const NameValue s_key_aliases[] = {
+    {"return", SR_KEY_ENTER}, {"enter", SR_KEY_ENTER}, {"keypadenter", SR_KEY_ENTER},
+    {"spacebar", SR_KEY_SPACE}, {"space", SR_KEY_SPACE},
+    {"leftshift", SR_KEY_LEFT_SHIFT}, {"lshift", SR_KEY_LEFT_SHIFT},
+    {"shift", SR_KEY_LEFT_SHIFT},
+    {"rightshift", SR_KEY_RIGHT_SHIFT}, {"rshift", SR_KEY_RIGHT_SHIFT},
+    {"leftctrl", SR_KEY_LEFT_CTRL}, {"lctrl", SR_KEY_LEFT_CTRL},
+    {"leftcontrol", SR_KEY_LEFT_CTRL}, {"ctrl", SR_KEY_LEFT_CTRL},
+    {"control", SR_KEY_LEFT_CTRL},
+    {"rightctrl", SR_KEY_RIGHT_CTRL}, {"rctrl", SR_KEY_RIGHT_CTRL},
+    {"rightcontrol", SR_KEY_RIGHT_CTRL},
+    {"up", SR_KEY_UP}, {"uparrow", SR_KEY_UP}, {"arrowup", SR_KEY_UP},
+    {"right", SR_KEY_RIGHT}, {"rightarrow", SR_KEY_RIGHT}, {"arrowright", SR_KEY_RIGHT},
+    {"down", SR_KEY_DOWN}, {"downarrow", SR_KEY_DOWN}, {"arrowdown", SR_KEY_DOWN},
+    {"left", SR_KEY_LEFT}, {"leftarrow", SR_KEY_LEFT}, {"arrowleft", SR_KEY_LEFT},
+    {"tab", SR_KEY_TAB}, {"backspace", SR_KEY_BACKSPACE},
+};
+
+static const NameValue s_pad_aliases[] = {
+    {"south", SR_PAD_SOUTH}, {"a", SR_PAD_SOUTH}, {"cross", SR_PAD_SOUTH},
+    {"east", SR_PAD_EAST}, {"b", SR_PAD_EAST}, {"circle", SR_PAD_EAST},
+    {"west", SR_PAD_WEST}, {"x", SR_PAD_WEST}, {"square", SR_PAD_WEST},
+    {"north", SR_PAD_NORTH}, {"y", SR_PAD_NORTH}, {"triangle", SR_PAD_NORTH},
+    {"start", SR_PAD_START}, {"menu", SR_PAD_START}, {"options", SR_PAD_START},
+    {"back", SR_PAD_BACK}, {"select", SR_PAD_BACK}, {"view", SR_PAD_BACK},
+    {"share", SR_PAD_BACK},
+    {"leftshoulder", SR_PAD_LEFT_SHOULDER}, {"lb", SR_PAD_LEFT_SHOULDER},
+    {"l1", SR_PAD_LEFT_SHOULDER}, {"leftbumper", SR_PAD_LEFT_SHOULDER},
+    {"rightshoulder", SR_PAD_RIGHT_SHOULDER}, {"rb", SR_PAD_RIGHT_SHOULDER},
+    {"r1", SR_PAD_RIGHT_SHOULDER}, {"rightbumper", SR_PAD_RIGHT_SHOULDER},
+    {"lefttrigger", SR_PAD_LEFT_TRIGGER}, {"lt", SR_PAD_LEFT_TRIGGER},
+    {"l2", SR_PAD_LEFT_TRIGGER},
+    {"righttrigger", SR_PAD_RIGHT_TRIGGER}, {"rt", SR_PAD_RIGHT_TRIGGER},
+    {"r2", SR_PAD_RIGHT_TRIGGER},
+    {"dpadup", SR_PAD_DPAD_UP}, {"dpup", SR_PAD_DPAD_UP},
+    {"dpadright", SR_PAD_DPAD_RIGHT}, {"dpright", SR_PAD_DPAD_RIGHT},
+    {"dpaddown", SR_PAD_DPAD_DOWN}, {"dpdown", SR_PAD_DPAD_DOWN},
+    {"dpadleft", SR_PAD_DPAD_LEFT}, {"dpleft", SR_PAD_DPAD_LEFT},
+    {"leftstick", SR_PAD_LEFT_STICK}, {"ls", SR_PAD_LEFT_STICK},
+    {"l3", SR_PAD_LEFT_STICK}, {"leftthumb", SR_PAD_LEFT_STICK},
+    {"rightstick", SR_PAD_RIGHT_STICK}, {"rs", SR_PAD_RIGHT_STICK},
+    {"r3", SR_PAD_RIGHT_STICK}, {"rightthumb", SR_PAD_RIGHT_STICK},
+};
+
+static void compact_name(const char *text, char *out, size_t out_size) {
+    size_t used = 0;
+    for (; *text && used + 1 < out_size; text++) {
+        unsigned char c = (unsigned char)*text;
+        if (c == ' ' || c == '_' || c == '-') continue;
+        out[used++] = (char)tolower(c);
+    }
+    out[used] = 0;
+}
+
+static int find_alias(
+    const NameValue *names, size_t count, const char *text) {
+    char compact[64];
+    compact_name(text, compact, sizeof(compact));
+    for (size_t i = 0; i < count; i++)
+        if (strcmp(compact, names[i].name) == 0) return names[i].value;
+    return -1;
+}
+
 static int parse_key_token(const char *text) {
+    int value;
     if (text_equal(text, "none")) return SR_KEY_NONE;
     if (text[0] && !text[1] && isalnum((unsigned char)text[0]))
         return toupper((unsigned char)text[0]);
-    return find_name(
+    value = find_name(
         s_key_names, sizeof(s_key_names) / sizeof(s_key_names[0]), text);
+    if (value >= 0) return value;
+    return find_alias(
+        s_key_aliases, sizeof(s_key_aliases) / sizeof(s_key_aliases[0]), text);
 }
 
 static int parse_pad_token(const char *text) {
+    int value;
     if (text_equal(text, "none")) return SR_PAD_NONE;
-    return find_name(
+    value = find_name(
         s_pad_names, sizeof(s_pad_names) / sizeof(s_pad_names[0]), text);
+    if (value >= 0) return value;
+    return find_alias(
+        s_pad_aliases, sizeof(s_pad_aliases) / sizeof(s_pad_aliases[0]), text);
 }
 
 static int parse_mouse_token(const char *text) {
@@ -276,16 +350,29 @@ static int parse_mouse_token(const char *text) {
 static int parse_binding(
     SrInputBinding *binding, char *value, int binding_type,
     int line, char *error, size_t error_size) {
+    SrInputBinding previous = *binding;
+    int skipped = 0;
     binding->count = 0;
     char *cursor = value;
     while (*cursor) {
-        char *comma = strchr(cursor, ',');
+        /* ',' is the file's own separator; '|' is the launcher's default. */
+        char *comma = strpbrk(cursor, ",|");
         if (comma) *comma = 0;
         char *token = trim(cursor);
         int parsed =
             binding_type == 1 ? parse_pad_token(token) :
             binding_type == 2 ? parse_mouse_token(token) :
             parse_key_token(token);
+        if (parsed < 0 && binding_type != 2 &&
+            (binding_type == 1 ? parse_key_token(token)
+                               : parse_pad_token(token)) > 0) {
+            /* A key on a controller line, or a button on a keyboard line: a launcher that
+             * stores both on one action wrote it. The other device's line binds it. */
+            skipped = 1;
+            if (!comma) break;
+            cursor = comma + 1;
+            continue;
+        }
         if (parsed < 0) {
             set_error(error, error_size, line, "unknown binding", token);
             return 0;
@@ -313,6 +400,7 @@ static int parse_binding(
         if (!comma) break;
         cursor = comma + 1;
     }
+    if (skipped && !binding->count) *binding = previous;
     return 1;
 }
 

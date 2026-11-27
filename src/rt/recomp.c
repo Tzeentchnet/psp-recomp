@@ -108,7 +108,7 @@ static void *sr_load_raw(const char *name, size_t expected) {
     } else {
         char relative[256], error[256];
         snprintf(relative, sizeof(relative), "assets\\vfpu\\%s.dat", name);
-        if (!sr_settings_path(
+        if (!sr_program_path(
                 relative, path, sizeof(path), error, sizeof(error))) {
             fprintf(stderr, "sr_vfpu: %s\n", error);
             abort();

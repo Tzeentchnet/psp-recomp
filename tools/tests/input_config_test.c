@@ -232,6 +232,38 @@ int main(void) {
             &config, "gamepad.cross=banana\n", error, sizeof(error)));
     sr_input_config_defaults(&config);
     check_true(
+        "accept launcher spellings",
+        sr_input_config_parse(
+            &config,
+            "keyboard.cross = Space|Left Shift\n"
+            "keyboard.start = Return\n"
+            "gamepad.cross = A|Space\n"
+            "gamepad.l = LB\n"
+            "gamepad.select = Space\n"
+            "keyboard.circle = Right Trigger\n",
+            error, sizeof(error)));
+    check_u32("launcher keyboard count",
+              (uint32_t)config.keyboard[SR_INPUT_CROSS].count, 2);
+    check_u32("launcher keyboard space",
+              (uint32_t)config.keyboard[SR_INPUT_CROSS].values[0], SR_KEY_SPACE);
+    check_u32("launcher keyboard shift",
+              (uint32_t)config.keyboard[SR_INPUT_CROSS].values[1],
+              SR_KEY_LEFT_SHIFT);
+    check_u32("launcher return",
+              (uint32_t)config.keyboard[SR_INPUT_START].values[0], SR_KEY_ENTER);
+    check_u32("launcher pad skips key",
+              (uint32_t)config.gamepad[SR_INPUT_CROSS].count, 1);
+    check_u32("launcher pad a",
+              (uint32_t)config.gamepad[SR_INPUT_CROSS].values[0], SR_PAD_SOUTH);
+    check_u32("launcher pad lb",
+              (uint32_t)config.gamepad[SR_INPUT_L].values[0],
+              SR_PAD_LEFT_SHOULDER);
+    check_u32("only a key keeps pad default",
+              (uint32_t)config.gamepad[SR_INPUT_SELECT].values[0], SR_PAD_BACK);
+    check_u32("only a button keeps key default",
+              (uint32_t)config.keyboard[SR_INPUT_CIRCLE].values[0], 'G');
+    sr_input_config_defaults(&config);
+    check_true(
         "reject unknown mouse binding",
         !sr_input_config_parse(
             &config, "mouse.square=wheel_up\n", error, sizeof(error)));

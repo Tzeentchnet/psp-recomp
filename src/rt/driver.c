@@ -7,6 +7,9 @@
  * Usage: driver <elf> <ref-trace> <out-trace>
  *        driver --image <image.bin> <base-hex> <entry-hex> <ref-trace> <out-trace>
  *        driver --boot <image.bin> <base-hex> <entry-hex> <out-trace>
+ *
+ * Any mode also takes --game <iso>, --data-dir <folder>, --log <file> and --fullscreen (see
+ * take_player_options).
  */
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -14,6 +17,7 @@
 #include "graphics_settings.h"
 #include "input_config.h"
 #include "input_settings.h"
+#include "log_file.h"
 #include "recomp.h"
 #include "startup_check.h"
 
@@ -52,6 +56,7 @@ static LONG WINAPI sr_crash_filter(EXCEPTION_POINTERS *ep) {
         fprintf(stderr, "\n");
     }
     fflush(stderr);
+    sr_log_flush();
     return EXCEPTION_CONTINUE_SEARCH;   /* still crash (after reporting) */
 }
 
@@ -149,13 +154,85 @@ static void seed_from_init(const char *trace_path, CpuState *s) {
     if (mem_lines) fprintf(stderr, "seed: %d memory lines from %s\n", mem_lines, trace_path);
 }
 
+static int has_suffix(const char *text, const char *suffix) {
+    size_t length = strlen(text), suffix_length = strlen(suffix);
+    return length >= suffix_length &&
+           _stricmp(text + length - suffix_length, suffix) == 0;
+}
+
+/* Options for players and launchers, accepted anywhere on the command line and removed before
+ * the positional modes below parse argv:
+ *   --game <disc.iso>    the disc image (sets PSP_ISO)
+ *   --data-dir <folder>  settings, saves and logs (sets SR_DATA_DIR)
+ *   --log <file>         log file (default <data-dir>\logs\<exe>.log; SR_LOG=0 turns it off)
+ *   --fullscreen         start full screen (sets SR_FULLSCREEN=1)
+ * Returns the new argc, or -1 after printing an error. */
+static int take_player_options(int argc, char **argv, const char **log_path) {
+    int kept = 1;
+    for (int i = 1; i < argc; i++) {
+        const char *name = argv[i];
+        int takes_value = strcmp(name, "--game") == 0 ||
+                          strcmp(name, "--data-dir") == 0 ||
+                          strcmp(name, "--log") == 0;
+        if (takes_value) {
+            const char *value = i + 1 < argc ? argv[i + 1] : NULL;
+            if (!value || !value[0]) {
+                fprintf(stderr, "%s needs a value\n", name);
+                return -1;
+            }
+            i++;
+            if (strcmp(name, "--game") == 0) {
+                if (has_suffix(value, ".cso") || has_suffix(value, ".chd")) {
+                    fprintf(stderr,
+                            "%s: %s is compressed. Run setup with it once; setup converts it "
+                            "to an ISO, and the launcher starts the game from that.\n",
+                            SR_GAME_TITLE, value);
+                    return -1;
+                }
+                _putenv_s("PSP_ISO", value);
+            } else if (strcmp(name, "--data-dir") == 0) {
+                _putenv_s("SR_DATA_DIR", value);
+            } else {
+                *log_path = value;
+            }
+            continue;
+        }
+        if (strcmp(name, "--fullscreen") == 0) {
+            _putenv_s("SR_FULLSCREEN", "1");
+            continue;
+        }
+        argv[kept++] = argv[i];
+    }
+    argv[kept] = NULL;
+    return kept;
+}
+
+static void start_log(const char *requested) {
+    char module[MAX_PATH];
+    char name[64] = "game";
+    const char *path = requested;
+    DWORD length = GetModuleFileNameA(NULL, module, sizeof(module));
+    if (length && length < sizeof(module)) {
+        const char *base = strrchr(module, '\\');
+        char *dot;
+        snprintf(name, sizeof(name), "%s", base ? base + 1 : module);
+        dot = strrchr(name, '.');
+        if (dot) *dot = 0;
+    }
+    if (!path) path = sr_log_default_path(name);
+    if (path) sr_log_start(path);
+}
+
 int main(int argc, char **argv) {
     uint32_t entry;
     uint32_t boot_arglen = 0, boot_argp = 0;
     const char *ref_trace = NULL, *out;
+    const char *log_path = NULL;
     int standalone = 0;
 
     SetUnhandledExceptionFilter(sr_crash_filter);
+    argc = take_player_options(argc, argv, &log_path);
+    if (argc < 0) return 2;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--configure-input") == 0) {
@@ -179,6 +256,7 @@ int main(int argc, char **argv) {
 
     /* Normal runtime path: the generated image is already rebased and relocated by prxload.py. */
     if (argc >= 6 && strcmp(argv[1], "--boot") == 0) {
+        start_log(log_path);
         if (!sr_startup_validate()) return 2;
         long len;
         uint8_t *img = read_file(argv[2], &len);

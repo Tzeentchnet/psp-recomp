@@ -57,6 +57,7 @@ src/ref/interp.cpp \
               src/rt/pgf.c \
               src/rt/gui.c \
               src/rt/settings_path.c \
+              src/rt/log_file.c \
               src/rt/graphics_config.c \
               src/rt/graphics_settings.c \
               src/rt/input_config.c \
