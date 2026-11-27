@@ -27,6 +27,7 @@
 #include "../graphics_config.h"
 #include "../platform.h"
 #include "../recomp.h"
+#include "../window_mode.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -563,7 +564,8 @@ int sdl3vk_init(const char *title) {
     s_win = SDL_CreateWindow(title ? title : "PSP Recomp",
                              PSP_W * 2, PSP_H * 2,
                              SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
-                                 SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                                 SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                                 (sr_start_fullscreen() ? SDL_WINDOW_FULLSCREEN : 0));
     if (!s_win) {
         fprintf(stderr, "sdl3vk: SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 0;

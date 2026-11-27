@@ -1,7 +1,8 @@
 /* sceUtilitySavedata: a persistent virtual memory stick.
  *
  * Save operations write real files under the application's ms0/PSP/SAVEDATA tree (override the
- * root with SR_MEMSTICK), the same layout PPSSPP and a real PSP use. Secure operations use
+ * root with SR_MEMSTICK; a --data-dir / SR_DATA_DIR folder keeps it in memstick/), the same
+ * layout PPSSPP and a real PSP use. Secure operations use
  * PPSSPP's Chnnlsv/libkirk path and SFO/file hashes, so encrypted
  * saves round-trip with PPSSPP and real PSP saves. Field offsets and result codes
  * follow PPSSPP's SceUtilitySavedataParam (Core/Dialog/SavedataParam.h); the earlier no-op
@@ -107,6 +108,14 @@ static int ms_root(char *out, size_t out_size) {
                         r[root_length - 1u] != '/' &&
                         r[root_length - 1u] != '\\'
                     ? "/" : "");
+        } else if (sr_data_dir()) {
+            /* The player's data folder keeps the memory stick in memstick/. */
+            if (sr_data_path(
+                    "memstick", out, out_size, error, sizeof(error))) {
+                return 1;
+            }
+            fprintf(stderr, "savedata: %s\n", error);
+            return 0;
         } else if (sr_data_path(
                        "ms0", out, out_size,
                        error, sizeof(error))) {

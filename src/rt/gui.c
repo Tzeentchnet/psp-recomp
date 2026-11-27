@@ -9,6 +9,7 @@
 #include "input_config.h"
 #include "input_settings.h"
 #include "fps_counter.h"
+#include "window_mode.h"
 #ifdef SR_SDL3VK
 #include "gpu_sdl3vk/sdl3vk.h"
 #include "gpu_sdl3vk/ge_gpu.h"
@@ -283,9 +284,38 @@ static void read_pad(PadState *state) {
     s_pad_present = state->present;
 }
 
+/* Borderless full screen on the window's monitor, or back to the saved window. */
+static int s_gdi_fullscreen;
+
+static void gdi_set_fullscreen(HWND h, int on) {
+    static WINDOWPLACEMENT placement = {sizeof(WINDOWPLACEMENT)};
+    if (on == s_gdi_fullscreen) return;
+    if (on) {
+        MONITORINFO monitor = {sizeof(MONITORINFO)};
+        GetWindowPlacement(h, &placement);
+        if (!GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &monitor)) return;
+        SetWindowLongPtrA(h, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(h, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
+                     monitor.rcMonitor.right - monitor.rcMonitor.left,
+                     monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        SetWindowLongPtrA(h, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPlacement(h, &placement);
+        SetWindowPos(h, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER |
+                     SWP_FRAMECHANGED);
+    }
+    s_gdi_fullscreen = on;
+}
+
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE || m == WM_DESTROY) { PostQuitMessage(0); return 0; }
     if (m == WM_KEYDOWN && w == VK_ESCAPE) { PostQuitMessage(0); return 0; }
+    if (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30))) {
+        gdi_set_fullscreen(h, !s_gdi_fullscreen);
+        return 0;
+    }
     return DefWindowProc(h, m, w, l);
 }
 
@@ -472,6 +502,7 @@ int gui_init(const char *title) {
         s_px = NULL;
         return 0;
     }
+    if (sr_start_fullscreen()) gdi_set_fullscreen(s_hwnd, 1);
     s_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     s_bmi.bmiHeader.biWidth = PSP_W;
     s_bmi.bmiHeader.biHeight = -PSP_H;          /* top-down */

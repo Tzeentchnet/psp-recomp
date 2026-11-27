@@ -173,11 +173,32 @@ int sr_data_root(
         set_error(error, error_size, "invalid user data path arguments");
         return 0;
     }
-    if (!sr_user_data_path(SR_APPLICATION_DATA_NAME, path, path_size)) {
+    if (sr_data_dir()) {
+        if (strlen(sr_data_dir()) >= path_size) {
+            set_error(error, error_size, "SR_DATA_DIR is too long");
+            return 0;
+        }
+        strcpy(path, sr_data_dir());
+    } else if (!sr_user_data_path(SR_APPLICATION_DATA_NAME, path, path_size)) {
         set_error(error, error_size, "cannot locate user data directory");
         return 0;
     }
     return ensure_directory(path, error, error_size);
+}
+
+const char *sr_data_dir(void) {
+    const char *value = getenv("SR_DATA_DIR");
+    return value && value[0] ? value : NULL;
+}
+
+int sr_make_parent_directories(
+    const char *path, char *error, size_t error_size) {
+    if (error && error_size) error[0] = 0;
+    if (!path || !path[0]) {
+        set_error(error, error_size, "invalid path arguments");
+        return 0;
+    }
+    return ensure_parent_directory(path, error, error_size);
 }
 
 int sr_data_path(
@@ -376,6 +397,9 @@ int sr_settings_path(
             return 0;
         }
         memcpy(directory, override, directory_length + 1u);
+    } else if (sr_data_dir()) {
+        /* The player's data folder (--data-dir) holds the settings files. */
+        return sr_data_path(filename, path, path_size, error, error_size);
     } else {
 #ifdef __APPLE__
         if (!sr_data_path(

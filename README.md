@@ -345,7 +345,13 @@ are `A`-`Z`, `0`-`9`, `enter`, `left_shift`, `right_shift`, `up`, `right`,
 Mouse inputs are `left`, `right`, `middle`, `x1`, and `x2`.
 Gamepad inputs are `south`, `east`, `west`, `north`, `start`, `back`,
 `left_shoulder`, `right_shoulder`, `left_trigger`, `right_trigger`, the four
-`dpad_*` names, `left_stick`, and `right_stick`. Invalid settings stop startup
+`dpad_*` names, `left_stick`, and `right_stick`. Inputs may also be separated
+by `|`, and common spellings from launchers are accepted: SDL key names such
+as `Return`, `Space` or `Left Shift`, and Xbox or PlayStation button names
+such as `A`, `Cross`, `LB`, `R2` or `DPad Up` (case, spaces, `_` and `-` are
+ignored). A key on a `gamepad.*` line or a button on a `keyboard.*` line is
+skipped, so a launcher that stores both devices on one action does not break
+the file. Other invalid settings stop startup
 with a line-specific error instead of silently falling back. Set
 `SR_INPUT_CONFIG=<path>` to use another file, or `SR_INPUT_CONFIG=0` to use
 built-in defaults without reading or writing a file. An untouched generated
@@ -360,6 +366,27 @@ Support directory rather than beside the executable. `SR_RESOURCE_DIR`
 overrides immutable app/developer resources such as fonts and VFPU tables.
 Title-specific launchers may persist an ISO path in `launcher.ini`; `PSP_ISO`
 always takes precedence.
+
+## Player Options
+
+Every mode of the driver also accepts these options anywhere on the command
+line:
+
+- `--game <disc.iso>` sets the disc image (`PSP_ISO`).
+- `--data-dir <folder>` keeps settings, saves and logs in one folder
+  (`SR_DATA_DIR`), in place of the per-user data folder: `graphics.ini` and
+  `input.ini`, the Memory Stick in `memstick/` (both sceUtilitySavedata and
+  `ms0:` files), other writable devices in `fs/<device>/`, and
+  `logs/<exe>.log`. Program resources (VFPU tables, fonts) still come from the
+  resource folder. `SR_SETTINGS_DIR`, `SR_MEMSTICK` and `SR_FSDIR` still
+  override single locations.
+- `--log <file>` copies everything printed to stderr into a log file, keeping
+  the previous run's as `<name>.previous.log`. With a data folder the game logs
+  to `logs/<exe>.log` unless `SR_LOG=0`; `SR_LOG_FILE` sets the path. The crash
+  handler flushes the log before the process ends.
+- `--fullscreen` starts full screen (`SR_FULLSCREEN=1`; `0` forces a window).
+  `RECOMPLAUNCHER_MODE=bigpicture` also starts full screen. F11 toggles it in
+  the GDI, D3D12 and Vulkan windows.
 
 ## Environment Settings
 

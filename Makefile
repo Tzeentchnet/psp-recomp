@@ -132,6 +132,7 @@ RT_SRCS    := src/rt/recomp.c \
               src/rt/mpeg.c \
               src/rt/pgf.c \
               src/rt/settings_path.c \
+              src/rt/log_file.c \
               src/rt/graphics_config.c \
               src/rt/graphics_auto.c \
               src/rt/input_config.c \
