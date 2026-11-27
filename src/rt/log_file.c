@@ -24,14 +24,25 @@ static HANDLE s_console = INVALID_HANDLE_VALUE;
 static HANDLE s_read = NULL;
 static volatile LONG s_busy;
 
+/* The pump peeks before it reads, so it is never blocked inside ReadFile: Windows serializes
+ * synchronous I/O on a handle, and a blocked read would also block sr_log_flush's
+ * PeekNamedPipe until more output arrived, hanging the process at exit. */
 static DWORD WINAPI log_pump(LPVOID unused) {
     char buffer[4096];
     (void)unused;
     for (;;) {
-        DWORD count = 0, written;
-        if (!ReadFile(s_read, buffer, sizeof(buffer), &count, NULL) || !count)
+        DWORD available = 0, count = 0, written;
+        if (!PeekNamedPipe(s_read, NULL, 0, NULL, &available, NULL)) break;
+        if (!available) {
+            Sleep(5);
+            continue;
+        }
+        if (available > sizeof(buffer)) available = sizeof(buffer);
+        InterlockedExchange(&s_busy, 1);   /* before the read empties the pipe */
+        if (!ReadFile(s_read, buffer, available, &count, NULL) || !count) {
+            InterlockedExchange(&s_busy, 0);
             break;
-        InterlockedExchange(&s_busy, 1);
+        }
         WriteFile(s_file, buffer, count, &written, NULL);
         if (s_console != INVALID_HANDLE_VALUE)
             WriteFile(s_console, buffer, count, &written, NULL);
@@ -145,7 +156,7 @@ void sr_log_flush(void) {
     for (int waited = 0; waited < 1000; waited += 5) {
         DWORD pending = 0;
         if (!PeekNamedPipe(s_read, NULL, 0, NULL, &pending, NULL)) break;
-        if (!pending && !s_busy) break;
+        if (!pending && !InterlockedCompareExchange(&s_busy, 0, 0)) break;
         Sleep(5);
     }
     FlushFileBuffers(s_file);
