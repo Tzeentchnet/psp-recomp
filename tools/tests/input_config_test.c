@@ -309,9 +309,9 @@ int main(void) {
     check_true(
         "create temporary input config directory",
         sr_test_mkdir(config_dir));
+    /* settings_path.c joins with '/' on every platform. */
     snprintf(
-        config_path, sizeof(config_path), "%s%sinput.ini",
-        config_dir, SR_TEST_PATH_SEPARATOR);
+        config_path, sizeof(config_path), "%s/input.ini", config_dir);
     FILE *file = fopen(config_path, "wb");
     check_true("create temporary config", file != NULL);
     if (file) {
