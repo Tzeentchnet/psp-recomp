@@ -69,6 +69,8 @@ void sr_graphics_config_defaults(SrGraphicsConfig *config) {
     if (!config) return;
     config->renderer = SR_GRAPHICS_RENDERER_D3D12;
     config->internal_resolution = 2u;
+    config->texture_scale = 1u;
+    config->d3d12_full_rate = 0u;
 }
 
 const char *sr_graphics_renderer_name(int renderer) {
@@ -179,6 +181,49 @@ int sr_graphics_config_parse(
             }
             seen |= setting;
             config->internal_resolution = (uint32_t)parsed;
+        } else if (text_equal(name, "texture_scale")) {
+            char *end = NULL;
+            unsigned long parsed;
+            setting = 4u;
+            if (seen & setting) {
+                set_error(
+                    error, error_size, line_number,
+                    "duplicate setting", name);
+                return 0;
+            }
+            errno = 0;
+            parsed = strtoul(value, &end, 10);
+            if (errno || !end || *trim(end) ||
+                parsed < SR_TEXTURE_SCALE_MIN ||
+                parsed > SR_TEXTURE_SCALE_MAX) {
+                set_error(
+                    error, error_size, line_number,
+                    "texture_scale must be an integer from 1 to 5",
+                    value);
+                return 0;
+            }
+            seen |= setting;
+            config->texture_scale = (uint32_t)parsed;
+        } else if (text_equal(name, "d3d12_full_rate")) {
+            char *end = NULL;
+            unsigned long parsed;
+            setting = 8u;
+            if (seen & setting) {
+                set_error(
+                    error, error_size, line_number,
+                    "duplicate setting", name);
+                return 0;
+            }
+            errno = 0;
+            parsed = strtoul(value, &end, 10);
+            if (errno || !end || *trim(end) || parsed > 1u) {
+                set_error(
+                    error, error_size, line_number,
+                    "d3d12_full_rate must be 0 or 1", value);
+                return 0;
+            }
+            seen |= setting;
+            config->d3d12_full_rate = (uint32_t)parsed;
         } else {
             set_error(
                 error, error_size, line_number,
@@ -293,9 +338,12 @@ int sr_graphics_config_init(void) {
     s_first_run = 0;
     s_initialized = 1;
     fprintf(
-        stderr, "graphics: loaded %s (renderer %s, internal resolution %ux)\n",
+        stderr,
+        "graphics: loaded %s (renderer %s, internal resolution %ux, "
+        "texture scale %ux, D3D12 full-rate %s)\n",
         s_config_path, sr_graphics_renderer_name(s_config.renderer),
-        s_config.internal_resolution);
+        s_config.internal_resolution, s_config.texture_scale,
+        s_config.d3d12_full_rate ? "on" : "off");
     return 1;
 }
 
@@ -329,7 +377,10 @@ int sr_graphics_config_save(
     renderer = sr_graphics_renderer_name(config->renderer);
     if (!renderer ||
         config->internal_resolution < SR_GRAPHICS_SCALE_MIN ||
-        config->internal_resolution > SR_GRAPHICS_SCALE_MAX) {
+        config->internal_resolution > SR_GRAPHICS_SCALE_MAX ||
+        config->texture_scale < SR_TEXTURE_SCALE_MIN ||
+        config->texture_scale > SR_TEXTURE_SCALE_MAX ||
+        config->d3d12_full_rate > 1u) {
         set_error(
             error, error_size, 0,
             "graphics config contains invalid values", NULL);
@@ -352,10 +403,13 @@ int sr_graphics_config_save(
     }
     ok = fprintf(
             file,
-            "# KZL graphics config v1\n"
+        "# PSP recomp graphics config v2\n"
             "renderer = %s\n"
-            "internal_resolution = %u\n",
-            renderer, config->internal_resolution) > 0 &&
+        "internal_resolution = %u\n"
+        "texture_scale = %u\n"
+        "d3d12_full_rate = %u\n",
+        renderer, config->internal_resolution,
+        config->texture_scale, config->d3d12_full_rate) > 0 &&
          fflush(file) == 0 &&
          _commit(_fileno(file)) == 0;
     if (fclose(file) != 0) ok = 0;
@@ -382,8 +436,12 @@ int sr_graphics_config_save(
     s_config = *config;
     s_first_run = 0;
     fprintf(
-        stderr, "graphics: saved %s (renderer %s, internal resolution %ux)\n",
-        s_config_path, renderer, config->internal_resolution);
+        stderr,
+        "graphics: saved %s (renderer %s, internal resolution %ux, "
+        "texture scale %ux, D3D12 full-rate %s)\n",
+        s_config_path, renderer, config->internal_resolution,
+        config->texture_scale,
+        config->d3d12_full_rate ? "on" : "off");
     return 1;
 }
 

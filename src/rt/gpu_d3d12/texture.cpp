@@ -3,7 +3,9 @@
 #include "device.h"
 
 extern "C" {
+#include "../graphics_config.h"
 #include "../recomp.h"
+#include "../texture_scaler.h"
 }
 
 #include <limits.h>
@@ -14,7 +16,7 @@ extern "C" {
 #define MAX_TEXTURES 512u
 #define EVICT_TEXTURES 128u
 #define MAX_CLUTS 256u
-#define MAX_PENDING_DECODE_BYTES (64ull * 1024ull * 1024ull)
+#define MAX_PENDING_DECODE_BYTES (512ull * 1024ull * 1024ull)
 #define RELEASE_COM(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
 
 struct TextureEntry {
@@ -69,6 +71,7 @@ static uint64_t s_misses;
 static uint64_t s_uploads;
 static uint64_t s_invalidations;
 static uint64_t s_evictions;
+static uint32_t s_texture_scale = 1u;
 static bool s_initialized;
 static bool s_log;
 
@@ -257,11 +260,13 @@ static TextureEntry *allocate_entry(uint32_t *slot) {
 }
 
 static bool decode_entry(TextureEntry *entry) {
+    uint32_t *decoded = nullptr;
     uint64_t pixel_count = 0;
     for (uint32_t level = 0; level < entry->key.mip_count; level++) {
         entry->pixel_offset[level] = (uint32_t)pixel_count;
-        pixel_count += (uint64_t)entry->key.width[level] *
-                       entry->key.height[level];
+        pixel_count +=
+            (uint64_t)entry->key.width[level] * s_texture_scale *
+            (uint64_t)entry->key.height[level] * s_texture_scale;
     }
     if (!pixel_count || pixel_count > UINT32_MAX ||
         pixel_count > SIZE_MAX / sizeof(uint32_t)) {
@@ -285,10 +290,44 @@ static bool decode_entry(TextureEntry *entry) {
     }
     entry->pixel_count = (uint32_t)pixel_count;
     s_pending_decode_bytes += bytes;
-    for (uint32_t level = 0; level < entry->key.mip_count; level++) {
-        ge_decode_tex_rgba_level(
-            entry->pixels + entry->pixel_offset[level], (int)level);
+    if (s_texture_scale > 1u) {
+        uint64_t decoded_bytes =
+            (uint64_t)entry->key.width[0] *
+            entry->key.height[0] * sizeof(uint32_t);
+        decoded = static_cast<uint32_t *>(malloc((size_t)decoded_bytes));
+        if (!decoded) {
+            fprintf(stderr,
+                    "ged3d12: could not allocate %llu bytes for texture scaling\n",
+                    (unsigned long long)decoded_bytes);
+            free(entry->pixels);
+            entry->pixels = nullptr;
+            entry->pixel_count = 0;
+            s_pending_decode_bytes -= bytes;
+            return false;
+        }
     }
+    for (uint32_t level = 0; level < entry->key.mip_count; level++) {
+        uint32_t *destination =
+            entry->pixels + entry->pixel_offset[level];
+        if (s_texture_scale == 1u) {
+            ge_decode_tex_rgba_level(destination, (int)level);
+        } else {
+            ge_decode_tex_rgba_level(decoded, (int)level);
+            if (!sr_texture_scale_rgba(
+                    decoded, entry->key.width[level],
+                    entry->key.height[level], s_texture_scale,
+                    destination)) {
+                fprintf(stderr, "ged3d12: xBRZ texture scaling failed\n");
+                free(decoded);
+                free(entry->pixels);
+                entry->pixels = nullptr;
+                entry->pixel_count = 0;
+                s_pending_decode_bytes -= bytes;
+                return false;
+            }
+        }
+    }
+    free(decoded);
     entry->pending = true;
     return true;
 }
@@ -300,8 +339,8 @@ static bool create_resource(TextureEntry *entry) {
     heap.VisibleNodeMask = 1;
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = entry->key.width[0];
-    desc.Height = entry->key.height[0];
+    desc.Width = entry->key.width[0] * s_texture_scale;
+    desc.Height = entry->key.height[0] * s_texture_scale;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = entry->key.mip_count;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -321,8 +360,8 @@ static bool upload_entry(TextureEntry *entry) {
     if (!entry->resource && !create_resource(entry)) return false;
     ID3D12GraphicsCommandList *command_list = ged3d12_command_list();
     for (uint32_t level = 0; level < entry->key.mip_count; level++) {
-        UINT width = entry->key.width[level];
-        UINT height = entry->key.height[level];
+        UINT width = entry->key.width[level] * s_texture_scale;
+        UINT height = entry->key.height[level] * s_texture_scale;
         UINT row_pitch = (width * 4u + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
                          ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
         UINT64 upload_size = (UINT64)row_pitch * height;
@@ -460,9 +499,14 @@ bool ged3d12_texture_cache_init(void) {
     s_pending_decode_bytes = 0;
     s_lookups = s_hits = s_misses = s_uploads = 0;
     s_invalidations = s_evictions = 0;
+    const SrGraphicsConfig *config = sr_graphics_config_get();
+    s_texture_scale = config ? config->texture_scale : 1u;
     const char *log = getenv("SR_D3D12_TEXTURE_LOG");
     s_log = log && log[0] && strcmp(log, "0") != 0;
     s_initialized = true;
+    fprintf(
+        stderr, "ged3d12: texture cache xBRZ scale %ux\n",
+        s_texture_scale);
     return true;
 }
 
@@ -484,6 +528,7 @@ void ged3d12_texture_cache_shutdown(void) {
     memset(s_samplers, 0, sizeof(s_samplers));
     memset(s_cluts, 0, sizeof(s_cluts));
     s_sampler_count = 0;
+    s_texture_scale = 1u;
     s_initialized = false;
     s_log = false;
 }
@@ -511,6 +556,8 @@ bool ged3d12_texture_capture(GeD3D12TextureBinding *out) {
         out->flags |= GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT;
         return true;
     }
+    if (s_texture_scale > 1u)
+        out->flags |= GE_D3D12_TEXTURE_UPSCALED;
 
     GeD3D12TextureKey key = {};
     ged3d12_texture_key_build(state, &key);

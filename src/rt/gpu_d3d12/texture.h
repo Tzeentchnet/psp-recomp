@@ -14,6 +14,7 @@
 
 enum GeD3D12TextureBindingFlag : uint8_t {
     GE_D3D12_TEXTURE_FRAMEBUFFER_CLUT = 1u,
+    GE_D3D12_TEXTURE_UPSCALED = 2u,
 };
 
 struct GeD3D12TextureKey {
